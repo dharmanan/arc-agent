@@ -28,15 +28,17 @@ const quoteSchema = z.object({
 
 router.post('/swap/quote', txRateLimit, async (req, res, next) => {
   try {
-    const body      = quoteSchema.parse(req.body);
-    const amountOut = await agentWalletService.getSwapQuote(body);
+    const body = quoteSchema.parse(req.body);
+    const { amountOut, quoteError } = await agentWalletService.getSwapQuoteResult(body);
     const stablePair = ['USDC', 'EURC'].includes(body.fromToken) && ['USDC', 'EURC'].includes(body.toToken);
+
     res.json({
       fromToken:  body.fromToken,
       toToken:    body.toToken,
       amountIn:   body.amountIn,
-      amountOut:  amountOut ?? (stablePair ? body.amountIn : 0),
+      amountOut:  amountOut ?? (stablePair ? body.amountIn : null),
       isDexQuote: amountOut !== null,
+      quoteError: amountOut === null ? quoteError : null,
     });
   } catch (err) { next(err); }
 });

@@ -25,7 +25,7 @@ export default function SwapTab({ onBack }) {
   const [fromToken, setFromToken] = useState('USDC');
   const [toToken,   setToToken]   = useState('EURC');
   const [amountIn,  setAmountIn]  = useState('');
-  const [quote,     setQuote]     = useState(null);  // { amountOut, isDexQuote }
+  const [quote,     setQuote]     = useState(null);  // { amountOut, isDexQuote, quoteError }
   const [quoting,   setQuoting]   = useState(false);
   const [result,    setResult]    = useState(null);  // completed tx
   const [status,    setStatus]    = useState(null);  // executing status string
@@ -50,6 +50,9 @@ export default function SwapTab({ onBack }) {
   const exceedsMax   = usdEquivalentIn !== null && usdEquivalentIn > maxTrade;
   const limitAwaitingQuote = hasAmount && fromToken === 'cirBTC' && usdEquivalentIn === null;
   const swapDisabledByDex = hasAmount && !quoting && !!quote && !quote.isDexQuote;
+  const quoteWarning = swapDisabledByDex
+    ? (quote?.quoteError || 'Live Arc swap routing is unavailable right now.')
+    : null;
 
   // ── Fetch quote on amount / direction change ──────────────────────────────
   const fetchQuote = useCallback(async (amount, from, to) => {
@@ -60,7 +63,13 @@ export default function SwapTab({ onBack }) {
       setQuote(q);
     } catch {
       const stablePair = STABLE_SWAP_TOKENS.has(from) && STABLE_SWAP_TOKENS.has(to);
-      setQuote({ amountOut: stablePair ? parseFloat(amount) : 0, isDexQuote: false });
+      setQuote({
+        amountOut: stablePair ? parseFloat(amount) : null,
+        isDexQuote: false,
+        quoteError: stablePair
+          ? 'Live Arc swap routing is unavailable right now. Stable-to-stable quotes may fall back to a placeholder.'
+          : 'Live Arc swap routing is unavailable right now.',
+      });
     } finally {
       setQuoting(false);
     }
@@ -337,9 +346,9 @@ export default function SwapTab({ onBack }) {
                 {quoting ? <RefreshCw size={14} className="animate-spin inline"/> : (quote && Number.isFinite(quotedAmountOut) ? quotedAmountOut.toFixed(toToken === 'cirBTC' ? 6 : 4) : '—')}
               </span>
             </div>
-            {swapDisabledByDex && (
+            {quoteWarning && (
               <Alert type="warning">
-                Live Arc swap routing is unavailable right now. Stable-to-stable quotes may fall back to a placeholder, and execution stays disabled until a live route is available.
+                {quoteWarning}
               </Alert>
             )}
           </div>

@@ -183,6 +183,20 @@ function createArcSwapAdapter(privateKey) {
   });
 }
 
+function normalizeSwapQuoteError(error) {
+  const message = error?.message || 'Live quote is unavailable right now.';
+
+  if (message.includes('No route available')) {
+    return 'No live route is available for this amount right now.';
+  }
+
+  if (message.includes('Invalid API key format')) {
+    return 'Swap configuration is invalid on this deployment.';
+  }
+
+  return 'Live quote is unavailable right now.';
+}
+
 async function estimateArcSwap({ adapter, fromToken, toToken, amountIn, slippagePct }) {
   return SWAP_KIT.estimate({
     from: { adapter, chain: ARC_SWAP_CHAIN },
@@ -677,8 +691,10 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
 // ─────────────────────────────────────────────────────────────────────────────
 // QUOTE (okuma, tx yok)
 // ─────────────────────────────────────────────────────────────────────────────
-async function getSwapQuote({ fromToken, toToken, amountIn }) {
-  if (!isSwapConfigured()) return null;
+async function getSwapQuoteResult({ fromToken, toToken, amountIn }) {
+  if (!isSwapConfigured()) {
+    return { amountOut: null, quoteError: 'Swap is not configured on this deployment.' };
+  }
 
   try {
     const adapter = createArcSwapAdapter(SWAP_QUOTE_PRIVATE_KEY);
@@ -689,11 +705,16 @@ async function getSwapQuote({ fromToken, toToken, amountIn }) {
       amountIn,
       slippagePct: 0.5,
     });
-    return quote.estimatedOutput.amount;
+    return { amountOut: quote.estimatedOutput.amount, quoteError: null };
   } catch (error) {
     console.warn('[AGENT-SWAP-QUOTE]', error.message);
-    return null;
+    return { amountOut: null, quoteError: normalizeSwapQuoteError(error) };
   }
+}
+
+async function getSwapQuote(params) {
+  const { amountOut } = await getSwapQuoteResult(params);
+  return amountOut;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -726,6 +747,7 @@ module.exports = {
   agentSwap,
   agentSend,
   getSwapQuote,
+  getSwapQuoteResult,
   isSwapConfigured,
   getAgentSigner,
   getCurrentBlockNumber,
