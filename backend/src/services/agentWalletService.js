@@ -724,6 +724,7 @@ module.exports = {
   agentSwap,
   agentSend,
   getSwapQuote,
+  isSwapConfigured,
   getAgentSigner,
   getCurrentBlockNumber,
   getNativeBalance,
