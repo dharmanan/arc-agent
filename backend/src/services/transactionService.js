@@ -599,8 +599,8 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
     throw Object.assign(new Error('Swap is only supported on Arc Testnet'), { status: 400 });
   }
 
-  if (!process.env.ARC_DEX_ROUTER) {
-    throw Object.assign(new Error('DEX swap is not yet available on Arc Testnet. Please check back later.'), { status: 503 });
+  if (!agentWalletService.isSwapConfigured()) {
+    throw Object.assign(new Error('Swap is not configured on this deployment. Set CIRCLE_KIT_KEY and try again.'), { status: 503 });
   }
 
   const allowedPairs = [['USDC', 'EURC'], ['EURC', 'USDC']];

@@ -88,7 +88,7 @@ export default function SwapTab({ onBack }) {
   async function handleSwap() {
     if (!hasAmount) { setError('Enter a valid amount.'); return; }
     if (quoting || !quote) { setError('Waiting for a live swap quote from Arc Testnet…'); return; }
-    if (!quote.isDexQuote) { setError('Swap is unavailable on this deployment until ARC_DEX_ROUTER is configured.'); return; }
+    if (!quote.isDexQuote) { setError('Swap is unavailable on this deployment until CIRCLE_KIT_KEY is configured.'); return; }
     if (exceedsMax) { setError(`Amount exceeds agent auto-approve limit (${maxTrade} USDC). Lower the amount or raise the limit in Agent Settings.`); return; }
 
     setError('');
@@ -275,7 +275,7 @@ export default function SwapTab({ onBack }) {
             </div>
             {swapDisabledByDex && (
               <Alert type="warning">
-                Live Arc DEX routing is not configured on this deployment. The 1:1 number is a placeholder, and execution is disabled until `ARC_DEX_ROUTER` is set.
+                Live Arc swap routing is not configured on this deployment. The shown amount is a placeholder, and execution is disabled until CIRCLE_KIT_KEY is set.
               </Alert>
             )}
           </div>

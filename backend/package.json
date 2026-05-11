@@ -12,6 +12,9 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",
+    "@circle-fin/adapter-ethers-v6": "^1.7.0",
+    "@coral-xyz/anchor": "^0.32.1",
+    "@circle-fin/swap-kit": "^1.2.0",
     "@simplewebauthn/server": "^11.0.0",
     "bcryptjs": "^2.4.3",
     "bull": "^4.16.3",

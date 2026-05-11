@@ -17,6 +17,8 @@
 const { ethers } = require('ethers');
 const https      = require('https');
 const { decrypt } = require('./cryptoService');
+const { createEthersAdapterFromPrivateKey } = require('@circle-fin/adapter-ethers-v6');
+const { SwapKit, SwapChain, getChainByEnum } = require('@circle-fin/swap-kit');
 
 // ── Sabitler ──────────────────────────────────────────────────────────────────
 const NANO_THRESHOLD_USDC = 0.01;
@@ -107,7 +109,9 @@ const IRIS_API = 'https://iris-api-sandbox.circle.com';
 // ── Token adresleri (Arc Testnet) ─────────────────────────────────────────────
 const USDC_ARC   = process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000';
 const EURC_ARC   = process.env.EURC_ADDRESS_ARC || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
-const DEX_ROUTER = process.env.ARC_DEX_ROUTER   || '';
+const ARC_SWAP_CHAIN = getChainByEnum(SwapChain.Arc_Testnet);
+const SWAP_KIT = new SwapKit();
+const SWAP_QUOTE_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
 
 // ── ABI'lar ───────────────────────────────────────────────────────────────────
 const ERC20_ABI = [
@@ -135,11 +139,6 @@ const ARBITRUM_INBOX_ABI = [
   'function depositEth() payable returns (uint256)',
 ];
 
-const ROUTER_ABI = [
-  'function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) returns (uint[] memory amounts)',
-  'function getAmountsOut(uint amountIn, address[] memory path) view returns (uint[] memory amounts)',
-];
-
 // ── Provider cache ────────────────────────────────────────────────────────────
 const _providers = {};
 function getProvider(chainName) {
@@ -152,11 +151,48 @@ function getProvider(chainName) {
 }
 
 // ── Ajan imzalayıcı (private key şifre çözme) ─────────────────────────────────
-function getAgentSigner(agent, chainName = 'Arc Testnet') {
+function getAgentPrivateKey(agent) {
   const encrypted = agent.private_key_encrypted || agent.privateKeyEncrypted;
   if (!encrypted) throw new Error('Agent private key kaydedilmemiş (ajanı yeniden oluşturun)');
-  const privateKey = decrypt(encrypted);
-  return new ethers.Wallet(privateKey, getProvider(chainName));
+  return decrypt(encrypted);
+}
+
+function getAgentSigner(agent, chainName = 'Arc Testnet') {
+  return new ethers.Wallet(getAgentPrivateKey(agent), getProvider(chainName));
+}
+
+function getSwapKitKey() {
+  return process.env.CIRCLE_KIT_KEY || process.env.KIT_KEY || '';
+}
+
+function isSwapConfigured() {
+  return Boolean(getSwapKitKey());
+}
+
+function toSlippageBps(slippagePct = 0.5) {
+  const normalized = Number(slippagePct);
+  if (!Number.isFinite(normalized) || normalized <= 0) return 50;
+  return Math.max(1, Math.round(normalized * 100));
+}
+
+function createArcSwapAdapter(privateKey) {
+  return createEthersAdapterFromPrivateKey({
+    privateKey,
+    getProvider: () => getProvider('Arc Testnet'),
+  });
+}
+
+async function estimateArcSwap({ adapter, fromToken, toToken, amountIn, slippagePct }) {
+  return SWAP_KIT.estimate({
+    from: { adapter, chain: ARC_SWAP_CHAIN },
+    tokenIn: fromToken,
+    tokenOut: toToken,
+    amountIn: String(amountIn),
+    config: {
+      kitKey: getSwapKitKey(),
+      slippageBps: toSlippageBps(slippagePct),
+    },
+  });
 }
 
 async function getNativeBalance(chainName, address) {
@@ -605,52 +641,57 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AGENTIC SWAP (USDC ↔ EURC, Arc Testnet DEX)
+// AGENTIC SWAP (USDC ↔ EURC on Arc Testnet)
 // ─────────────────────────────────────────────────────────────────────────────
 async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5 }) {
-  if (!DEX_ROUTER) throw new Error('ARC_DEX_ROUTER yapılandırılmamış');
+  if (!isSwapConfigured()) throw new Error('CIRCLE_KIT_KEY is not configured');
 
-  const fromAddr  = resolveTokenAddress(fromToken);
-  const toAddr    = resolveTokenAddress(toToken);
-  const signer    = getAgentSigner(agent);
-  const amountWei = ethers.parseUnits(String(amountIn), 6);
-  const router    = new ethers.Contract(DEX_ROUTER, ROUTER_ABI, signer);
-  const fromERC   = new ethers.Contract(fromAddr, ERC20_ABI, signer);
+  const adapter = createArcSwapAdapter(getAgentPrivateKey(agent));
+  const quote = await estimateArcSwap({
+    adapter,
+    fromToken,
+    toToken,
+    amountIn,
+    slippagePct,
+  });
 
-  const balance = await fromERC.balanceOf(signer.address);
-  if (balance < amountWei) throw new Error(`Yetersiz ${fromToken} bakiyesi`);
+  const result = await SWAP_KIT.swap({
+    from: { adapter, chain: ARC_SWAP_CHAIN },
+    tokenIn: fromToken,
+    tokenOut: toToken,
+    amountIn: String(amountIn),
+    config: {
+      kitKey: getSwapKitKey(),
+      slippageBps: toSlippageBps(slippagePct),
+      stopLimit: quote.stopLimit.amount,
+    },
+  });
 
-  const allowance = await fromERC.allowance(signer.address, DEX_ROUTER);
-  if (allowance < amountWei) {
-    const appTx = await fromERC.approve(DEX_ROUTER, ethers.MaxUint256, { gasLimit: 80_000, maxFeePerGas: AGENT_MAX_GAS });
-    await appTx.wait(1);
-  }
-
-  const path       = [fromAddr, toAddr];
-  const amounts    = await router.getAmountsOut(amountWei, path);
-  const slipBps    = BigInt(Math.floor(slippagePct * 100));
-  const minOut     = amounts[1] * (10000n - slipBps) / 10000n;
-  const deadline   = Math.floor(Date.now() / 1000) + 1200;
-
-  const tx      = await router.swapExactTokensForTokens(amountWei, minOut, path, signer.address, deadline, { gasLimit: 250_000, maxFeePerGas: AGENT_MAX_GAS });
-  const receipt = await tx.wait(1);
-  const amountOut = ethers.formatUnits(amounts[1], 6);
-  console.log(`[AGENT-SWAP] ✓ ${receipt.hash} | out: ${amountOut} ${toToken}`);
-  return { hash: receipt.hash, amountOut };
+  const amountOut = result.amountOut || quote.estimatedOutput.amount;
+  console.log(`[AGENT-SWAP] ✓ ${result.txHash} | out: ${amountOut} ${toToken}`);
+  return { hash: result.txHash, amountOut };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QUOTE (okuma, tx yok)
 // ─────────────────────────────────────────────────────────────────────────────
 async function getSwapQuote({ fromToken, toToken, amountIn }) {
-  if (!DEX_ROUTER) return null;
-  const provider  = getProvider('Arc Testnet');
-  const fromAddr  = resolveTokenAddress(fromToken);
-  const toAddr    = resolveTokenAddress(toToken);
-  const amountWei = ethers.parseUnits(String(amountIn), 6);
-  const router    = new ethers.Contract(DEX_ROUTER, ROUTER_ABI, provider);
-  const amounts   = await router.getAmountsOut(amountWei, [fromAddr, toAddr]);
-  return ethers.formatUnits(amounts[1], 6);
+  if (!isSwapConfigured()) return null;
+
+  try {
+    const adapter = createArcSwapAdapter(SWAP_QUOTE_PRIVATE_KEY);
+    const quote = await estimateArcSwap({
+      adapter,
+      fromToken,
+      toToken,
+      amountIn,
+      slippagePct: 0.5,
+    });
+    return quote.estimatedOutput.amount;
+  } catch (error) {
+    console.warn('[AGENT-SWAP-QUOTE]', error.message);
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,13 @@
+{
+  "typescript.tsdk": "frontend/node_modules/typescript/lib",
+  "typescript.preferences.includePackageJsonAutoImports": "off",
+  "typescript.disableAutomaticTypeAcquisition": true,
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true
+  },
+  "typescript.excludeHints": "all"
+}

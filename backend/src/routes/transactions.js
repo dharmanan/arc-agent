@@ -207,12 +207,12 @@ router.post('/swap/quote', async (req, res, next) => {
   try {
     const body     = quoteSchema.parse(req.body);
     const amountOut = await agentWalletService.getSwapQuote(body);
-    // amountOut is null if DEX not configured — return estimated 1:1 (stables)
+    // amountOut is null if live Arc swap quoting is unavailable — return a 1:1 stable fallback.
     res.json({
       fromToken:  body.fromToken,
       toToken:    body.toToken,
       amountIn:   body.amountIn,
-      amountOut:  amountOut ?? body.amountIn,  // 1:1 estimate if DEX unavailable
+      amountOut:  amountOut ?? body.amountIn,  // 1:1 estimate if live quote is unavailable
       isDexQuote: amountOut !== null,
     });
   } catch (err) { next(err); }
