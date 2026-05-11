@@ -1,0 +1,145 @@
+'use strict';
+/**
+ * LLM Service — wraps Anthropic / OpenAI / Gemini.
+ *
+ * Key design decisions:
+ *  1. Market analysis results are cached in Redis (TTL = LLM_CACHE_TTL, default 5 min)
+ *     so 100 agents asking the same question only costs ONE LLM call.
+ *  2. All decisions are written to llm_audit for transparency.
+ *  3. Users supply their own API keys (decrypted in-flight, never logged).
+ */
+const crypto    = require('crypto');
+const Anthropic  = require('@anthropic-ai/sdk');
+const OpenAI     = require('openai');
+const db         = require('../db');
+const redis      = require('./redisClient');
+const { decrypt } = require('./cryptoService');
+
+const CACHE_TTL = parseInt(process.env.LLM_CACHE_TTL || '300', 10); // seconds
+
+// ── Client factory ────────────────────────────────────────────────────────────
+function buildClient(model, apiKey) {
+  if (model.startsWith('claude')) {
+    return new Anthropic({ apiKey });
+  }
+  // Gemini uses OpenAI-compatible endpoint
+  if (model.startsWith('gemini')) {
+    return new OpenAI({
+      apiKey,
+      baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    });
+  }
+  return new OpenAI({ apiKey });
+}
+
+// ── Core call (with Redis caching) ────────────────────────────────────────────
+async function callLlm({ model, apiKey, systemPrompt, userPrompt, agentId }) {
+  const cacheKey = `llm:${crypto.createHash('sha256').update(model + systemPrompt + userPrompt).digest('hex')}`;
+  const cached = await redis.get(cacheKey);
+
+  if (cached) {
+    await auditLog(agentId, model, userPrompt, cached, 0, true);
+    return { decision: cached, fromCache: true };
+  }
+
+  const t0 = Date.now();
+  let decision;
+
+  const client = buildClient(model, apiKey);
+
+  if (model.startsWith('claude')) {
+    const msg = await client.messages.create({
+      model,
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    });
+    decision = msg.content[0].text;
+  } else {
+    const resp = await client.chat.completions.create({
+      model,
+      max_tokens: 1024,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt   },
+      ],
+    });
+    decision = resp.choices[0].message.content;
+  }
+
+  const latency = Date.now() - t0;
+  await redis.setex(cacheKey, CACHE_TTL, decision);
+  await auditLog(agentId, model, userPrompt, decision, latency, false);
+  return { decision, fromCache: false, latencyMs: latency };
+}
+
+async function auditLog(agentId, model, prompt, decision, latencyMs, fromCache) {
+  const promptHash = crypto.createHash('sha256').update(prompt).digest('hex');
+  await db.query(
+    `INSERT INTO llm_audit (agent_id, model, prompt_hash, decision, latency_ms, from_cache)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [agentId || null, model, promptHash, decision, latencyMs, fromCache],
+  ).catch(err => console.error('[LLM AUDIT]', err.message));
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────────
+
+/**
+ * Shared market analysis — result cached globally for all agents.
+ * @param {{ chain: string, token: string }} params
+ */
+async function analyzeMarket({ chain, token, model, apiKey, agentId }) {
+  return callLlm({
+    model,
+    apiKey,
+    agentId,
+    systemPrompt: `You are a DeFi market analysis engine for Arc Testnet.
+Respond with concise JSON only: { "opportunity": string, "risk": "low"|"medium"|"high", "action": string }`,
+    userPrompt: `Analyze current testnet conditions for ${token} on ${chain}. What should my agent do?`,
+  });
+}
+
+/**
+ * Pre-transaction analysis — is this transaction safe?
+ */
+async function analyzeTransaction({ toAddress, amountUsdc, chain, model, apiKey, agentId }) {
+  return callLlm({
+    model,
+    apiKey,
+    agentId,
+    systemPrompt: `You are a transaction safety analyzer for an Arc Testnet agent wallet.
+Respond with JSON only: { "safe": boolean, "reason": string, "riskScore": 0-10 }`,
+    userPrompt: `Analyze this transaction:
+- To: ${toAddress}
+- Amount: ${amountUsdc} USDC
+- Chain: ${chain}
+Is it safe?`,
+  });
+}
+
+/**
+ * Arbitrage decision — called by the agent queue when a price diff event arrives.
+ */
+async function getArbitrageDecision({ opportunity, model, apiKey, agentId }) {
+  return callLlm({
+    model,
+    apiKey,
+    agentId,
+    systemPrompt: `You are an arbitrage bot controller for Arc Testnet.
+Respond with JSON: { "execute": boolean, "reason": string, "suggestedAmount": number }`,
+    userPrompt: `Opportunity: ${JSON.stringify(opportunity)}. Should I execute?`,
+  });
+}
+
+// ── Resolve API key for an agent (decrypt from DB if not provided directly) ───
+async function resolveApiKey(agent) {
+  if (!agent.llm_api_key_encrypted) throw new Error('No LLM API key configured for this agent');
+  return decrypt(agent.llm_api_key_encrypted);
+}
+
+module.exports = {
+  analyzeMarket,
+  analyzeTransaction,
+  getArbitrageDecision,
+  resolveApiKey,
+};

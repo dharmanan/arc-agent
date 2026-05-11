@@ -1,0 +1,1351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arc Machina — Agentic Wallet</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.14.0/tabler-icons.min.css">
+<link rel="stylesheet" href="css/styles.css?v=4">
+<style>
+html,body{height:100%;margin:0;padding:0;background:#0a0b0f;}
+body{display:flex;justify-content:center;align-items:flex-start;}
+.app{
+  display:flex!important;
+  width:100%!important;
+  max-width:1440px!important;
+  height:100vh!important;
+  max-height:none!important;
+  border-radius:0!important;
+  border-left:1px solid #1e2530!important;
+  border-right:1px solid #1e2530!important;
+  overflow:hidden!important;
+  position:relative!important;
+}
+.sidebar{width:248px!important;flex-shrink:0!important;height:100%!important;}
+.main{flex:1!important;min-width:0!important;display:flex!important;flex-direction:column!important;overflow:hidden!important;}
+.topbar{flex-shrink:0!important;}
+.content{flex:1!important;overflow-y:auto!important;padding:28px!important;display:flex!important;flex-direction:column!important;}
+
+/* Her tab tam yüksekliği doldursun */
+.content > div[id^="tab-"]{
+  flex:1!important;
+  display:none;
+  flex-direction:column!important;
+  gap:22px!important;
+  min-height:0!important;
+}
+
+/* Kart ve grid alanları büyüsün */
+.content > div[id^="tab-"] .gwide{flex:1!important;align-items:stretch!important;}
+.content > div[id^="tab-"] .gwide > div{display:flex!important;flex-direction:column!important;min-height:0!important;}
+.content > div[id^="tab-"] .gwide > div > .card,
+.content > div[id^="tab-"] .gwide > div > #logBox{flex:1!important;min-height:300px!important;}
+
+/* margin-bottom'ları gap ile yönetiyoruz, sıfırla */
+.content > div[id^="tab-"] > .g2,
+.content > div[id^="tab-"] > .g3,
+.content > div[id^="tab-"] > .gwide,
+.content > div[id^="tab-"] > .card,
+.content > div[id^="tab-"] > div{margin-bottom:0!important;}
+</style>
+<!-- Backend API URL — override with your deployed URL -->
+<script>window.ARC_API_URL = 'https://humble-space-xylophone-4xq74qj5r6vf7x97-3001.app.github.dev/api';</script>
+</head>
+<body>
+
+<div class="app" id="app" style="position:relative">
+
+  <!-- ── SIDEBAR ─────────────────────────────────────────────────────────── -->
+  <div class="sidebar">
+    <div class="logo">
+      <div class="logo-icon"><svg viewBox="0 0 16 16" fill="white"><polygon points="8,1 15,5 15,11 8,15 1,11 1,5"/></svg></div>
+      <div class="logo-title">Arc Machina</div>
+      <div class="logo-sub">Testnet Agent</div>
+    </div>
+    <nav class="nav">
+      <div class="nav-lbl">Main</div>
+      <button class="ni active" onclick="showTab('dashboard')"><i class="ti ti-layout-dashboard"></i> Dashboard</button>
+      <button class="ni"        onclick="showTab('bridge')"><i class="ti ti-transfer"></i> Bridge</button>
+      <button class="ni"        onclick="showTab('swap')"><i class="ti ti-arrows-exchange"></i> Swap</button>
+      <div class="nav-sep"></div>
+      <div class="nav-lbl">Agent</div>
+      <button class="ni" onclick="showTab('agent')"><i class="ti ti-robot"></i> Agent Settings</button>
+      <button class="ni" onclick="showTab('security')"><i class="ti ti-shield-check"></i> Security</button>
+    </nav>
+    <div class="sb-bot">
+      <!-- MetaMask Cüzdanı -->
+      <div id="walletChip" class="wallet-chip" onclick="connectWallet()" style="margin-bottom:6px">
+        <div class="wlbl"><span class="dot dot-m" id="wdot"></span><span id="wlbl">MetaMask Bağla</span></div>
+        <div class="waddr" id="waddr" style="display:none"></div>
+        <div class="wnet" style="font-size:7px">Sahip Cüzdan (MetaMask)</div>
+      </div>
+      <!-- Agent Cüzdanı -->
+      <div id="agentWalletChip" style="display:none;background:rgba(0,229,160,.06);border:1px solid rgba(0,229,160,.2);border-radius:9px;padding:8px 11px;margin-top:2px">
+        <div style="font-size:8px;font-weight:700;color:var(--grn);display:flex;align-items:center;gap:4px">
+          <span style="width:5px;height:5px;background:var(--grn);border-radius:50%;display:inline-block"></span>
+          Agent Cüzdanı
+        </div>
+        <div id="sbAgentAddr" style="font-size:8px;font-family:var(--mono);color:var(--txt);margin-top:3px;cursor:pointer" onclick="copyAgentAddr()" title="Kopyala"></div>
+        <div style="font-size:7px;color:var(--mut);margin-top:2px">↑ Tıklayarak kopyala</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── MAIN ──────────────────────────────────────────────────────────────── -->
+  <div class="main">
+
+    <!-- TOPBAR -->
+    <div class="topbar">
+      <div class="tprow">
+        <div id="agBadge" class="badge badge-idle"><i class="ti ti-robot" style="font-size:12px"></i> No Agent</div>
+        <div id="modBadge" class="badge badge-idle" style="display:none"><i class="ti ti-brain" style="font-size:12px"></i> <span id="modTxt">Base Mode</span></div>
+        <div style="flex:1"></div>
+        <button class="btn btn-ghost" onclick="openSendModal()"><i class="ti ti-send" style="font-size:11px"></i> Send</button>
+        <button class="btn btn-grn"   onclick="openReceiveModal()"><i class="ti ti-download" style="font-size:11px"></i> Receive</button>
+        <button class="btn btn-acc"   onclick="openDeployModal()"><i class="ti ti-plus" style="font-size:11px"></i> Create Agent</button>
+      </div>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="content">
+
+      <!-- ╔══════════════ DASHBOARD ══════════════╗ -->
+      <div id="tab-dashboard">
+
+        <!-- GATE: Agent yoksa büyük CTA -->
+        <div id="dashNoAgent" style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:16px;text-align:center">
+          <div style="font-size:48px">🤖</div>
+          <div style="font-size:20px;font-weight:800">Önce Bir Agent Oluştur</div>
+          <div style="font-size:12px;color:var(--mut);max-width:340px;line-height:1.7">
+            MetaMask'ı bağla → Agent oluştur → Agent için ayrı bir cüzdan (EOA) üretilecek → O cüzdana ETH/USDC gönder → Bridge, Swap, Send kullanmaya başla
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
+            <button class="btn btn-ghost" onclick="connectWallet()" id="dashConnBtn"><i class="ti ti-wallet"></i> MetaMask Bağla</button>
+            <button class="btn btn-acc" onclick="openDeployModal()"><i class="ti ti-plus"></i> Agent Oluştur</button>
+          </div>
+        </div>
+
+        <!-- AGENT ACTIVE VIEW -->
+        <div id="dashAgentView" style="display:none;flex-direction:column;flex:1;gap:22px">
+
+          <div class="gwide dash-overview">
+            <div class="card dash-hero">
+              <div class="dash-hero-head">
+                <div>
+                  <div class="dash-hero-status"><span class="dash-hero-dot"></span>Agent Aktif — <span id="dashAgentName"></span></div>
+                  <div class="dash-hero-label">Agent Cuzdan Adresi (Public)</div>
+                </div>
+                <span class="tag tg-g">EOA Wallet</span>
+              </div>
+              <div class="dash-hero-address">
+                <div id="dashAgentAddr" class="dash-hero-address-text"></div>
+                <button class="btn btn-acc dash-copy-btn" onclick="copyAgentAddr()"><i class="ti ti-copy"></i> Kopyala</button>
+              </div>
+              <div class="dash-hero-hint">
+                <strong>Bu adrese MetaMask'tan ETH veya Sepolia USDC gonder.</strong>
+                Agent bridge, swap ve send islemlerini bu cüzdandan yapar.
+                <span class="dash-hero-link"><a id="dashEtherscan" href="#" target="_blank">Etherscan'de gor</a></span>
+              </div>
+            </div>
+            <div class="card dash-guide">
+              <div>
+                <div class="ctitle">Quick Flow</div>
+                <div class="dash-guide-title">Kullanici akisi net olsun: bagla, fonla, sonra islem yap.</div>
+              </div>
+              <div class="dash-guide-steps">
+                <div class="dash-guide-step">
+                  <div class="dash-guide-num">1</div>
+                  <div>
+                    <div class="dash-guide-step-title">MetaMask sahip cüzdanin</div>
+                    <div class="dash-guide-step-copy">Sol alttaki MetaMask alanindan owner cüzdani görürsün.</div>
+                  </div>
+                </div>
+                <div class="dash-guide-step">
+                  <div class="dash-guide-num">2</div>
+                  <div>
+                    <div class="dash-guide-step-title">Agent cüzdanini fonla</div>
+                    <div class="dash-guide-step-copy">Yukaridaki public adrese Sepolia ETH veya USDC gönder.</div>
+                  </div>
+                </div>
+                <div class="dash-guide-step">
+                  <div class="dash-guide-num">3</div>
+                  <div>
+                    <div class="dash-guide-step-title">Bridge ve Swap sekmelerini kullan</div>
+                    <div class="dash-guide-step-copy">Fon geldikten sonra soldaki sekmelerden agent adina islem başlat.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Bakiye kartları -->
+          <div class="g3">
+            <div class="card"><div class="ctitle">Total Balance</div><div class="cval" id="totalBal">$0.00</div><div class="csub">USDC</div></div>
+            <div class="card"><div class="ctitle">Daily Remaining</div><div class="cval" style="font-size:19px" id="dailyRem">—</div><div class="csub">of daily limit</div></div>
+            <div class="card"><div class="ctitle">Agent Txs</div><div class="cval" style="font-size:19px" id="txCount">0</div><div class="csub">This session</div></div>
+          </div>
+
+          <!-- TX geçmişi + log -->
+          <div class="gwide" style="flex:1;min-height:0">
+            <div>
+              <div class="stitle"><i class="ti ti-clock"></i> Transaction History</div>
+              <div class="card" id="txHistory" style="height:calc(100% - 28px);overflow-y:auto">
+                <div style="text-align:center;padding:18px;color:var(--mut);font-size:11px;font-family:var(--mono)">
+                  <i class="ti ti-database-off" style="font-size:22px;display:block;margin-bottom:6px;color:var(--bdr)"></i>No transactions yet
+                </div>
+              </div>
+            </div>
+            <div>
+              <div class="stitle"><i class="ti ti-terminal"></i> Agent Log</div>
+              <div id="logBox" style="height:calc(100% - 28px);overflow-y:auto"></div>
+            </div>
+          </div>
+
+          <!-- Network info -->
+          <div class="ibox" style="font-size:9px;font-family:var(--mono);color:var(--mut)">
+            Arc Testnet · Chain ID: 5042002 · RPC: rpc.testnet.arc.network · USDC: 0x3600…0000
+          </div>
+
+        </div>
+      </div>
+
+      <!-- ╔══════════════ BRIDGE ══════════════╗ -->
+      <div id="tab-bridge" style="display:none">
+        <!-- Gate: agent yoksa -->
+        <div id="bridgeGate" style="display:none;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:14px;text-align:center">
+          <div style="font-size:40px">⛓️</div>
+          <div style="font-size:16px;font-weight:800">Bridge Kullanmak İçin Agent Gerekli</div>
+          <div style="font-size:11px;color:var(--mut);max-width:300px;line-height:1.7">
+            Önce bir agent oluştur, agent cüzdanına ETH/USDC gönder, sonra bridge kullanabilirsin.
+          </div>
+          <button class="btn btn-acc" onclick="openDeployModal()"><i class="ti ti-plus"></i> Agent Oluştur</button>
+        </div>
+        <!-- Bridge form -->
+        <div id="bridgeForm">
+        <div class="stitle mb8"><i class="ti ti-transfer"></i> Cross-Chain Bridge</div>
+        <div class="ibox mb14">Circle CCTP · Wormhole relay · Real on-chain USDC transfers</div>
+        <div class="card mb12">
+          <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:8px">FROM</div>
+          <div class="chain-wrap" id="bFromChains"></div>
+          <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:8px">TO</div>
+          <div class="chain-wrap" id="bToChains"></div>
+          <div class="tbox mb4">
+            <div class="tlbl">SEND</div>
+            <div class="trow"><input class="tinput" type="number" min="0" placeholder="0.00" id="bridgeAmt" oninput="updateBridgeOut()"><span style="font-size:12px;font-weight:700;color:var(--mut);font-family:var(--mono)">USDC</span></div>
+          </div>
+          <div class="sarrow"><div class="sarrow-btn" style="pointer-events:none"><i class="ti ti-chevron-down" style="font-size:13px"></i></div></div>
+          <div class="tbox mb12">
+            <div class="tlbl">RECEIVE (estimated)</div>
+            <div class="trow"><div style="font-size:20px;font-weight:800;flex:1;letter-spacing:-.5px" id="bridgeOut">0.00</div><span style="font-size:12px;font-weight:700;color:var(--mut);font-family:var(--mono)">USDC</span></div>
+          </div>
+          <div class="ibox mb12">Bridge fee: ~0.50 USDC · Est. time: 2-5 min · <span id="bRoute">Select chains above</span></div>
+          <button class="btn btn-acc btn-full" onclick="executeBridge()"><i class="ti ti-shield-check"></i> Sign with Passkey & Bridge</button>
+        </div>
+        <div id="bridgeProgress" style="display:none">
+          <div class="card">
+            <div class="stitle mb10"><i class="ti ti-loader"></i> Bridge Status</div>
+            <div class="bstep idle" id="bs1"><div class="bsic"><i class="ti ti-check"></i></div><div><div style="font-size:11px;font-weight:700">Token Approval</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">ERC-20 approve signed</div></div></div>
+            <div class="bstep idle" id="bs2"><div class="bsic"><i class="ti ti-transfer"></i></div><div><div style="font-size:11px;font-weight:700">Bridge Initiation</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">Circle CCTP relay</div></div></div>
+            <div class="bstep idle" id="bs3"><div class="bsic"><i class="ti ti-circle-check"></i></div><div><div style="font-size:11px;font-weight:700">Confirmation</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">USDC received on destination</div></div></div>
+          </div>
+        </div>
+        </div>
+      </div>
+
+      <!-- ╔══════════════ SWAP ══════════════╗ -->
+      <div id="tab-swap" style="display:none">
+        <!-- Gate: agent yoksa -->
+        <div id="swapGate" style="display:none;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:14px;text-align:center">
+          <div style="font-size:40px">🔄</div>
+          <div style="font-size:16px;font-weight:800">Swap Kullanmak İçin Agent Gerekli</div>
+          <div style="font-size:11px;color:var(--mut);max-width:300px;line-height:1.7">
+            Önce bir agent oluştur, agent cüzdanına ETH gönder, sonra swap kullanabilirsin.
+          </div>
+          <button class="btn btn-acc" onclick="openDeployModal()"><i class="ti ti-plus"></i> Agent Oluştur</button>
+        </div>
+        <!-- Swap form -->
+        <div id="swapForm">
+        <div class="stitle mb8"><i class="ti ti-arrows-exchange"></i> Token Swap — Uniswap V2</div>
+        <div class="ibox mb14">Router: 0xC532...4008 · Real on-chain swaps · 0.1 ETH/24h rate limit applies</div>
+        <div class="card mb12">
+          <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:8px">NETWORK</div>
+          <div class="chain-wrap" id="swapChains"></div>
+          <div class="tbox mb4">
+            <div class="tlbl">YOU SELL</div>
+            <div class="trow">
+              <input class="tinput" type="number" min="0" placeholder="0.00" id="swapIn" oninput="updateSwap()">
+              <select class="tsel" id="swapFrom" onchange="updateSwap()"><option value="ETH">ETH</option><option value="USDC">USDC</option></select>
+            </div>
+          </div>
+          <div class="sarrow"><button class="sarrow-btn" onclick="flipSwap()"><i class="ti ti-arrows-up-down" style="font-size:13px"></i></button></div>
+          <div class="tbox mb12">
+            <div class="tlbl">YOU GET (estimated)</div>
+            <div class="trow"><div style="font-size:20px;font-weight:800;flex:1;letter-spacing:-.5px" id="swapOut">0.00</div><div id="swapToTok" style="font-size:12px;font-weight:700;color:var(--mut);font-family:var(--mono)">USDC</div></div>
+          </div>
+          <div class="g2 mb12" style="font-size:9px;font-family:var(--mono);color:var(--mut)">
+            <div class="card-sm"><div>Price Impact</div><div style="color:var(--grn);margin-top:2px" id="priceImpact">—</div></div>
+            <div class="card-sm"><div>Slippage</div><div style="color:var(--txt);margin-top:2px" id="slippageDisp">0.5%</div></div>
+          </div>
+          <div class="wbox mb12" id="limitWarn" style="display:none">⚠ ETH → USDC: max 0.1 ETH per 24 hours (on-chain rate limit)</div>
+          <button class="btn btn-acc btn-full" onclick="executeSwap()"><i class="ti ti-shield-lock"></i> Sign with Passkey & Swap</button>
+        </div>
+        <div class="card">
+          <div class="ctitle">Contract Addresses</div>
+          <div style="font-size:9px;font-family:var(--mono);color:var(--mut);line-height:1.9">
+            <div>Uniswap V2 Router: <span style="color:var(--acc)">0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008</span></div>
+            <div>WETH (Sepolia):     <span style="color:var(--txt)">0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9</span></div>
+            <div>USDC (Sepolia):     <span style="color:var(--txt)">0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238</span></div>
+            <div>USDC (Arc Native):  <span style="color:var(--txt)">0x3600000000000000000000000000000000000000</span></div>
+          </div>
+        </div>
+        </div><!-- /swapForm -->
+      </div>
+
+      <!-- ╔══════════════ AGENT SETTINGS ══════════════╗ -->
+      <div id="tab-agent" style="display:none">
+        <div class="stitle mb12"><i class="ti ti-robot"></i> Agent Settings</div>
+        <div id="agentLocked" class="card mb14" style="text-align:center;padding:26px">
+          <i class="ti ti-lock" style="font-size:34px;color:var(--bdr);display:block;margin-bottom:11px"></i>
+          <div style="font-weight:700;margin-bottom:5px">No Agent Deployed</div>
+          <div style="font-size:11px;color:var(--mut);font-family:var(--mono);margin-bottom:14px">Connect wallet and create an agent to get started</div>
+          <button class="btn btn-acc" onclick="openDeployModal()">Create Agent</button>
+        </div>
+        <div id="agentPanel" style="display:none">
+          <div class="card mb12">
+            <div class="flex ic jb mb10">
+              <div>
+                <div style="font-weight:700;font-size:13px" id="agNameDisp">—</div>
+                <div style="font-size:9px;color:var(--mut);font-family:var(--mono);margin-top:2px">Passkey secured · Agent EOA wallet</div>
+              </div>
+              <div class="tag tg-g">Active</div>
+            </div>
+            <div style="font-size:9px;font-family:var(--mono);color:var(--mut)">
+              Wallet: <span id="agWalletAddr" style="color:var(--acc)">Creating…</span>
+            </div>
+          </div>
+
+          <!-- LLM Connection -->
+          <div class="card mb12">
+            <div class="stitle mb10"><i class="ti ti-brain"></i> LLM Connection</div>
+            <div class="ibox mb10">Without an LLM, the agent runs in base mode: send/receive payments, check balances only.</div>
+            <div class="igrp"><div class="ilbl">API Key (stored encrypted)</div><input class="inp" type="password" placeholder="sk-ant-... / AIza... / sk-..." id="apiKey" oninput="checkApi()"></div>
+            <div class="igrp">
+              <div class="ilbl">Model</div>
+              <select class="inp" id="modelSel" onchange="checkApi()">
+                <option value="">-- Select model --</option>
+                <option>claude-sonnet-4-20250514</option>
+                <option>gemini-2.5-pro</option>
+                <option>gpt-4o</option>
+              </select>
+            </div>
+            <div id="apiStatus" style="display:none" class="gbox"></div>
+          </div>
+
+          <!-- Smart Permissions -->
+          <div class="card" id="smartPerms" style="display:none">
+            <div class="stitle mb10"><i class="ti ti-sparkles"></i> Smart Agent Permissions <span class="tag tg-b" style="margin-left:4px">LLM Required</span></div>
+            <div id="permList"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ╔══════════════ SECURITY ══════════════╗ -->
+      <div id="tab-security" style="display:none">
+        <div class="stitle mb12"><i class="ti ti-shield-check"></i> Security Center</div>
+        <div class="card mb12">
+          <div class="stitle mb10">Authentication</div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Passkey (WebAuthn / FIDO2)</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">FaceID · TouchID · Platform Authenticator</div></div><label class="tog"><input type="checkbox" id="togPk" checked onchange="saveSecurity('passkey',this.checked)"><span class="tog-sl"></span></label></div>
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Two-Factor Auth (TOTP)</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">Time-based one-time password</div></div><label class="tog"><input type="checkbox" id="tog2fa" onchange="saveSecurity('2fa',this.checked)"><span class="tog-sl"></span></label></div>
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Auto-Lock</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">Lock after inactivity</div></div><label class="tog"><input type="checkbox" id="togLock" checked onchange="saveSecurity('lock',this.checked)"><span class="tog-sl"></span></label></div>
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Contract Guard</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">LLM pre-checks every contract call</div></div><label class="tog"><input type="checkbox" id="togGuard" checked onchange="saveSecurity('guard',this.checked)"><span class="tog-sl"></span></label></div>
+          </div>
+        </div>
+        <div class="card mb12">
+          <div class="stitle mb10">Transaction Limits</div>
+          <div class="g2" style="gap:9px">
+            <div><div class="ilbl">Daily Max (USDC)</div><input class="inp" type="number" id="dailyMax" value="1000"></div>
+            <div><div class="ilbl">Max Gas (Gwei)</div><input class="inp" type="number" id="maxGas" value="50"></div>
+            <div><div class="ilbl">Slippage (%)</div><input class="inp" type="number" id="slip" value="0.5" step="0.1"></div>
+            <div><div class="ilbl">Max Trade (USDC)</div><input class="inp" type="number" id="maxTrade" value="200"></div>
+          </div>
+          <button class="btn btn-ghost" style="margin-top:10px;width:100%" onclick="saveLimits()">Save Limits to Backend</button>
+        </div>
+        <div class="card">
+          <div class="ctitle">On-Chain Session Key Status</div>
+          <div class="ibox" id="enclaveStatus"><i class="ti ti-shield-off"></i> No agent deployed. Agent wallet access not initialized yet.</div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+
+  <!-- ╔══════════════════════ MODALS ══════════════════════╗ -->
+
+  <!-- MODAL: DEPLOY AGENT (3-step) -->
+  <div class="mov" id="deployMod">
+    <div class="mbox">
+      <button class="mclose" onclick="closeMod('deployMod')"><i class="ti ti-x"></i></button>
+
+      <!-- Step 1: Name -->
+      <div id="dStep1">
+        <div style="font-size:34px;margin-bottom:10px">🤖</div>
+        <div class="mtitle">Create Agent</div>
+        <div class="msub">Ajana özel bir cüzdan oluşturulacak — private key sana gösterilecek.</div>
+        <div class="igrp" style="text-align:left;margin-bottom:14px">
+          <div class="ilbl">Agent Name</div>
+          <input class="inp" placeholder="e.g. My Main Wallet" id="agNameIn">
+        </div>
+        <div class="sbar">
+          <div class="step active"><div class="snum">1</div><div class="slbl">Kayıt</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">2</div><div class="slbl">Passkey</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">3</div><div class="slbl">Oluştur</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">4</div><div class="slbl">Key Kaydet</div></div>
+        </div>
+        <button class="btn btn-acc btn-full" onclick="dStep1()">Continue</button>
+      </div>
+
+      <!-- Step 2: Passkey registration -->
+      <div id="dStep2" style="display:none">
+        <div class="pkring"><i class="ti ti-fingerprint" style="font-size:30px;color:var(--grn)"></i></div>
+        <div class="mtitle">Register Passkey</div>
+        <div class="msub">Your biometrics secure the agent.<br>FaceID · TouchID · PIN</div>
+        <div class="sbar">
+          <div class="step done"><div class="snum">1</div><div class="slbl">Kayıt</div></div>
+          <div class="sline done"></div>
+          <div class="step active"><div class="snum">2</div><div class="slbl">Passkey</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">3</div><div class="slbl">Oluştur</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">4</div><div class="slbl">Key Kaydet</div></div>
+        </div>
+        <button class="btn btn-acc btn-full" onclick="dStep2()"><i class="ti ti-fingerprint"></i> Passkey ile Kayıt Ol</button>
+      </div>
+
+      <!-- Step 3: Backend creates agent + generates wallet -->
+      <div id="dStep3" style="display:none">
+        <div style="font-size:34px;margin-bottom:10px">⚙️</div>
+        <div class="mtitle">Creating Agent</div>
+        <div class="msub" id="dStep3Msg">Generating agent wallet…</div>
+        <div class="sbar">
+          <div class="step done"><div class="snum">1</div><div class="slbl">Register</div></div>
+          <div class="sline done"></div>
+          <div class="step done"><div class="snum">2</div><div class="slbl">Passkey</div></div>
+          <div class="sline done"></div>
+          <div class="step active"><div class="snum">3</div><div class="slbl">Create</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">4</div><div class="slbl">Save Key</div></div>
+        </div>
+        <div id="dStep3Spinner" style="margin-top:14px;color:var(--mut);font-size:10px;font-family:var(--mono)">
+          <i class="ti ti-loader ti-spin"></i> Generating…
+        </div>
+      </div>
+
+      <!-- Step 4: Show private key — user MUST save it -->
+      <div id="dStep4" style="display:none">
+        <div style="font-size:34px;margin-bottom:8px">🔑</div>
+        <div class="mtitle" style="color:#f59e0b">Private Key — Save Now!</div>
+        <div class="msub" style="color:var(--red,#ef4444);font-weight:600;margin-bottom:10px">
+          ⚠️ Bu ekran bir daha gösterilmeyecek. Kaydetmezsen erişimi kaybedersin.
+        </div>
+        <div class="sbar" style="margin-bottom:14px">
+          <div class="step done"><div class="snum">1</div><div class="slbl">Register</div></div>
+          <div class="sline done"></div>
+          <div class="step done"><div class="snum">2</div><div class="slbl">Passkey</div></div>
+          <div class="sline done"></div>
+          <div class="step done"><div class="snum">3</div><div class="slbl">Create</div></div>
+          <div class="sline done"></div>
+          <div class="step active"><div class="snum">4</div><div class="slbl">Save Key</div></div>
+        </div>
+
+        <!-- Wallet Address -->
+        <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:8px;padding:10px 12px;margin-bottom:8px;text-align:left">
+          <div style="font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Agent Wallet Address (Public)</div>
+          <div id="pkWalletAddr" style="font-family:var(--mono);font-size:10px;word-break:break-all;color:var(--acc)"></div>
+        </div>
+
+        <!-- Private Key -->
+        <div style="background:#1a0a00;border:2px solid #f59e0b;border-radius:8px;padding:10px 12px;margin-bottom:10px;text-align:left;position:relative">
+          <div style="font-size:9px;color:#f59e0b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">🔑 Private Key (Gizli — Kimseyle Paylaşma!)</div>
+          <div id="pkKeyDisplay" style="font-family:var(--mono);font-size:9px;word-break:break-all;color:#fbbf24;line-height:1.5"></div>
+          <button onclick="copyPrivKey()" style="position:absolute;top:8px;right:8px;background:#f59e0b;color:#000;border:none;border-radius:5px;padding:3px 8px;font-size:9px;cursor:pointer;font-weight:700">
+            <i class="ti ti-copy"></i> Kopyala
+          </button>
+        </div>
+
+        <button class="btn btn-acc btn-full" onclick="confirmKeySaved()" style="background:#22c55e;border-color:#22c55e">
+          <i class="ti ti-check"></i> Private Key'i Kaydettim — Devam Et
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: SEND PAYMENT -->
+  <div class="mov" id="sendMod">
+    <div class="mbox">
+      <button class="mclose" onclick="closeMod('sendMod')"><i class="ti ti-x"></i></button>
+
+      <!-- Choice -->
+      <div id="sChoice">
+        <div class="mtitle">Send Payment</div>
+        <div class="msub">Choose method</div>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <button class="btn btn-ghost btn-full" style="padding:13px" onclick="showSend('qr')"><i class="ti ti-qrcode"></i> Scan QR Code</button>
+          <button class="btn btn-ghost btn-full" style="padding:13px" onclick="showSend('manual')"><i class="ti ti-keyboard"></i> Manual Entry</button>
+        </div>
+      </div>
+
+      <!-- QR Scanner -->
+      <div id="sQR" style="display:none">
+        <div class="mtitle">Scan QR</div>
+        <div class="msub">Point camera at recipient's payment QR</div>
+        <div style="width:150px;height:150px;background:var(--surf);border:1px solid var(--bdr);border-radius:11px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden">
+          <div style="position:absolute;width:100%;height:2px;background:var(--acc);opacity:.7;animation:scan 2s ease-in-out infinite"></div>
+          <i class="ti ti-qrcode" style="font-size:44px;color:var(--bdr);position:relative;z-index:1"></i>
+        </div>
+        <button class="btn btn-acc btn-full mb8" onclick="simulateScan()">TEST: QR Detected → Prefill</button>
+        <button onclick="showSend('choice')" style="background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;font-family:var(--sans)">← Back</button>
+      </div>
+
+      <!-- Manual -->
+      <div id="sManual" style="display:none;text-align:left">
+        <div class="mtitle" style="text-align:center">Manual Payment</div>
+        <div class="msub" style="text-align:center">Enter recipient details</div>
+        <div class="igrp"><div class="ilbl">Recipient Address</div><input class="inp" placeholder="0x… or Solana address" id="sendAddr"></div>
+        <div class="igrp"><div class="ilbl">Amount (USDC)</div><input class="inp" type="number" min="0" placeholder="0.00" id="sendAmt"></div>
+        <div class="igrp">
+          <div class="ilbl">Network</div>
+          <select class="inp" id="sendChain">
+            <option>Arc Testnet</option><option>Sepolia</option><option>Base</option><option>Optimism</option><option>Arbitrum</option><option>Solana</option>
+          </select>
+        </div>
+        <button class="btn btn-acc btn-full" style="margin-top:4px" onclick="confirmSend()"><i class="ti ti-fingerprint"></i> Sign with Passkey &amp; Send</button>
+        <button onclick="showSend('choice')" style="display:block;background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;margin-top:10px;font-family:var(--sans)">← Back</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: RECEIVE (QR + Payment Request) -->
+  <div class="mov" id="receiveMod">
+    <div class="mbox" style="width:400px">
+      <button class="mclose" onclick="closeMod('receiveMod')"><i class="ti ti-x"></i></button>
+
+      <!-- Step 1: Enter amount -->
+      <div id="rStep1">
+        <div class="mtitle">Receive Payment</div>
+        <div class="msub">Set amount → generate a tamper-proof payment request QR</div>
+        <div class="igrp" style="text-align:left">
+          <div class="ilbl">Requested Amount (USDC)</div>
+          <input class="inp" type="number" min="0" placeholder="0.00" id="receiveAmt"
+                 style="font-size:18px;font-weight:800;text-align:center" oninput="updateReceivePreview()">
+        </div>
+        <div class="igrp" style="text-align:left">
+          <div class="ilbl">Network</div>
+          <select class="inp" id="receiveChain" onchange="updateReceivePreview()">
+            <option>Arc Testnet</option><option>Sepolia</option><option>Base</option><option>Optimism</option><option>Arbitrum</option><option>Solana</option>
+          </select>
+        </div>
+        <div id="rPreview" style="display:none">
+          <div class="pay-req-box mb12">
+            <div style="font-size:9px;color:var(--mut);font-family:var(--mono);margin-bottom:4px">PAYMENT REQUEST PREVIEW</div>
+            <div class="pay-amount" id="previewAmt">0.00 USDC</div>
+            <div class="pay-chain" id="previewChain">Arc Testnet</div>
+          </div>
+        </div>
+        <button class="btn btn-acc btn-full" onclick="generatePayQR()"><i class="ti ti-qrcode"></i> Generate Payment QR</button>
+      </div>
+
+      <!-- Step 2: Show QR -->
+      <div id="rStep2" style="display:none">
+        <div class="mtitle">Payment Request QR</div>
+        <div class="msub" id="rQRsub">Share this — payer sees the exact amount and must approve it</div>
+        <div style="margin-bottom:14px">
+          <div class="qr-wrap" id="qrDisplay"></div>
+        </div>
+        <!-- EIP-681 / payment URI -->
+        <div style="font-size:8px;font-family:var(--mono);color:var(--mut);background:var(--surf);border:1px solid var(--bdr);border-radius:7px;padding:8px;text-align:left;margin-bottom:12px;word-break:break-all" id="payURI">—</div>
+
+        <!-- Security panel -->
+        <div class="pay-security mb12">
+          <div style="font-size:10px;font-weight:700;color:var(--grn);margin-bottom:8px"><i class="ti ti-shield-check" style="font-size:12px"></i> What the payer will see on scan:</div>
+          <div class="pay-sec-row"><i class="ti ti-coin" style="font-size:12px"></i><span>Amount locked: <strong style="color:var(--txt)" id="secAmt">—</strong> — cannot be altered</span></div>
+          <div class="pay-sec-row"><i class="ti ti-user-check" style="font-size:12px"></i><span>Recipient address verified before signing</span></div>
+          <div class="pay-sec-row"><i class="ti ti-lock" style="font-size:12px"></i><span>Payer approves exact USDC amount only</span></div>
+          <div class="pay-sec-row"><i class="ti ti-fingerprint" style="font-size:12px"></i><span>Passkey / biometric required to sign</span></div>
+        </div>
+
+        <div style="display:flex;gap:7px">
+          <button class="btn btn-ghost" style="flex:1;padding:10px" onclick="copyPayURI()"><i class="ti ti-copy"></i> Copy Link</button>
+          <button class="btn btn-grn"   style="flex:1;padding:10px" onclick="simReceive()">TEST: Payer View</button>
+        </div>
+        <button onclick="showRStep(1)" style="display:block;background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;margin-top:10px;font-family:var(--sans);width:100%;text-align:center">← Change Amount</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: PAYER CONFIRMATION VIEW -->
+  <div class="mov" id="payerMod">
+    <div class="mbox" style="width:360px">
+      <button class="mclose" onclick="closeMod('payerMod')"><i class="ti ti-x"></i></button>
+      <div style="font-size:11px;color:var(--warn);font-family:var(--mono);margin-bottom:14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:7px;padding:8px">
+        <i class="ti ti-eye" style="font-size:12px"></i> PAYER VIEW — what the payment sender sees after scanning
+      </div>
+      <div class="mtitle">Confirm Payment</div>
+      <div class="msub">Review this payment request before approving</div>
+      <div class="pay-req-box mb12" style="text-align:left">
+        <div style="font-size:9px;color:var(--mut);font-family:var(--mono);margin-bottom:6px">YOU ARE SENDING</div>
+        <div class="pay-amount" id="payerAmt">0.00 USDC</div>
+        <div class="pay-chain" id="payerChain">Arc Testnet</div>
+      </div>
+      <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:5px">TO ADDRESS</div>
+      <div class="pay-addr-box" id="payerAddr">—</div>
+      <div class="pay-security mb14">
+        <div style="font-size:10px;font-weight:700;color:var(--grn);margin-bottom:8px"><i class="ti ti-shield-check" style="font-size:12px"></i> Security Checks</div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)"></i><span style="color:var(--txt)">Amount set by requester — read-only</span></div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)"></i><span style="color:var(--txt)">Address verified via QR signature</span></div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)"></i><span style="color:var(--txt)">ERC-20 approval scoped to exact amount</span></div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)"></i><span style="color:var(--txt)">No extra token approvals granted</span></div>
+      </div>
+      <button class="btn btn-acc btn-full mb8" onclick="payerConfirm()"><i class="ti ti-fingerprint"></i> Approve &amp; Sign with Passkey</button>
+      <button class="btn btn-ghost btn-full" onclick="closeMod('payerMod')">Cancel</button>
+    </div>
+  </div>
+
+  <!-- MODAL: PASSKEY AUTH SPINNER -->
+  <div class="mov" id="authMod">
+    <div class="mbox" style="width:300px">
+      <div class="pkring"><i class="ti ti-fingerprint" style="font-size:30px;color:var(--grn)"></i></div>
+      <div class="mtitle">Secure Signature</div>
+      <div class="msub" id="authMsg">Verifying Passkey…<br>Broadcasting to chain</div>
+      <div style="font-size:9px;color:var(--mut);font-family:var(--mono)">WebAuthn · FIDO2 · On-chain enforcement</div>
+    </div>
+  </div>
+
+  <!-- NOTIFICATIONS -->
+  <div id="notifBar" style="position:absolute;bottom:14px;right:14px;z-index:200;display:flex;flex-direction:column;gap:5px;max-width:260px;pointer-events:none"></div>
+
+</div><!-- /app -->
+
+<!-- ─── Scripts ──────────────────────────────────────────────────────────────── -->
+<script type="module">
+import { auth as authApi, agents as agentsApi, transactions as txApi, setToken, getToken, isLoggedIn } from './js/api.js';
+import { registerPasskey, authenticatePasskey, requestTransactionSignature, isPasskeySupported } from './js/passkey.js';
+import { CHAINS, CHAIN_IDS, AGENT_PERMISSIONS } from './js/config.js';
+
+// ── App state ─────────────────────────────────────────────────────────────────
+const S = {
+  tab: 'dashboard',
+  ownerAddress: null,
+  agentId: null,
+  agentName: '',
+  agentWallet: null,
+  isSmartMode: false,
+  balance: 0,
+  dailyRem: null,
+  txCount: 0,
+  bFromChain: 'Sepolia',
+  bToChain:   'Arc Testnet',
+  swapChain:  'Sepolia',
+  receiveAmt: 0,
+  receiveChain: 'Arc Testnet',
+  payURI: '',
+};
+
+let logs = [{ type: 'sys', text: 'System ready.', time: '--:--' }];
+let txs  = [];
+
+// ── Initialise chain pickers ───────────────────────────────────────────────────
+function buildChainPickers() {
+  const chainNames = Object.keys(CHAINS);
+
+  ['bFromChains','bToChains'].forEach((id, idx) => {
+    const wrap = document.getElementById(id);
+    wrap.innerHTML = chainNames.map(name =>
+      `<div class="cp ${name === (idx===0?S.bFromChain:S.bToChain) ? 'sel' : ''}"
+            onclick="selectBChain('${idx===0?'from':'to'}','${name}')"
+            style="cursor:pointer">
+        <div class="cdot" style="background:${CHAINS[name].color}"></div>${name}
+      </div>`,
+    ).join('');
+  });
+
+  // Swap — only EVM chains
+  const swapNames = chainNames.filter(n => n !== 'Solana' && n !== 'Arc Testnet');
+  document.getElementById('swapChains').innerHTML = swapNames.map(name =>
+    `<div class="cp ${name === S.swapChain ? 'sel' : ''}"
+          onclick="selectSwapChain(this,'${name}')"
+          style="cursor:pointer">
+      <div class="cdot" style="background:${CHAINS[name].color}"></div>${name}
+    </div>`,
+  ).join('');
+}
+
+// ── Tab navigation ─────────────────────────────────────────────────────────────
+window.showTab = function(t) {
+  S.tab = t;
+  ['dashboard','bridge','swap','agent','security'].forEach(id => {
+    const el = document.getElementById('tab-'+id);
+    el.style.display = id === t ? 'flex' : 'none';
+    if (id === t) { el.style.flexDirection = 'column'; el.style.flex = '1'; el.style.gap = '18px'; }
+  });
+  document.querySelector('.content').scrollTop = 0;
+  document.querySelectorAll('.ni').forEach(el =>
+    el.classList.toggle('active', el.getAttribute('onclick') === `showTab('${t}')`),
+  );
+
+  // Dashboard: doğru view göster
+  if (t === 'dashboard') {
+    const hasAgent = !!S.agentId;
+    document.getElementById('dashNoAgent').style.display   = hasAgent ? 'none' : 'flex';
+    document.getElementById('dashAgentView').style.display = hasAgent ? 'flex' : 'none';
+  }
+
+  // Bridge/Swap: agent yoksa gate göster
+  if (t === 'bridge') {
+    const has = !!S.agentId;
+    document.getElementById('bridgeGate').style.display = has ? 'none' : 'flex';
+    document.getElementById('bridgeForm').style.display = has ? 'block' : 'none';
+  }
+  if (t === 'swap') {
+    const has = !!S.agentId;
+    document.getElementById('swapGate').style.display = has ? 'none' : 'flex';
+    document.getElementById('swapForm').style.display = has ? 'block' : 'none';
+  }
+
+  if (t === 'agent') renderAgent();
+  if (t === 'agent' && S.agentId) refreshStatus();
+};
+
+// ── Wallet connect (via MetaMask) ─────────────────────────────────────────────
+window.connectWallet = async function() {
+  if (S.ownerAddress) return;
+
+  if (!window.ethereum) {
+    notify('Install MetaMask to connect');
+    return;
+  }
+
+  try {
+    const [addr] = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    S.ownerAddress = addr.toLowerCase();
+    document.getElementById('wlbl').textContent = addr.slice(0, 6) + '…' + addr.slice(-4);
+    document.getElementById('wdot').className = 'dot dot-g';
+    document.getElementById('waddr').textContent = addr.slice(0, 10) + '…';
+    document.getElementById('waddr').style.display = 'block';
+    document.getElementById('walletChip').classList.add('connected');
+    if (document.getElementById('dashConnBtn'))
+      document.getElementById('dashConnBtn').innerHTML = '<i class="ti ti-check"></i> Bağlandı';
+    addLog('sys', 'Wallet connected: ' + S.ownerAddress);
+
+    // Try auto-login if passkey already registered
+    if (isLoggedIn()) {
+      await loadAgents();
+    } else if (await isPasskeySupported()) {
+      try {
+        const result = await authenticatePasskey(S.ownerAddress);
+        notify('Signed in via Passkey');
+        await loadAgents();
+      } catch {
+        // First-time user — they'll create an agent which triggers registration
+      }
+    }
+  } catch (err) {
+    notify('Wallet connection failed: ' + err.message);
+  }
+};
+
+async function loadAgents() {
+  try {
+    const list = await agentsApi.list();
+    if (list.length) {
+      const agent = list[0];
+      S.agentId    = agent.id;
+      S.agentName  = agent.name;
+      S.agentWallet = agent.walletAddress;
+      S.isSmartMode = agent.isSmartMode;
+      activateAgentUI(agent);
+      txs = await txApi.list(agent.id);
+      renderTxs();
+    }
+  } catch (err) {
+    console.error('loadAgents:', err);
+  }
+}
+
+// ── Deploy flow ───────────────────────────────────────────────────────────────
+window.openDeployModal = function() {
+  if (!S.ownerAddress) { connectWallet().then(openDeployModal); return; }
+  ['dStep1','dStep2','dStep3'].forEach((id, i) =>
+    document.getElementById(id).style.display = i === 0 ? 'block' : 'none',
+  );
+  openMod('deployMod');
+};
+
+window.dStep1 = function() {
+  const name = document.getElementById('agNameIn').value.trim();
+  if (!name) { notify('Enter an agent name'); return; }
+  S.agentName = name;
+  document.getElementById('dStep1').style.display = 'none';
+  document.getElementById('dStep2').style.display = 'block';
+};
+
+window.dStep2 = async function() {
+  document.getElementById('dStep2').style.display = 'none';
+  document.getElementById('dStep3').style.display = 'block';
+
+  try {
+    // Register passkey (or login if already exists)
+    let token;
+    try {
+      const r = await registerPasskey(S.ownerAddress, 'My Device');
+      token = r.token;
+    } catch (regErr) {
+      // Passkey might already exist — try login
+      const r = await authenticatePasskey(S.ownerAddress);
+      token = r.token;
+    }
+
+    document.getElementById('dStep3Msg').textContent = 'Creating agent record in database…';
+
+    // Create agent in backend — backend generates a fresh EOA wallet
+    const agent = await agentsApi.create({ name: S.agentName });
+    S.agentId     = agent.id;
+    S.agentWallet = agent.walletAddress;
+    S.isSmartMode = false;
+
+    // Private key is returned ONCE — move to key-save step
+    document.getElementById('dStep3Spinner').innerHTML = '<i class="ti ti-check" style="color:var(--grn)"></i> Agent oluşturuldu!';
+    await new Promise(r => setTimeout(r, 600));
+
+    // Show step 4: private key
+    document.getElementById('dStep3').style.display = 'none';
+    document.getElementById('dStep4').style.display  = 'block';
+    document.getElementById('pkWalletAddr').textContent = agent.walletAddress || '—';
+    document.getElementById('pkKeyDisplay').textContent  = agent.privateKey  || '(Hata: key alınamadı)';
+    S._pendingPrivKey = agent.privateKey; // keep for copy button
+  } catch (err) {
+    document.getElementById('dStep3Msg').textContent = 'Error: ' + err.message;
+    document.getElementById('dStep3Spinner').textContent = '✗ Failed';
+    notify('Deploy failed: ' + err.message);
+  }
+};
+
+window.copyPrivKey = function() {
+  const key = S._pendingPrivKey || document.getElementById('pkKeyDisplay').textContent;
+  if (!key) return;
+  navigator.clipboard.writeText(key).then(() => notify('Private key kopyalandı!')).catch(() => {
+    // fallback
+    const el = document.getElementById('pkKeyDisplay');
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    notify('Metni seçin ve Ctrl+C ile kopyalayın');
+  });
+};
+
+window.confirmKeySaved = function() {
+  // Wipe the private key from memory
+  document.getElementById('pkKeyDisplay').textContent = '••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••';
+  S._pendingPrivKey = null;
+
+  const agentObj = { id: S.agentId, name: S.agentName, walletAddress: S.agentWallet };
+  closeMod('deployMod');
+  activateAgentUI(agentObj);
+  addLog('sec', `Agent "${S.agentName}" oluşturuldu. Cüzdan: ${(S.agentWallet||'').slice(0,12)}…`);
+  notify(`${S.agentName} hazır!`);
+  if (S.tab === 'agent') renderAgent();
+};
+
+window.copyAgentAddr = function() {
+  const addr = S.agentWallet || '';
+  if (!addr) { notify('Agent cüzdan adresi henüz yok'); return; }
+  navigator.clipboard.writeText(addr)
+    .then(() => notify('Agent adresi kopyalandı: ' + addr.slice(0,10) + '…'))
+    .catch(() => { notify(addr); });
+};
+
+function activateAgentUI(agent) {
+  S.agentId     = agent.id     || S.agentId;
+  S.agentName   = agent.name   || S.agentName;
+  S.agentWallet = agent.walletAddress || S.agentWallet;
+
+  // Topbar badge
+  document.getElementById('agBadge').className = 'badge badge-active';
+  document.getElementById('agBadge').innerHTML = `<i class="ti ti-robot" style="font-size:12px"></i> ${S.agentName} · Aktif`;
+  document.getElementById('modBadge').style.display = 'flex';
+  if (document.getElementById('enclaveStatus'))
+    document.getElementById('enclaveStatus').innerHTML =
+      `<i class="ti ti-shield-check"></i> ${S.agentName} · Relayer yönetiminde`;
+
+  // Sidebar agent wallet section
+  if (S.agentWallet) {
+    const chip = document.getElementById('agentWalletChip');
+    chip.style.display = 'block';
+    document.getElementById('sbAgentAddr').textContent =
+      S.agentWallet.slice(0,6) + '…' + S.agentWallet.slice(-6);
+  }
+
+  // Dashboard: gizle CTA, göster aktif view
+  document.getElementById('dashNoAgent').style.display  = 'none';
+  const av = document.getElementById('dashAgentView');
+  av.style.display = 'flex';
+  document.getElementById('dashAgentName').textContent = S.agentName;
+  if (S.agentWallet) {
+    document.getElementById('dashAgentAddr').textContent = S.agentWallet;
+    document.getElementById('dashEtherscan').href =
+      `https://sepolia.etherscan.io/address/${S.agentWallet}`;
+  }
+
+  // Bridge/Swap gate'leri kaldır
+  const bg = document.getElementById('bridgeGate');
+  const bf = document.getElementById('bridgeForm');
+  const sg = document.getElementById('swapGate');
+  const sf = document.getElementById('swapForm');
+  if (bg) { bg.style.display = 'none'; }
+  if (bf) { bf.style.display = 'block'; }
+  if (sg) { sg.style.display = 'none'; }
+  if (sf) { sf.style.display = 'block'; }
+}
+
+// ── Agent tab render ──────────────────────────────────────────────────────────
+function renderAgent() {
+  const locked = document.getElementById('agentLocked');
+  const panel  = document.getElementById('agentPanel');
+  if (!S.agentId) { locked.style.display = 'block'; panel.style.display = 'none'; return; }
+  locked.style.display = 'none';
+  panel.style.display  = 'block';
+  document.getElementById('agNameDisp').textContent  = S.agentName;
+  document.getElementById('agWalletAddr').textContent = S.agentWallet || 'Pending…';
+  renderPerms();
+}
+
+function renderPerms() {
+  document.getElementById('smartPerms').style.display = 'block';
+  document.getElementById('permList').innerHTML = AGENT_PERMISSIONS.map(p => `
+    <div class="flex ic jb" style="padding:7px 0;border-bottom:1px solid var(--bdr)">
+      <div>
+        <div style="font-size:11px;font-weight:600;color:${S.isSmartMode?'var(--txt)':'var(--mut)'}">${p.label}</div>
+        <div style="font-size:9px;color:var(--mut);font-family:var(--mono)">${p.desc}</div>
+      </div>
+      <label class="tog">
+        <input type="checkbox" ${S.isSmartMode?'':'disabled'}
+               onchange="togglePerm('${p.key}',this.checked)">
+        <span class="tog-sl"></span>
+      </label>
+    </div>`,
+  ).join('');
+}
+
+window.togglePerm = async function(key, val) {
+  if (!S.agentId) return;
+  try {
+    await agentsApi.updatePermissions(S.agentId, { [key]: val });
+    addLog('sys', `Permission ${key} ${val ? 'enabled' : 'disabled'}`);
+  } catch (err) { notify('Permission update failed: ' + err.message); }
+};
+
+window.checkApi = async function() {
+  const key   = document.getElementById('apiKey').value;
+  const model = document.getElementById('modelSel').value;
+  const box   = document.getElementById('apiStatus');
+  if (key.length > 10 && model && S.agentId) {
+    try {
+      await agentsApi.update(S.agentId, { llmApiKey: key, llmModel: model });
+      S.isSmartMode = true;
+      box.style.display = 'block';
+      box.textContent = `✓ ${model} connected · API key encrypted & stored`;
+      document.getElementById('modBadge').className = 'badge badge-smart';
+      document.getElementById('modTxt').textContent = model.split('-')[0].toUpperCase() + ' · Smart Mode';
+      addLog('br', model + ' connected. Smart permissions available.');
+      renderPerms();
+    } catch (err) {
+      box.style.display = 'block';
+      box.className = 'wbox';
+      box.textContent = 'Failed to save: ' + err.message;
+    }
+  } else {
+    box.style.display = 'none';
+  }
+};
+
+window.saveLimits = async function() {
+  if (!S.agentId) { notify('No agent deployed'); return; }
+  try {
+    await agentsApi.update(S.agentId, {
+      dailyLimitUsdc:  parseFloat(document.getElementById('dailyMax').value)  || 1000,
+      maxGasGwei:      parseInt(document.getElementById('maxGas').value)       || 50,
+      slippagePercent: parseFloat(document.getElementById('slip').value)       || 0.5,
+      maxTradeUsdc:    parseFloat(document.getElementById('maxTrade').value)   || 200,
+    });
+    notify('Limits saved to backend');
+    addLog('sys', 'Transaction limits updated');
+  } catch (err) { notify('Save failed: ' + err.message); }
+};
+
+window.saveSecurity = async function(key, val) {
+  if (!S.agentId) return;
+  addLog('sys', `Security setting "${key}" → ${val}`);
+};
+
+// ── Status polling ────────────────────────────────────────────────────────────
+async function refreshStatus() {
+  if (!S.agentId) return;
+  try {
+    const st = await agentsApi.status(S.agentId);
+    if (st) {
+      document.getElementById('dailyRem').textContent =
+        '$' + st.remainingToday.toFixed(2) + ' / $' + st.dailyLimit.toFixed(0);
+    }
+  } catch {}
+}
+
+// ── Send ──────────────────────────────────────────────────────────────────────
+window.openSendModal = function() { openMod('sendMod'); showSend('choice'); };
+window.showSend = function(s) {
+  ['sChoice','sQR','sManual'].forEach(id => document.getElementById(id).style.display = 'none');
+  document.getElementById(s==='choice'?'sChoice':s==='qr'?'sQR':'sManual').style.display = 'block';
+};
+window.simulateScan = function() {
+  document.getElementById('sendAddr').value = '0x5F3dE423AB1e94BeA4BAC741ABCA3C5A4bC7e3e1';
+  document.getElementById('sendAmt').value  = '25';
+  showSend('manual');
+  notify('QR detected → address and amount pre-filled');
+};
+
+window.confirmSend = async function() {
+  const addr = document.getElementById('sendAddr').value.trim();
+  const amt  = parseFloat(document.getElementById('sendAmt').value) || 0;
+  const chain = document.getElementById('sendChain').value;
+
+  if (!addr || !amt)           { notify('Enter address and amount'); return; }
+  if (!S.agentId)              { notify('Create an agent first');    return; }
+  if (!S.ownerAddress)         { notify('Connect wallet first');     return; }
+
+  closeMod('sendMod');
+  document.getElementById('authMsg').textContent = 'Requesting Passkey…\nThis proves your consent to send.';
+  openMod('authMod');
+
+  try {
+    const assertion = await requestTransactionSignature(S.ownerAddress);
+    document.getElementById('authMsg').textContent = 'Passkey verified.\nBroadcasting transaction…';
+
+    const { txId } = await txApi.send({
+      agentId: S.agentId, toAddress: addr, amountUsdc: amt, chain, passkeyAssertion: assertion,
+    });
+
+    const result = await txApi.poll(txId, tx => {
+      document.getElementById('authMsg').textContent = `Status: ${tx.status}…`;
+    });
+
+    closeMod('authMod');
+    if (result.status === 'confirmed') {
+      addTx('send', 'Sent to ' + addr.slice(0, 10) + '…', '−' + amt + ' USDC', 's');
+      addLog('sec', `Payment (${amt} USDC) confirmed on ${chain}`);
+      notify('Payment Sent: ' + amt + ' USDC');
+    } else {
+      notify('Transaction failed — see history');
+    }
+  } catch (err) {
+    closeMod('authMod');
+    notify('Send failed: ' + err.message);
+  }
+};
+
+// ── Receive ───────────────────────────────────────────────────────────────────
+window.openReceiveModal = function() { openMod('receiveMod'); showRStep(1); };
+window.showRStep = function(n) {
+  document.getElementById('rStep1').style.display = n === 1 ? 'block' : 'none';
+  document.getElementById('rStep2').style.display = n === 2 ? 'block' : 'none';
+};
+
+window.updateReceivePreview = function() {
+  const amt   = parseFloat(document.getElementById('receiveAmt').value) || 0;
+  const chain = document.getElementById('receiveChain').value;
+  const prev  = document.getElementById('rPreview');
+  if (amt > 0) {
+    prev.style.display = 'block';
+    document.getElementById('previewAmt').textContent   = amt.toFixed(2) + ' USDC';
+    document.getElementById('previewChain').textContent = chain + ' · ' + (S.ownerAddress || '0x…');
+  } else {
+    prev.style.display = 'none';
+  }
+};
+
+window.generatePayQR = function() {
+  const amt   = parseFloat(document.getElementById('receiveAmt').value) || 0;
+  const chain = document.getElementById('receiveChain').value;
+  if (!amt)           { notify('Enter an amount first'); return; }
+  if (!S.ownerAddress){ notify('Connect wallet first');  return; }
+
+  S.receiveAmt   = amt;
+  S.receiveChain = chain;
+
+  const cid = CHAIN_IDS[chain] || '5042002';
+  const usdc = CHAINS[chain]?.usdcAddress || '0x0000000000000000000000000000000000000000';
+  // EIP-681 payment URI
+  S.payURI = `ethereum:${usdc}@${cid}/transfer?address=${S.ownerAddress}&uint256=${Math.round(amt * 1e6)}`;
+
+  document.getElementById('payURI').textContent = S.payURI;
+  document.getElementById('rQRsub').textContent = amt + ' USDC payment request on ' + chain;
+  document.getElementById('secAmt').textContent = amt.toFixed(2) + ' USDC';
+  buildQR(S.payURI);
+  showRStep(2);
+};
+
+window.copyPayURI = function() {
+  navigator.clipboard?.writeText(S.payURI).catch(() => {});
+  notify('Payment link copied!');
+};
+
+window.simReceive = function() {
+  closeMod('receiveMod');
+  document.getElementById('payerAmt').textContent  = S.receiveAmt.toFixed(2) + ' USDC';
+  document.getElementById('payerChain').textContent = S.receiveChain;
+  document.getElementById('payerAddr').textContent  = S.ownerAddress || '—';
+  openMod('payerMod');
+};
+
+window.payerConfirm = async function() {
+  closeMod('payerMod');
+  document.getElementById('authMsg').textContent = 'Payer Passkey verification…';
+  openMod('authMod');
+  setTimeout(async () => {
+    closeMod('authMod');
+    const amt = S.receiveAmt;
+    S.balance += amt;
+    addTx('download', 'Received (QR Pay)', '+' + amt + ' USDC', 'r');
+    addLog('sec', `Incoming ${amt} USDC received · Signed by payer`);
+    notify(amt + ' USDC Payment Received!');
+  }, 2200);
+};
+
+// ── Bridge ────────────────────────────────────────────────────────────────────
+window.selectBChain = function(dir, name) {
+  const key = dir === 'from' ? 'bFromChain' : 'bToChain';
+  S[key] = name;
+  const id = dir === 'from' ? 'bFromChains' : 'bToChains';
+  document.getElementById(id).querySelectorAll('.cp').forEach(el =>
+    el.classList.toggle('sel', el.textContent.trim() === name),
+  );
+  document.getElementById('bRoute').textContent = S.bFromChain + ' → ' + S.bToChain;
+  updateBridgeOut();
+};
+
+window.updateBridgeOut = function() {
+  const a = parseFloat(document.getElementById('bridgeAmt').value) || 0;
+  document.getElementById('bridgeOut').textContent = a > 0.5 ? (a - 0.5).toFixed(2) : '0.00';
+};
+
+window.executeBridge = async function() {
+  const amt = parseFloat(document.getElementById('bridgeAmt').value) || 0;
+  if (!amt)           { notify('Enter an amount'); return; }
+  if (!S.agentId)     { notify('Create an agent first'); return; }
+  if (S.bFromChain === S.bToChain) { notify('Select different chains'); return; }
+
+  // Show bridge progress panel immediately
+  const prog = document.getElementById('bridgeProgress');
+  prog.style.display = 'block';
+  const s1 = document.getElementById('bs1');
+  const s2 = document.getElementById('bs2');
+  const s3 = document.getElementById('bs3');
+  [s1,s2,s3].forEach(s => s.className = 'bstep idle');
+  s1.className = 'bstep active';
+
+  document.getElementById('authMsg').textContent = 'Requesting Passkey for bridge…';
+  openMod('authMod');
+
+  try {
+    const assertion = await requestTransactionSignature(S.ownerAddress);
+    s1.className = 'bstep done'; s2.className = 'bstep active';
+    document.getElementById('authMsg').innerHTML = 'Passkey verified. Initiating Circle CCTP bridge…';
+
+    const res = await txApi.bridge({
+      agentId: S.agentId, fromChain: S.bFromChain, toChain: S.bToChain,
+      amountUsdc: amt, passkeyAssertion: assertion,
+    });
+    const txId = res.txId || res.id;
+
+    s2.className = 'bstep done'; s3.className = 'bstep active';
+    document.getElementById('authMsg').innerHTML =
+      `Relaying to chain…<br><span style="font-size:9px;font-family:monospace;color:var(--mut)">TX ID: ${txId}</span>`;
+
+    const result = await txApi.poll(txId, tx => {
+      document.getElementById('authMsg').innerHTML =
+        `Status: ${tx.status}…<br><span style="font-size:9px;font-family:monospace;color:var(--mut)">TX ID: ${txId}</span>`;
+    });
+
+    s3.className = 'bstep done';
+    const hash = result.txHash || result.tx_hash || '';
+    closeMod('authMod');
+    addTx('transfer', `Bridge: ${S.bFromChain}→${S.bToChain}`, '−' + amt + ' USDC', 'b');
+    addLog('tx', `Bridge ${amt} USDC · ${S.bFromChain}→${S.bToChain}` + (hash ? ` · ${hash.slice(0,12)}…` : ''));
+    if (hash) {
+      notify(`Bridge submitted · Tx: ${hash.slice(0,10)}…`);
+    } else {
+      notify(`Bridge initiated · ID: ${txId.slice(0,8)}…`);
+    }
+  } catch (err) {
+    closeMod('authMod');
+    [s1,s2,s3].forEach(s => s.className = 'bstep idle');
+    notify('Bridge failed: ' + err.message);
+  }
+};
+
+// ── Swap ──────────────────────────────────────────────────────────────────────
+window.selectSwapChain = function(el, name) {
+  S.swapChain = name;
+  document.getElementById('swapChains').querySelectorAll('.cp').forEach(e => e.classList.remove('sel'));
+  el.classList.add('sel');
+  updateSwap();
+};
+
+window.updateSwap = function() {
+  const from = document.getElementById('swapFrom').value;
+  const a    = parseFloat(document.getElementById('swapIn').value)  || 0;
+  const rate = from === 'ETH' ? 1850 : 1/1850;
+  document.getElementById('swapOut').textContent = a > 0 ? (a * rate).toFixed(from==='ETH'?2:6) : '0.00';
+  document.getElementById('swapToTok').textContent = from === 'ETH' ? 'USDC' : 'ETH';
+  document.getElementById('limitWarn').style.display = from === 'ETH' ? 'block' : 'none';
+  document.getElementById('priceImpact').textContent = '~' + Math.min(0.05 * (a || 0.12), 5).toFixed(2) + '%';
+};
+
+window.flipSwap = function() {
+  const sel = document.getElementById('swapFrom');
+  sel.value = sel.value === 'ETH' ? 'USDC' : 'ETH';
+  updateSwap();
+};
+
+window.executeSwap = async function() {
+  const a    = parseFloat(document.getElementById('swapIn').value) || 0;
+  const from = document.getElementById('swapFrom').value;
+  if (!a)         { notify('Enter an amount'); return; }
+  if (!S.agentId) { notify('Create an agent first'); return; }
+
+  openMod('authMod');
+  document.getElementById('authMsg').textContent = 'Requesting Passkey for swap…';
+
+  try {
+    const assertion = await requestTransactionSignature(S.ownerAddress);
+    const { txId }  = await txApi.swap({
+      agentId: S.agentId, fromToken: from, toToken: from === 'ETH' ? 'USDC' : 'ETH',
+      amountIn: a, chain: S.swapChain, passkeyAssertion: assertion,
+    });
+
+    const result = await txApi.poll(txId, tx => {
+      document.getElementById('authMsg').textContent = `Swap: ${tx.status}…`;
+    });
+
+    closeMod('authMod');
+    const out = (a * (from==='ETH'?1850:1/1850)).toFixed(2);
+    addTx('arrows-exchange', 'Swap ' + from + '→' + (from==='ETH'?'USDC':'ETH'), out + (from==='ETH'?' USDC':' ETH'), 'b');
+    addLog('tx', `Swap ${a} ${from} → ${out} ${from==='ETH'?'USDC':'ETH'} on ${S.swapChain}`);
+    notify('Swap Complete!');
+  } catch (err) {
+    closeMod('authMod');
+    notify('Swap failed: ' + err.message);
+  }
+};
+
+// ── QR Builder ────────────────────────────────────────────────────────────────
+function buildQR(data) {
+  let h = 0;
+  for (let i = 0; i < data.length; i++) { h = ((h << 5) - h + data.charCodeAt(i)) | 0; }
+  const SIZE = 17;
+  const PAT  = [
+    [0,0],[0,1],[0,2],[0,3],[0,4],[0,5],[0,6],[1,0],[1,6],[2,0],[2,6],[3,0],[3,6],[4,0],[4,6],[5,0],[5,6],[6,0],[6,1],[6,2],[6,3],[6,4],[6,5],[6,6],[2,2],[2,3],[2,4],[3,2],[3,3],[3,4],[4,2],[4,3],[4,4],
+    [0,10],[0,11],[0,12],[0,13],[0,14],[0,15],[0,16],[1,10],[1,16],[2,10],[2,16],[3,10],[3,16],[4,10],[4,16],[5,10],[5,16],[6,10],[6,11],[6,12],[6,13],[6,14],[6,15],[6,16],[2,12],[2,13],[2,14],[3,12],[3,13],[3,14],[4,12],[4,13],[4,14],
+    [10,0],[11,0],[12,0],[13,0],[14,0],[15,0],[16,0],[10,6],[11,6],[12,6],[13,6],[14,6],[15,6],[16,6],[10,1],[10,2],[10,3],[10,4],[10,5],[16,1],[16,2],[16,3],[16,4],[16,5],[12,2],[12,3],[12,4],[13,2],[13,3],[13,4],[14,2],[14,3],[14,4],
+  ];
+  const fixed = new Set(PAT.map(([r,c]) => r * SIZE + c));
+  const cells = [];
+  for (let r = 0; r < SIZE; r++) for (let c = 0; c < SIZE; c++) {
+    cells.push(fixed.has(r * SIZE + c) ? true : ((h >> ((r * SIZE + c) % 31)) & 1) === 1);
+  }
+  const el = document.getElementById('qrDisplay');
+  el.innerHTML = `<div class="qr-grid" style="grid-template-columns:repeat(17,7px)">
+    ${cells.map(d => `<div class="qrc ${d?'qrd':'qrl'}"></div>`).join('')}
+  </div>`;
+}
+
+// ── Modals ────────────────────────────────────────────────────────────────────
+window.openMod  = id => document.getElementById(id).classList.add('show');
+window.closeMod = id => document.getElementById(id).classList.remove('show');
+
+// ── Logs & Txs ────────────────────────────────────────────────────────────────
+function addLog(type, text) {
+  const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  logs.unshift({ type, text, time: t }); if (logs.length > 8) logs.pop(); renderLogs();
+}
+
+function renderLogs() {
+  document.getElementById('logBox').innerHTML = logs.map(l =>
+    `<div class="log log-${l.type}"><span class="log-t">${l.time}</span><span>${l.text}</span></div>`,
+  ).join('');
+}
+
+function addTx(icon, label, amount, type) {
+  txs.unshift({ icon, label, amount, type, time: new Date().toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) });
+  S.txCount++;
+  document.getElementById('txCount').textContent = S.txCount;
+  renderTxs();
+}
+
+function renderTxs() {
+  const b = document.getElementById('txHistory');
+  if (!txs.length) {
+    b.innerHTML = '<div style="text-align:center;padding:18px;color:var(--mut);font-size:11px;font-family:var(--mono)"><i class="ti ti-database-off" style="font-size:22px;display:block;margin-bottom:6px;color:var(--bdr)"></i>No transactions yet</div>';
+    return;
+  }
+  b.innerHTML = txs.slice(0, 6).map(t =>
+    `<div class="txrow">
+      <div class="txic tx-${t.type}"><i class="ti ti-${t.icon}"></i></div>
+      <div style="flex:1"><div style="font-size:11px;font-weight:600">${t.label}</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">${t.time}</div></div>
+      <div style="font-size:11px;font-weight:700;font-family:var(--mono);color:${t.type==='r'?'var(--grn)':t.type==='s'?'var(--red)':'var(--acc)'}">${t.amount}</div>
+    </div>`,
+  ).join('');
+}
+
+// ── Notifications ─────────────────────────────────────────────────────────────
+window.notify = function(msg) {
+  const bar = document.getElementById('notifBar');
+  const el  = document.createElement('div');
+  el.style.cssText = 'background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:9px 14px;font-size:10px;font-weight:700;font-family:var(--sans);color:var(--txt);display:flex;align-items:center;gap:7px;animation:sli .18s ease;pointer-events:all';
+  el.innerHTML = '<i class="ti ti-circle-check" style="color:var(--grn)"></i>' + msg;
+  bar.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+};
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+const style2 = document.createElement('style');
+style2.textContent = '@keyframes sli{from{transform:translateX(15px);opacity:0}to{transform:translateX(0);opacity:1}} @keyframes scan{0%,100%{top:10%}50%{top:85%}}';
+document.head.appendChild(style2);
+
+buildChainPickers();
+renderLogs();
+renderTxs();
+// dashboard'u flex ile aç (block değil — flex layout için gerekli)
+const _dash = document.getElementById('tab-dashboard');
+_dash.style.display = 'flex';
+_dash.style.flexDirection = 'column';
+_dash.style.flex = '1';
+_dash.style.gap = '18px';
+// Başlangıçta: agent yok göster
+document.getElementById('dashNoAgent').style.display   = 'flex';
+document.getElementById('dashAgentView').style.display = 'none';
+document.getElementById('bridgeForm').style.display    = 'none';
+document.getElementById('swapForm').style.display      = 'none';
+
+// Auto-connect if already permitted
+if (window.ethereum) {
+  window.ethereum.request({ method: 'eth_accounts' }).then(accounts => {
+    if (accounts.length) connectWallet();
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>

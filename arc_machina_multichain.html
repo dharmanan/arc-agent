@@ -1,0 +1,874 @@
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0b0f;--surf:#111318;--card:#181c24;--bdr:#1e2530;
+  --acc:#3d7eff;--grn:#00e5a0;--warn:#f59e0b;--red:#ef4444;--pur:#a78bfa;
+  --txt:#e8eaf0;--mut:#6b7a99;--mono:'Space Mono',monospace;--sans:'Syne',sans-serif;
+}
+body{background:var(--bg);color:var(--txt);font-family:var(--sans);min-height:600px}
+h2.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+.app{display:flex;height:620px;overflow:hidden;border-radius:16px;border:1px solid var(--bdr)}
+.sidebar{width:210px;background:var(--surf);border-right:1px solid var(--bdr);display:flex;flex-direction:column;flex-shrink:0}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{background:var(--surf);border-bottom:1px solid var(--bdr);padding:10px 18px;flex-shrink:0}
+.content{flex:1;overflow-y:auto;padding:18px;background:var(--bg)}
+.content::-webkit-scrollbar{width:3px}
+.content::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:2px}
+/* SIDEBAR */
+.logo{padding:18px 14px 10px;border-bottom:1px solid var(--bdr)}
+.logo-icon{width:26px;height:26px;background:var(--acc);border-radius:7px;display:flex;align-items:center;justify-content:center;margin-bottom:7px}
+.logo-icon svg{width:14px;height:14px;fill:white}
+.logo-title{font-size:16px;font-weight:800;letter-spacing:-.5px}
+.logo-sub{font-size:8px;color:var(--mut);letter-spacing:3px;text-transform:uppercase;font-family:var(--mono)}
+.nav{padding:10px 8px;flex:1}
+.nav-lbl{font-size:8px;color:var(--mut);letter-spacing:2px;text-transform:uppercase;padding:4px 10px;font-family:var(--mono)}
+.ni{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:12px;font-weight:600;color:var(--mut);border:none;background:none;width:100%;text-align:left;transition:all .12s;margin-bottom:1px}
+.ni:hover{background:var(--card);color:var(--txt)}
+.ni.active{background:rgba(61,126,255,.15);color:var(--acc);border:1px solid rgba(61,126,255,.2)}
+.ni i{font-size:15px}
+.nav-sep{height:1px;background:var(--bdr);margin:6px 0}
+.sb-bot{padding:10px 8px;border-top:1px solid var(--bdr)}
+.wallet-chip{background:var(--card);border:1px solid var(--bdr);border-radius:9px;padding:9px 11px;cursor:pointer;transition:all .12s}
+.wallet-chip:hover,.wallet-chip.connected{border-color:rgba(0,229,160,.35)}
+.wlbl{font-size:10px;font-weight:700;color:var(--mut)}
+.waddr{font-size:9px;font-family:var(--mono);color:var(--grn);margin-top:2px}
+.wnet{font-size:8px;color:var(--mut);margin-top:2px}
+.dot{width:5px;height:5px;border-radius:50%;display:inline-block;margin-right:4px;vertical-align:middle}
+.dot-g{background:var(--grn)}.dot-r{background:var(--red)}.dot-m{background:var(--mut)}
+/* TOPBAR */
+.tprow{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.badge{display:flex;align-items:center;gap:5px;font-size:10px;font-weight:700;padding:4px 10px;border-radius:20px;font-family:var(--mono)}
+.badge-active{background:rgba(0,229,160,.1);color:var(--grn);border:1px solid rgba(0,229,160,.2)}
+.badge-idle{background:var(--card);color:var(--mut);border:1px solid var(--bdr)}
+.badge-smart{background:rgba(167,139,250,.1);color:var(--pur);border:1px solid rgba(167,139,250,.2)}
+.btn{font-size:11px;font-weight:700;padding:6px 13px;border-radius:8px;border:none;cursor:pointer;font-family:var(--sans);transition:all .12s;line-height:1}
+.btn-acc{background:var(--acc);color:#fff}.btn-acc:hover{opacity:.88}
+.btn-ghost{background:var(--card);color:var(--txt);border:1px solid var(--bdr)}.btn-ghost:hover{border-color:var(--acc)}
+.btn-grn{background:rgba(0,229,160,.12);color:var(--grn);border:1px solid rgba(0,229,160,.25)}.btn-grn:hover{background:rgba(0,229,160,.2)}
+.btn-full{width:100%;padding:13px;font-size:13px}
+/* CARDS */
+.card{background:var(--card);border:1px solid var(--bdr);border-radius:13px;padding:15px}
+.card-sm{background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:11px}
+.ctitle{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:2px;font-family:var(--mono);margin-bottom:6px}
+.cval{font-size:24px;font-weight:800;letter-spacing:-1px}
+.csub{font-size:10px;color:var(--mut);margin-top:3px;font-family:var(--mono)}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.gwide{display:grid;grid-template-columns:3fr 2fr;gap:12px}
+.stitle{font-size:12px;font-weight:700;margin-bottom:9px;display:flex;align-items:center;gap:5px}
+.mb8{margin-bottom:8px}.mb12{margin-bottom:12px}.mb16{margin-bottom:16px}.mb18{margin-bottom:18px}
+.flex{display:flex}.ic{align-items:center}.jb{justify-content:space-between}.gap8{gap:8px}.gap6{gap:6px}
+/* CHAIN CHIPS */
+.chain-wrap{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.cp{display:flex;align-items:center;gap:5px;background:var(--card);border:1px solid var(--bdr);border-radius:20px;padding:5px 11px;font-size:11px;font-weight:700;cursor:pointer;transition:all .12s}
+.cp:hover{border-color:var(--acc)}.cp.sel{border-color:var(--acc);background:rgba(61,126,255,.12);color:var(--acc)}
+.cdot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+/* TOKEN BOX */
+.tbox{background:var(--surf);border:1px solid var(--bdr);border-radius:11px;padding:13px;transition:border .12s}
+.tbox:focus-within{border-color:var(--acc)}
+.tlbl{font-size:9px;color:var(--mut);font-family:var(--mono);margin-bottom:5px}
+.trow{display:flex;align-items:center;gap:7px}
+.tinput{background:none;border:none;outline:none;font-size:20px;font-weight:800;color:var(--txt);font-family:var(--sans);width:0;flex:1;letter-spacing:-.5px}
+.tinput::placeholder{color:var(--bdr)}
+.tsel{background:var(--card);border:1px solid var(--bdr);border-radius:7px;padding:5px 9px;color:var(--txt);font-size:12px;font-weight:700;font-family:var(--sans);outline:none;cursor:pointer}
+.sarrow{display:flex;justify-content:center;margin:3px 0}
+.sarrow-btn{background:var(--card);border:1px solid var(--bdr);border-radius:7px;padding:7px;cursor:pointer;color:var(--mut);transition:all .12s;line-height:0}
+.sarrow-btn:hover{border-color:var(--acc);color:var(--acc)}
+/* FORM */
+.ilbl{font-size:10px;color:var(--mut);margin-bottom:4px;font-family:var(--mono);letter-spacing:.4px}
+.inp{background:var(--surf);border:1px solid var(--bdr);border-radius:9px;padding:10px 12px;color:var(--txt);font-family:var(--mono);font-size:12px;width:100%;outline:none;transition:border .12s}
+.inp:focus{border-color:var(--acc)}.inp::placeholder{color:var(--mut)}
+select.inp{cursor:pointer}
+.igrp{margin-bottom:11px}
+/* INFO/WARN BOXES */
+.ibox{background:rgba(61,126,255,.05);border:1px solid rgba(61,126,255,.15);border-radius:9px;padding:11px;font-size:10px;color:var(--mut);font-family:var(--mono);line-height:1.5}
+.wbox{background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.25);border-radius:9px;padding:11px;font-size:10px;color:var(--warn);font-family:var(--mono);line-height:1.5}
+.gbox{background:rgba(0,229,160,.06);border:1px solid rgba(0,229,160,.2);border-radius:9px;padding:11px;font-size:10px;color:var(--grn);font-family:var(--mono);line-height:1.5}
+/* TAGS */
+.tag{font-size:9px;font-weight:700;padding:3px 7px;border-radius:5px;font-family:var(--mono)}
+.tg-b{background:rgba(61,126,255,.15);color:var(--acc)}.tg-g{background:rgba(0,229,160,.15);color:var(--grn)}
+.tg-w{background:rgba(245,158,11,.15);color:var(--warn)}.tg-m{background:var(--surf);color:var(--mut);border:1px solid var(--bdr)}
+/* LOG */
+.log{font-size:10px;font-family:var(--mono);padding:5px 9px;border-radius:5px;background:var(--surf);border-left:2px solid var(--bdr);margin-bottom:3px;display:flex;gap:7px}
+.log-t{color:var(--mut);flex-shrink:0}.log-sys{border-left-color:var(--mut)}.log-sec{border-left-color:var(--grn)}
+.log-tx{border-left-color:var(--acc)}.log-br{border-left-color:var(--pur)}.log-ok{border-left-color:var(--grn)}
+/* TX ROW */
+.txrow{display:flex;align-items:center;gap:9px;padding:9px 0;border-bottom:1px solid var(--bdr);font-size:11px}
+.txic{width:30px;height:30px;border-radius:7px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.tx-s{background:rgba(239,68,68,.1);color:var(--red)}.tx-r{background:rgba(0,229,160,.1);color:var(--grn)}.tx-b{background:rgba(61,126,255,.1);color:var(--acc)}
+/* TOGGLE */
+.tog{position:relative;width:34px;height:18px;flex-shrink:0}
+.tog input{opacity:0;width:0;height:0}
+.tog-sl{position:absolute;inset:0;background:var(--bdr);border-radius:18px;cursor:pointer;transition:.18s}
+.tog-sl:before{content:'';position:absolute;width:12px;height:12px;left:3px;top:3px;background:var(--mut);border-radius:50%;transition:.18s}
+.tog input:checked+.tog-sl{background:rgba(61,126,255,.3)}
+.tog input:checked+.tog-sl:before{transform:translateX(16px);background:var(--acc)}
+/* BRIDGE STEPS */
+.bstep{display:flex;align-items:center;gap:9px;padding:9px;border-radius:9px;margin-bottom:5px}
+.bstep.done{background:rgba(0,229,160,.05)}.bstep.active{background:rgba(61,126,255,.05)}.bstep.idle{opacity:.35}
+.bsic{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0}
+.bstep.done .bsic{background:rgba(0,229,160,.2);color:var(--grn)}
+.bstep.active .bsic{background:rgba(61,126,255,.2);color:var(--acc)}
+.bstep.idle .bsic{background:var(--surf);color:var(--mut)}
+/* STEP BAR */
+.sbar{display:flex;align-items:center;gap:0;margin-bottom:18px}
+.step{display:flex;align-items:center;gap:5px;font-size:10px;font-weight:700;font-family:var(--mono)}
+.snum{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;flex-shrink:0}
+.step.done .snum{background:var(--grn);color:#000}.step.active .snum{background:var(--acc);color:#fff}.step.idle .snum{background:var(--card);color:var(--mut);border:1px solid var(--bdr)}
+.step.done .slbl{color:var(--grn)}.step.active .slbl{color:var(--txt)}.step.idle .slbl{color:var(--mut)}
+.sline{flex:1;height:1px;background:var(--bdr);margin:0 5px}.sline.done{background:var(--grn)}
+/* MODAL */
+.mov{position:absolute;inset:0;background:rgba(0,0,0,.88);backdrop-filter:blur(10px);z-index:100;display:none;align-items:center;justify-content:center;border-radius:16px}
+.mov.show{display:flex}
+.mbox{background:var(--card);border:1px solid var(--bdr);border-radius:18px;padding:26px;width:380px;text-align:center;position:relative;max-height:580px;overflow-y:auto}
+.mbox::-webkit-scrollbar{width:3px}.mbox::-webkit-scrollbar-thumb{background:var(--bdr)}
+.mtitle{font-size:17px;font-weight:800;letter-spacing:-.5px;margin-bottom:6px}
+.msub{font-size:11px;color:var(--mut);font-family:var(--mono);margin-bottom:18px;line-height:1.5}
+.mclose{position:absolute;top:12px;right:14px;background:none;border:none;color:var(--mut);cursor:pointer;font-size:16px;line-height:1}
+/* PASSKEY */
+.pkring{width:72px;height:72px;border-radius:50%;border:2px solid rgba(0,229,160,.3);display:flex;align-items:center;justify-content:center;margin:0 auto 14px;position:relative}
+.pkring::before{content:'';position:absolute;inset:-6px;border-radius:50%;border:1px solid rgba(0,229,160,.1);animation:pr 2s ease-out infinite}
+@keyframes pr{0%{transform:scale(.8);opacity:1}100%{transform:scale(1.3);opacity:0}}
+/* QR */
+.qr-wrap{background:white;border-radius:10px;padding:10px;margin:0 auto 12px;display:inline-block}
+.qr-grid{display:grid;grid-template-columns:repeat(11,7px);gap:1px}
+.qrc{width:7px;height:7px;border-radius:1px}
+.qrd{background:#111}.qrl{background:white}
+/* PAYMENT REQUEST CONFIRM */
+.pay-req-box{background:rgba(0,229,160,.05);border:1px solid rgba(0,229,160,.2);border-radius:12px;padding:16px;margin-bottom:14px}
+.pay-amount{font-size:32px;font-weight:800;letter-spacing:-1px;color:var(--grn)}
+.pay-chain{font-size:10px;color:var(--mut);font-family:var(--mono);margin-top:4px}
+.pay-addr-box{background:var(--surf);border:1px solid var(--bdr);border-radius:8px;padding:10px;font-family:var(--mono);font-size:9px;color:var(--txt);word-break:break-all;text-align:left;margin-bottom:12px}
+.pay-security{background:rgba(0,229,160,.04);border:1px solid rgba(0,229,160,.12);border-radius:9px;padding:10px;text-align:left;margin-bottom:14px}
+.pay-sec-row{display:flex;align-items:center;gap:7px;font-size:10px;font-family:var(--mono);color:var(--mut);margin-bottom:4px}
+.pay-sec-row:last-child{margin-bottom:0}
+/* SCAN LINE ANIMATION */
+@keyframes scan{0%,100%{top:10%}50%{top:85%}}
+</style>
+
+<h2 class="sr-only">Arc Machina — Multi-chain agentic wallet: Dashboard, Bridge (Solana/Base/Optimism/Arbitrum/Arc), Swap</h2>
+
+<div class="app" style="position:relative">
+  <!-- SIDEBAR -->
+  <div class="sidebar">
+    <div class="logo">
+      <div class="logo-icon"><svg viewBox="0 0 16 16"><polygon points="8,1 15,5 15,11 8,15 1,11 1,5"/></svg></div>
+      <div class="logo-title">Arc Machina</div>
+      <div class="logo-sub">Testnet Agent</div>
+    </div>
+    <nav class="nav">
+      <div class="nav-lbl">Main</div>
+      <button class="ni active" onclick="showTab('dashboard')"><i class="ti ti-layout-dashboard" aria-hidden="true"></i> Dashboard</button>
+      <button class="ni" onclick="showTab('bridge')"><i class="ti ti-transfer" aria-hidden="true"></i> Bridge</button>
+      <button class="ni" onclick="showTab('swap')"><i class="ti ti-arrows-exchange" aria-hidden="true"></i> Swap</button>
+      <div class="nav-sep"></div>
+      <div class="nav-lbl">Agent</div>
+      <button class="ni" onclick="showTab('agent')"><i class="ti ti-robot" aria-hidden="true"></i> Agent Settings</button>
+      <button class="ni" onclick="showTab('security')"><i class="ti ti-shield-check" aria-hidden="true"></i> Security</button>
+    </nav>
+    <div class="sb-bot">
+      <div id="walletChip" class="wallet-chip" onclick="connectWallet()">
+        <div class="wlbl"><span class="dot dot-m" id="wdot"></span><span id="wlbl">Not Connected</span></div>
+        <div class="waddr" id="waddr" style="display:none">0xArc...7F3e</div>
+        <div class="wnet">Arc Testnet · 5042002</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="main">
+    <!-- TOPBAR -->
+    <div class="topbar">
+      <div class="tprow">
+        <div id="agBadge" class="badge badge-idle"><i class="ti ti-robot" style="font-size:12px" aria-hidden="true"></i> No Agent</div>
+        <div id="modBadge" class="badge badge-idle" style="display:none"><i class="ti ti-brain" style="font-size:12px" aria-hidden="true"></i> <span id="modTxt">Base Mode</span></div>
+        <div style="flex:1"></div>
+        <button class="btn btn-ghost" onclick="openSendModal()"><i class="ti ti-send" style="font-size:11px" aria-hidden="true"></i> Send</button>
+        <button class="btn btn-grn" onclick="openReceiveModal()"><i class="ti ti-download" style="font-size:11px" aria-hidden="true"></i> Receive</button>
+        <button class="btn btn-acc" onclick="openDeployModal()"><i class="ti ti-plus" style="font-size:11px" aria-hidden="true"></i> Create Agent</button>
+      </div>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="content">
+
+      <!-- DASHBOARD -->
+      <div id="tab-dashboard">
+        <div class="g3 mb12">
+          <div class="card"><div class="ctitle">Total Balance</div><div class="cval" id="totalBal">$0.00</div><div class="csub">Arc Testnet USDC</div></div>
+          <div class="card"><div class="ctitle">Sepolia USDC</div><div class="cval" style="font-size:19px" id="sepolBal">0.00</div><div class="csub">Sepolia Testnet</div></div>
+          <div class="card"><div class="ctitle">Agent Txs</div><div class="cval" style="font-size:19px" id="txCount">0</div><div class="csub">This session</div></div>
+        </div>
+        <div class="gwide mb16">
+          <div>
+            <div class="stitle"><i class="ti ti-clock" aria-hidden="true"></i> Transaction History</div>
+            <div class="card" id="txHistory">
+              <div style="text-align:center;padding:18px;color:var(--mut);font-size:11px;font-family:var(--mono)"><i class="ti ti-database-off" style="font-size:22px;display:block;margin-bottom:6px;color:var(--bdr)" aria-hidden="true"></i>No transactions yet</div>
+            </div>
+          </div>
+          <div>
+            <div class="stitle"><i class="ti ti-terminal" aria-hidden="true"></i> Agent Log</div>
+            <div id="logBox"></div>
+          </div>
+        </div>
+        <div>
+          <div class="stitle"><i class="ti ti-info-circle" aria-hidden="true"></i> Network Info</div>
+          <div class="ibox">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">
+              <div>RPC: <span style="color:var(--txt)">rpc.testnet.arc.network</span></div>
+              <div>Chain ID: <span style="color:var(--acc)">5042002</span></div>
+              <div>USDC (Arc): <span style="color:var(--txt)">0x3600...0000</span></div>
+              <div>Explorer: <span style="color:var(--grn)">testnet.arcscan.app</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- BRIDGE -->
+      <div id="tab-bridge" style="display:none">
+        <div class="stitle mb8"><i class="ti ti-transfer" aria-hidden="true"></i> Cross-Chain Bridge</div>
+        <div class="ibox mb14">Circle Bridge Kit · Wormhole · Real on-chain transactions · Sepolia ↔ Arc Testnet</div>
+        <div class="card mb12">
+          <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:8px">FROM</div>
+          <div class="chain-wrap" id="bFromChains">
+            <div class="cp sel" onclick="selectBChain('from','Sepolia','#627eea')"><div class="cdot" style="background:#627eea"></div>Sepolia</div>
+            <div class="cp" onclick="selectBChain('from','Base','#0052ff')"><div class="cdot" style="background:#0052ff"></div>Base</div>
+            <div class="cp" onclick="selectBChain('from','Optimism','#ff0420')"><div class="cdot" style="background:#ff0420"></div>Optimism</div>
+            <div class="cp" onclick="selectBChain('from','Arbitrum','#28a0f0')"><div class="cdot" style="background:#28a0f0"></div>Arbitrum</div>
+            <div class="cp" onclick="selectBChain('from','Solana','#9945ff')"><div class="cdot" style="background:#9945ff"></div>Solana</div>
+            <div class="cp" onclick="selectBChain('from','Arc Testnet','#3d7eff')"><div class="cdot" style="background:#3d7eff"></div>Arc Testnet</div>
+          </div>
+          <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:8px">TO</div>
+          <div class="chain-wrap" id="bToChains">
+            <div class="cp" onclick="selectBChain('to','Sepolia','#627eea')"><div class="cdot" style="background:#627eea"></div>Sepolia</div>
+            <div class="cp" onclick="selectBChain('to','Base','#0052ff')"><div class="cdot" style="background:#0052ff"></div>Base</div>
+            <div class="cp" onclick="selectBChain('to','Optimism','#ff0420')"><div class="cdot" style="background:#ff0420"></div>Optimism</div>
+            <div class="cp" onclick="selectBChain('to','Arbitrum','#28a0f0')"><div class="cdot" style="background:#28a0f0"></div>Arbitrum</div>
+            <div class="cp" onclick="selectBChain('to','Solana','#9945ff')"><div class="cdot" style="background:#9945ff"></div>Solana</div>
+            <div class="cp sel" onclick="selectBChain('to','Arc Testnet','#3d7eff')"><div class="cdot" style="background:#3d7eff"></div>Arc Testnet</div>
+          </div>
+          <div class="tbox mb4">
+            <div class="tlbl">SEND</div>
+            <div class="trow"><input class="tinput" type="number" placeholder="0.00" id="bridgeAmt" oninput="updateBridgeOut()"><span style="font-size:12px;font-weight:700;color:var(--mut);font-family:var(--mono)">USDC</span></div>
+          </div>
+          <div class="sarrow"><div class="sarrow-btn" style="pointer-events:none"><i class="ti ti-chevron-down" style="font-size:13px" aria-hidden="true"></i></div></div>
+          <div class="tbox mb12">
+            <div class="tlbl">RECEIVE (estimated)</div>
+            <div class="trow"><div style="font-size:20px;font-weight:800;flex:1;letter-spacing:-.5px" id="bridgeOut">0.00</div><span style="font-size:12px;font-weight:700;color:var(--mut);font-family:var(--mono)">USDC</span></div>
+          </div>
+          <div class="ibox mb12" id="bFeeBox">Bridge fee: ~0.50 USDC · Est. time: 2-5 min · <span id="bRoute">Sepolia → Arc Testnet</span></div>
+          <button class="btn btn-acc btn-full" onclick="executeBridge()"><i class="ti ti-shield-check" aria-hidden="true"></i> Approve & Bridge</button>
+        </div>
+        <div id="bridgeProgress" style="display:none">
+          <div class="card">
+            <div class="stitle mb10"><i class="ti ti-loader" aria-hidden="true"></i> Bridge Status</div>
+            <div class="bstep active" id="bs1"><div class="bsic"><i class="ti ti-check" aria-hidden="true"></i></div><div><div style="font-size:11px;font-weight:700">Token Approval</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">ERC-20 approve signed</div></div></div>
+            <div class="bstep idle" id="bs2"><div class="bsic"><i class="ti ti-transfer" aria-hidden="true"></i></div><div><div style="font-size:11px;font-weight:700">Bridge Initiation</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">Circle Bridge Kit relay</div></div></div>
+            <div class="bstep idle" id="bs3"><div class="bsic"><i class="ti ti-circle-check" aria-hidden="true"></i></div><div><div style="font-size:11px;font-weight:700">Confirmation</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">USDC received on destination</div></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SWAP -->
+      <div id="tab-swap" style="display:none">
+        <div class="stitle mb8"><i class="ti ti-arrows-exchange" aria-hidden="true"></i> Token Swap — Uniswap V2 · Sepolia</div>
+        <div class="ibox mb14">Uniswap V2 Router · 0xC532...4008 · Real on-chain swap · Max 0.1 ETH/24h rate limit</div>
+        <div class="card mb12">
+          <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:8px">NETWORK</div>
+          <div class="chain-wrap" id="swapChains">
+            <div class="cp sel" onclick="selectSwapChain(this,'Sepolia')"><div class="cdot" style="background:#627eea"></div>Sepolia</div>
+            <div class="cp" onclick="selectSwapChain(this,'Base')"><div class="cdot" style="background:#0052ff"></div>Base</div>
+            <div class="cp" onclick="selectSwapChain(this,'Optimism')"><div class="cdot" style="background:#ff0420"></div>Optimism</div>
+            <div class="cp" onclick="selectSwapChain(this,'Arbitrum')"><div class="cdot" style="background:#28a0f0"></div>Arbitrum</div>
+            <div class="cp" onclick="selectSwapChain(this,'Solana')"><div class="cdot" style="background:#9945ff"></div>Solana</div>
+          </div>
+          <div class="tbox mb4">
+            <div class="tlbl">YOU SELL</div>
+            <div class="trow">
+              <input class="tinput" type="number" placeholder="0.00" id="swapIn" oninput="updateSwap()">
+              <select class="tsel" id="swapFrom" onchange="updateSwap()"><option value="ETH">ETH</option><option value="USDC">USDC</option></select>
+            </div>
+          </div>
+          <div class="sarrow"><button class="sarrow-btn" onclick="flipSwap()"><i class="ti ti-arrows-up-down" style="font-size:13px" aria-hidden="true"></i></button></div>
+          <div class="tbox mb12">
+            <div class="tlbl">YOU GET (estimated)</div>
+            <div class="trow"><div style="font-size:20px;font-weight:800;flex:1;letter-spacing:-.5px" id="swapOut">0.00</div><div id="swapToTok" style="font-size:12px;font-weight:700;color:var(--mut);font-family:var(--mono)">USDC</div></div>
+          </div>
+          <div class="g2 mb12" style="font-size:9px;font-family:var(--mono);color:var(--mut)">
+            <div class="card-sm"><div>Price Impact</div><div style="color:var(--grn);margin-top:2px" id="priceImpact">~0.12%</div></div>
+            <div class="card-sm"><div>Slippage</div><div style="color:var(--txt);margin-top:2px">0.5%</div></div>
+          </div>
+          <div class="wbox mb12" id="limitWarn" style="display:none">⚠ ETH→USDC: Max 0.1 ETH per 24 hours (rate limit active)</div>
+          <button class="btn btn-acc btn-full" onclick="executeSwap()"><i class="ti ti-shield-lock" aria-hidden="true"></i> Approve & Swap</button>
+        </div>
+        <div class="card">
+          <div class="ctitle">Contract Addresses</div>
+          <div style="font-size:9px;font-family:var(--mono);color:var(--mut);line-height:1.9">
+            <div>Uniswap V2 Router: <span style="color:var(--acc)">0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008</span></div>
+            <div>WETH (Sepolia): <span style="color:var(--txt)">0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9</span></div>
+            <div>USDC (Bridge Kit): <span style="color:var(--txt)">0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238</span></div>
+            <div>USDC (Arc Native): <span style="color:var(--txt)">0x3600000000000000000000000000000000000000</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- AGENT SETTINGS -->
+      <div id="tab-agent" style="display:none">
+        <div class="stitle mb12"><i class="ti ti-robot" aria-hidden="true"></i> Agent Settings</div>
+        <div id="agentLocked" class="card mb14" style="text-align:center;padding:26px">
+          <i class="ti ti-lock" style="font-size:34px;color:var(--bdr);display:block;margin-bottom:11px" aria-hidden="true"></i>
+          <div style="font-weight:700;margin-bottom:5px">No Agent Deployed</div>
+          <div style="font-size:11px;color:var(--mut);font-family:var(--mono);margin-bottom:14px">Connect wallet and create an agent to get started</div>
+          <button class="btn btn-acc" onclick="openDeployModal()">Create Agent</button>
+        </div>
+        <div id="agentPanel" style="display:none">
+          <div class="card mb12">
+            <div class="flex ic jb mb10">
+              <div><div style="font-weight:700;font-size:13px" id="agNameDisp">—</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono);margin-top:2px">Passkey secured · Secure Enclave</div></div>
+              <div class="tag tg-g">Active</div>
+            </div>
+            <div style="font-size:9px;font-family:var(--mono);color:var(--mut)">Private Key: <span id="agKeyDisp" style="color:var(--txt)">0x••••••••••••</span></div>
+          </div>
+          <div class="card mb12">
+            <div class="stitle mb10"><i class="ti ti-brain" aria-hidden="true"></i> LLM Connection</div>
+            <div class="ibox mb10">Without an LLM model, the agent runs in base mode: send/receive payments, check balances only.</div>
+            <div class="igrp"><div class="ilbl">API Key</div><input class="inp" type="password" placeholder="sk-ant-... / AIza... / sk-..." id="apiKey" oninput="checkApi()"></div>
+            <div class="igrp"><div class="ilbl">Model</div>
+              <select class="inp" id="modelSel" onchange="checkApi()">
+                <option value="">-- Select model --</option>
+                <option>claude-sonnet-4-20250514</option>
+                <option>gemini-2.5-pro</option>
+                <option>gpt-4o</option>
+              </select>
+            </div>
+            <div id="apiStatus" style="display:none" class="gbox"></div>
+          </div>
+          <div class="card" id="smartPerms" style="display:none">
+            <div class="stitle mb10"><i class="ti ti-sparkles" aria-hidden="true"></i> Smart Agent Permissions <span class="tag tg-b" style="margin-left:4px">LLM Required</span></div>
+            <div id="permList"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SECURITY -->
+      <div id="tab-security" style="display:none">
+        <div class="stitle mb12"><i class="ti ti-shield-check" aria-hidden="true"></i> Security Center</div>
+        <div class="card mb12">
+          <div class="stitle mb10">Authentication</div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Passkey (WebAuthn / FIDO2)</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">FaceID · TouchID · Platform Authenticator</div></div><label class="tog"><input type="checkbox" id="togPk" onchange="togSec('passkey')"><span class="tog-sl"></span></label></div>
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Two-Factor Auth (TOTP)</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">Time-based one-time password</div></div><label class="tog"><input type="checkbox" id="tog2fa" checked onchange="togSec('2fa')"><span class="tog-sl"></span></label></div>
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Auto-Lock</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">Lock after 5 min inactivity</div></div><label class="tog"><input type="checkbox" id="togLock" checked onchange="togSec('lock')"><span class="tog-sl"></span></label></div>
+            <div class="flex ic jb"><div><div style="font-size:12px;font-weight:600">Contract Guard</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">Auto contract analysis before signing</div></div><label class="tog"><input type="checkbox" id="togGuard" checked onchange="togSec('guard')"><span class="tog-sl"></span></label></div>
+          </div>
+        </div>
+        <div class="card mb12">
+          <div class="stitle mb10">Transaction Limits</div>
+          <div class="g2" style="gap:9px">
+            <div><div class="ilbl">Daily Max (USDC)</div><input class="inp" type="number" value="1000" id="dailyMax"></div>
+            <div><div class="ilbl">Max Gas (Gwei)</div><input class="inp" type="number" value="50" id="maxGas"></div>
+            <div><div class="ilbl">Slippage (%)</div><input class="inp" type="number" value="0.5" step="0.1" id="slip"></div>
+            <div><div class="ilbl">Max Trade (USDC)</div><input class="inp" type="number" value="200" id="maxTrade"></div>
+          </div>
+          <button class="btn btn-ghost" style="margin-top:10px;width:100%" onclick="saveLimits()">Save Limits</button>
+        </div>
+        <div class="card">
+          <div class="ctitle">Secure Enclave Status</div>
+          <div class="ibox" id="enclaveStatus"><i class="ti ti-shield-off" aria-hidden="true"></i> No agent deployed. Private key not bound to Secure Enclave.</div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+
+  <!-- MODAL: DEPLOY -->
+  <div class="mov" id="deployMod">
+    <div class="mbox">
+      <button class="mclose" onclick="closeMod('deployMod')"><i class="ti ti-x" aria-hidden="true"></i></button>
+      <div id="dStep1">
+        <div style="font-size:34px;margin-bottom:10px">🤖</div>
+        <div class="mtitle">Create Agent</div>
+        <div class="msub">Deploy your non-custodial agent wallet — no code needed. Private key secured by Passkey.</div>
+        <div class="igrp" style="text-align:left;margin-bottom:14px"><div class="ilbl">Agent Name</div><input class="inp" placeholder="e.g. My Main Wallet" id="agNameIn"></div>
+        <div class="sbar">
+          <div class="step active"><div class="snum">1</div><div class="slbl">Create</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">2</div><div class="slbl">Deploy</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">3</div><div class="slbl">Secure</div></div>
+        </div>
+        <button class="btn btn-acc btn-full" onclick="dStep1()">Generate Private Key</button>
+      </div>
+      <div id="dStep2" style="display:none">
+        <div style="font-size:34px;margin-bottom:10px">🔑</div>
+        <div class="mtitle">Key Generated</div>
+        <div class="msub">Store this key safely. It will be encrypted via your Passkey.</div>
+        <div style="background:var(--surf);border:1px solid var(--bdr);border-radius:9px;padding:10px;font-family:var(--mono);font-size:8px;word-break:break-all;color:var(--acc);text-align:left;margin-bottom:14px" id="genKeyDisp">—</div>
+        <div class="sbar">
+          <div class="step done"><div class="snum">1</div><div class="slbl">Create</div></div>
+          <div class="sline done"></div>
+          <div class="step active"><div class="snum">2</div><div class="slbl">Deploy</div></div>
+          <div class="sline"></div>
+          <div class="step idle"><div class="snum">3</div><div class="slbl">Secure</div></div>
+        </div>
+        <button class="btn btn-acc btn-full" onclick="dStep2()"><i class="ti ti-fingerprint" aria-hidden="true"></i> Bind with Passkey</button>
+      </div>
+      <div id="dStep3" style="display:none">
+        <div class="pkring"><i class="ti ti-fingerprint" style="font-size:30px;color:var(--grn)" aria-hidden="true"></i></div>
+        <div class="mtitle">Authenticating</div>
+        <div class="msub">Use your device biometrics.<br>FaceID · TouchID · PIN</div>
+        <div style="font-size:9px;color:var(--mut);font-family:var(--mono)">WebAuthn · Secure Enclave · FIDO2</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: SEND -->
+  <div class="mov" id="sendMod">
+    <div class="mbox">
+      <button class="mclose" onclick="closeMod('sendMod')"><i class="ti ti-x" aria-hidden="true"></i></button>
+      <div id="sChoice">
+        <div class="mtitle">Send Payment</div>
+        <div class="msub">Choose method</div>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <button class="btn btn-ghost btn-full" style="padding:13px" onclick="showSend('qr')"><i class="ti ti-qrcode" aria-hidden="true"></i> Scan QR Code</button>
+          <button class="btn btn-ghost btn-full" style="padding:13px" onclick="showSend('manual')"><i class="ti ti-keyboard" aria-hidden="true"></i> Manual Address Entry</button>
+        </div>
+      </div>
+      <div id="sQR" style="display:none">
+        <div class="mtitle">Scan QR</div>
+        <div class="msub">Point camera at recipient's payment QR</div>
+        <div style="width:150px;height:150px;background:var(--surf);border:1px solid var(--bdr);border-radius:11px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden">
+          <div style="position:absolute;width:100%;height:2px;background:var(--acc);opacity:.7;animation:scan 2s ease-in-out infinite"></div>
+          <i class="ti ti-qrcode" style="font-size:44px;color:var(--bdr);position:relative;z-index:1" aria-hidden="true"></i>
+        </div>
+        <button class="btn btn-acc btn-full mb8" onclick="simulateScan()">TEST: QR Detected → Confirm</button>
+        <button onclick="showSend('choice')" style="background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;font-family:var(--sans)">← Back</button>
+      </div>
+      <div id="sManual" style="display:none;text-align:left">
+        <div class="mtitle" style="text-align:center">Manual Payment</div>
+        <div class="msub" style="text-align:center">Enter recipient details</div>
+        <div class="igrp"><div class="ilbl">Recipient Address</div><input class="inp" placeholder="0x... or Solana address" id="sendAddr"></div>
+        <div class="igrp"><div class="ilbl">Amount (USDC)</div><input class="inp" type="number" placeholder="0.00" id="sendAmt"></div>
+        <div class="igrp"><div class="ilbl">Network</div>
+          <select class="inp" id="sendChain">
+            <option>Arc Testnet</option><option>Sepolia</option><option>Base</option><option>Optimism</option><option>Arbitrum</option><option>Solana</option>
+          </select>
+        </div>
+        <button class="btn btn-acc btn-full" style="margin-top:4px" onclick="confirmSend()"><i class="ti ti-fingerprint" aria-hidden="true"></i> Sign with Passkey</button>
+        <button onclick="showSend('choice')" style="display:block;background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;margin-top:10px;font-family:var(--sans)">← Back</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: RECEIVE — QR + PAYMENT REQUEST -->
+  <div class="mov" id="receiveMod">
+    <div class="mbox" style="width:400px">
+      <button class="mclose" onclick="closeMod('receiveMod')"><i class="ti ti-x" aria-hidden="true"></i></button>
+      <!-- Step 1: Set amount -->
+      <div id="rStep1">
+        <div class="mtitle">Receive Payment</div>
+        <div class="msub">Set the amount to generate a secure payment request QR</div>
+        <div class="igrp" style="text-align:left">
+          <div class="ilbl">Requested Amount (USDC)</div>
+          <input class="inp" type="number" placeholder="0.00" id="receiveAmt" style="font-size:18px;font-weight:800;text-align:center" oninput="updateReceivePreview()">
+        </div>
+        <div class="igrp" style="text-align:left">
+          <div class="ilbl">Network</div>
+          <select class="inp" id="receiveChain" onchange="updateReceivePreview()">
+            <option>Arc Testnet</option><option>Sepolia</option><option>Base</option><option>Optimism</option><option>Arbitrum</option><option>Solana</option>
+          </select>
+        </div>
+        <div id="rPreview" style="display:none">
+          <div class="pay-req-box mb12">
+            <div style="font-size:9px;color:var(--mut);font-family:var(--mono);margin-bottom:4px">PAYMENT REQUEST</div>
+            <div class="pay-amount" id="previewAmt">0.00 USDC</div>
+            <div class="pay-chain" id="previewChain">Arc Testnet · 0xArc...7F3e</div>
+          </div>
+        </div>
+        <button class="btn btn-acc btn-full" onclick="generatePayQR()"><i class="ti ti-qrcode" aria-hidden="true"></i> Generate Payment QR</button>
+      </div>
+      <!-- Step 2: Show QR + payer sees this -->
+      <div id="rStep2" style="display:none">
+        <div class="mtitle">Payment Request QR</div>
+        <div class="msub" id="rQRsub">Share this QR — payer will see the exact amount to approve</div>
+        <!-- QR code with amount encoded -->
+        <div style="margin-bottom:14px">
+          <div class="qr-wrap" id="qrDisplay"></div>
+        </div>
+        <!-- Encoded payment data (EIP-681 style) -->
+        <div style="font-size:8px;font-family:var(--mono);color:var(--mut);background:var(--surf);border:1px solid var(--bdr);border-radius:7px;padding:8px;text-align:left;margin-bottom:12px;word-break:break-all" id="payURI">—</div>
+        <!-- What payer sees when they scan -->
+        <div class="pay-security mb12">
+          <div style="font-size:10px;font-weight:700;color:var(--grn);margin-bottom:8px"><i class="ti ti-shield-check" style="font-size:12px" aria-hidden="true"></i> What the payer will see on scan:</div>
+          <div class="pay-sec-row"><i class="ti ti-coin" style="font-size:12px" aria-hidden="true"></i><span>Amount locked: <strong style="color:var(--txt)" id="secAmt">5 USDC</strong> — cannot be altered by recipient</span></div>
+          <div class="pay-sec-row"><i class="ti ti-user-check" style="font-size:12px" aria-hidden="true"></i><span>Recipient address verified before signing</span></div>
+          <div class="pay-sec-row"><i class="ti ti-lock" style="font-size:12px" aria-hidden="true"></i><span>Payer must approve exact USDC amount in wallet</span></div>
+          <div class="pay-sec-row"><i class="ti ti-fingerprint" style="font-size:12px" aria-hidden="true"></i><span>Passkey / biometric required to sign</span></div>
+        </div>
+        <div style="display:flex;gap:7px">
+          <button class="btn btn-ghost" style="flex:1;padding:10px" onclick="copyPayURI()"><i class="ti ti-copy" aria-hidden="true"></i> Copy Link</button>
+          <button class="btn btn-grn" style="flex:1;padding:10px" onclick="simReceive()">TEST: Payment Received</button>
+        </div>
+        <button onclick="showRStep(1)" style="display:block;background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;margin-top:10px;font-family:var(--sans);width:100%;text-align:center">← Change Amount</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: PAYER CONFIRMATION (what payer sees) -->
+  <div class="mov" id="payerMod">
+    <div class="mbox" style="width:360px">
+      <button class="mclose" onclick="closeMod('payerMod')"><i class="ti ti-x" aria-hidden="true"></i></button>
+      <div style="font-size:11px;color:var(--warn);font-family:var(--mono);margin-bottom:14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:7px;padding:8px">
+        <i class="ti ti-eye" style="font-size:12px" aria-hidden="true"></i> PAYER VIEW — This is what the payment sender sees after scanning
+      </div>
+      <div class="mtitle">Confirm Payment</div>
+      <div class="msub">Review and approve this payment request</div>
+      <div class="pay-req-box mb12" style="text-align:left">
+        <div style="font-size:9px;color:var(--mut);font-family:var(--mono);margin-bottom:6px">YOU ARE SENDING</div>
+        <div class="pay-amount" id="payerAmt">5.00 USDC</div>
+        <div class="pay-chain" id="payerChain">Arc Testnet</div>
+      </div>
+      <div style="font-size:10px;color:var(--mut);font-family:var(--mono);margin-bottom:5px">TO ADDRESS</div>
+      <div class="pay-addr-box" id="payerAddr">0xArc...7F3e</div>
+      <div class="pay-security mb14">
+        <div style="font-size:10px;font-weight:700;color:var(--grn);margin-bottom:8px"><i class="ti ti-shield-check" style="font-size:12px" aria-hidden="true"></i> Security Checks</div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)" aria-hidden="true"></i><span style="color:var(--txt)">Amount set by requester — read-only</span></div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)" aria-hidden="true"></i><span style="color:var(--txt)">Address verified via QR signature</span></div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)" aria-hidden="true"></i><span style="color:var(--txt)">ERC-20 approval scoped to exact amount</span></div>
+        <div class="pay-sec-row"><i class="ti ti-check" style="font-size:12px;color:var(--grn)" aria-hidden="true"></i><span style="color:var(--txt)">No extra token approvals granted</span></div>
+      </div>
+      <button class="btn btn-acc btn-full mb8" onclick="payerConfirm()"><i class="ti ti-fingerprint" aria-hidden="true"></i> Approve & Sign with Passkey</button>
+      <button class="btn btn-ghost btn-full" onclick="closeMod('payerMod')">Cancel</button>
+    </div>
+  </div>
+
+  <!-- MODAL: PASSKEY AUTH -->
+  <div class="mov" id="authMod">
+    <div class="mbox" style="width:300px">
+      <div class="pkring"><i class="ti ti-fingerprint" style="font-size:30px;color:var(--grn)" aria-hidden="true"></i></div>
+      <div class="mtitle">Secure Signature</div>
+      <div class="msub">Verifying Passkey...<br>Broadcasting to chain</div>
+      <div style="font-size:9px;color:var(--mut);font-family:var(--mono)">WebAuthn · FIDO2 · Secure Enclave</div>
+    </div>
+  </div>
+
+  <!-- NOTIFICATIONS -->
+  <div id="notifBar" style="position:absolute;bottom:14px;right:14px;z-index:200;display:flex;flex-direction:column;gap:5px;max-width:260px;pointer-events:none"></div>
+</div>
+
+<script>
+const S = {
+  tab:'dashboard', wallet:false, hasAgent:false, agentName:'', agentKey:'',
+  isSmartMode:false, model:'', balance:0, sepolBal:892.40, txCount:0,
+  bFromChain:'Sepolia', bToChain:'Arc Testnet', swapChain:'Sepolia',
+  receiveAmt:0, receiveChain:'Arc Testnet',
+  payURI:''
+};
+const perms=[
+  {key:'scanDeFi',label:'DeFi Protocol Scanner',desc:'Auto-scan opportunities',val:true},
+  {key:'arbitrage',label:'Arbitrage',desc:'Cross-chain price differences',val:false},
+  {key:'testnetExplorer',label:'Testnet Explorer',desc:'ArcScan data reads',val:true},
+  {key:'scanContracts',label:'New Contract Scanner',desc:'Watch deployed contracts',val:false},
+  {key:'liquidations',label:'Liquidations',desc:'Monitor liquidation events',val:false},
+  {key:'aggressiveMode',label:'Aggressive Mode',desc:'High risk / high reward',val:false},
+];
+let logs=[{type:'sys',text:'System ready. Awaiting wallet connection.',time:'--:--'}];
+let txs=[];
+
+function showTab(t){
+  S.tab=t;
+  ['dashboard','bridge','swap','agent','security'].forEach(id=>document.getElementById('tab-'+id).style.display=id===t?'block':'none');
+  document.querySelectorAll('.ni').forEach(el=>el.classList.toggle('active',el.getAttribute('onclick')===`showTab('${t}')`));
+  if(t==='agent') renderAgent();
+}
+function connectWallet(){
+  if(S.wallet) return;
+  S.wallet=true; S.balance=12450.60;
+  document.getElementById('wlbl').textContent='0xArc...7F3e';
+  document.getElementById('wdot').className='dot dot-g';
+  document.getElementById('waddr').style.display='block';
+  document.getElementById('walletChip').classList.add('connected');
+  updateBals(); addLog('sys','Wallet connected: 0xArc...7F3e · Arc Testnet'); notify('Wallet Connected');
+}
+function updateBals(){
+  document.getElementById('totalBal').textContent='$'+S.balance.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  document.getElementById('sepolBal').textContent=S.sepolBal.toFixed(2);
+  document.getElementById('txCount').textContent=S.txCount;
+}
+function addLog(type,text){
+  const t=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  logs.unshift({type,text,time:t}); if(logs.length>8) logs.pop(); renderLogs();
+}
+function renderLogs(){
+  document.getElementById('logBox').innerHTML=logs.map(l=>`<div class="log log-${l.type}"><span class="log-t">${l.time}</span><span>${l.text}</span></div>`).join('');
+}
+function addTx(icon,label,amount,type){
+  txs.unshift({icon,label,amount,type,time:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})});
+  S.txCount++; renderTxs(); updateBals();
+}
+function renderTxs(){
+  const b=document.getElementById('txHistory');
+  if(!txs.length){b.innerHTML='<div style="text-align:center;padding:18px;color:var(--mut);font-size:11px;font-family:var(--mono)"><i class="ti ti-database-off" style="font-size:22px;display:block;margin-bottom:6px;color:var(--bdr)"></i>No transactions yet</div>';return;}
+  b.innerHTML=txs.slice(0,6).map(t=>`<div class="txrow"><div class="txic tx-${t.type}"><i class="ti ti-${t.icon}"></i></div><div style="flex:1"><div style="font-size:11px;font-weight:600">${t.label}</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">${t.time}</div></div><div style="font-size:11px;font-weight:700;font-family:var(--mono);color:${t.type==='r'?'var(--grn)':t.type==='s'?'var(--red)':'var(--acc)'}">${t.amount}</div></div>`).join('');
+}
+
+// MODALS
+function openMod(id){document.getElementById(id).classList.add('show');}
+function closeMod(id){document.getElementById(id).classList.remove('show');}
+
+// DEPLOY
+function openDeployModal(){
+  if(!S.wallet){connectWallet();setTimeout(openDeployModal,600);return;}
+  ['dStep1','dStep2','dStep3'].forEach((id,i)=>document.getElementById(id).style.display=i===0?'block':'none');
+  openMod('deployMod');
+}
+function dStep1(){
+  const n=document.getElementById('agNameIn').value.trim();
+  if(!n){notify('Enter an agent name');return;}
+  S.agentName=n; S.agentKey='0x'+Array.from({length:64},()=>Math.floor(Math.random()*16).toString(16)).join('');
+  document.getElementById('genKeyDisp').textContent=S.agentKey;
+  document.getElementById('dStep1').style.display='none'; document.getElementById('dStep2').style.display='block';
+}
+function dStep2(){
+  document.getElementById('dStep2').style.display='none'; document.getElementById('dStep3').style.display='block';
+  setTimeout(()=>{
+    closeMod('deployMod'); S.hasAgent=true;
+    document.getElementById('agBadge').className='badge badge-active';
+    document.getElementById('agBadge').innerHTML='<i class="ti ti-robot" style="font-size:12px"></i> '+S.agentName+' · Active';
+    document.getElementById('modBadge').style.display='flex';
+    document.getElementById('togPk').checked=true;
+    document.getElementById('enclaveStatus').innerHTML='<i class="ti ti-shield-check"></i> '+S.agentName+' · Private key bound to Secure Enclave. Passkey active.';
+    addLog('sec','Agent "'+S.agentName+'" deployed. Key encrypted via Passkey + Secure Enclave.');
+    notify(S.agentName+' created successfully!');
+    if(S.tab==='agent') renderAgent();
+  },2000);
+}
+function renderAgent(){
+  const locked=document.getElementById('agentLocked'); const panel=document.getElementById('agentPanel');
+  if(!S.hasAgent){locked.style.display='block';panel.style.display='none';return;}
+  locked.style.display='none'; panel.style.display='block';
+  document.getElementById('agNameDisp').textContent=S.agentName;
+  document.getElementById('agKeyDisp').textContent=S.agentKey.substring(0,18)+'••••••••';
+  renderPerms();
+}
+function renderPerms(){
+  const on=S.isSmartMode;
+  document.getElementById('smartPerms').style.display='block';
+  document.getElementById('permList').innerHTML=perms.map(p=>`
+    <div class="flex ic jb" style="padding:7px 0;border-bottom:1px solid var(--bdr)">
+      <div><div style="font-size:11px;font-weight:600;color:${on?'var(--txt)':'var(--mut)'}">${p.label}</div><div style="font-size:9px;color:var(--mut);font-family:var(--mono)">${p.desc}</div></div>
+      <label class="tog"><input type="checkbox" ${p.val&&on?'checked':''} ${on?'':'disabled'} onchange="toggleP('${p.key}',this.checked)"><span class="tog-sl"></span></label>
+    </div>`).join('');
+}
+function toggleP(k,v){const p=perms.find(x=>x.key===k);if(p)p.val=v;addLog('sys',k+' permission '+(v?'enabled':'disabled'));}
+function checkApi(){
+  const k=document.getElementById('apiKey').value; const m=document.getElementById('modelSel').value;
+  const box=document.getElementById('apiStatus');
+  if(k.length>10&&m){
+    S.isSmartMode=true; S.model=m; box.style.display='block';
+    box.innerHTML='✓ '+m+' connected · Smart agent permissions unlocked';
+    document.getElementById('modBadge').className='badge badge-smart';
+    document.getElementById('modTxt').textContent=m.split('-')[0].toUpperCase()+' · Smart Mode';
+    addLog('br',m+' engine synced. Smart analysis active.');
+    if(S.hasAgent) renderPerms();
+  } else {
+    S.isSmartMode=false; box.style.display='none';
+    document.getElementById('modBadge').className='badge badge-idle';
+    document.getElementById('modTxt').textContent='Base Mode';
+    if(S.hasAgent) renderPerms();
+  }
+}
+
+// SEND
+function openSendModal(){openMod('sendMod'); showSend('choice');}
+function showSend(s){['sChoice','sQR','sManual'].forEach(id=>document.getElementById(id).style.display='none'); document.getElementById(s==='choice'?'sChoice':s==='qr'?'sQR':'sManual').style.display='block';}
+function simulateScan(){
+  document.getElementById('sendAddr').value='0x5F3d...A4bC';
+  document.getElementById('sendAmt').value='25';
+  showSend('manual'); notify('QR detected: 0x5F3d...A4bC · 25 USDC');
+}
+function confirmSend(){
+  const addr=document.getElementById('sendAddr').value; const amt=parseFloat(document.getElementById('sendAmt').value)||0;
+  if(!addr||!amt){notify('Enter address and amount');return;}
+  closeMod('sendMod'); openMod('authMod');
+  setTimeout(()=>{
+    closeMod('authMod'); S.balance=Math.max(0,S.balance-amt);
+    addTx('send','Sent: '+addr.substring(0,12)+'...','−'+amt+' USDC','s');
+    addLog('sec','Payment ('+amt+' USDC) signed via Passkey. Recipient: '+addr);
+    notify('Payment Sent: '+amt+' USDC');
+  },2000);
+}
+
+// RECEIVE
+function openReceiveModal(){openMod('receiveMod'); showRStep(1);}
+function showRStep(n){
+  document.getElementById('rStep1').style.display=n===1?'block':'none';
+  document.getElementById('rStep2').style.display=n===2?'block':'none';
+}
+function updateReceivePreview(){
+  const amt=parseFloat(document.getElementById('receiveAmt').value)||0;
+  const chain=document.getElementById('receiveChain').value;
+  const prev=document.getElementById('rPreview');
+  if(amt>0){
+    prev.style.display='block';
+    document.getElementById('previewAmt').textContent=amt.toFixed(2)+' USDC';
+    document.getElementById('previewChain').textContent=chain+' · 0xArc...7F3e';
+  } else { prev.style.display='none'; }
+}
+function generatePayQR(){
+  const amt=parseFloat(document.getElementById('receiveAmt').value)||0;
+  const chain=document.getElementById('receiveChain').value;
+  if(!amt){notify('Enter an amount first');return;}
+  S.receiveAmt=amt; S.receiveChain=chain;
+  // EIP-681 style URI: ethereum:<address>@<chainId>/transfer?address=<token>&uint256=<amount>
+  const chainIds={'Arc Testnet':'5042002','Sepolia':'11155111','Base':'8453','Optimism':'10','Arbitrum':'42161','Solana':'solana'};
+  const cid=chainIds[chain]||'5042002';
+  S.payURI=`ethereum:0x3600000000000000000000000000000000000000@${cid}/transfer?address=0xArc7F3e&uint256=${Math.round(amt*1e6)}`;
+  document.getElementById('payURI').textContent=S.payURI;
+  document.getElementById('rQRsub').textContent=amt+' USDC payment request on '+chain;
+  document.getElementById('secAmt').textContent=amt.toFixed(2)+' USDC';
+  // generate QR
+  buildQR(S.payURI);
+  showRStep(2);
+}
+function buildQR(data){
+  // Deterministic visual QR based on data hash
+  let h=0; for(let i=0;i<data.length;i++){h=(h<<5)-h+data.charCodeAt(i);h|=0;}
+  const cells=[];
+  // fixed finder patterns (corners)
+  const pat=[
+    [0,0],[0,1],[0,2],[0,3],[0,4],[0,5],[0,6],
+    [1,0],[1,6],[2,0],[2,6],[3,0],[3,6],[4,0],[4,6],[5,0],[5,6],[6,0],[6,1],[6,2],[6,3],[6,4],[6,5],[6,6],
+    [2,2],[2,3],[2,4],[3,2],[3,3],[3,4],[4,2],[4,3],[4,4],
+    // top-right
+    [0,10],[0,11],[0,12],[0,13],[0,14],[0,15],[0,16],
+    [1,10],[1,16],[2,10],[2,16],[3,10],[3,16],[4,10],[4,16],[5,10],[5,16],[6,10],[6,11],[6,12],[6,13],[6,14],[6,15],[6,16],
+    [2,12],[2,13],[2,14],[3,12],[3,13],[3,14],[4,12],[4,13],[4,14],
+    // bottom-left
+    [10,0],[11,0],[12,0],[13,0],[14,0],[15,0],[16,0],
+    [10,6],[11,6],[12,6],[13,6],[14,6],[15,6],[16,6],
+    [10,1],[10,2],[10,3],[10,4],[10,5],
+    [16,1],[16,2],[16,3],[16,4],[16,5],
+    [12,2],[12,3],[12,4],[13,2],[13,3],[13,4],[14,2],[14,3],[14,4],
+  ];
+  const fixed=new Set(pat.map(([r,c])=>r*17+c));
+  const SIZE=17;
+  for(let r=0;r<SIZE;r++) for(let c=0;c<SIZE;c++){
+    let dark;
+    if(fixed.has(r*SIZE+c)) dark=true;
+    else { const bit=(h>>(((r*SIZE+c)%31)))&1; dark=bit===1; }
+    cells.push(dark);
+  }
+  const qr=document.getElementById('qrDisplay');
+  qr.innerHTML='<div class="qr-grid" style="grid-template-columns:repeat(17,7px)">'+cells.map(d=>`<div class="qrc ${d?'qrd':'qrl'}"></div>`).join('')+'</div>';
+}
+function copyPayURI(){ notify('Payment link copied!'); }
+function simReceive(){
+  closeMod('receiveMod');
+  // Show payer view
+  document.getElementById('payerAmt').textContent=S.receiveAmt.toFixed(2)+' USDC';
+  document.getElementById('payerChain').textContent=S.receiveChain;
+  document.getElementById('payerAddr').textContent='0xArc...7F3e ('+S.receiveChain+')';
+  openMod('payerMod');
+}
+function payerConfirm(){
+  closeMod('payerMod'); openMod('authMod');
+  setTimeout(()=>{
+    closeMod('authMod'); const amt=S.receiveAmt;
+    S.balance+=amt;
+    addTx('download','Received (QR Pay)','+'+amt+' USDC','r');
+    addLog('sec','Incoming payment: '+amt+' USDC · Signed by payer via Passkey');
+    notify(amt+' USDC Payment Received!');
+  },2000);
+}
+
+// BRIDGE
+function selectBChain(dir,name,color){
+  const key=dir==='from'?'bFromChain':'bToChain';
+  S[key]=name;
+  const id=dir==='from'?'bFromChains':'bToChains';
+  document.getElementById(id).querySelectorAll('.cp').forEach(el=>{
+    el.classList.toggle('sel',el.textContent.trim()===name);
+  });
+  document.getElementById('bRoute').textContent=S.bFromChain+' → '+S.bToChain;
+  updateBridgeOut();
+}
+function updateBridgeOut(){
+  const a=parseFloat(document.getElementById('bridgeAmt').value)||0;
+  document.getElementById('bridgeOut').textContent=a>0?(a-0.5).toFixed(2):'0.00';
+}
+function executeBridge(){
+  const a=parseFloat(document.getElementById('bridgeAmt').value)||0;
+  if(!a){notify('Enter an amount');return;}
+  if(!S.wallet){connectWallet();return;}
+  openMod('authMod');
+  document.getElementById('bridgeProgress').style.display='block';
+  setTimeout(()=>{
+    closeMod('authMod');
+    const s1=document.getElementById('bs1'),s2=document.getElementById('bs2'),s3=document.getElementById('bs3');
+    s1.className='bstep done'; s2.className='bstep active';
+    setTimeout(()=>{s2.className='bstep done'; s3.className='bstep active';
+      setTimeout(()=>{s3.className='bstep done';
+        addTx('transfer','Bridge: '+S.bFromChain+'→'+S.bToChain,'-'+a+' USDC','b');
+        addLog('tx','Bridge complete: '+a+' USDC · '+S.bFromChain+'→'+S.bToChain);
+        notify('Bridge Complete: '+a+' USDC');
+      },1200);
+    },1200);
+  },2000);
+}
+
+// SWAP
+function selectSwapChain(el,name){
+  S.swapChain=name;
+  document.getElementById('swapChains').querySelectorAll('.cp').forEach(e=>e.classList.remove('sel'));
+  el.classList.add('sel'); updateSwap();
+}
+function updateSwap(){
+  const from=document.getElementById('swapFrom').value;
+  const a=parseFloat(document.getElementById('swapIn').value)||0;
+  const rate=from==='ETH'?1850:1/1850;
+  document.getElementById('swapOut').textContent=a>0?(a*rate).toFixed(from==='ETH'?2:6):'0.00';
+  document.getElementById('swapToTok').textContent=from==='ETH'?'USDC':'ETH';
+  document.getElementById('limitWarn').style.display=from==='ETH'?'block':'none';
+  document.getElementById('priceImpact').textContent='~'+Math.min(0.05*(a||0.12),5).toFixed(2)+'%';
+}
+function flipSwap(){
+  const sel=document.getElementById('swapFrom'); sel.value=sel.value==='ETH'?'USDC':'ETH'; updateSwap();
+}
+function executeSwap(){
+  const a=parseFloat(document.getElementById('swapIn').value)||0;
+  const from=document.getElementById('swapFrom').value;
+  if(!a){notify('Enter an amount');return;}
+  if(!S.wallet){connectWallet();return;}
+  openMod('authMod');
+  setTimeout(()=>{
+    closeMod('authMod');
+    const out=(a*(from==='ETH'?1850:1/1850)).toFixed(2);
+    addTx('arrows-exchange','Swap: '+from+'→'+(from==='ETH'?'USDC':'ETH'),out+(from==='ETH'?' USDC':' ETH'),'b');
+    addLog('tx','Swap complete: '+a+' '+from+' → '+out+' '+(from==='ETH'?'USDC':'ETH')+' · '+S.swapChain);
+    notify('Swap Complete!');
+  },2000);
+}
+
+// SECURITY
+function togSec(k){addLog('sys','Security setting updated: '+k);}
+function saveLimits(){notify('Limits saved'); addLog('sys','Transaction limits updated');}
+
+// NOTIFY
+function notify(msg){
+  const bar=document.getElementById('notifBar');
+  const el=document.createElement('div');
+  el.style.cssText='background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:9px 14px;font-size:10px;font-weight:700;font-family:var(--sans);color:var(--txt);display:flex;align-items:center;gap:7px;animation:sli .18s ease;pointer-events:all';
+  el.innerHTML='<i class="ti ti-circle-check" style="color:var(--grn)"></i>'+msg;
+  bar.appendChild(el); setTimeout(()=>el.remove(),3000);
+}
+const s2=document.createElement('style');
+s2.textContent='@keyframes sli{from{transform:translateX(15px);opacity:0}to{transform:translateX(0);opacity:1}}';
+document.head.appendChild(s2);
+
+// INIT
+renderLogs(); renderTxs();
+document.getElementById('tab-dashboard').style.display='block';
+</script>
