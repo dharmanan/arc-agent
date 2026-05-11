@@ -34,9 +34,12 @@ export default function SwapTab({ onBack }) {
   const quoteTimer = useRef(null);
 
   const maxTrade    = agent?.settings?.maxTradeUsdc  ?? 200;
-  const isNano      = parseFloat(amountIn) > 0 && parseFloat(amountIn) < 0.01;
-  const isAgentic   = parseFloat(amountIn) > 0 && parseFloat(amountIn) <= maxTrade;
-  const exceedsMax  = parseFloat(amountIn) > maxTrade;
+  const parsedAmount = parseFloat(amountIn);
+  const hasAmount    = Number.isFinite(parsedAmount) && parsedAmount > 0;
+  const isNano       = hasAmount && parsedAmount < 0.01;
+  const isAgentic    = hasAmount && parsedAmount <= maxTrade;
+  const exceedsMax   = hasAmount && parsedAmount > maxTrade;
+  const swapDisabledByDex = hasAmount && !quoting && !!quote && !quote.isDexQuote;
 
   // ── Fetch quote on amount / direction change ──────────────────────────────
   const fetchQuote = useCallback(async (amount, from, to) => {
@@ -83,7 +86,9 @@ export default function SwapTab({ onBack }) {
 
   // ── Execute swap (agent auto-signs) ──────────────────────────────────────
   async function handleSwap() {
-    if (!amountIn || parseFloat(amountIn) <= 0) { setError('Enter a valid amount.'); return; }
+    if (!hasAmount) { setError('Enter a valid amount.'); return; }
+    if (quoting || !quote) { setError('Waiting for a live swap quote from Arc Testnet…'); return; }
+    if (!quote.isDexQuote) { setError('Swap is unavailable on this deployment until ARC_DEX_ROUTER is configured.'); return; }
     if (exceedsMax) { setError(`Amount exceeds agent auto-approve limit (${maxTrade} USDC). Lower the amount or raise the limit in Agent Settings.`); return; }
 
     setError('');
@@ -95,7 +100,7 @@ export default function SwapTab({ onBack }) {
         agentId:   agent.id,
         fromToken,
         toToken,
-        amountIn:  parseFloat(amountIn),
+        amountIn:  parsedAmount,
       });
 
       // Poll for confirmation
@@ -268,8 +273,10 @@ export default function SwapTab({ onBack }) {
                 {quoting ? <RefreshCw size={14} className="animate-spin inline"/> : (quote ? parseFloat(quote.amountOut).toFixed(4) : '—')}
               </span>
             </div>
-            {quote && !quote.isDexQuote && (
-              <p className="text-xs text-amber-600">⚠ Estimated 1:1 (DEX not configured on Arc Testnet — actual rate may differ)</p>
+            {swapDisabledByDex && (
+              <Alert type="warning">
+                Live Arc DEX routing is not configured on this deployment. The 1:1 number is a placeholder, and execution is disabled until `ARC_DEX_ROUTER` is set.
+              </Alert>
             )}
           </div>
 
@@ -302,10 +309,14 @@ export default function SwapTab({ onBack }) {
           <Button
             onClick={handleSwap}
             loading={loading}
-            disabled={exceedsMax || !amountIn || parseFloat(amountIn) <= 0}
+            disabled={exceedsMax || !hasAmount || quoting || !quote?.isDexQuote}
             className="w-full"
           >
-            {isNano ? '⚡ Nano Swap' : <><Bot size={15}/> Agent Swap {amountIn || '0'} {fromToken} → {toToken}</>}
+            {swapDisabledByDex
+              ? 'Swap unavailable on this deployment'
+              : isNano
+              ? '⚡ Nano Swap'
+              : <><Bot size={15}/> Agent Swap {amountIn || '0'} {fromToken} → {toToken}</>}
           </Button>
         </div>
       </Card>

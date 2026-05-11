@@ -117,8 +117,7 @@ export default function DashboardTab({ onNavigate }) {
     setConnectError('');
     setConnecting(true);
     try {
-      const { authenticatePasskey: auth } = await import('../lib/passkey.js');
-      const result = await auth(ownerAddress);
+      const result = await authenticatePasskey(ownerAddress);
       setJwt(result.token);
       const list = await agents.list();
       if (list.length > 0) setAgent(list[0]);
