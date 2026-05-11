@@ -14,6 +14,8 @@ export const CHAINS = {
     // Adresler: Circle SDK'dan (@circle-fin/bridge-kit → ArcTestnet)
     usdcAddress: '0x3600000000000000000000000000000000000000',
     eurcAddress: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
+    // Adres: @circle-fin/swap-kit built-in CIRBTC locator for Blockchain.Arc_Testnet
+    cirbtcAddress: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
     // Circle CCTP V2 kontratları
     cctpTokenMessenger:    '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     cctpMessageTransmitter:'0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',

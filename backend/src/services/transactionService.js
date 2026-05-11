@@ -591,7 +591,7 @@ async function getBridgeAttestation({ txId, userId }) {
 
 
 /**
- * Agentic swap: USDC ↔ EURC on Arc Testnet only.
+ * Agentic swap: USDC / EURC / cirBTC on Arc Testnet only.
  * Agent signs with its own private key — no user MetaMask interaction needed.
  */
 async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain }) {
@@ -603,14 +603,22 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
     throw Object.assign(new Error('Swap is not configured on this deployment. Set CIRCLE_KIT_KEY and try again.'), { status: 503 });
   }
 
-  const allowedPairs = [['USDC', 'EURC'], ['EURC', 'USDC']];
-  const pairValid = allowedPairs.some(([a, b]) => a === fromToken && b === toToken);
+  const allowedTokens = ['USDC', 'EURC', 'cirBTC'];
+  const pairValid = fromToken !== toToken && allowedTokens.includes(fromToken) && allowedTokens.includes(toToken);
   if (!pairValid) {
-    throw Object.assign(new Error('Only USDC ↔ EURC swaps are supported on Arc Testnet'), { status: 400 });
+    throw Object.assign(new Error('Only USDC, EURC, and cirBTC swaps are supported on Arc Testnet'), { status: 400 });
   }
 
-  // Amount in for limit check (both USDC and EURC are ~1:1 with USD)
-  const usdcEquiv = parseFloat(amountIn);
+  // Amount in for limit check. Stable inputs are ~1:1 with USD; cirBTC uses a live quote.
+  let usdcEquiv = parseFloat(amountIn);
+  if (fromToken === 'cirBTC') {
+    const quotedOut = await agentWalletService.getSwapQuote({ fromToken, toToken, amountIn });
+    usdcEquiv = parseFloat(quotedOut);
+    if (!Number.isFinite(usdcEquiv) || usdcEquiv <= 0) {
+      throw Object.assign(new Error('Could not determine a live cirBTC limit quote. Try again.'), { status: 503 });
+    }
+  }
+
   await checkAndReserveDailyLimit(agent, usdcEquiv);
 
   // Get raw agent row for private key access

@@ -109,6 +109,7 @@ const IRIS_API = 'https://iris-api-sandbox.circle.com';
 // ── Token adresleri (Arc Testnet) ─────────────────────────────────────────────
 const USDC_ARC   = process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000';
 const EURC_ARC   = process.env.EURC_ADDRESS_ARC || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
+const CIRBTC_ARC = process.env.CIRBTC_ADDRESS_ARC || '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF';
 const ARC_SWAP_CHAIN = getChainByEnum(SwapChain.Arc_Testnet);
 const SWAP_KIT = new SwapKit();
 const SWAP_QUOTE_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
@@ -368,6 +369,7 @@ async function bridgeNativeGasTopUp({ agent, toChain, recipient, amountEth, amou
 function resolveTokenAddress(symbol) {
   if (symbol === 'USDC') return USDC_ARC;
   if (symbol === 'EURC') return EURC_ARC;
+  if (symbol === 'cirBTC') return CIRBTC_ARC;
   throw new Error(`Bilinmeyen token: ${symbol}`);
 }
 
@@ -641,7 +643,7 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AGENTIC SWAP (USDC ↔ EURC on Arc Testnet)
+// AGENTIC SWAP (USDC / EURC / cirBTC on Arc Testnet)
 // ─────────────────────────────────────────────────────────────────────────────
 async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5 }) {
   if (!isSwapConfigured()) throw new Error('CIRCLE_KIT_KEY is not configured');

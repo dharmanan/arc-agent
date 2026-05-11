@@ -2,15 +2,17 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useAccount } from 'wagmi';
 import { useAgent } from '../providers/AgentProvider.jsx';
 import { transactions as txApi } from '../lib/api.js';
-import { fetchUsdcBalance, fetchEurcBalance } from '../lib/agentBalances.js';
+import { fetchUsdcBalance, fetchEurcBalance, fetchCirbtcBalance } from '../lib/agentBalances.js';
 import { ARC_TESTNET_ID } from '../lib/chains.js';
 import { Card, Button, Input, Alert, Badge, SectionHeader } from './ui/index.jsx';
 import { ArrowUpDown, Bot, Zap, ExternalLink, ChevronLeft, RefreshCw } from 'lucide-react';
 
 const ARC_EXPLORER = 'https://testnet.arcscan.app';
+const SWAP_TOKENS = ['USDC', 'EURC', 'cirBTC'];
+const STABLE_SWAP_TOKENS = new Set(['USDC', 'EURC']);
 
 /**
- * SwapTab — USDC ↔ EURC on Arc Testnet, fully agentic
+ * SwapTab — USDC / EURC / cirBTC on Arc Testnet, fully agentic
  *
  * All swaps are executed by the agent's own private key (no MetaMask pop-up
  * for amounts within maxTradeUsdc). This follows Circle's agentic payment
@@ -29,16 +31,24 @@ export default function SwapTab({ onBack }) {
   const [status,    setStatus]    = useState(null);  // executing status string
   const [error,     setError]     = useState('');
   const [loading,   setLoading]   = useState(false);
-  const [balances,  setBalances]  = useState({ usdc: null, eurc: null });
+  const [balances,  setBalances]  = useState({ usdc: null, eurc: null, cirbtc: null });
   const [loadingBalances, setLoadingBalances] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const quoteTimer = useRef(null);
 
   const maxTrade    = agent?.settings?.maxTradeUsdc  ?? 200;
   const parsedAmount = parseFloat(amountIn);
+  const quotedAmountOut = parseFloat(quote?.amountOut ?? '');
   const hasAmount    = Number.isFinite(parsedAmount) && parsedAmount > 0;
-  const isNano       = hasAmount && parsedAmount < 0.01;
-  const isAgentic    = hasAmount && parsedAmount <= maxTrade;
-  const exceedsMax   = hasAmount && parsedAmount > maxTrade;
+  const usdEquivalentIn = !hasAmount
+    ? null
+    : fromToken === 'cirBTC'
+      ? (quote?.isDexQuote && Number.isFinite(quotedAmountOut) ? quotedAmountOut : null)
+      : parsedAmount;
+  const isNano       = usdEquivalentIn !== null && usdEquivalentIn < 0.01;
+  const isAgentic    = usdEquivalentIn !== null && usdEquivalentIn <= maxTrade;
+  const exceedsMax   = usdEquivalentIn !== null && usdEquivalentIn > maxTrade;
+  const limitAwaitingQuote = hasAmount && fromToken === 'cirBTC' && usdEquivalentIn === null;
   const swapDisabledByDex = hasAmount && !quoting && !!quote && !quote.isDexQuote;
 
   // ── Fetch quote on amount / direction change ──────────────────────────────
@@ -49,11 +59,40 @@ export default function SwapTab({ onBack }) {
       const q = await txApi.swapQuote({ fromToken: from, toToken: to, amountIn: parseFloat(amount) });
       setQuote(q);
     } catch {
-      setQuote({ amountOut: parseFloat(amount), isDexQuote: false }); // 1:1 fallback
+      const stablePair = STABLE_SWAP_TOKENS.has(from) && STABLE_SWAP_TOKENS.has(to);
+      setQuote({ amountOut: stablePair ? parseFloat(amount) : 0, isDexQuote: false });
     } finally {
       setQuoting(false);
     }
   }, [agent]);
+
+  const refreshBalances = useCallback(async () => {
+    if (!agent?.walletAddress) return;
+    setLoadingBalances(true);
+    try {
+      const [usdc, eurc, cirbtc] = await Promise.all([
+        fetchUsdcBalance(agent.walletAddress, ARC_TESTNET_ID),
+        fetchEurcBalance(agent.walletAddress, ARC_TESTNET_ID),
+        fetchCirbtcBalance(agent.walletAddress, ARC_TESTNET_ID),
+      ]);
+      setBalances({ usdc, eurc, cirbtc });
+    } finally {
+      setLoadingBalances(false);
+    }
+  }, [agent?.walletAddress]);
+
+  const refreshSwapData = useCallback(async () => {
+    setManualRefreshing(true);
+    setError('');
+    try {
+      await Promise.all([
+        refreshBalances(),
+        hasAmount ? fetchQuote(amountIn, fromToken, toToken) : Promise.resolve(),
+      ]);
+    } finally {
+      setManualRefreshing(false);
+    }
+  }, [amountIn, fetchQuote, fromToken, hasAmount, refreshBalances, toToken]);
 
   useEffect(() => {
     clearTimeout(quoteTimer.current);
@@ -66,21 +105,25 @@ export default function SwapTab({ onBack }) {
   }, [amountIn, fromToken, toToken, fetchQuote]);
 
   useEffect(() => {
-    if (!agent?.walletAddress) return;
-    setLoadingBalances(true);
-    Promise.all([
-      fetchUsdcBalance(agent.walletAddress, ARC_TESTNET_ID),
-      fetchEurcBalance(agent.walletAddress, ARC_TESTNET_ID),
-    ])
-      .then(([usdc, eurc]) => setBalances({ usdc, eurc }))
-      .finally(() => setLoadingBalances(false));
-  }, [agent?.walletAddress]);
+    refreshBalances();
+  }, [refreshBalances]);
 
   // ── Flip direction ────────────────────────────────────────────────────────
   function flipTokens() {
-    setFromToken(t => t === 'USDC' ? 'EURC' : 'USDC');
-    setToToken(t   => t === 'USDC' ? 'EURC' : 'USDC');
-    setAmountIn('');
+    setFromToken(toToken);
+    setToToken(fromToken);
+    setQuote(null);
+  }
+
+  function handleFromTokenChange(nextToken) {
+    if (nextToken === toToken) setToToken(fromToken);
+    setFromToken(nextToken);
+    setQuote(null);
+  }
+
+  function handleToTokenChange(nextToken) {
+    if (nextToken === fromToken) setFromToken(toToken);
+    setToToken(nextToken);
     setQuote(null);
   }
 
@@ -89,6 +132,7 @@ export default function SwapTab({ onBack }) {
     if (!hasAmount) { setError('Enter a valid amount.'); return; }
     if (quoting || !quote) { setError('Waiting for a live swap quote from Arc Testnet…'); return; }
     if (!quote.isDexQuote) { setError('Swap is unavailable on this deployment until CIRCLE_KIT_KEY is configured.'); return; }
+    if (limitAwaitingQuote) { setError('Waiting for a live cirBTC quote to evaluate your agent limit…'); return; }
     if (exceedsMax) { setError(`Amount exceeds agent auto-approve limit (${maxTrade} USDC). Lower the amount or raise the limit in Agent Settings.`); return; }
 
     setError('');
@@ -142,7 +186,7 @@ export default function SwapTab({ onBack }) {
   if (!agent || !isAuthenticated) {
     return (
       <div className="max-w-lg mx-auto space-y-4">
-        <SectionHeader title="Swap" subtitle="USDC ↔ EURC on Arc Testnet." />
+        <SectionHeader title="Swap" subtitle="USDC / EURC / cirBTC on Arc Testnet." />
         <Card className="border-yellow-200 bg-yellow-50">
           <p className="text-sm font-medium text-yellow-800">
             You need an active agent wallet to use Swap. Go to the Agent tab to create or reconnect one.
@@ -164,7 +208,7 @@ export default function SwapTab({ onBack }) {
               <ChevronLeft size={16}/> Back
             </button>
           )}
-          <SectionHeader title="Swap" subtitle="USDC ↔ EURC on Arc Testnet — agentic." />
+          <SectionHeader title="Swap" subtitle="USDC / EURC / cirBTC on Arc Testnet — agentic." />
         </div>
         <Card>
           <div className="flex flex-col items-center gap-4 py-4 text-center">
@@ -204,7 +248,7 @@ export default function SwapTab({ onBack }) {
         )}
         <SectionHeader
           title="Swap"
-          subtitle="USDC ↔ EURC on Arc Testnet — agent executes autonomously within your limits."
+            subtitle="USDC / EURC / cirBTC on Arc Testnet — agent executes autonomously within your limits."
         />
       </div>
 
@@ -217,17 +261,25 @@ export default function SwapTab({ onBack }) {
                 <p className="text-sm font-semibold text-slate-900">Agent balances on Arc Testnet</p>
                 <p className="mt-1 text-xs text-slate-500">Swap uses the agent wallet directly on Arc Testnet.</p>
               </div>
-              {loadingBalances && <span className="text-xs text-slate-400">Refreshing…</span>}
+              <div className="flex items-center gap-2">
+                {loadingBalances && <span className="text-xs text-slate-400">Refreshing…</span>}
+                <Button
+                  variant="outline"
+                  onClick={refreshSwapData}
+                  loading={manualRefreshing}
+                  className="px-3 py-2 text-xs"
+                >
+                  <RefreshCw size={13}/> Refresh
+                </Button>
+              </div>
             </div>
-            <div className="mt-4 grid grid-cols-2 gap-3">
-              <div className="rounded-xl border border-slate-200 bg-white px-3 py-3 text-center">
-                <p className="text-[11px] uppercase tracking-wide text-slate-500">USDC</p>
-                <p className="mt-1 text-sm font-semibold text-slate-900">{balances.usdc ?? '—'}</p>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-white px-3 py-3 text-center">
-                <p className="text-[11px] uppercase tracking-wide text-slate-500">EURC</p>
-                <p className="mt-1 text-sm font-semibold text-slate-900">{balances.eurc ?? '—'}</p>
-              </div>
+            <div className="mt-4 grid grid-cols-3 gap-3">
+              {SWAP_TOKENS.map((token) => (
+                <div key={token} className="rounded-xl border border-slate-200 bg-white px-3 py-3 text-center">
+                  <p className="text-[11px] uppercase tracking-wide text-slate-500">{token}</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">{balances[token.toLowerCase()] ?? '—'}</p>
+                </div>
+              ))}
             </div>
           </div>
 
@@ -241,12 +293,18 @@ export default function SwapTab({ onBack }) {
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-slate-500 uppercase tracking-wide">From</label>
             <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-              <span className="flex-1 text-sm font-semibold text-slate-800">{fromToken}</span>
+              <select
+                value={fromToken}
+                onChange={e => handleFromTokenChange(e.target.value)}
+                className="flex-1 bg-transparent text-sm font-semibold text-slate-800 outline-none"
+              >
+                {SWAP_TOKENS.map(token => <option key={token} value={token}>{token}</option>)}
+              </select>
               <Input
                 type="number"
                 placeholder="0.00"
                 min="0"
-                step="0.01"
+                step={fromToken === 'cirBTC' ? '0.00000001' : '0.01'}
                 value={amountIn}
                 onChange={e => setAmountIn(e.target.value)}
                 className="w-36 border-0 bg-transparent text-right text-base font-bold text-slate-900 focus:ring-0 p-0"
@@ -268,14 +326,20 @@ export default function SwapTab({ onBack }) {
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-slate-500 uppercase tracking-wide">To (estimated)</label>
             <div className="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 px-4 py-3">
-              <span className="flex-1 text-sm font-semibold text-slate-800">{toToken}</span>
+              <select
+                value={toToken}
+                onChange={e => handleToTokenChange(e.target.value)}
+                className="flex-1 bg-transparent text-sm font-semibold text-slate-800 outline-none"
+              >
+                {SWAP_TOKENS.map(token => <option key={token} value={token}>{token}</option>)}
+              </select>
               <span className="text-right text-base font-bold text-slate-400">
-                {quoting ? <RefreshCw size={14} className="animate-spin inline"/> : (quote ? parseFloat(quote.amountOut).toFixed(4) : '—')}
+                {quoting ? <RefreshCw size={14} className="animate-spin inline"/> : (quote && Number.isFinite(quotedAmountOut) ? quotedAmountOut.toFixed(toToken === 'cirBTC' ? 6 : 4) : '—')}
               </span>
             </div>
             {swapDisabledByDex && (
               <Alert type="warning">
-                Live Arc swap routing is not configured on this deployment. The shown amount is a placeholder, and execution is disabled until CIRCLE_KIT_KEY is set.
+                Live Arc swap routing is unavailable right now. Stable-to-stable quotes may fall back to a placeholder, and execution stays disabled until a live route is available.
               </Alert>
             )}
           </div>
@@ -287,14 +351,16 @@ export default function SwapTab({ onBack }) {
               <span>
                 {isNano
                   ? <><strong className="text-slate-700">Nano payment</strong> — agent executes automatically ({'<'}$0.01)</>
+                  : limitAwaitingQuote
+                  ? 'Waiting for a live cirBTC quote to evaluate your agent limit'
                   : isAgentic
-                  ? <><strong className="text-slate-700">Agentic</strong> — agent auto-executes (within {maxTrade} USDC limit)</>
+                  ? <><strong className="text-slate-700">Agentic</strong> — agent auto-executes (within {maxTrade} USDC-equivalent limit)</>
                   : exceedsMax
                   ? <span className="text-red-600">Exceeds auto-approve limit ({maxTrade} USDC) — raise limit in Agent Settings</span>
                   : 'Enter an amount to see execution mode'}
               </span>
             </div>
-            {isAgentic && !exceedsMax && (
+            {isAgentic && !exceedsMax && !limitAwaitingQuote && (
               <div className="flex items-center gap-2">
                 <Zap size={13} className="text-amber-500 shrink-0"/>
                 <span>No MetaMask pop-up needed — agent wallet signs autonomously</span>
@@ -309,7 +375,7 @@ export default function SwapTab({ onBack }) {
           <Button
             onClick={handleSwap}
             loading={loading}
-            disabled={exceedsMax || !hasAmount || quoting || !quote?.isDexQuote}
+            disabled={exceedsMax || limitAwaitingQuote || !hasAmount || quoting || !quote?.isDexQuote}
             className="w-full"
           >
             {swapDisabledByDex

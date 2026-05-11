@@ -76,6 +76,11 @@ export async function fetchEurcBalance(agentAddress, chainId) {
   return fetchTokenBalance(agentAddress, chainId, chainConfig?.eurcAddress, 6, 2);
 }
 
+export async function fetchCirbtcBalance(agentAddress, chainId) {
+  const chainConfig = Object.values(CHAINS).find(c => c.chainId === chainId);
+  return fetchTokenBalance(agentAddress, chainId, chainConfig?.cirbtcAddress, 8, 6);
+}
+
 export async function fetchAgentBalances(agentAddress) {
   const results = {};
   await Promise.allSettled(
@@ -92,10 +97,11 @@ export async function fetchAgentPortfolio(agentAddress, chainNames = ['Arc Testn
       const chainConfig = CHAINS[chainName];
       if (!chainConfig) return null;
 
-      const [nativeBalance, usdcBalance, eurcBalance] = await Promise.all([
+      const [nativeBalance, usdcBalance, eurcBalance, cirbtcBalance] = await Promise.all([
         fetchAgentBalance(agentAddress, chainConfig.chainId),
         fetchUsdcBalance(agentAddress, chainConfig.chainId),
         fetchEurcBalance(agentAddress, chainConfig.chainId),
+        fetchCirbtcBalance(agentAddress, chainConfig.chainId),
       ]);
 
       return {
@@ -105,6 +111,7 @@ export async function fetchAgentPortfolio(agentAddress, chainNames = ['Arc Testn
         nativeBalance,
         usdcBalance,
         eurcBalance,
+        cirbtcBalance,
       };
     }),
   );

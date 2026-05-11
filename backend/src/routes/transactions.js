@@ -171,11 +171,11 @@ router.get('/bridge/:txId/attestation', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── Swap — Arc Testnet only, USDC ↔ EURC (agentic) ──────────────────────────
+// ── Swap — Arc Testnet only, USDC / EURC / cirBTC (agentic) ─────────────────
 const swapSchema = z.object({
   agentId:   z.string().uuid(),
-  fromToken: z.enum(['USDC', 'EURC']),
-  toToken:   z.enum(['USDC', 'EURC']),
+  fromToken: z.enum(['USDC', 'EURC', 'cirBTC']),
+  toToken:   z.enum(['USDC', 'EURC', 'cirBTC']),
   amountIn:  z.number().positive(),
   slippage:  z.number().min(0.1).max(50).optional(),
 }).refine(b => b.fromToken !== b.toToken, { message: 'fromToken and toToken must differ' });
@@ -190,7 +190,7 @@ router.post('/swap', async (req, res, next) => {
       toToken:   body.toToken,
       amountIn:  body.amountIn,
       slippage:  body.slippage,
-      chain:     'Arc Testnet',  // always Arc Testnet for USDC↔EURC
+      chain:     'Arc Testnet',
     });
     res.status(202).json(tx);
   } catch (err) { next(err); }
@@ -198,8 +198,8 @@ router.post('/swap', async (req, res, next) => {
 
 // ── Swap Quote (read-only, no tx) ─────────────────────────────────────────────
 const quoteSchema = z.object({
-  fromToken: z.enum(['USDC', 'EURC']),
-  toToken:   z.enum(['USDC', 'EURC']),
+  fromToken: z.enum(['USDC', 'EURC', 'cirBTC']),
+  toToken:   z.enum(['USDC', 'EURC', 'cirBTC']),
   amountIn:  z.number().positive(),
 });
 
