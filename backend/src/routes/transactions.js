@@ -19,6 +19,28 @@ const transactionService  = require('../services/transactionService');
 const agentService        = require('../services/agentService');
 const agentWalletService  = require('../services/agentWalletService');
 
+// ── Public Swap Quote (read-only, no tx) ─────────────────────────────────────
+const quoteSchema = z.object({
+  fromToken: z.enum(['USDC', 'EURC', 'cirBTC']),
+  toToken:   z.enum(['USDC', 'EURC', 'cirBTC']),
+  amountIn:  z.number().positive(),
+});
+
+router.post('/swap/quote', txRateLimit, async (req, res, next) => {
+  try {
+    const body      = quoteSchema.parse(req.body);
+    const amountOut = await agentWalletService.getSwapQuote(body);
+    const stablePair = ['USDC', 'EURC'].includes(body.fromToken) && ['USDC', 'EURC'].includes(body.toToken);
+    res.json({
+      fromToken:  body.fromToken,
+      toToken:    body.toToken,
+      amountIn:   body.amountIn,
+      amountOut:  amountOut ?? (stablePair ? body.amountIn : 0),
+      isDexQuote: amountOut !== null,
+    });
+  } catch (err) { next(err); }
+});
+
 router.use(requireAuth);
 router.use(txRateLimit);
 
@@ -193,28 +215,6 @@ router.post('/swap', async (req, res, next) => {
       chain:     'Arc Testnet',
     });
     res.status(202).json(tx);
-  } catch (err) { next(err); }
-});
-
-// ── Swap Quote (read-only, no tx) ─────────────────────────────────────────────
-const quoteSchema = z.object({
-  fromToken: z.enum(['USDC', 'EURC', 'cirBTC']),
-  toToken:   z.enum(['USDC', 'EURC', 'cirBTC']),
-  amountIn:  z.number().positive(),
-});
-
-router.post('/swap/quote', async (req, res, next) => {
-  try {
-    const body     = quoteSchema.parse(req.body);
-    const amountOut = await agentWalletService.getSwapQuote(body);
-    // amountOut is null if live Arc swap quoting is unavailable — return a 1:1 stable fallback.
-    res.json({
-      fromToken:  body.fromToken,
-      toToken:    body.toToken,
-      amountIn:   body.amountIn,
-      amountOut:  amountOut ?? body.amountIn,  // 1:1 estimate if live quote is unavailable
-      isDexQuote: amountOut !== null,
-    });
   } catch (err) { next(err); }
 });
 
