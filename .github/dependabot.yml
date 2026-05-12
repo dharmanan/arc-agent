@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # hardhat is intentionally pinned at v2 (CJS compat) — ignore its ecosystem
+    ignore:
+      - dependency-name: "hardhat"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@nomicfoundation/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "lodash"
+      - dependency-name: "serialize-javascript"
+      - dependency-name: "undici"
+      - dependency-name: "bn.js"
+      - dependency-name: "elliptic"
+      - dependency-name: "tmp"
+      - dependency-name: "mocha"
+      - dependency-name: "solidity-coverage"
+
+  - package-ecosystem: "npm"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"

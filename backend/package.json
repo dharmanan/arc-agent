@@ -39,8 +39,6 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@nomicfoundation/hardhat-toolbox": "^6.1.2",
-    "hardhat": "^2.28.6",
     "jest": "^29.7.0",
     "nodemon": "^3.1.7"
   },
