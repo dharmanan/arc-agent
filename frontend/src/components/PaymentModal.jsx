@@ -10,7 +10,7 @@ import { CHAINS } from '../lib/chains.js';
 import { X, QrCode, Camera, ClipboardCheck, AlertTriangle, CheckCircle, Loader2, ExternalLink } from 'lucide-react';
 
 // ── SendResult: shows amount, recipient, polls for confirmed tx hash ───────────
-function SendResult({ result, onClose }) {
+function SendResult({ result, agentName, onClose }) {
   const [txHash, setTxHash]     = useState(null);
   const [pollDone, setPollDone] = useState(false);
   const pollRef                 = useRef(null);
@@ -45,6 +45,9 @@ function SendResult({ result, onClose }) {
     <div className="p-6 text-center">
       <CheckCircle size={36} className="mx-auto mb-3 text-arc-green" />
       <h2 className="mb-1 text-lg font-bold text-slate-900">Payment Sent!</h2>
+      {agentName && (
+        <p className="mb-1 text-sm font-semibold text-slate-600">{agentName}</p>
+      )}
       {result?.amountUsdc && (
         <p className="mb-1 text-xl font-bold text-arc-green">-{result.amountUsdc} USDC</p>
       )}
@@ -170,6 +173,9 @@ function ReceiveFlow({ agent, onClose }) {
       <div className="p-6 text-center">
         <CheckCircle size={40} className="mx-auto mb-3 text-arc-green" />
         <h2 className="mb-1 text-lg font-bold text-slate-900">Payment Received!</h2>
+        {agent.name && (
+          <p className="mb-1 text-sm font-semibold text-slate-600">{agent.name}</p>
+        )}
         <p className="mb-1 text-2xl font-bold text-arc-green">+{rxAmount} USDC</p>
         {fromAddr && (
           <p className="mb-4 font-mono text-xs text-slate-500">
@@ -488,8 +494,9 @@ function SendFlow({ agent, ownerAddress, onClose }) {
 
   // ── Step 3: Result — poll for tx hash until confirmed
   if (step === 3) {
-    return <SendResult result={result} onClose={onClose} />;
+    return <SendResult result={result} agentName={agent.name} onClose={onClose} />;
   }
+}
 
 // ── Main export ───────────────────────────────────────────────────────────────
 /**
