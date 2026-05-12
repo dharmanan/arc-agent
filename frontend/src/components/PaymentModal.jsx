@@ -205,7 +205,7 @@ function SendFlow({ agent, ownerAddress, onClose }) {
         token:      'USDC',
         chain:      'Arc Testnet',
       });
-      setResult({ txHash: tx.txHash || tx.id });
+      setResult({ txHash: tx.txHash || tx.txId || tx.id, status: tx.status });
       setStep(3);
     } catch (err) {
       if (err.status === 422 && err.message?.includes('requiresPasskey')) {
@@ -244,7 +244,7 @@ function SendFlow({ agent, ownerAddress, onClose }) {
         token:      'USDC',
         chain:      'Arc Testnet',
       });
-      setResult({ txHash: tx.txHash || tx.id });
+      setResult({ txHash: tx.txHash || tx.txId || tx.id, status: tx.status });
       setStep(3);
     } catch (err) {
       if (err.status === 429) {
@@ -381,12 +381,14 @@ function SendFlow({ agent, ownerAddress, onClose }) {
   // ── Step 3: Result
   return (
     <div className="p-6 text-center">
-      {result?.txHash ? (
+      {result && !result.error ? (
         <>
           <CheckCircle size={36} className="mx-auto mb-3 text-arc-green" />
           <h2 className="mb-1 text-lg font-bold text-slate-900">Payment Sent!</h2>
           <p className="mb-3 text-sm text-slate-500">Your transaction is being processed.</p>
-          <p className="mb-4 break-all rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-600">{result.txHash}</p>
+          {result.txHash && (
+            <p className="mb-4 break-all rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-600">{result.txHash}</p>
+          )}
         </>
       ) : (
         <>
