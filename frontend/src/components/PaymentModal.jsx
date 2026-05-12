@@ -6,7 +6,76 @@ import { authenticatePasskey } from '../lib/passkey.js';
 import { buildPaymentURI, generateQRDataURL } from '../lib/qrPayment.js';
 import { startScan, stopScan, parsePaymentURI } from '../lib/qrScanner.js';
 import { Button, Input } from './ui/index.jsx';
-import { X, QrCode, Camera, ClipboardCheck, AlertTriangle, CheckCircle, Loader2 } from 'lucide-react';
+import { CHAINS } from '../lib/chains.js';
+import { X, QrCode, Camera, ClipboardCheck, AlertTriangle, CheckCircle, Loader2, ExternalLink } from 'lucide-react';
+
+// ── SendResult: shows amount, recipient, polls for confirmed tx hash ───────────
+function SendResult({ result, onClose }) {
+  const [txHash, setTxHash]     = useState(null);
+  const [pollDone, setPollDone] = useState(false);
+  const pollRef                 = useRef(null);
+
+  useEffect(() => {
+    if (!result?.txId) { setPollDone(true); return; }
+
+    let attempts = 0;
+    pollRef.current = setInterval(async () => {
+      attempts++;
+      try {
+        const data = await txApi.getStatus(result.txId);
+        if (data?.tx_hash || data?.txHash) {
+          setTxHash(data.tx_hash || data.txHash);
+          setPollDone(true);
+          clearInterval(pollRef.current);
+          return;
+        }
+        if (data?.status === 'failed') { setPollDone(true); clearInterval(pollRef.current); return; }
+      } catch (_) {}
+      if (attempts >= 12) { setPollDone(true); clearInterval(pollRef.current); } // give up after ~60s
+    }, 5000);
+
+    return () => clearInterval(pollRef.current);
+  }, [result?.txId]);
+
+  const explorerUrl = txHash
+    ? `${CHAINS['Arc Testnet']?.explorerUrl || 'https://testnet.arcscan.app'}/tx/${txHash}`
+    : null;
+
+  return (
+    <div className="p-6 text-center">
+      <CheckCircle size={36} className="mx-auto mb-3 text-arc-green" />
+      <h2 className="mb-1 text-lg font-bold text-slate-900">Payment Sent!</h2>
+      {result?.amountUsdc && (
+        <p className="mb-1 text-xl font-bold text-arc-green">-{result.amountUsdc} USDC</p>
+      )}
+      {result?.toAddress && (
+        <p className="mb-3 font-mono text-xs text-slate-500">
+          to {result.toAddress.slice(0, 8)}…{result.toAddress.slice(-6)}
+        </p>
+      )}
+      {!pollDone && (
+        <p className="mb-3 flex items-center justify-center gap-1.5 text-xs text-slate-400">
+          <Loader2 size={12} className="animate-spin" /> Waiting for on-chain confirmation…
+        </p>
+      )}
+      {txHash && explorerUrl && (
+        <a
+          href={explorerUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mb-4 flex items-center justify-center gap-1.5 break-all rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 font-mono text-xs text-arc-green hover:underline"
+        >
+          <span>{txHash.slice(0, 14)}…{txHash.slice(-8)}</span>
+          <ExternalLink size={10} />
+        </a>
+      )}
+      {pollDone && !txHash && (
+        <p className="mb-4 text-xs text-slate-400">Transaction submitted. Check Recent Activity for status.</p>
+      )}
+      <Button onClick={onClose} variant="outline" className="w-full">Close</Button>
+    </div>
+  );
+}
 
 // ── Modal wrapper ─────────────────────────────────────────────────────────────
 function ModalOverlay({ onClose, children }) {
@@ -245,11 +314,10 @@ function SendFlow({ agent, ownerAddress, onClose }) {
         token:      'USDC',
         chain:      'Arc Testnet',
       });
-      setResult({ txHash: tx.txHash || tx.txId || tx.id, status: tx.status });
+      setResult({ txId: tx.txId || tx.id, toAddress: parsed.recipient, amountUsdc: parsed.amountUsdc });
       setStep(3);
     } catch (err) {
       if (err.status === 422 && err.message?.includes('requiresPasskey')) {
-        // Should not happen (frontend should have shown passkey button), but handle gracefully
         setFormError('Passkey sign required. Please use the "Sign with Passkey" button.');
       } else if (err.status === 429) {
         setFormError('Daily limit reached. Try again tomorrow.');
@@ -284,7 +352,7 @@ function SendFlow({ agent, ownerAddress, onClose }) {
         token:      'USDC',
         chain:      'Arc Testnet',
       });
-      setResult({ txHash: tx.txHash || tx.txId || tx.id, status: tx.status });
+      setResult({ txId: tx.txId || tx.id, toAddress: parsed.recipient, amountUsdc: parsed.amountUsdc });
       setStep(3);
     } catch (err) {
       if (err.status === 429) {
@@ -418,29 +486,10 @@ function SendFlow({ agent, ownerAddress, onClose }) {
     );
   }
 
-  // ── Step 3: Result
-  return (
-    <div className="p-6 text-center">
-      {result && !result.error ? (
-        <>
-          <CheckCircle size={36} className="mx-auto mb-3 text-arc-green" />
-          <h2 className="mb-1 text-lg font-bold text-slate-900">Payment Sent!</h2>
-          <p className="mb-3 text-sm text-slate-500">Your transaction is being processed.</p>
-          {result.txHash && (
-            <p className="mb-4 break-all rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-600">{result.txHash}</p>
-          )}
-        </>
-      ) : (
-        <>
-          <AlertTriangle size={36} className="mx-auto mb-3 text-red-500" />
-          <h2 className="mb-1 text-lg font-bold text-slate-900">Transaction Failed</h2>
-          <p className="mb-4 text-sm text-slate-500">{result?.error || 'Unknown error'}</p>
-        </>
-      )}
-      <Button onClick={onClose} variant="outline" className="w-full">Close</Button>
-    </div>
-  );
-}
+  // ── Step 3: Result — poll for tx hash until confirmed
+  if (step === 3) {
+    return <SendResult result={result} onClose={onClose} />;
+  }
 
 // ── Main export ───────────────────────────────────────────────────────────────
 /**
