@@ -64,10 +64,7 @@ async function _registerErc8004(agentId, walletAddress, agentName) {
 async function attemptErc8004Registration(agentId, walletAddress, agentName) {
   // Allow disabling via env — useful when the contract is not yet live on testnet
   if (process.env.ERC8004_ENABLED === 'false') {
-    await db.query(
-      "UPDATE agents SET erc8004_status = 'skipped', erc8004_error = NULL WHERE id = $1",
-      [agentId],
-    );
+    // Silently skip — erc8004_status column may not exist yet; formatAgent defaults to 'skipped'
     console.log(`[ERC-8004] Skipped for agent ${agentId} (ERC8004_ENABLED=false)`);
     return { success: false, skipped: true };
   }
@@ -339,7 +336,7 @@ function formatAgent(row, perms) {
     llmModel:       row.llm_model,
     hasLlmKey:      !!row.llm_api_key_encrypted,
     identity: {
-      status:       row.erc8004_status   || 'pending',  // pending|registered|failed
+      status:       row.erc8004_status   || 'skipped',  // pending|registered|failed|skipped
       tokenId:      row.erc8004_token_id || null,
       txHash:       row.erc8004_tx_hash  || null,
       registeredAt: row.erc8004_registered_at || null,
