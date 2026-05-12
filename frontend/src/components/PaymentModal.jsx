@@ -30,13 +30,43 @@ function ModalOverlay({ onClose, children }) {
 
 // ── RECEIVE FLOW ──────────────────────────────────────────────────────────────
 function ReceiveFlow({ agent, onClose }) {
-  const [step, setStep]       = useState(1); // 1 = amount input, 2 = QR display
-  const [amount, setAmount]   = useState('');
-  const [qrUrl, setQrUrl]     = useState('');
-  const [uri, setUri]         = useState('');
-  const [copied, setCopied]   = useState(false);
-  const [error, setError]     = useState('');
-  const [loading, setLoading] = useState(false);
+  const [step, setStep]             = useState(1); // 1 = amount input, 2 = QR display, 3 = received
+  const [amount, setAmount]         = useState('');
+  const [qrUrl, setQrUrl]           = useState('');
+  const [uri, setUri]               = useState('');
+  const [copied, setCopied]         = useState(false);
+  const [error, setError]           = useState('');
+  const [loading, setLoading]       = useState(false);
+  const [receivedTx, setReceivedTx] = useState(null);
+  const pollRef                     = useRef(null);
+  const knownIdsRef                 = useRef(new Set());
+
+  // Start polling when QR is shown; stop on unmount
+  useEffect(() => {
+    if (step !== 2) return;
+
+    // Snapshot existing tx ids so we only react to NEW ones
+    txApi.list(agent.id).then(data => {
+      if (Array.isArray(data)) data.forEach(tx => knownIdsRef.current.add(tx.id));
+    }).catch(() => {});
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const data = await txApi.list(agent.id);
+        if (!Array.isArray(data)) return;
+        const newReceive = data.find(
+          tx => tx.type === 'receive' && tx.status === 'confirmed' && !knownIdsRef.current.has(tx.id)
+        );
+        if (newReceive) {
+          clearInterval(pollRef.current);
+          setReceivedTx(newReceive);
+          setStep(3);
+        }
+      } catch (_) {}
+    }, 5000);
+
+    return () => clearInterval(pollRef.current);
+  }, [step, agent.id]);
 
   async function handleGenerate() {
     setError('');
@@ -63,13 +93,24 @@ function ReceiveFlow({ agent, onClose }) {
     });
   }
 
-  function handleSimulate() {
-    try {
-      const parsed = parsePaymentURI(uri);
-      alert(`[Simulate] QR parsed:\nRecipient: ${parsed.recipient}\nAmount: ${parsed.amountUsdc} USDC\nChain: ${parsed.chainId}`);
-    } catch (e) {
-      alert('Parse error: ' + e.message);
-    }
+  // ── Step 3: Payment received confirmation
+  if (step === 3 && receivedTx) {
+    const rxAmount = receivedTx.amount_usdc ?? receivedTx.amountUsdc ?? '?';
+    const fromAddr = receivedTx.from_address || '';
+    return (
+      <div className="p-6 text-center">
+        <CheckCircle size={40} className="mx-auto mb-3 text-arc-green" />
+        <h2 className="mb-1 text-lg font-bold text-slate-900">Payment Received!</h2>
+        <p className="mb-1 text-2xl font-bold text-arc-green">+{rxAmount} USDC</p>
+        {fromAddr && (
+          <p className="mb-4 font-mono text-xs text-slate-500">
+            from {fromAddr.slice(0, 8)}…{fromAddr.slice(-6)}
+          </p>
+        )}
+        <p className="mb-5 text-sm text-slate-500">Your agent wallet has been credited on Arc Testnet.</p>
+        <Button onClick={onClose} className="w-full">Close</Button>
+      </div>
+    );
   }
 
   return (
@@ -97,16 +138,15 @@ function ReceiveFlow({ agent, onClose }) {
 
       {step === 2 && (
         <div className="space-y-4 text-center">
+          <div className="mx-auto mb-1 flex items-center gap-1.5 justify-center text-xs text-slate-400 animate-pulse">
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-arc-green" />
+            Listening for payment…
+          </div>
           <img src={qrUrl} alt="Payment QR" className="mx-auto rounded-xl border border-slate-100" />
           <p className="text-xs text-slate-500 break-all">{uri}</p>
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={handleCopy} className="flex-1">
-              <ClipboardCheck size={14} /> {copied ? 'Copied!' : 'Copy URI'}
-            </Button>
-            <Button variant="outline" onClick={handleSimulate} className="flex-1">
-              Simulate Scan
-            </Button>
-          </div>
+          <Button variant="outline" onClick={handleCopy} className="w-full">
+            <ClipboardCheck size={14} /> {copied ? 'Copied!' : 'Copy URI'}
+          </Button>
           <Button variant="ghost" onClick={() => setStep(1)} className="w-full text-sm">
             ← Change amount
           </Button>
