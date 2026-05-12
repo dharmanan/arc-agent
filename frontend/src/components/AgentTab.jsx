@@ -396,6 +396,13 @@ export default function AgentTab() {
             </div>
           )}
 
+          {(!agent?.identity?.status || agent?.identity?.status === 'skipped') && (
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+              <span className="h-2 w-2 rounded-full bg-slate-300 shrink-0" />
+              <span className="text-sm text-slate-500">On-chain identity not configured (testnet)</span>
+            </div>
+          )}
+
           {identityMsg && (
             <p className={`mt-1 text-xs font-medium ${identityMsg.startsWith('Error') || identityMsg.includes('failed') ? 'text-red-500' : 'text-green-600'}`}>
               {identityMsg}
