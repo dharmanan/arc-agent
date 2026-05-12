@@ -34,8 +34,14 @@ async function _registerErc8004(agentId, walletAddress, agentName) {
   const description = `Arc Machina autonomous agent — ${walletAddress}`;
   const metadataUri = `https://arc-machina.app/agents/${agentId}`;
 
+  // 30-second timeout so tx.wait() never hangs forever
+  const TIMEOUT_MS = 30_000;
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('ERC-8004 registration timed out after 30s')), TIMEOUT_MS),
+  );
+
   const tx = await registry.registerAgent(agentName, description, metadataUri);
-  const receipt = await tx.wait(1);
+  const receipt = await Promise.race([tx.wait(1), timeout]);
 
   // Parse AgentRegistered event to get tokenId
   const iface = new ethers.Interface(IDENTITY_REGISTRY_ABI);
@@ -56,6 +62,16 @@ async function _registerErc8004(agentId, walletAddress, agentName) {
 // ── ERC-8004 registration attempt — called after agent DB insert ──────────────
 // Never throws: failures are recorded in DB so user can retry.
 async function attemptErc8004Registration(agentId, walletAddress, agentName) {
+  // Allow disabling via env — useful when the contract is not yet live on testnet
+  if (process.env.ERC8004_ENABLED === 'false') {
+    await db.query(
+      "UPDATE agents SET erc8004_status = 'skipped', erc8004_error = NULL WHERE id = $1",
+      [agentId],
+    );
+    console.log(`[ERC-8004] Skipped for agent ${agentId} (ERC8004_ENABLED=false)`);
+    return { success: false, skipped: true };
+  }
+
   try {
     const { tokenId, txHash } = await _registerErc8004(agentId, walletAddress, agentName);
     await db.query(
