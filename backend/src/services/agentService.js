@@ -15,53 +15,76 @@ const DEFAULT_PERMISSIONS = [
 // ── ERC-8004 IdentityRegistry (Arc Testnet) ───────────────────────────────────
 const IDENTITY_REGISTRY_ADDRESS = '0x8004A818BFB912233c491871b3d84c89A494BD9e';
 const IDENTITY_REGISTRY_ABI = [
-  'function registerAgent(string name, string description, string metadataUri) returns (uint256 tokenId)',
-  'event AgentRegistered(uint256 indexed tokenId, address indexed owner, string name)',
+  'function register(string agentURI) returns (uint256 agentId)',
+  'function setAgentWallet(uint256 agentId, address newWallet, uint256 deadline, bytes signature)',
+  'event Registered(uint256 indexed agentId, string agentURI, address indexed owner)',
 ];
+// EIP-712 domain + type for setAgentWallet signature (signed by the agent's EOA)
+const EIP712_DOMAIN = {
+  name: 'ERC8004IdentityRegistry',
+  version: '1',
+  chainId: 5042002,
+  verifyingContract: IDENTITY_REGISTRY_ADDRESS,
+};
+const EIP712_TYPES = {
+  AgentWalletSet: [
+    { name: 'agentId',   type: 'uint256' },
+    { name: 'newWallet', type: 'address' },
+    { name: 'owner',     type: 'address' },
+    { name: 'deadline',  type: 'uint256' },
+  ],
+};
 
-async function _registerErc8004(agentId, walletAddress, agentName) {
+async function _registerErc8004(agentId, walletAddress, agentPrivateKey) {
   const rpc = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
   const relayerKey = process.env.RELAYER_PRIVATE_KEY;
 
-  if (!relayerKey) {
-    throw new Error('RELAYER_PRIVATE_KEY not set — cannot register on-chain identity');
-  }
+  if (!relayerKey) throw new Error('RELAYER_PRIVATE_KEY not set');
 
-  const provider = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
-  const relayer  = new ethers.Wallet(relayerKey, provider);
-  const registry = new ethers.Contract(IDENTITY_REGISTRY_ADDRESS, IDENTITY_REGISTRY_ABI, relayer);
+  const provider   = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
+  const relayer    = new ethers.Wallet(relayerKey, provider);
+  const agentEOA   = new ethers.Wallet(agentPrivateKey, provider);
+  const registry   = new ethers.Contract(IDENTITY_REGISTRY_ADDRESS, IDENTITY_REGISTRY_ABI, relayer);
+  const agentURI   = `https://arc-machina.app/agents/${agentId}`;
 
-  const description = `Arc Machina autonomous agent — ${walletAddress}`;
-  const metadataUri = `https://arc-machina.app/agents/${agentId}`;
+  const TIMEOUT_MS = 60_000;
+  const mkTimeout  = () => new Promise((_, rej) =>
+    setTimeout(() => rej(new Error('ERC-8004 tx timed out')), TIMEOUT_MS));
 
-  // 30-second timeout so tx.wait() never hangs forever
-  const TIMEOUT_MS = 30_000;
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('ERC-8004 registration timed out after 30s')), TIMEOUT_MS),
-  );
+  // Step 1: register(agentURI) — relayer pays gas, becomes NFT owner
+  const tx1     = await registry['register(string)'](agentURI);
+  const receipt1 = await Promise.race([tx1.wait(1), mkTimeout()]);
 
-  const tx = await registry.registerAgent(agentName, description, metadataUri);
-  const receipt = await Promise.race([tx.wait(1), timeout]);
-
-  // Parse AgentRegistered event to get tokenId
-  const iface = new ethers.Interface(IDENTITY_REGISTRY_ABI);
-  let tokenId = null;
-  for (const log of receipt.logs) {
+  // Parse Registered event → on-chain tokenId
+  const iface   = new ethers.Interface(IDENTITY_REGISTRY_ABI);
+  let tokenId   = null;
+  for (const log of receipt1.logs) {
     try {
       const parsed = iface.parseLog(log);
-      if (parsed && parsed.name === 'AgentRegistered') {
-        tokenId = parsed.args.tokenId.toString();
-        break;
-      }
-    } catch { /* skip unparseable logs */ }
+      if (parsed?.name === 'Registered') { tokenId = parsed.args.agentId.toString(); break; }
+    } catch { /* skip */ }
   }
+  if (tokenId === null) throw new Error('Registered event not found in receipt');
 
-  return { tokenId, txHash: receipt.hash };
+  // Step 2: setAgentWallet — agent's EOA signs EIP-712 message, relayer sends tx
+  // deadline must be within 5 minutes (MAX_DEADLINE_DELAY on contract)
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 4 * 60);
+  const sig = await agentEOA.signTypedData(EIP712_DOMAIN, EIP712_TYPES, {
+    agentId:   BigInt(tokenId),
+    newWallet: walletAddress,
+    owner:     relayer.address,
+    deadline,
+  });
+
+  const tx2 = await registry.setAgentWallet(tokenId, walletAddress, deadline, sig);
+  await Promise.race([tx2.wait(1), mkTimeout()]);
+
+  return { tokenId, txHash: receipt1.hash };
 }
 
 // ── ERC-8004 registration attempt — called after agent DB insert ──────────────
 // Never throws: failures are recorded in DB so user can retry.
-async function attemptErc8004Registration(agentId, walletAddress, agentName) {
+async function attemptErc8004Registration(agentId, walletAddress, agentPrivateKey) {
   // Allow disabling via env — useful when the contract is not yet live on testnet
   if (process.env.ERC8004_ENABLED === 'false') {
     // Silently skip — erc8004_status column may not exist yet; formatAgent defaults to 'skipped'
@@ -70,7 +93,7 @@ async function attemptErc8004Registration(agentId, walletAddress, agentName) {
   }
 
   try {
-    const { tokenId, txHash } = await _registerErc8004(agentId, walletAddress, agentName);
+    const { tokenId, txHash } = await _registerErc8004(agentId, walletAddress, agentPrivateKey);
     await db.query(
       `UPDATE agents SET
          erc8004_status        = 'registered',
@@ -100,7 +123,7 @@ async function attemptErc8004Registration(agentId, walletAddress, agentName) {
 // ── Retry ERC-8004 registration (called from route handler) ───────────────────
 async function retryErc8004Registration(agentId, userId) {
   const { rows } = await db.query(
-    'SELECT id, wallet_address, name, erc8004_status FROM agents WHERE id = $1 AND user_id = $2',
+    'SELECT id, wallet_address, private_key_encrypted, erc8004_status FROM agents WHERE id = $1 AND user_id = $2',
     [agentId, userId],
   );
   if (!rows.length) return null;
@@ -110,13 +133,18 @@ async function retryErc8004Registration(agentId, userId) {
     return { alreadyRegistered: true };
   }
 
+  if (!agent.private_key_encrypted) {
+    throw new Error('Agent private key not found — cannot retry registration');
+  }
+
   // Mark as pending before attempting
   await db.query(
     "UPDATE agents SET erc8004_status = 'pending', erc8004_error = NULL WHERE id = $1",
     [agentId],
   );
 
-  return attemptErc8004Registration(agentId, agent.wallet_address, agent.name);
+  const privateKey = decrypt(agent.private_key_encrypted);
+  return attemptErc8004Registration(agentId, agent.wallet_address, privateKey);
 }
 
 // ── Create ────────────────────────────────────────────────────────────────────
@@ -174,8 +202,8 @@ async function createAgent(userId, data) {
     const formatted = { ...formatAgent(agent, []), privateKey: wallet.privateKey };
 
     // Attempt ERC-8004 onchain identity registration (non-blocking, never throws)
-    // Result is written back to DB — frontend polls /status or retries via route
-    setImmediate(() => attemptErc8004Registration(agent.id, wallet.address.toLowerCase(), data.name));
+    // Pass the plaintext private key — it's still in memory here, not yet GC'd
+    setImmediate(() => attemptErc8004Registration(agent.id, wallet.address.toLowerCase(), wallet.privateKey));
 
     return formatted;
   } catch (err) {
