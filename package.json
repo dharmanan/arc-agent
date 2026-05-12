@@ -1,12 +1,9 @@
 {
   "name": "arc-agent",
   "version": "1.0.0",
-  "description": "Arc Testnet Agentic Wallet – root project (Hardhat + backend)",
+  "description": "Arc Testnet Agentic Wallet",
   "private": true,
   "scripts": {
-    "compile": "hardhat compile",
-    "deploy:arc": "hardhat run scripts/deploy.js --network arc",
-    "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia",
     "frontend:dev": "cd frontend && npm run dev",
     "frontend:build": "cd frontend && npm run build",
     "backend:dev": "cd backend && npm run dev",
@@ -15,10 +12,8 @@
     "docker:down": "docker-compose down"
   },
   "devDependencies": {
-    "@nomicfoundation/hardhat-toolbox": "5.0.0",
     "@openzeppelin/contracts": "^5.0.0",
-    "dotenv": "^16.6.1",
-    "hardhat": "^2.28.6"
+    "dotenv": "^16.6.1"
   },
   "dependencies": {
     "ethers": "^6.16.0"
