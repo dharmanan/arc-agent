@@ -73,7 +73,7 @@ async function subscribeToChain(chain, config) {
 
       // Find agents whose wallet_address matches `to` and queue a job
       const { rows: agents } = await db.query(
-        `SELECT id, is_smart_mode, llm_model FROM agents WHERE LOWER(wallet_address) = LOWER($1) AND status = 'active'`,
+        `SELECT id, is_smart_mode, llm_model FROM agents WHERE LOWER(wallet_address) = LOWER($1) AND status != 'locked'`,
         [to],
       );
       for (const agent of agents) {

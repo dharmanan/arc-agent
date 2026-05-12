@@ -124,6 +124,15 @@ function getTxDisplay(tx) {
           url: getExplorerTxUrl(toChain, destinationTxHash),
         }
       : null,
+    // For send/receive/swap — use tx_hash directly if no bridge links
+    (!isBridge && !sourceTxHash && !destinationTxHash && isRealHash(tx.tx_hash || tx.txHash))
+      ? {
+          key: `${tx.id}-tx`,
+          label: 'Tx',
+          hash: tx.tx_hash || tx.txHash,
+          url: getExplorerTxUrl(fromChain || 'Arc Testnet', tx.tx_hash || tx.txHash),
+        }
+      : null,
   ].filter(Boolean);
 
   return { title, routeLabel, amountLabel, phase, links };
