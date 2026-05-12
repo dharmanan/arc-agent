@@ -149,15 +149,32 @@ async function retryErc8004Registration(agentId, userId) {
 
 // ── Create ────────────────────────────────────────────────────────────────────
 async function createAgent(userId, data) {
-  // Testnet limit: 1 active agent per user
-  const { rows: existing } = await db.query(
-    "SELECT id FROM agents WHERE user_id = $1 AND status != 'locked' LIMIT 1",
-    [userId],
-  );
-  if (existing.length > 0) {
-    const err = new Error('Testnet limit: only 1 active agent allowed per user');
-    err.status = 409;
-    throw err;
+  // Testnet limit: 1 active agent per user (bypass for whitelisted addresses)
+  const whitelist = (process.env.AGENT_LIMIT_WHITELIST || '')
+    .split(',')
+    .map((a) => a.trim().toLowerCase())
+    .filter(Boolean);
+
+  let isWhitelisted = false;
+  if (whitelist.length > 0) {
+    const { rows: userRows } = await db.query(
+      'SELECT owner_address FROM users WHERE id = $1',
+      [userId],
+    );
+    const ownerAddr = (userRows[0]?.owner_address || '').toLowerCase();
+    isWhitelisted = whitelist.includes(ownerAddr);
+  }
+
+  if (!isWhitelisted) {
+    const { rows: existing } = await db.query(
+      "SELECT id FROM agents WHERE user_id = $1 AND status != 'locked' LIMIT 1",
+      [userId],
+    );
+    if (existing.length > 0) {
+      const err = new Error('Testnet limit: only 1 active agent allowed per user');
+      err.status = 409;
+      throw err;
+    }
   }
 
   const client = await db.getClient();
