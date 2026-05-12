@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAccount } from 'wagmi';
 import { useAgent } from '../providers/AgentProvider.jsx';
-import { agents as agentApi } from '../lib/api.js';
+import { agents as agentApi, tasks as tasksApi } from '../lib/api.js';
 import { AGENT_PERMISSIONS } from '../lib/chains.js';
 import { registerPasskey, authenticatePasskey, isPasskeySupported } from '../lib/passkey.js';
 import {
   Card, Button, Input, Badge, Alert, AddressBox, Spinner, SectionHeader, Select
 } from './ui/index.jsx';
-import { Bot, Plus, Trash2, Key, AlertTriangle, LogOut, Brain, Shield, Zap } from 'lucide-react';
+import { Bot, Plus, Trash2, Key, AlertTriangle, LogOut, Brain, Shield, Zap, CheckCircle, XCircle, RefreshCw, PlayCircle, Clock } from 'lucide-react';
 
 export default function AgentTab() {
   const { address: ownerAddress } = useAccount();
@@ -24,13 +24,30 @@ export default function AgentTab() {
   const [savingPerms, setSavingPerms]     = useState(false);
   const [permMsg, setPermMsg]             = useState('');
 
+  // ERC-8004 identity retry
+  const [retryingIdentity, setRetryingIdentity] = useState(false);
+  const [identityMsg, setIdentityMsg]           = useState('');
+
   // Settings state
   const [settings, setSettings]   = useState({});
   const [llmApiKey, setLlmApiKey] = useState('');
-  const [llmModel, setLlmModel]   = useState('claude-sonnet-4-20250514');
+  const [llmModel, setLlmModel]   = useState('llama-3.3-70b-versatile');
   const [smartMode, setSmartMode] = useState(false);
+  const [features, setFeatures]   = useState({
+    dailyTasksEnabled:     false,
+    marketAnalysisEnabled: false,
+    oracleEnabled:         false,
+    defiLoopEnabled:       false,
+    reputationEnabled:     false,
+  });
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsMsg, setSettingsMsg]       = useState('');
+
+  // Today's featured tasks (rotates daily at 00:00 UTC)
+  const [featuredTasks, setFeaturedTasks]   = useState([]);
+  const [taskRunning, setTaskRunning]       = useState(null);  // taskId currently running
+  const [taskMsg, setTaskMsg]               = useState('');
+  const [ranToday, setRanToday]             = useState(new Set()); // taskIds run today
 
   const pendingAgent = useRef(null);
 
@@ -41,7 +58,27 @@ export default function AgentTab() {
     }
     if (agent?.isSmartMode !== undefined) setSmartMode(agent.isSmartMode);
     if (agent?.llmModel) setLlmModel(agent.llmModel);
+    if (agent?.features) setFeatures(f => ({ ...f, ...agent.features }));
   }, [agent]);
+
+  // Load today's featured tasks once on mount
+  useEffect(() => {
+    tasksApi.featured().then(data => setFeaturedTasks(data.tasks || [])).catch(() => {});
+  }, []);
+
+  // Track which tasks the agent already ran today
+  useEffect(() => {
+    if (!agent?.id) return;
+    tasksApi.results(agent.id, 50).then(data => {
+      const todayUtc = new Date().toISOString().slice(0, 10);
+      const done = new Set(
+        (data.results || [])
+          .filter(r => r.created_at.startsWith(todayUtc))
+          .map(r => r.task_id),
+      );
+      setRanToday(done);
+    }).catch(() => {});
+  }, [agent?.id]);
 
   if (!ownerAddress) {
     return (
@@ -51,6 +88,27 @@ export default function AgentTab() {
         <p className="mt-1 text-sm text-slate-500">Connect your wallet to manage your agent.</p>
       </div>
     );
+  }
+
+  async function handleRetryIdentity() {
+    if (!agent?.id) return;
+    setRetryingIdentity(true);
+    setIdentityMsg('');
+    try {
+      const result = await agentApi.retryIdentity(agent.id);
+      if (result.success) {
+        setAgent(a => ({ ...a, identity: { ...a.identity, status: 'registered', tokenId: result.tokenId, txHash: result.txHash, error: null } }));
+        setIdentityMsg('Identity registered successfully.');
+      } else {
+        setAgent(a => ({ ...a, identity: { ...a.identity, status: 'failed', error: result.error } }));
+        setIdentityMsg('Registration failed: ' + result.error);
+      }
+    } catch (e) {
+      setIdentityMsg('Error: ' + e.message);
+    } finally {
+      setRetryingIdentity(false);
+      setTimeout(() => setIdentityMsg(''), 6000);
+    }
   }
 
   async function handleCreate() {
@@ -125,6 +183,12 @@ export default function AgentTab() {
       };
       if (llmApiKey.trim()) payload.llmApiKey = llmApiKey.trim();
       if (smartMode || llmApiKey.trim()) payload.llmModel = llmModel;
+      payload.isSmartMode           = smartMode;
+      payload.dailyTasksEnabled     = features.dailyTasksEnabled;
+      payload.marketAnalysisEnabled = features.marketAnalysisEnabled;
+      payload.oracleEnabled         = features.oracleEnabled;
+      payload.defiLoopEnabled       = features.defiLoopEnabled;
+      payload.reputationEnabled     = features.reputationEnabled;
       const updated = await agentApi.update(agent.id, payload);
       setAgent({ ...agent, ...updated });
       setLlmApiKey('');
@@ -282,6 +346,63 @@ export default function AgentTab() {
         <p className="mt-2 text-xs text-slate-400">
           Send ARC or ETH to this address to fund your agent operations.
         </p>
+
+        {/* ERC-8004 Identity status */}
+        <div className="mt-4">
+          {agent?.identity?.status === 'registered' && (
+            <div className="flex flex-wrap items-center gap-2 rounded-xl border border-green-200 bg-green-50 px-3 py-2">
+              <CheckCircle size={14} className="shrink-0 text-green-600" />
+              <span className="text-sm font-medium text-green-800">Arc Identity Registered</span>
+              {agent.identity.tokenId && (
+                <span className="text-xs text-green-700">· Token #{agent.identity.tokenId}</span>
+              )}
+              {agent.identity.arcScanUrl && (
+                <a
+                  href={agent.identity.arcScanUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="ml-auto text-xs text-green-700 underline hover:text-green-900"
+                >
+                  View on ArcScan →
+                </a>
+              )}
+            </div>
+          )}
+
+          {agent?.identity?.status === 'pending' && (
+            <div className="flex items-center gap-2 rounded-xl border border-yellow-200 bg-yellow-50 px-3 py-2">
+              <Spinner size={14} className="text-yellow-600" />
+              <span className="text-sm text-yellow-800">Registering identity on-chain…</span>
+            </div>
+          )}
+
+          {agent?.identity?.status === 'failed' && (
+            <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <XCircle size={14} className="shrink-0 text-red-500" />
+                <span className="text-sm font-medium text-red-800">Identity registration failed</span>
+                <Button
+                  variant="outline"
+                  onClick={handleRetryIdentity}
+                  loading={retryingIdentity}
+                  className="ml-auto flex items-center gap-1 text-xs border-red-300 text-red-700 hover:bg-red-100"
+                >
+                  <RefreshCw size={12} /> Retry
+                </Button>
+              </div>
+              {agent.identity.error && (
+                <p className="mt-1 text-xs text-red-600 break-all">{agent.identity.error}</p>
+              )}
+            </div>
+          )}
+
+          {identityMsg && (
+            <p className={`mt-1 text-xs font-medium ${identityMsg.startsWith('Error') || identityMsg.includes('failed') ? 'text-red-500' : 'text-green-600'}`}>
+              {identityMsg}
+            </p>
+          )}
+        </div>
+
       </Card>
 
       {/* Security & Limits */}
@@ -353,6 +474,109 @@ export default function AgentTab() {
         </p>
       </Card>
 
+      {/* Today's Featured Tasks */}
+      {featuredTasks.length > 0 && (
+      <Card>
+        <div className="mb-4 flex items-center gap-2">
+          <PlayCircle size={16} className="text-arc-green" />
+          <h3 className="font-bold text-slate-900">Today's Featured Tasks</h3>
+          <span className="ml-auto flex items-center gap-1 text-xs text-slate-400">
+            <Clock size={12} /> Rotates at midnight UTC
+          </span>
+        </div>
+        {!features.dailyTasksEnabled && (
+          <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+            Enable <strong>Daily Tasks</strong> in Autonomous Features below to run these.
+          </div>
+        )}
+        <div className="space-y-2">
+          {featuredTasks.map(task => {
+            const alreadyRan = ranToday.has(task.id);
+            const isRunning  = taskRunning === task.id;
+            const disabled   = !features.dailyTasksEnabled || alreadyRan || isRunning || !agent?.id;
+            return (
+              <div key={task.id} className="flex items-center justify-between rounded-xl border border-slate-100 p-3">
+                <div className="min-w-0 mr-3">
+                  <p className="text-sm font-semibold text-slate-800 truncate">{task.title}</p>
+                  <p className="text-xs text-slate-500 truncate">{task.description}</p>
+                </div>
+                <button
+                  disabled={disabled}
+                  onClick={async () => {
+                    setTaskRunning(task.id);
+                    setTaskMsg('');
+                    try {
+                      await tasksApi.runTask(agent.id, task.id);
+                      setRanToday(s => new Set([...s, task.id]));
+                      setTaskMsg(`"${task.title}" queued successfully.`);
+                    } catch (e) {
+                      setTaskMsg(e.message || 'Failed to queue task.');
+                    } finally {
+                      setTaskRunning(null);
+                    }
+                  }}
+                  className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-semibold transition
+                    ${alreadyRan
+                      ? 'bg-slate-100 text-slate-400 cursor-default'
+                      : disabled
+                        ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                        : 'bg-arc-green text-white hover:opacity-90'
+                    }`}
+                >
+                  {isRunning ? <Spinner size={12} /> : alreadyRan ? 'Done' : 'Run'}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+        {taskMsg && (
+          <p className={`mt-2 text-xs ${taskMsg.includes('Failed') ? 'text-red-500' : 'text-arc-green'}`}>
+            {taskMsg}
+          </p>
+        )}
+      </Card>
+      )}
+
+      {/* Autonomous Features */}
+      <Card>
+        <div className="mb-4 flex items-center gap-2">
+          <Zap size={16} className="text-arc-green" />
+          <h3 className="font-bold text-slate-900">Autonomous Features</h3>
+        </div>
+        <p className="text-xs text-slate-500 mb-4">
+          All features are <strong>off by default</strong>. Enable only what you want your agent to do autonomously.
+          Daily limits apply per feature — see the plan docs for Tier 1 / Tier 2 caps.
+        </p>
+        <div className="space-y-3">
+          {[
+            { key: 'dailyTasksEnabled',     label: 'Daily Tasks (Tier 1)',      desc: 'Agent runs up to 5 free tasks per day (oracle checks, analysis pings).' },
+            { key: 'marketAnalysisEnabled', label: 'Market Analysis',           desc: 'Periodic price & opportunity scans via oracle feeds.' },
+            { key: 'oracleEnabled',         label: 'Oracle Data Feed',          desc: 'Pull live forex, DeFi TVL, and on-chain price data.' },
+            { key: 'defiLoopEnabled',       label: 'DeFi Loop Execution',       desc: 'Automated borrow-supply loops within daily limits.' },
+            { key: 'reputationEnabled',     label: 'Reputation Tracking',       desc: 'Track on-chain agent score and broadcast actions.' },
+          ].map(({ key, label, desc }) => (
+            <div key={key} className="flex items-center justify-between rounded-xl border border-slate-100 p-3 hover:bg-arc-greenBg/20 transition">
+              <div>
+                <p className="text-sm font-semibold text-slate-800">{label}</p>
+                <p className="text-xs text-slate-500">{desc}</p>
+              </div>
+              <label className="flex cursor-pointer items-center gap-2 ml-4 shrink-0">
+                <span className="text-sm text-slate-500">{features[key] ? 'On' : 'Off'}</span>
+                <div
+                  onClick={() => setFeatures(f => ({ ...f, [key]: !f[key] }))}
+                  className={`relative h-6 w-11 rounded-full transition-colors ${features[key] ? 'bg-arc-green' : 'bg-slate-200'}`}
+                >
+                  <div className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${features[key] ? 'translate-x-5' : ''}`} />
+                </div>
+              </label>
+            </div>
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-slate-400">
+          Changes take effect after clicking <strong>Save Settings</strong> below.
+        </p>
+      </Card>
+
       {/* Smart Agent Mode */}
       <Card>
         <div className="mb-4 flex items-center gap-2">
@@ -384,19 +608,59 @@ export default function AgentTab() {
               value={llmModel}
               onChange={e => setLlmModel(e.target.value)}
             >
-              <option value="claude-sonnet-4-20250514">Claude Sonnet 4 (Recommended)</option>
-              <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-              <option value="gpt-4o">GPT-4o</option>
+              <optgroup label="Free Tier (No cost)">
+                <option value="llama-3.3-70b-versatile">Llama 3.3 70B — Groq FREE ⭐ Recommended</option>
+                <option value="llama-3.1-8b-instant">Llama 3.1 8B Instant — Groq FREE (fastest)</option>
+              </optgroup>
+              <optgroup label="Paid Tier">
+                <option value="claude-haiku-3-5-20241022">Claude Haiku 3.5 — Anthropic</option>
+                <option value="gemini-2.0-flash">Gemini 2.0 Flash — Google</option>
+                <option value="gpt-4o-mini">GPT-4o Mini — OpenAI</option>
+              </optgroup>
             </Select>
             <Input
               label={agent?.hasLlmKey ? 'LLM API Key (leave blank to keep current)' : 'LLM API Key'}
               type="password"
-              placeholder={agent?.hasLlmKey ? '••••••••••••••••••••••' : 'sk-ant-... / AIzaSy... / sk-...'}
+              placeholder={agent?.hasLlmKey ? '••••••••••••••••••••••' : 'sk-ant-... / AIzaSy... / sk-... / gsk_...'}
               value={llmApiKey}
               onChange={e => setLlmApiKey(e.target.value)}
             />
             {agent?.hasLlmKey && (
               <p className="text-xs text-arc-green">✓ API key is stored (encrypted at rest with AES-256-GCM)</p>
+            )}
+            {/* Groq onboarding card */}
+            {(llmModel === 'llama-3.3-70b-versatile' || llmModel === 'llama-3.1-8b-instant') && (
+              <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-xs text-blue-900 space-y-3">
+                {/* Capability answer */}
+                <div>
+                  <p className="font-bold text-sm text-blue-800 mb-1">Is Groq's free tier capable enough?</p>
+                  <p>
+                    <span className="font-semibold text-arc-green">Yes.</span>{' '}
+                    Llama 3.3 70B is a large, capable model — it can analyze market signals, evaluate trade conditions, and make decisions within your agent's limits.
+                    This is a <span className="font-semibold">testnet environment</span>, so the free tier is more than sufficient to get started.
+                  </p>
+                </div>
+                {/* Tier comparison */}
+                <div className="rounded-lg border border-blue-200 bg-white/60 p-2 space-y-1">
+                  <p className="font-semibold text-blue-700">Free vs Paid models:</p>
+                  <p>• <span className="font-medium">Groq free (Llama 3.3 70B)</span> — handles testnet tasks well, no cost, great for getting started</p>
+                  <p>• <span className="font-medium">Paid models</span> (Claude, GPT-4o, Gemini) — higher reasoning quality, better for complex strategies or mainnet</p>
+                  <p className="text-blue-600 italic">You can always switch to a paid model later as your strategy gets more sophisticated.</p>
+                </div>
+                {/* Steps */}
+                <div>
+                  <p className="font-semibold mb-1">Get your free Groq API key (takes ~1 minute):</p>
+                  <ol className="list-decimal list-inside space-y-1">
+                    <li>Go to <a href="https://console.groq.com" target="_blank" rel="noopener noreferrer" className="underline font-medium text-blue-700">console.groq.com</a> and create a free account</li>
+                    <li>In the left sidebar, click <strong>API Keys</strong></li>
+                    <li>Click <strong>Create API Key</strong> and copy it — it starts with <code className="bg-blue-100 px-1 rounded font-mono">gsk_</code></li>
+                    <li>Paste it in the field above and save</li>
+                  </ol>
+                </div>
+                <p className="text-blue-600 border-t border-blue-200 pt-2">
+                  Your key runs only for your agent. Groq's rate limits apply to your own account — not to this platform.
+                </p>
+              </div>
             )}
           </div>
         )}

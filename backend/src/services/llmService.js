@@ -17,10 +17,33 @@ const { decrypt } = require('./cryptoService');
 
 const CACHE_TTL = parseInt(process.env.LLM_CACHE_TTL || '300', 10); // seconds
 
+// Testnet-approved models — cost-effective tier only
+// Each entry: [modelId, provider]
+const ALLOWED_MODELS = new Set([
+  'claude-haiku-3-5-20241022',   // Anthropic (paid)
+  'gemini-2.0-flash',            // Google (paid)
+  'gpt-4o-mini',                 // OpenAI (paid)
+  'llama-3.3-70b-versatile',     // Groq FREE tier — recommended for beginners
+  'llama-3.1-8b-instant',        // Groq FREE tier — fastest
+]);
+
+// Models that route to Groq's OpenAI-compatible endpoint
+const GROQ_MODELS = new Set([
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+]);
+
 // ── Client factory ────────────────────────────────────────────────────────────
 function buildClient(model, apiKey) {
   if (model.startsWith('claude')) {
     return new Anthropic({ apiKey });
+  }
+  // Groq uses OpenAI-compatible endpoint
+  if (GROQ_MODELS.has(model)) {
+    return new OpenAI({
+      apiKey,
+      baseURL: 'https://api.groq.com/openai/v1',
+    });
   }
   // Gemini uses OpenAI-compatible endpoint
   if (model.startsWith('gemini')) {
@@ -34,6 +57,9 @@ function buildClient(model, apiKey) {
 
 // ── Core call (with Redis caching) ────────────────────────────────────────────
 async function callLlm({ model, apiKey, systemPrompt, userPrompt, agentId }) {
+  if (!ALLOWED_MODELS.has(model)) {
+    throw new Error(`Model "${model}" is not allowed on testnet. Allowed: ${[...ALLOWED_MODELS].join(', ')}`);
+  }
   const cacheKey = `llm:${crypto.createHash('sha256').update(model + systemPrompt + userPrompt).digest('hex')}`;
   const cached = await redis.get(cacheKey);
 

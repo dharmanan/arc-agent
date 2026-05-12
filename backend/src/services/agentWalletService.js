@@ -187,7 +187,7 @@ function normalizeSwapQuoteError(error) {
   const message = error?.message || 'Live quote is unavailable right now.';
 
   if (message.includes('No route available')) {
-    return 'No live route is available for this amount right now.';
+    return 'No live route is available for this amount right now. Try a lower amount.';
   }
 
   if (message.includes('Invalid API key format')) {

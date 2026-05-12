@@ -9,6 +9,10 @@ const authRoutes         = require('./routes/auth');
 const agentRoutes        = require('./routes/agents');
 const transactionRoutes  = require('./routes/transactions');
 const bridgeRoutes       = require('./routes/bridge');
+const oracleRoutes       = require('./routes/oracle');
+const tasksRoutes        = require('./routes/tasks');
+const jobsRoutes         = require('./routes/jobs');
+const agentQueue         = require('./queue/agentQueue');
 const { globalRateLimit }  = require('./middleware/rateLimit');
 const { startIndexer }     = require('./services/indexerService');
 const bridgeActivityService = require('./services/bridgeActivityService');
@@ -67,6 +71,11 @@ app.use('/api/auth',         authRoutes);
 app.use('/api/agents',       agentRoutes);
 app.use('/api/transactions', transactionRoutes);
 app.use('/api/bridge',       bridgeRoutes);
+app.use('/api/oracle',       oracleRoutes);
+app.use('/api/tasks',        tasksRoutes);
+// tasks.js also handles /api/tasks/agents/:id/tasks/* routes (mounted at /api/tasks)
+app.use('/api/agents/:id/jobs', jobsRoutes);
+// jobs.js handles /api/agents/:id/jobs/* routes (ERC-8183 AgenticCommerce)
 
 // ── Root info ─────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
@@ -75,12 +84,29 @@ app.get('/', (_req, res) => {
 
 // ── Health probe ──────────────────────────────────────────────────────────────
 app.get('/health', async (_req, res) => {
+  const health = { status: 'ok', db: 'ok', redis: 'ok', ts: new Date().toISOString() };
+  let httpStatus = 200;
+
   try {
     await db.query('SELECT 1');
-    res.json({ status: 'ok', ts: new Date().toISOString() });
   } catch (err) {
-    res.status(503).json({ status: 'degraded', error: err.message });
+    health.db = 'error';
+    health.dbError = err.message;
+    health.status = 'degraded';
+    httpStatus = 503;
   }
+
+  try {
+    const redisClient = require('./services/redisClient');
+    await redisClient.ping();
+  } catch (err) {
+    health.redis = 'error';
+    health.redisError = err.message;
+    health.status = 'degraded';
+    httpStatus = 503;
+  }
+
+  res.status(httpStatus).json(health);
 });
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
@@ -96,7 +122,12 @@ app.use((err, _req, res, _next) => {
   }
   const status = err.status || 500;
   if (status >= 500) console.error('[ERROR]', err);
-  res.status(status).json({ error: err.message || 'Internal server error' });
+  // Never leak stack traces or internal messages to clients in production
+  const isProd = process.env.NODE_ENV === 'production';
+  const message = isProd && status >= 500
+    ? 'Internal server error'
+    : (err.message || 'Internal server error');
+  res.status(status).json({ error: message });
 });
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -114,6 +145,15 @@ async function bootstrap() {
     (agentId) => agentService.getAgentWithKeyById(agentId),
   );
   bridgeActivityService.startPoller();
+
+  // Start oracle query loop (only runs for agents with oracle_enabled = TRUE)
+  agentQueue.scheduleOracleLoop().catch(err => console.error('[ORACLE_LOOP] startup error', err));
+
+  // Start DeFi loop (only runs for agents with defi_loop_enabled = TRUE)
+  agentQueue.scheduleDefiLoop().catch(err => console.error('[DEFI_LOOP] startup error', err));
+
+  // Start daily free task scheduler (only for agents with daily_tasks_enabled = TRUE)
+  agentQueue.scheduleDailyTasks().catch(err => console.error('[DAILY_TASKS] startup error', err));
 
   app.listen(PORT, () =>
     console.log(`[SERVER] Arc Machina backend running on port ${PORT} (${process.env.NODE_ENV})`),

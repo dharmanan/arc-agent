@@ -8,13 +8,15 @@ import AgentTab      from './components/AgentTab.jsx';
 import BridgeTab     from './components/BridgeTab.jsx';
 import SwapTab       from './components/SwapTab.jsx';
 import SecurityTab   from './components/SecurityTab.jsx';
-import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Send, ChevronDown } from 'lucide-react';
+import JobsTab       from './components/JobsTab.jsx';
+import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Send, Briefcase, ChevronDown } from 'lucide-react';
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
   { id: 'bridge',    label: 'Bridge',    Icon: ArrowLeftRight  },
   { id: 'swap',      label: 'Swap',      Icon: Repeat2         },
   { id: 'agent',     label: 'Agent',     Icon: Bot             },
+  { id: 'jobs',      label: 'Jobs',      Icon: Briefcase       },
   { id: 'security',  label: 'Send',      Icon: Send            },
 ];
 
@@ -137,6 +139,7 @@ function AppContent() {
         {tab === 'bridge'    && <BridgeTab     onBack={back} />}
         {tab === 'swap'      && <SwapTab       onBack={back} />}
         {tab === 'agent'     && <AgentTab />}
+        {tab === 'jobs'      && <JobsTab />}
         {tab === 'security'  && <SecurityTab   onBack={back} />}
       </main>
     </div>

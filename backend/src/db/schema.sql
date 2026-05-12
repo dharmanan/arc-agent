@@ -10,8 +10,14 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- gen_random_uuid()
 CREATE TABLE IF NOT EXISTS users (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_address       VARCHAR(42) NOT NULL UNIQUE,  -- EVM hex address (lowercase)
+  failed_auth_count   SMALLINT NOT NULL DEFAULT 0,  -- brute-force counter
+  locked_until        TIMESTAMPTZ,                  -- NULL = not locked
   created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Migration: add lockout columns to existing deployments
+ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_auth_count SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. PASSKEY CREDENTIALS (WebAuthn / FIDO2)
@@ -84,6 +90,14 @@ CREATE TABLE IF NOT EXISTS agents (
   daily_spent_usdc          NUMERIC(20,6)  NOT NULL DEFAULT 0,
   last_reset_day            DATE           NOT NULL DEFAULT CURRENT_DATE,
 
+  -- ERC-8004 onchain identity (Arc Testnet IdentityRegistry)
+  -- status: 'pending' | 'registered' | 'failed'
+  erc8004_status            VARCHAR(20)    NOT NULL DEFAULT 'pending',
+  erc8004_token_id          VARCHAR(100),   -- NFT token ID from IdentityRegistry
+  erc8004_tx_hash           VARCHAR(100),   -- registration tx hash
+  erc8004_registered_at     TIMESTAMPTZ,
+  erc8004_error             TEXT,           -- last error message if failed
+
   created_at                TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
   updated_at                TIMESTAMPTZ    NOT NULL DEFAULT NOW()
 );
@@ -92,6 +106,28 @@ CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id);
 -- ── Migrations (idempotent) ───────────────────────────────────────────────────
 -- Add private_key_encrypted if the column was missing from an earlier schema
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_key_encrypted TEXT;
+
+-- ERC-8004 identity columns (added after initial schema)
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS erc8004_status        VARCHAR(20)  NOT NULL DEFAULT 'pending';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS erc8004_token_id      VARCHAR(100);
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS erc8004_tx_hash       VARCHAR(100);
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS erc8004_registered_at TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS erc8004_error         TEXT;
+
+-- Faza 2.0: opt-in feature flags (all default OFF — nothing runs without user choice)
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_tasks_enabled        BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_enabled    BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_enabled             BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_enabled          BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_enabled         BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Faza 2.0: daily operation counters (reset at 00:00 UTC via daily_limit_reset_at)
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_free_task_count       INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_paid_task_count       INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_defi_loop_count       INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_market_analysis_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_auto_tx_count         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_limit_reset_at        TIMESTAMPTZ DEFAULT NOW();
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 5. AGENT PERMISSIONS (only relevant in smart mode)
@@ -195,4 +231,91 @@ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$;
 DROP TRIGGER IF EXISTS trg_agents_updated_at ON agents;
 CREATE TRIGGER trg_agents_updated_at
   BEFORE UPDATE ON agents
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 11. TASK CATALOG (static free/paid task definitions)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS task_catalog (
+  id          TEXT PRIMARY KEY,
+  title       TEXT NOT NULL,
+  description TEXT NOT NULL,
+  tier        INTEGER NOT NULL DEFAULT 1,   -- 1=free, 2=paid
+  fee_usdc    NUMERIC(10,4) NOT NULL DEFAULT 0,
+  enabled     BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- Seed the 5 free daily tasks (idempotent)
+INSERT INTO task_catalog (id, title, description, tier, fee_usdc, enabled) VALUES
+  ('DAILY_PRICE_REPORT',  'FX Price Report',    'EURC/USDC + BRLA/USDC live rates via Frankfurter',        1, 0, true),
+  ('DAILY_POOL_HEALTH',   'Pool Health Check',  'Curve pool spread%, virtual_price and coin balances',     1, 0, true),
+  ('DAILY_YIELD_RANK',    'Yield Ranking',      'Top 3 APY opportunities across USDC/EURC pools',          1, 0, true),
+  ('DAILY_ARB_SCAN',      'Arb Signal Scan',    'Stablecoin spread arbitrage opportunity detector',        1, 0, true),
+  ('DAILY_WALLET_DIGEST', 'Wallet Digest',      '24h activity summary and agent wallet balance snapshot',  1, 0, true)
+ON CONFLICT (id) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 12. AGENT TASK RESULTS (output of each DAILY_* job run)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_task_results (
+  id         BIGSERIAL PRIMARY KEY,
+  agent_id   UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  task_id    TEXT NOT NULL REFERENCES task_catalog(id),
+  payload    JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_task_results_agent ON agent_task_results(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_results_task  ON agent_task_results(task_id, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 13. ORACLE PAYMENTS (x402 nanopayment audit log — one row per verified tx)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS oracle_payments (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tx_hash     TEXT UNIQUE NOT NULL,
+  endpoint    TEXT NOT NULL,                -- e.g. 'stablecoin-fx'
+  amount_usdc NUMERIC(10,6) NOT NULL,
+  from_addr   TEXT,                         -- payer address (from Transfer log)
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_oracle_payments_endpoint ON oracle_payments(endpoint, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 14. AGENT REPUTATION EVENTS (local record of ERC-8004 reputation calls)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_reputation_events (
+  id          BIGSERIAL PRIMARY KEY,
+  agent_id    UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  event_type  TEXT NOT NULL,              -- e.g. 'TRANSACTION_COMPLETED'
+  score_delta INTEGER NOT NULL DEFAULT 1,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rep_events_agent ON agent_reputation_events(agent_id, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 15. AGENT JOBS (ERC-8183 AgenticCommerce escrow jobs)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_jobs (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id          UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  job_id_onchain    VARCHAR(100),        -- jobId from AgenticCommerce contract
+  client_address    VARCHAR(42),         -- who created the job
+  provider_address  VARCHAR(42),         -- agent wallet (fulfills the job)
+  amount_usdc       NUMERIC(20,6),
+  description       TEXT,
+  status            VARCHAR(20) NOT NULL DEFAULT 'open',
+                                         -- open|funded|delivered|completed|cancelled
+  deliverable_hash  VARCHAR(100),        -- keccak256 hash of deliverable
+  tx_hash_create    VARCHAR(100),
+  tx_hash_deliver   VARCHAR(100),
+  tx_hash_settle    VARCHAR(100),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_agent  ON agent_jobs(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON agent_jobs(status);
+
+DROP TRIGGER IF EXISTS trg_jobs_updated_at ON agent_jobs;
+CREATE TRIGGER trg_jobs_updated_at
+  BEFORE UPDATE ON agent_jobs
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();

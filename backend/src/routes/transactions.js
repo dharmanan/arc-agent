@@ -85,7 +85,16 @@ router.post('/send', async (req, res, next) => {
       chain:      body.chain,
     });
     res.status(202).json(tx);
-  } catch (err) { next(err); }
+  } catch (err) {
+    // QR payment: surface limit errors with structured payloads for the frontend
+    if (err.code === 'EXCEEDS_MAX_TRADE') {
+      return res.status(422).json({ error: err.message, requiresPasskey: true });
+    }
+    if (err.code === 'DAILY_LIMIT_EXCEEDED') {
+      return res.status(429).json({ error: err.message, dailyLimitReached: true });
+    }
+    next(err);
+  }
 });
 
 // ── Nano Payment (< $0.01 USDC, always agentic) ───────────────────────────────

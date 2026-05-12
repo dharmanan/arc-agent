@@ -70,8 +70,11 @@ export function Spinner({ size = 20, className = '' }) {
   return <Loader2 size={size} className={`animate-spin text-arc-green ${className}`} />;
 }
 
-export function AddressBox({ address, label }) {
+export function AddressBox({ address, label, compact = false, startChars = 8, endChars = 6 }) {
   const [copied, setCopied] = React.useState(false);
+  const displayAddress = !compact || !address || address.length <= startChars + endChars
+    ? address
+    : `${address.slice(0, startChars)}....${address.slice(-endChars)}`;
   const copy = () => {
     navigator.clipboard.writeText(address).then(() => {
       setCopied(true);
@@ -82,7 +85,7 @@ export function AddressBox({ address, label }) {
     <div className="flex flex-col gap-1.5">
       {label && <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">{label}</label>}
       <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-        <span className="flex-1 break-all font-mono text-sm text-slate-700">{address}</span>
+        <span className="flex-1 break-all font-mono text-sm text-slate-700">{displayAddress}</span>
         <button
           onClick={copy}
           title="Copy address"

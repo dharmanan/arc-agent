@@ -61,7 +61,20 @@ const updateSchema = z.object({
   contractGuard:     z.boolean().optional(),
   // LLM — user provides their own key, encrypted at rest
   llmApiKey:         z.string().max(200).optional(),
-  llmModel:          z.enum(['claude-sonnet-4-20250514','gemini-2.5-pro','gpt-4o']).optional(),
+  // Testnet-approved models only (cost-effective tier)
+  llmModel:          z.enum([
+    'claude-haiku-3-5-20241022',   // Anthropic — paid
+    'gemini-2.0-flash',            // Google — paid
+    'gpt-4o-mini',                 // OpenAI — paid
+    'llama-3.3-70b-versatile',     // Groq — FREE tier
+    'llama-3.1-8b-instant',        // Groq — FREE tier (fastest)
+  ]).optional(),
+  // Faza 2.0: opt-in feature flags (all default OFF)
+  dailyTasksEnabled:     z.boolean().optional(),
+  marketAnalysisEnabled: z.boolean().optional(),
+  oracleEnabled:         z.boolean().optional(),
+  defiLoopEnabled:       z.boolean().optional(),
+  reputationEnabled:     z.boolean().optional(),
 }).strict();
 
 router.put('/:id', async (req, res, next) => {
@@ -106,6 +119,14 @@ router.delete('/:id', async (req, res, next) => {
   try {
     await agentService.deactivateAgent(req.params.id, req.user.userId);
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ── Retry ERC-8004 identity registration ─────────────────────────────────────
+router.post('/:id/register-identity', async (req, res, next) => {
+  try {
+    const result = await agentService.retryErc8004Registration(req.params.id, req.user.userId);
+    res.json(result);
   } catch (err) { next(err); }
 });
 

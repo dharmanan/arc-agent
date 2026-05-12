@@ -5,8 +5,14 @@ import { agents, transactions } from '../lib/api.js';
 import { authenticatePasskey } from '../lib/passkey.js';
 import { fetchAgentPortfolio } from '../lib/agentBalances.js';
 import { Card, Badge, Button, AddressBox, Alert, Spinner } from './ui/index.jsx';
-import { Wallet, Activity, ArrowRight, Zap, LogIn, ExternalLink, RefreshCw } from 'lucide-react';
+import PaymentModal from './PaymentModal.jsx';
+import { Wallet, Activity, ArrowRight, Zap, LogIn, ExternalLink, RefreshCw, QrCode, Send } from 'lucide-react';
 import { CHAINS } from '../lib/chains.js';
+
+function formatAddress(address, startChars = 8, endChars = 6) {
+  if (!address || address.length <= startChars + endChars) return address;
+  return `${address.slice(0, startChars)}....${address.slice(-endChars)}`;
+}
 
 function getTxMeta(tx) {
   return tx?.meta && typeof tx.meta === 'object' ? tx.meta : {};
@@ -14,6 +20,14 @@ function getTxMeta(tx) {
 
 function isRealHash(hash) {
   return /^0x[0-9a-fA-F]{64}$/.test(hash || '');
+}
+
+function formatTokenAmount(amount, token) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+
+  const digits = token === 'cirBTC' ? 8 : 4;
+  return `${numeric.toFixed(digits).replace(/\.0+$|(?<=\.\d*?)0+$/g, '')} ${token}`;
 }
 
 function getExplorerTxUrl(chainName, txHash) {
@@ -24,6 +38,34 @@ function getExplorerTxUrl(chainName, txHash) {
 
 function getTxDisplay(tx) {
   const meta = getTxMeta(tx);
+  const isSwap = tx.type === 'swap';
+
+  if (isSwap) {
+    const fromToken = meta.fromToken || tx.token || 'USDC';
+    const toToken = meta.toToken || 'USDC';
+    const inputAmountLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, fromToken);
+    const outputAmountLabel = formatTokenAmount(meta.amountOut, toToken);
+    const swapTxHash = tx.tx_hash || tx.txHash || null;
+    const swapUrl = getExplorerTxUrl('Arc Testnet', swapTxHash);
+
+    return {
+      title: 'swap',
+      routeLabel: `Arc Testnet · ${fromToken} → ${toToken}`,
+      amountLabel: inputAmountLabel,
+      phase: outputAmountLabel
+        ? `${tx.status === 'confirmed' ? 'Received' : 'Estimated out'}: ${outputAmountLabel}`
+        : (tx.status === 'executing' ? 'Awaiting on-chain confirmation' : null),
+      links: swapUrl
+        ? [{
+            key: `${tx.id}-swap`,
+            label: 'Tx',
+            hash: swapTxHash,
+            url: swapUrl,
+          }]
+        : [],
+    };
+  }
+
   const fromChain = tx.from_chain || tx.fromChain || meta.fromChain || '';
   const toChain = tx.to_chain || tx.toChain || meta.toChain || '';
   const bridgeKind = meta.bridgeType || meta.kind || null;
@@ -98,6 +140,7 @@ export default function DashboardTab({ onNavigate }) {
   const [txError, setTxError]     = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState('');
+  const [paymentMode, setPaymentMode] = useState(null); // 'send' | 'receive' | null
   const agentWalletAddress = agent?.walletAddress || agent?.wallet_address;
 
   const arcPortfolio = portfolio.find(entry => entry.chainName === 'Arc Testnet');
@@ -143,6 +186,24 @@ export default function DashboardTab({ onNavigate }) {
     }
   }, [agentWalletAddress]);
 
+  const loadTransactions = useCallback(async ({ silent = false } = {}) => {
+    if (!agent?.id || !isAuthenticated) {
+      setTxs([]);
+      return;
+    }
+
+    if (!silent) setLoadingTxs(true);
+    setTxError('');
+    try {
+      const data = await transactions.list(agent.id);
+      setTxs(Array.isArray(data) ? data.slice(0, 5) : []);
+    } catch (e) {
+      setTxError(e.message || 'Failed to load recent activity');
+    } finally {
+      if (!silent) setLoadingTxs(false);
+    }
+  }, [agent?.id, isAuthenticated]);
+
   useEffect(() => {
     loadPortfolio(agentWalletAddress);
   }, [agentWalletAddress, loadPortfolio]);
@@ -158,15 +219,18 @@ export default function DashboardTab({ onNavigate }) {
   }, [agentWalletAddress, loadPortfolio]);
 
   useEffect(() => {
-    if (agent?.id && isAuthenticated) {
-      setLoadingTxs(true);
-      setTxError('');
-      transactions.list(agent.id)
-        .then(data => setTxs(Array.isArray(data) ? data.slice(0, 5) : []))
-        .catch(e => setTxError(e.message))
-        .finally(() => setLoadingTxs(false));
-    }
-  }, [agent?.id, isAuthenticated]);
+    loadTransactions();
+  }, [loadTransactions]);
+
+  useEffect(() => {
+    if (!agent?.id || !isAuthenticated) return undefined;
+
+    const intervalId = setInterval(() => {
+      loadTransactions({ silent: true });
+    }, 15_000);
+
+    return () => clearInterval(intervalId);
+  }, [agent?.id, isAuthenticated, loadTransactions]);
 
   if (!ownerAddress) {
     return (
@@ -225,7 +289,7 @@ export default function DashboardTab({ onNavigate }) {
           <div className="flex items-center gap-3 text-slate-500">
             <Wallet size={18} />
             <span className="text-sm font-medium">Your owner wallet:</span>
-            <span className="font-mono text-sm text-slate-700">{ownerAddress?.slice(0, 8)}…{ownerAddress?.slice(-6)}</span>
+            <span className="font-mono text-sm text-slate-700">{formatAddress(ownerAddress)}</span>
           </div>
         </Card>
       </div>
@@ -234,6 +298,11 @@ export default function DashboardTab({ onNavigate }) {
 
   return (
     <div className="space-y-6">
+      {/* Payment modal */}
+      {paymentMode && (
+        <PaymentModal mode={paymentMode} onClose={() => setPaymentMode(null)} />
+      )}
+
       {/* Agent wallet card */}
       <Card className="border-[#66D121]/30 bg-gradient-to-br from-arc-greenBg to-white">
         <div className="flex flex-wrap items-start justify-between gap-4">
@@ -251,10 +320,24 @@ export default function DashboardTab({ onNavigate }) {
             <div className="rounded-xl border border-[#627eea]/30 bg-white px-4 py-2 text-sm font-bold text-[#627eea]">
               {sepoliaPortfolio?.nativeBalance !== null && sepoliaPortfolio?.nativeBalance !== undefined ? `${sepoliaPortfolio.nativeBalance} ETH (Sepolia)` : '— ETH'}
             </div>
+            {/* Send / Receive */}
+            <Button
+              variant="outline"
+              className="px-4 py-2 text-sm"
+              onClick={() => setPaymentMode('send')}
+            >
+              <Send size={14} /> Send
+            </Button>
+            <Button
+              className="px-4 py-2 text-sm"
+              onClick={() => setPaymentMode('receive')}
+            >
+              <QrCode size={14} /> Receive
+            </Button>
           </div>
         </div>
         <div className="mt-4">
-          <AddressBox address={agent.walletAddress} label="Agent Wallet Address" />
+          <AddressBox address={agent.walletAddress} label="Agent Wallet Address" compact />
         </div>
         <div className="mt-4">
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -301,6 +384,12 @@ export default function DashboardTab({ onNavigate }) {
                         <span className="font-semibold text-slate-900">{entry.eurcBalance}</span>
                       </div>
                     )}
+                    {entry.cirbtcBalance !== null && entry.cirbtcBalance !== undefined && (
+                      <div className="flex items-center justify-between gap-3 text-slate-600">
+                        <span>cirBTC</span>
+                        <span className="font-semibold text-slate-900">{entry.cirbtcBalance}</span>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
@@ -318,16 +407,26 @@ export default function DashboardTab({ onNavigate }) {
           <Wallet size={18} className="text-slate-400" />
           <div>
             <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Owner Wallet (MetaMask)</p>
-            <p className="font-mono text-sm text-slate-700">{ownerAddress}</p>
+            <p className="font-mono text-sm text-slate-700">{formatAddress(ownerAddress)}</p>
           </div>
         </div>
       </Card>
 
       {/* Recent activity */}
       <Card>
-        <div className="mb-4 flex items-center gap-2">
-          <Activity size={16} className="text-slate-400" />
-          <h3 className="font-semibold text-slate-800">Recent Activity</h3>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Activity size={16} className="text-slate-400" />
+            <h3 className="font-semibold text-slate-800">Recent Activity</h3>
+          </div>
+          <Button
+            variant="outline"
+            className="px-3 py-2 text-xs"
+            onClick={() => loadTransactions()}
+            loading={loadingTxs}
+          >
+            <RefreshCw size={13} /> Refresh
+          </Button>
         </div>
         {loadingTxs ? (
           <div className="flex justify-center py-8"><Spinner /></div>

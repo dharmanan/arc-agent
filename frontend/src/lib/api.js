@@ -57,6 +57,7 @@ export const agents = {
   updatePermissions: (id, perms) => put(`/agents/${id}/permissions`, perms),
   status:            (id)        => get(`/agents/${id}/status`),
   delete:            (id)        => del(`/agents/${id}`),
+  retryIdentity:     (id)        => post(`/agents/${id}/register-identity`),
 };
 
 // ── Transactions ──────────────────────────────────────────────────────────────
@@ -92,5 +93,22 @@ export const bridge = {
     post(`/bridge/activities/${activityId}/dismiss`, { agentId }),
   claim:         (activityId, agentId) =>
     post(`/bridge/claim/${activityId}`, { agentId }),
+};
+
+// ── Tasks ─────────────────────────────────────────────────────────────────────
+export const tasks = {
+  featured:    ()                => get('/tasks/featured'),
+  runTask:     (agentId, taskId) => post(`/tasks/agents/${agentId}/tasks/run`, { taskId }),
+  results:     (agentId, limit)  => get(`/tasks/agents/${agentId}/tasks/results${limit ? `?limit=${limit}` : ''}`),
+};
+
+// ── Jobs (ERC-8183 AgenticCommerce) ───────────────────────────────────────────
+export const jobs = {
+  list:     (agentId, status)      => get(`/agents/${agentId}/jobs${status ? `?status=${status}` : ''}`),
+  get:      (agentId, jobId)       => get(`/agents/${agentId}/jobs/${jobId}`),
+  create:   (agentId, data)        => post(`/agents/${agentId}/jobs`, data),
+  deliver:  (agentId, jobId, hash) => put(`/agents/${agentId}/jobs/${jobId}/deliver`, { deliverableHash: hash }),
+  complete: (agentId, jobId)       => put(`/agents/${agentId}/jobs/${jobId}/complete`, {}),
+  cancel:   (agentId, jobId)       => put(`/agents/${agentId}/jobs/${jobId}/cancel`, {}),
 };
 

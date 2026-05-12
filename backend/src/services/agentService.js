@@ -12,8 +12,113 @@ const DEFAULT_PERMISSIONS = [
   'aggressive_mode',
 ];
 
+// ── ERC-8004 IdentityRegistry (Arc Testnet) ───────────────────────────────────
+const IDENTITY_REGISTRY_ADDRESS = '0x8004A818BFB912233c491871b3d84c89A494BD9e';
+const IDENTITY_REGISTRY_ABI = [
+  'function registerAgent(string name, string description, string metadataUri) returns (uint256 tokenId)',
+  'event AgentRegistered(uint256 indexed tokenId, address indexed owner, string name)',
+];
+
+async function _registerErc8004(agentId, walletAddress, agentName) {
+  const rpc = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
+  const relayerKey = process.env.RELAYER_PRIVATE_KEY;
+
+  if (!relayerKey) {
+    throw new Error('RELAYER_PRIVATE_KEY not set — cannot register on-chain identity');
+  }
+
+  const provider = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
+  const relayer  = new ethers.Wallet(relayerKey, provider);
+  const registry = new ethers.Contract(IDENTITY_REGISTRY_ADDRESS, IDENTITY_REGISTRY_ABI, relayer);
+
+  const description = `Arc Machina autonomous agent — ${walletAddress}`;
+  const metadataUri = `https://arc-machina.app/agents/${agentId}`;
+
+  const tx = await registry.registerAgent(agentName, description, metadataUri);
+  const receipt = await tx.wait(1);
+
+  // Parse AgentRegistered event to get tokenId
+  const iface = new ethers.Interface(IDENTITY_REGISTRY_ABI);
+  let tokenId = null;
+  for (const log of receipt.logs) {
+    try {
+      const parsed = iface.parseLog(log);
+      if (parsed && parsed.name === 'AgentRegistered') {
+        tokenId = parsed.args.tokenId.toString();
+        break;
+      }
+    } catch { /* skip unparseable logs */ }
+  }
+
+  return { tokenId, txHash: receipt.hash };
+}
+
+// ── ERC-8004 registration attempt — called after agent DB insert ──────────────
+// Never throws: failures are recorded in DB so user can retry.
+async function attemptErc8004Registration(agentId, walletAddress, agentName) {
+  try {
+    const { tokenId, txHash } = await _registerErc8004(agentId, walletAddress, agentName);
+    await db.query(
+      `UPDATE agents SET
+         erc8004_status        = 'registered',
+         erc8004_token_id      = $1,
+         erc8004_tx_hash       = $2,
+         erc8004_registered_at = NOW(),
+         erc8004_error         = NULL
+       WHERE id = $3`,
+      [tokenId, txHash, agentId],
+    );
+    console.log(`[ERC-8004] Agent ${agentId} registered — tokenId=${tokenId} tx=${txHash}`);
+    return { success: true, tokenId, txHash };
+  } catch (err) {
+    const message = err.message || 'Unknown error';
+    await db.query(
+      `UPDATE agents SET
+         erc8004_status  = 'failed',
+         erc8004_error   = $1
+       WHERE id = $2`,
+      [message.slice(0, 500), agentId],
+    );
+    console.warn(`[ERC-8004] Registration failed for agent ${agentId}: ${message}`);
+    return { success: false, error: message };
+  }
+}
+
+// ── Retry ERC-8004 registration (called from route handler) ───────────────────
+async function retryErc8004Registration(agentId, userId) {
+  const { rows } = await db.query(
+    'SELECT id, wallet_address, name, erc8004_status FROM agents WHERE id = $1 AND user_id = $2',
+    [agentId, userId],
+  );
+  if (!rows.length) return null;
+
+  const agent = rows[0];
+  if (agent.erc8004_status === 'registered') {
+    return { alreadyRegistered: true };
+  }
+
+  // Mark as pending before attempting
+  await db.query(
+    "UPDATE agents SET erc8004_status = 'pending', erc8004_error = NULL WHERE id = $1",
+    [agentId],
+  );
+
+  return attemptErc8004Registration(agentId, agent.wallet_address, agent.name);
+}
+
 // ── Create ────────────────────────────────────────────────────────────────────
 async function createAgent(userId, data) {
+  // Testnet limit: 1 active agent per user
+  const { rows: existing } = await db.query(
+    "SELECT id FROM agents WHERE user_id = $1 AND status != 'locked' LIMIT 1",
+    [userId],
+  );
+  if (existing.length > 0) {
+    const err = new Error('Testnet limit: only 1 active agent allowed per user');
+    err.status = 409;
+    throw err;
+  }
+
   const client = await db.getClient();
   try {
     // Generate a fresh EOA wallet for this agent
@@ -53,7 +158,13 @@ async function createAgent(userId, data) {
     await client.query('COMMIT');
 
     // Return the private key ONCE so the frontend can show it to the user
-    return { ...formatAgent(agent, []), privateKey: wallet.privateKey };
+    const formatted = { ...formatAgent(agent, []), privateKey: wallet.privateKey };
+
+    // Attempt ERC-8004 onchain identity registration (non-blocking, never throws)
+    // Result is written back to DB — frontend polls /status or retries via route
+    setImmediate(() => attemptErc8004Registration(agent.id, wallet.address.toLowerCase(), data.name));
+
+    return formatted;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -91,16 +202,22 @@ async function getAgent(agentId, userId) {
 async function updateAgent(agentId, userId, data) {
   // Map camelCase → snake_case for safe dynamic update
   const colMap = {
-    name:                 'name',
-    dailyLimitUsdc:       'daily_limit_usdc',
-    maxGasGwei:           'max_gas_gwei',
-    slippagePercent:      'slippage_percent',
-    maxTradeUsdc:         'max_trade_usdc',
-    autoLockMinutes:      'auto_lock_minutes',
-    contractGuard:        'contract_guard_enabled',
-    llmApiKeyEncrypted:   'llm_api_key_encrypted',
-    llmModel:             'llm_model',
-    isSmartMode:          'is_smart_mode',
+    name:                    'name',
+    dailyLimitUsdc:          'daily_limit_usdc',
+    maxGasGwei:              'max_gas_gwei',
+    slippagePercent:         'slippage_percent',
+    maxTradeUsdc:            'max_trade_usdc',
+    autoLockMinutes:         'auto_lock_minutes',
+    contractGuard:           'contract_guard_enabled',
+    llmApiKeyEncrypted:      'llm_api_key_encrypted',
+    llmModel:                'llm_model',
+    isSmartMode:             'is_smart_mode',
+    // Faza 2.0: opt-in feature flags
+    dailyTasksEnabled:       'daily_tasks_enabled',
+    marketAnalysisEnabled:   'market_analysis_enabled',
+    oracleEnabled:           'oracle_enabled',
+    defiLoopEnabled:         'defi_loop_enabled',
+    reputationEnabled:       'reputation_enabled',
   };
 
   const setClauses = [];
@@ -205,6 +322,16 @@ function formatAgent(row, perms) {
     isSmartMode:    row.is_smart_mode,
     llmModel:       row.llm_model,
     hasLlmKey:      !!row.llm_api_key_encrypted,
+    identity: {
+      status:       row.erc8004_status   || 'pending',  // pending|registered|failed
+      tokenId:      row.erc8004_token_id || null,
+      txHash:       row.erc8004_tx_hash  || null,
+      registeredAt: row.erc8004_registered_at || null,
+      error:        row.erc8004_error    || null,
+      arcScanUrl:   row.erc8004_token_id
+        ? `https://testnet.arcscan.app/tx/${row.erc8004_tx_hash}`
+        : null,
+    },
     settings: {
       dailyLimitUsdc:  parseFloat(row.daily_limit_usdc),
       maxGasGwei:      row.max_gas_gwei,
@@ -216,6 +343,14 @@ function formatAgent(row, perms) {
       totpEnabled:     row.totp_enabled,
     },
     permissions: Object.fromEntries(perms.map(p => [p.permission_key, p.is_enabled])),
+    // Faza 2.0: opt-in feature flags
+    features: {
+      dailyTasksEnabled:     row.daily_tasks_enabled     ?? false,
+      marketAnalysisEnabled: row.market_analysis_enabled ?? false,
+      oracleEnabled:         row.oracle_enabled          ?? false,
+      defiLoopEnabled:       row.defi_loop_enabled       ?? false,
+      reputationEnabled:     row.reputation_enabled      ?? false,
+    },
     createdAt:    row.created_at,
   };
 }
@@ -252,4 +387,5 @@ module.exports = {
   updatePermissions,
   getAgentStatus,
   deactivateAgent,
+  retryErc8004Registration,
 };

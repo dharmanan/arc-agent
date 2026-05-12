@@ -64,14 +64,23 @@ router.post('/passkey/login/start', async (req, res, next) => {
     const { ownerAddress } = schema.parse(req.body);
     const addr = ownerAddress.toLowerCase();
 
-    const { rows } = await db.query('SELECT id FROM users WHERE owner_address = $1', [addr]);
+    const { rows } = await db.query(
+      'SELECT id, locked_until FROM users WHERE owner_address = $1', [addr]
+    );
     if (!rows.length) return res.status(404).json({ error: 'User not registered' });
-    const userId = rows[0].id;
 
-    const options = await passkeyService.generateAuthenticationOptions(userId);
+    // Lockout check — return generic message to avoid user enumeration
+    if (rows[0].locked_until && new Date(rows[0].locked_until) > new Date()) {
+      return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
+    }
+
+    const options = await passkeyService.generateAuthenticationOptions(rows[0].id);
     res.json(options);
   } catch (err) { next(err); }
 });
+
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_MINUTES     = 15;
 
 // ── Login: Step 2 — verify assertion ─────────────────────────────────────────
 router.post('/passkey/login/finish', async (req, res, next) => {
@@ -83,12 +92,40 @@ router.post('/passkey/login/finish', async (req, res, next) => {
     const { ownerAddress, credential } = schema.parse(req.body);
     const addr = ownerAddress.toLowerCase();
 
-    const { rows } = await db.query('SELECT id FROM users WHERE owner_address = $1', [addr]);
+    const { rows } = await db.query(
+      'SELECT id, failed_auth_count, locked_until FROM users WHERE owner_address = $1', [addr]
+    );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    const userId = rows[0].id;
+    const { id: userId, locked_until } = rows[0];
+
+    // Lockout check
+    if (locked_until && new Date(locked_until) > new Date()) {
+      return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
+    }
 
     credential._requestOrigin = req.get('origin');
-    await passkeyService.verifyAuthentication(userId, credential);
+    try {
+      await passkeyService.verifyAuthentication(userId, credential);
+    } catch (verifyErr) {
+      // Increment failure counter; lock if threshold reached
+      await db.query(
+        `UPDATE users
+         SET failed_auth_count = failed_auth_count + 1,
+             locked_until = CASE
+               WHEN failed_auth_count + 1 >= $1
+               THEN NOW() + INTERVAL '${LOCKOUT_MINUTES} minutes'
+               ELSE locked_until
+             END
+         WHERE id = $2`,
+        [MAX_FAILED_ATTEMPTS, userId]
+      );
+      return res.status(401).json({ error: 'Passkey verification failed' });
+    }
+
+    // Success — reset failure counter
+    await db.query(
+      'UPDATE users SET failed_auth_count = 0, locked_until = NULL WHERE id = $1', [userId]
+    );
     const token = signToken(userId, addr);
     res.json({ token, userId });
   } catch (err) { next(err); }

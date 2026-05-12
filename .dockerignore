@@ -1,0 +1,16 @@
+node_modules
+**/node_modules
+.env
+.env.railway
+*.local.md
+.git
+cache
+artifacts
+frontend
+scripts
+sil
+*.csv
+*.html
+js/
+css/
+assets/

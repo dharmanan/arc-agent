@@ -53,6 +53,7 @@ export default function SwapTab({ onBack }) {
   const quoteWarning = swapDisabledByDex
     ? (quote?.quoteError || 'Live Arc swap routing is unavailable right now.')
     : null;
+  const suggestLowerAmount = Boolean(quoteWarning && quoteWarning.includes('Try a lower amount.'));
 
   // ── Fetch quote on amount / direction change ──────────────────────────────
   const fetchQuote = useCallback(async (amount, from, to) => {
@@ -140,7 +141,7 @@ export default function SwapTab({ onBack }) {
   async function handleSwap() {
     if (!hasAmount) { setError('Enter a valid amount.'); return; }
     if (quoting || !quote) { setError('Waiting for a live swap quote from Arc Testnet…'); return; }
-    if (!quote.isDexQuote) { setError('Swap is unavailable on this deployment until CIRCLE_KIT_KEY is configured.'); return; }
+    if (!quote.isDexQuote) { setError(quote?.quoteError || 'Live Arc swap routing is unavailable right now.'); return; }
     if (limitAwaitingQuote) { setError('Waiting for a live cirBTC quote to evaluate your agent limit…'); return; }
     if (exceedsMax) { setError(`Amount exceeds agent auto-approve limit (${maxTrade} USDC). Lower the amount or raise the limit in Agent Settings.`); return; }
 
@@ -388,7 +389,7 @@ export default function SwapTab({ onBack }) {
             className="w-full"
           >
             {swapDisabledByDex
-              ? 'Swap unavailable on this deployment'
+              ? (suggestLowerAmount ? 'Try a lower amount' : 'Swap unavailable right now')
               : isNano
               ? '⚡ Nano Swap'
               : <><Bot size={15}/> Agent Swap {amountIn || '0'} {fromToken} → {toToken}</>}

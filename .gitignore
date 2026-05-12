@@ -3,3 +3,11 @@ node_modules
 sil/
 AGENTS.md
 .env
+.env.railway
+frontend/.env
+*.local.md
+dist/
+cache/
+artifacts/build-info/
+frontend/dist/
+frontend/.vercel/
