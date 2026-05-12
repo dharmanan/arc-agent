@@ -81,10 +81,10 @@ async function generateRegistrationOptions(userId, ownerAddress) {
     attestationType:     'none',
     excludeCredentials:  existingCreds.map(c => ({ id: c.id, type: 'public-key' })),
     authenticatorSelection: {
-      authenticatorAttachment: 'platform',   // Force device-local: Windows Hello PIN, Face ID, Touch ID
-      residentKey:             'required',   // Triggers full platform chooser dialog (PIN vs fingerprint)
-      requireResidentKey:      true,
-      userVerification:        'required',   // User MUST verify (PIN or biometric)
+      authenticatorAttachment: 'platform',   // Force device-local: Face ID, Touch ID, Windows Hello
+      residentKey:             'preferred',  // Prefer discoverable credential; 'required' breaks Safari iOS 15
+      requireResidentKey:      false,        // false = max compatibility across Safari versions
+      userVerification:        'preferred',  // preferred = works on Safari iOS 15 and 16+
     },
     supportedAlgorithmIDs: [-7, -257],    // ES256, RS256
   });
@@ -101,7 +101,7 @@ async function verifyRegistration(userId, credentialResponse, deviceName, reques
     expectedChallenge,
     expectedOrigin:     getAllowedOrigins(requestOrigin),
     expectedRPID:       RP_ID,
-    requireUserVerification: true,
+    requireUserVerification: false,
   });
 
   if (!verification.verified || !verification.registrationInfo) {
