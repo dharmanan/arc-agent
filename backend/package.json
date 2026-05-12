@@ -14,7 +14,7 @@
     "test": "jest --runInBand"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.0",
+    "@anthropic-ai/sdk": "^0.95.2",
     "@circle-fin/adapter-ethers-v6": "^1.7.0",
     "@circle-fin/swap-kit": "^1.2.0",
     "@coral-xyz/anchor": "^0.32.1",
