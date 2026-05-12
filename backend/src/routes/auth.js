@@ -76,7 +76,12 @@ router.post('/passkey/login/start', async (req, res, next) => {
 
     const options = await passkeyService.generateAuthenticationOptions(rows[0].id);
     res.json(options);
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.message === 'No passkey registered for this user') {
+      return res.status(404).json({ error: 'No passkey registered for this wallet. Please register first.' });
+    }
+    next(err);
+  }
 });
 
 const MAX_FAILED_ATTEMPTS = 5;
