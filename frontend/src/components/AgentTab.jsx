@@ -304,7 +304,14 @@ export default function AgentTab() {
               onChange={e => setDevice(e.target.value)}
             />
             {!isPasskeySupported() && (
-              <Alert type="warning">Your browser may not support Passkeys.</Alert>
+              <Alert type="warning">
+                Your browser does not support Passkeys. Use Safari (iOS) or Chrome (Android) — not MetaMask&apos;s built-in browser.
+              </Alert>
+            )}
+            {isPasskeySupported() && /MetaMask/i.test(navigator.userAgent) && (
+              <Alert type="warning">
+                MetaMask&apos;s built-in browser may block Passkeys. Open this page in Safari or Chrome instead.
+              </Alert>
             )}
             {error && <Alert type="error">{error}</Alert>}
             <div className="flex gap-3">
