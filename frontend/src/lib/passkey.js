@@ -61,6 +61,7 @@ export async function registerPasskey(ownerAddress, deviceName = 'My Device') {
     credential = await navigator.credentials.create({ publicKey: decodedOptions });
   } catch (err) {
     if (err.name === 'NotAllowedError') throw new Error('Passkey creation cancelled or timed out');
+    if (err.name === 'InvalidStateError') throw new Error('A passkey is already registered on this device for this account. Please use "Sign In" instead.');
     throw err;
   }
 

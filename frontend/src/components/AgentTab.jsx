@@ -116,7 +116,17 @@ export default function AgentTab() {
     setError('');
     setLoading(true);
     try {
-      const authResult = await registerPasskey(ownerAddress, deviceName);
+      let authResult;
+      try {
+        authResult = await registerPasskey(ownerAddress, deviceName);
+      } catch (regErr) {
+        // Passkey already exists on this device — fall back to authentication
+        if (regErr.message && regErr.message.includes('already registered')) {
+          authResult = await authenticatePasskey(ownerAddress);
+        } else {
+          throw regErr;
+        }
+      }
       setJwt(authResult.token);
       const created = await agentApi.create({ name: name.trim() });
       pendingAgent.current = created.agent || created;
