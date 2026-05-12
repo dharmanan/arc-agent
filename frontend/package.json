@@ -16,7 +16,7 @@
     "@zxing/browser": "^0.2.0",
     "@zxing/library": "^0.22.0",
     "ethers": "^6.16.0",
-    "lucide-react": "^0.383.0",
+    "lucide-react": "^1.14.0",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
