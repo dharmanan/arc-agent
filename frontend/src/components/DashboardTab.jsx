@@ -6,7 +6,7 @@ import { authenticatePasskey } from '../lib/passkey.js';
 import { fetchAgentPortfolio } from '../lib/agentBalances.js';
 import { Card, Badge, Button, AddressBox, Alert, Spinner } from './ui/index.jsx';
 import PaymentModal from './PaymentModal.jsx';
-import { Wallet, Activity, ArrowRight, Zap, LogIn, ExternalLink, RefreshCw, QrCode, Send } from 'lucide-react';
+import { Wallet, Activity, ArrowRight, ArrowUpRight, ArrowDownLeft, Repeat2, Zap, LogIn, ExternalLink, RefreshCw, QrCode, Send } from 'lucide-react';
 import { CHAINS } from '../lib/chains.js';
 
 function formatAddress(address, startChars = 8, endChars = 6) {
@@ -196,7 +196,7 @@ export default function DashboardTab({ onNavigate }) {
     setTxError('');
     try {
       const data = await transactions.list(agent.id);
-      setTxs(Array.isArray(data) ? data.slice(0, 5) : []);
+      setTxs(Array.isArray(data) ? data.slice(0, 20) : []);
     } catch (e) {
       setTxError(e.message || 'Failed to load recent activity');
     } finally {
@@ -438,18 +438,53 @@ export default function DashboardTab({ onNavigate }) {
           <div className="space-y-2">
             {txs.map(tx => {
               const { title, routeLabel, amountLabel, phase, links } = getTxDisplay(tx);
+              const isReceive = tx.type === 'receive';
+              const isSend    = tx.type === 'send' || tx.type === 'nano_payment';
+              const isSwap    = tx.type === 'swap';
+              const isBridge  = tx.type === 'bridge' || tx.type === 'gas_topup';
+
+              const TxIcon = isReceive ? ArrowDownLeft
+                : isSend    ? ArrowUpRight
+                : isSwap    ? Repeat2
+                : Zap;
+
+              const iconColor = isReceive ? 'text-arc-green'
+                : isSend    ? 'text-blue-500'
+                : isSwap    ? 'text-purple-500'
+                : 'text-slate-400';
+
+              const displayTitle = isReceive ? 'Received'
+                : isSend && tx.type === 'nano_payment' ? 'Nano payment'
+                : isSend ? 'Sent'
+                : title;
+
+              const meta = getTxMeta(tx);
+              const counterpart = isReceive
+                ? (tx.from_address || meta.from || null)
+                : (tx.to_address   || meta.toAddress || null);
+
               return (
                 <div key={tx.id} className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 text-sm">
                   <div className="flex items-center gap-3">
-                    <Zap size={14} className="shrink-0 text-arc-green" />
-                    <span className="font-semibold text-slate-800 capitalize">{title}</span>
+                    <TxIcon size={15} className={`shrink-0 ${iconColor}`} />
+                    <span className="font-semibold text-slate-800 capitalize">{displayTitle}</span>
+                    {amountLabel && (
+                      <span className={`font-semibold ${isReceive ? 'text-arc-green' : 'text-slate-700'}`}>
+                        {isReceive ? '+' : isSend ? '-' : ''}{amountLabel}
+                      </span>
+                    )}
                     <Badge variant={tx.status === 'confirmed' ? 'green' : tx.status === 'failed' ? 'red' : 'yellow'} className="ml-auto">
                       {tx.status}
                     </Badge>
                   </div>
-                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 pl-[22px] text-xs text-slate-500">
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 pl-[23px] text-xs text-slate-500">
                     {routeLabel && <span>{routeLabel}</span>}
-                    {amountLabel && <span className="font-medium text-slate-700">{amountLabel}</span>}
+                    {counterpart && (
+                      <span className="font-mono">
+                        {isReceive ? 'from ' : 'to '}
+                        {counterpart.slice(0, 8)}…{counterpart.slice(-5)}
+                      </span>
+                    )}
                     {phase && <span>{phase}</span>}
                     {links.map(link => (
                       <a key={link.key} href={link.url} target="_blank" rel="noopener noreferrer"
