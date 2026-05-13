@@ -44,6 +44,18 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
   const isPaid    = task.tier === 2;
   const isBlocked = !tasksEnabled;
 
+  // On mount: check if there's a recent result (last 3 min) for this task
+  useEffect(() => {
+    if (!agentId) return;
+    tasksApi.results(agentId, 20).then(data => {
+      const cutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+      const found = (data.results || []).find(
+        r => r.task_id === task.id && r.created_at >= cutoff,
+      );
+      if (found) { setResult(found); setRunState('done'); }
+    }).catch(() => {});
+  }, [agentId, task.id]);
+
   function stopPoll() {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
   }

@@ -40,7 +40,7 @@ const AGENTIC_COMMERCE_ABI = [
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function _getAgentForUser(agentId, userId) {
   const { rows: [agent] } = await db.query(
-    `SELECT id, wallet_address, encrypted_private_key FROM agents WHERE id = $1 AND user_id = $2`,
+    `SELECT id, wallet_address, private_key_encrypted FROM agents WHERE id = $1 AND user_id = $2`,
     [agentId, userId],
   );
   return agent || null;
