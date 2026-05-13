@@ -2,8 +2,9 @@
 /**
  * Blockchain Event Indexer
  *
- * Primary:  WebSocket event subscription (push-based)
- * Fallback: HTTP polling every 60s to catch any missed blocks
+ * Polls recent blocks over HTTP and only scans transfers sent to active agent
+ * wallets. This avoids subscribing to the full chain firehose while still
+ * backfilling missed transfers after restarts.
  */
 const { ethers } = require('ethers');
 const db         = require('../db');
@@ -13,32 +14,123 @@ const ERC20_ABI = [
   'event Transfer(address indexed from, address indexed to, uint256 value)',
 ];
 
-const UNISWAP_PAIR_ABI = [
-  'event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)',
-];
+const TRANSFER_IFACE = new ethers.Interface(ERC20_ABI);
+const TRANSFER_TOPIC = TRANSFER_IFACE.getEvent('Transfer').topicHash;
 
-function toWss(url) {
-  if (!url) return null;
-  return url.replace(/^https?:\/\//, 'wss://');
-}
+const POLL_INTERVAL_MS        = 30_000;
+const STARTUP_BACKFILL_BLOCKS = 300;
+const BLOCK_CHUNK_SIZE        = 250;
+const WALLET_CHUNK_SIZE       = 20;
 
 const WATCHED_CONTRACTS = {
   'Arc Testnet': {
     usdc: process.env.USDC_ADDRESS_ARC,
-    rpc:  toWss(process.env.ARC_TESTNET_RPC),
     rpcHttp: process.env.ARC_TESTNET_RPC,
   },
   'Sepolia': {
     usdc: process.env.USDC_ADDRESS_SEPOLIA,
-    rpc:  toWss(process.env.SEPOLIA_RPC),
     rpcHttp: process.env.SEPOLIA_RPC,
   },
 };
 
-const activeProviders = new Map();
+const httpProviders = new Map();
+const lastPolledBlock = new Map();
 
-// ── Core handler (shared between WS events and polling) ───────────────────────
-async function handleTransfer(chain, config, from, to, amountUsdc, txHash, blockNumber) {
+let pollInFlight = false;
+let lastWatcherCount = null;
+
+function getHttpProvider(chain, rpcHttp) {
+  let provider = httpProviders.get(chain);
+  if (!provider) {
+    provider = new ethers.JsonRpcProvider(rpcHttp);
+    httpProviders.set(chain, provider);
+  }
+  return provider;
+}
+
+function chunk(array, size) {
+  const chunks = [];
+  for (let index = 0; index < array.length; index += size) {
+    chunks.push(array.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
+async function loadWatchedAgents() {
+  const { rows } = await db.query(
+    `SELECT id, is_smart_mode, llm_model, LOWER(wallet_address) AS wallet_address
+       FROM agents
+      WHERE wallet_address IS NOT NULL
+        AND status != 'locked'`,
+  );
+
+  const watchedAgents = new Map();
+  for (const row of rows) {
+    const walletAddress = row.wallet_address;
+    if (!watchedAgents.has(walletAddress)) watchedAgents.set(walletAddress, []);
+    watchedAgents.get(walletAddress).push(row);
+  }
+
+  if (lastWatcherCount !== watchedAgents.size) {
+    console.log(`[INDEXER] Watching ${watchedAgents.size} active agent wallet(s)`);
+    lastWatcherCount = watchedAgents.size;
+  }
+
+  return watchedAgents;
+}
+
+async function lookupSenderAgentMeta(fromAddress) {
+  if (!fromAddress) return {};
+
+  const { rows: [sender] } = await db.query(
+    `SELECT id, name
+       FROM agents
+      WHERE LOWER(wallet_address) = LOWER($1)
+      LIMIT 1`,
+    [fromAddress],
+  );
+
+  if (!sender) return {};
+
+  return {
+    senderAgentId: sender.id,
+    senderAgentName: sender.name,
+  };
+}
+
+async function ensureReceiveTransaction(agentId, chain, amountUsdc, from, to, txHash) {
+  const { rows: existing } = await db.query(
+    `SELECT id
+       FROM transactions
+      WHERE agent_id = $1
+        AND type = 'receive'
+        AND tx_hash = $2
+      LIMIT 1`,
+    [agentId, txHash],
+  );
+  if (existing.length > 0) return false;
+
+  const senderMeta = await lookupSenderAgentMeta(from);
+
+  await db.query(
+    `INSERT INTO transactions
+       (agent_id, type, from_chain, to_chain, token, amount_usdc, from_address, to_address, tx_hash, status, meta)
+     VALUES ($1, 'receive', $2, $2, 'USDC', $3, $4, $5, $6, 'confirmed', $7)`,
+    [agentId, chain, amountUsdc, from, to, txHash, JSON.stringify(senderMeta)],
+  );
+
+  return true;
+}
+
+// ── Core handler for matched transfers only ───────────────────────────────────
+async function handleTransfer(chain, config, agents, from, to, amountUsdc, txHash, blockNumber) {
   // Deduplicate by tx_hash — skip if already recorded
   if (txHash) {
     const { rows: existing } = await db.query(
@@ -56,106 +148,172 @@ async function handleTransfer(chain, config, from, to, amountUsdc, txHash, block
      JSON.stringify({ from, to, amountUsdc })],
   );
 
-  const { rows: agents } = await db.query(
-    `SELECT id, is_smart_mode, llm_model FROM agents WHERE LOWER(wallet_address) = LOWER($1) AND status != 'locked'`,
-    [to],
-  );
   for (const agent of agents) {
-    await agentQueue.add('INCOMING_TRANSFER', {
-      eventId: row.id, agentId: agent.id, chain, amountUsdc, from,
-      isSmartMode: agent.is_smart_mode,
-    });
+    await ensureReceiveTransaction(agent.id, chain, amountUsdc, from, to, txHash);
+
+    if (agent.is_smart_mode) {
+      agentQueue.add('INCOMING_TRANSFER', {
+        eventId: row.id, agentId: agent.id, chain, amountUsdc, from,
+        isSmartMode: agent.is_smart_mode,
+        skipTransactionRecord: true,
+      }).catch((err) => {
+        console.error(`[INDEXER] ${chain} queue add error for agent ${agent.id}:`, err.message);
+      });
+    }
+
     console.log(`[INDEXER] ${chain} → agent ${agent.id}: ${amountUsdc} USDC from ${from.slice(0, 10)}…`);
   }
+
+  await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [row.id]);
 }
 
-async function subscribeToChain(chain, config) {
-  if (!config.rpc || !config.usdc) {
-    console.warn(`[INDEXER] ${chain}: missing RPC or USDC address — skipping`);
-    return;
+async function reconcilePendingEvents() {
+  const watchedAgents = await loadWatchedAgents();
+  const { rows } = await db.query(
+    `SELECT id, chain, tx_hash, data
+       FROM chain_events
+      WHERE event_type = 'Transfer'
+        AND processed = FALSE
+      ORDER BY created_at DESC
+      LIMIT 200`,
+  );
+
+  if (rows.length > 0) {
+    console.log(`[INDEXER] Reconciling ${rows.length} pending transfer event(s)`);
   }
 
-  let provider;
-  try {
-    provider = new ethers.WebSocketProvider(config.rpc);
-    activeProviders.set(chain, provider);
-  } catch (err) {
-    console.error(`[INDEXER] ${chain}: WebSocket provider failed (${err.message}), falling back to polling`);
-    return;
-  }
+  let restored = 0;
+  let discarded = 0;
 
-  const usdcContract = new ethers.Contract(config.usdc, ERC20_ABI, provider);
+  for (const row of rows) {
+    const to = String(row.data?.to || '').toLowerCase();
+    const from = row.data?.from;
+    const amountUsdc = Number(row.data?.amountUsdc || 0);
+    const agents = watchedAgents.get(to);
 
-  usdcContract.on('Transfer', async (from, to, value, event) => {
-    const amountUsdc = parseFloat(ethers.formatUnits(value, 6));
-    console.log(`[INDEXER] ${chain} Transfer: ${amountUsdc} USDC → ${to}`);
-    try {
-      await handleTransfer(chain, config, from, to, amountUsdc, event.log.transactionHash, event.log.blockNumber);
-    } catch (err) {
-      console.error('[INDEXER] WS handler error:', err.message);
+    if (!agents?.length || !row.tx_hash || !from || amountUsdc <= 0) {
+      await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [row.id]);
+      discarded += 1;
+      continue;
     }
-  });
 
-  provider.websocket?.on?.('close', () => {
-    console.warn(`[INDEXER] ${chain} WebSocket closed — reconnecting in 5s`);
-    activeProviders.delete(chain);
-    setTimeout(() => subscribeToChain(chain, config), 5000);
-  });
+    for (const agent of agents) {
+      const inserted = await ensureReceiveTransaction(
+        agent.id,
+        row.chain,
+        amountUsdc,
+        from,
+        row.data.to,
+        row.tx_hash,
+      );
+      if (inserted) restored += 1;
+    }
 
-  console.log(`[INDEXER] Subscribed to ${chain} events`);
+    await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [row.id]);
+  }
+
+  if (restored > 0 || discarded > 0) {
+    console.log(`[INDEXER] Reconciled pending events: restored=${restored} discarded=${discarded}`);
+  }
 }
 
-// ── HTTP polling fallback — scans last ~10 blocks every 60s ──────────────────
-const lastPolledBlock = new Map();
+async function getTransferLogs(provider, config, walletAddresses, fromBlock, toBlock) {
+  const logs = [];
+
+  for (const blockRange of chunk(
+    Array.from({ length: Math.ceil((toBlock - fromBlock + 1) / BLOCK_CHUNK_SIZE) }, (_, index) => ({
+      fromBlock: fromBlock + (index * BLOCK_CHUNK_SIZE),
+      toBlock: Math.min(fromBlock + ((index + 1) * BLOCK_CHUNK_SIZE) - 1, toBlock),
+    })),
+    1,
+  )) {
+    const { fromBlock: rangeStart, toBlock: rangeEnd } = blockRange[0];
+
+    for (const walletChunk of chunk(walletAddresses, WALLET_CHUNK_SIZE)) {
+      const topics = walletChunk.map((address) => ethers.zeroPadValue(address, 32));
+      const chunkLogs = await withTimeout(provider.getLogs({
+        address: config.usdc,
+        fromBlock: rangeStart,
+        toBlock: rangeEnd,
+        topics: [TRANSFER_TOPIC, null, topics],
+      }), 12_000);
+      logs.push(...chunkLogs);
+    }
+  }
+
+  return logs;
+}
 
 async function pollChain(chain, config) {
   if (!config.rpcHttp || !config.usdc) return;
+
   try {
-    const httpProvider = new ethers.JsonRpcProvider(config.rpcHttp);
-    const usdcContract = new ethers.Contract(config.usdc, ERC20_ABI, httpProvider);
+    const watchedAgents = await loadWatchedAgents();
+    const walletAddresses = [...watchedAgents.keys()];
+    if (walletAddresses.length === 0) return;
 
-    const latest = await httpProvider.getBlockNumber();
-    const fromBlock = (lastPolledBlock.get(chain) ?? latest - 10) + 1;
-    if (fromBlock > latest) return;
+    const httpProvider = getHttpProvider(chain, config.rpcHttp);
+    const latest = await withTimeout(httpProvider.getBlockNumber(), 8_000);
+    const previousBlock = lastPolledBlock.get(chain);
+    const fromBlock = previousBlock == null
+      ? Math.max(latest - STARTUP_BACKFILL_BLOCKS, 0)
+      : previousBlock + 1;
 
-    const filter = usdcContract.filters.Transfer();
-    const logs = await usdcContract.queryFilter(filter, fromBlock, latest);
+    if (fromBlock > latest) {
+      lastPolledBlock.set(chain, latest);
+      return;
+    }
+
+    const logs = await getTransferLogs(httpProvider, config, walletAddresses, fromBlock, latest);
+    let matchedTransfers = 0;
 
     for (const log of logs) {
-      const [from, to, value] = log.args;
-      const amountUsdc = parseFloat(ethers.formatUnits(value, 6));
-      await handleTransfer(chain, config, from, to, amountUsdc, log.transactionHash, log.blockNumber);
+      const parsed = TRANSFER_IFACE.parseLog(log);
+      const from = parsed.args.from;
+      const to = parsed.args.to;
+      const agents = watchedAgents.get(to.toLowerCase());
+      if (!agents?.length) continue;
+
+      const amountUsdc = parseFloat(ethers.formatUnits(parsed.args.value, 6));
+      await handleTransfer(chain, config, agents, from, to, amountUsdc, log.transactionHash, log.blockNumber);
+      matchedTransfers += 1;
     }
 
     lastPolledBlock.set(chain, latest);
-    if (logs.length > 0) {
-      console.log(`[INDEXER] ${chain} poll blocks ${fromBlock}–${latest}: ${logs.length} transfers`);
+    if (matchedTransfers > 0) {
+      console.log(`[INDEXER] ${chain} poll blocks ${fromBlock}–${latest}: ${matchedTransfers} matched transfer(s)`);
     }
   } catch (err) {
-    console.error(`[INDEXER] ${chain} poll error:`, err.message);
+    console.warn(`[INDEXER] ${chain} poll error:`, err.message);
+  }
+}
+
+async function pollAllChains() {
+  if (pollInFlight) {
+    return;
+  }
+
+  pollInFlight = true;
+  try {
+    for (const [chain, config] of Object.entries(WATCHED_CONTRACTS)) {
+      await pollChain(chain, config);
+    }
+  } finally {
+    pollInFlight = false;
   }
 }
 
 async function startIndexer() {
-  for (const [chain, config] of Object.entries(WATCHED_CONTRACTS)) {
-    await subscribeToChain(chain, config).catch(err =>
-      console.error(`[INDEXER] ${chain} startup failed:`, err.message),
-    );
-  }
-
-  // Polling fallback — every 60s, catches any transfers the WS missed
-  setInterval(async () => {
-    for (const [chain, config] of Object.entries(WATCHED_CONTRACTS)) {
-      await pollChain(chain, config).catch(() => {});
-    }
-  }, 60_000);
-
-  // Initial poll on startup to catch transfers since last restart
-  setTimeout(async () => {
-    for (const [chain, config] of Object.entries(WATCHED_CONTRACTS)) {
-      await pollChain(chain, config).catch(() => {});
-    }
-  }, 5_000);
+  console.log('[INDEXER] Starting HTTP polling indexer');
+  await reconcilePendingEvents().catch(err =>
+    console.error('[INDEXER] reconcile error:', err.message),
+  );
+  await pollAllChains().catch(err =>
+    console.error('[INDEXER] startup error:', err.message),
+  );
+  setInterval(() => {
+    pollAllChains().catch(err => console.error('[INDEXER] poll loop error:', err.message));
+  }, POLL_INTERVAL_MS);
 }
 
 module.exports = { startIndexer };

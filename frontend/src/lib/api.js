@@ -21,6 +21,7 @@ async function request(method, path, body) {
 
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
+    cache: method === 'GET' ? 'no-store' : 'default',
     headers,
     body: body ? JSON.stringify(body) : undefined,
   });

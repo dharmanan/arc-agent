@@ -60,21 +60,66 @@ async function resolveEngine(agent) {
 
 // ── Job processor ─────────────────────────────────────────────────────────────
 queue.process('INCOMING_TRANSFER', 5, async (job) => {
-  const { agentId, chain, amountUsdc, from, isSmartMode } = job.data;
+  const { agentId, chain, amountUsdc, from, isSmartMode, eventId, skipTransactionRecord } = job.data;
   console.log(`[QUEUE] INCOMING_TRANSFER agent=${agentId} amount=${amountUsdc} chain=${chain}`);
 
+  const { rows: [senderAgent] } = await db.query(
+    `SELECT id, name
+       FROM agents
+      WHERE LOWER(wallet_address) = LOWER($1)
+      LIMIT 1`,
+    [from],
+  );
+  const senderMeta = senderAgent
+    ? { senderAgentId: senderAgent.id, senderAgentName: senderAgent.name }
+    : {};
+
   // Mark event as processed
-  if (job.data.eventId) {
-    await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [job.data.eventId]);
+  if (eventId) {
+    await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [eventId]);
+  }
+
+  if (!skipTransactionRecord) {
+    let txHash = null;
+    let toAddress = null;
+
+    if (eventId) {
+      const { rows: [event] } = await db.query(
+        'SELECT tx_hash, data FROM chain_events WHERE id = $1',
+        [eventId],
+      );
+      txHash = event?.tx_hash || null;
+      toAddress = event?.data?.to || null;
+    }
+
+    if (txHash) {
+      const { rows: existing } = await db.query(
+        `SELECT id
+           FROM transactions
+          WHERE agent_id = $1
+            AND type = 'receive'
+            AND tx_hash = $2
+          LIMIT 1`,
+        [agentId, txHash],
+      );
+      if (existing.length === 0) {
+        await db.query(
+          `INSERT INTO transactions (agent_id, type, from_chain, to_chain, token, amount_usdc, from_address, to_address, tx_hash, status, meta)
+           VALUES ($1, 'receive', $2, $2, 'USDC', $3, $4, $5, $6, 'confirmed', $7)`,
+          [agentId, chain, amountUsdc, from, toAddress, txHash, JSON.stringify(senderMeta)],
+        );
+      }
+    } else {
+      await db.query(
+        `INSERT INTO transactions (agent_id, type, from_chain, to_chain, token, amount_usdc, from_address, status, meta)
+         VALUES ($1, 'receive', $2, $2, 'USDC', $3, $4, 'confirmed', $5)`,
+        [agentId, chain, amountUsdc, from, JSON.stringify(senderMeta)],
+      );
+    }
   }
 
   if (!isSmartMode) {
-    // Base mode — just log the event (frontend polls /status)
-    await db.query(
-      `INSERT INTO transactions (agent_id, type, from_chain, to_chain, token, amount_usdc, from_address, status)
-       VALUES ($1, 'receive', $2, $2, 'USDC', $3, $4, 'confirmed')`,
-      [agentId, chain, amountUsdc, from],
-    );
+    // Base mode — transaction is already recorded for the frontend poller
     return { ok: true, action: 'recorded' };
   }
 

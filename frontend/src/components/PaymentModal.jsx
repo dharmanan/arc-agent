@@ -9,6 +9,25 @@ import { Button, Input } from './ui/index.jsx';
 import { CHAINS } from '../lib/chains.js';
 import { X, QrCode, Camera, ClipboardCheck, AlertTriangle, CheckCircle, Loader2, ExternalLink } from 'lucide-react';
 
+function formatUsdcAmount(amount) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) return amount ?? '?';
+  return numeric.toFixed(4).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+}
+
+const RECEIVE_CLOCK_SKEW_MS = 1000;
+
+function parseTxCreatedAt(tx) {
+  const createdAt = Date.parse(tx?.created_at || tx?.createdAt || '');
+  return Number.isNaN(createdAt) ? null : createdAt;
+}
+
+function matchesRequestedAmount(tx, requestedAmount) {
+  const txAmount = Number(tx?.amount_usdc ?? tx?.amountUsdc);
+  if (!Number.isFinite(txAmount) || !Number.isFinite(requestedAmount)) return false;
+  return Math.abs(txAmount - requestedAmount) < 0.000001;
+}
+
 // ── SendResult: shows amount, recipient, polls for confirmed tx hash ───────────
 function SendResult({ result, agentName, onClose }) {
   const [txHash, setTxHash]     = useState(null);
@@ -112,28 +131,65 @@ function ReceiveFlow({ agent, onClose }) {
   const [receivedTx, setReceivedTx] = useState(null);
   const pollRef                     = useRef(null);
   const knownIdsRef                 = useRef(new Set());
+  const listeningSinceRef           = useRef(0);
+  const requestedAmountRef          = useRef(null);
+
+  function isFreshReceive(tx, requestedAmount) {
+    if (tx?.type !== 'receive' || tx?.status !== 'confirmed') return false;
+    if (!matchesRequestedAmount(tx, requestedAmount)) return false;
+    if (knownIdsRef.current.has(tx.id)) return false;
+
+    const createdAt = parseTxCreatedAt(tx);
+    if (createdAt == null) return false;
+
+    return createdAt >= listeningSinceRef.current - RECEIVE_CLOCK_SKEW_MS;
+  }
 
   // Start polling when QR is shown; stop on unmount
   useEffect(() => {
     if (step !== 2) return;
 
+    const requestedAmount = requestedAmountRef.current;
+    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) return;
+
+    listeningSinceRef.current = Date.now();
+    knownIdsRef.current = new Set();
+
     // Snapshot existing tx ids so we only react to NEW ones
     txApi.list(agent.id).then(data => {
-      if (Array.isArray(data)) data.forEach(tx => knownIdsRef.current.add(tx.id));
+      if (!Array.isArray(data)) return;
+
+      const freshReceive = data.find((tx) => isFreshReceive(tx, requestedAmount));
+      if (freshReceive) {
+        setReceivedTx(freshReceive);
+        setStep(3);
+        return;
+      }
+
+      data.forEach((tx) => {
+        const createdAt = parseTxCreatedAt(tx);
+        const isCurrentRequest = matchesRequestedAmount(tx, requestedAmount);
+        const isAfterListening = createdAt != null && createdAt >= listeningSinceRef.current - RECEIVE_CLOCK_SKEW_MS;
+
+        if (!isCurrentRequest || !isAfterListening) {
+          knownIdsRef.current.add(tx.id);
+        }
+      });
     }).catch(() => {});
 
     pollRef.current = setInterval(async () => {
       try {
         const data = await txApi.list(agent.id);
         if (!Array.isArray(data)) return;
-        const newReceive = data.find(
-          tx => tx.type === 'receive' && tx.status === 'confirmed' && !knownIdsRef.current.has(tx.id)
-        );
+        const newReceive = data.find((tx) => isFreshReceive(tx, requestedAmount));
         if (newReceive) {
           clearInterval(pollRef.current);
           setReceivedTx(newReceive);
           setStep(3);
+          return;
         }
+
+        data.forEach(tx => knownIdsRef.current.add(tx.id));
       } catch (_) {}
     }, 5000);
 
@@ -146,6 +202,8 @@ function ReceiveFlow({ agent, onClose }) {
     if (!val || val <= 0) { setError('Enter a valid amount'); return; }
     setLoading(true);
     try {
+      requestedAmountRef.current = val;
+      setReceivedTx(null);
       const payUri = buildPaymentURI(agent.walletAddress, val);
       const dataUrl = await generateQRDataURL(payUri);
       setUri(payUri);
@@ -167,17 +225,18 @@ function ReceiveFlow({ agent, onClose }) {
 
   // ── Step 3: Payment received confirmation
   if (step === 3 && receivedTx) {
-    const rxAmount = receivedTx.amount_usdc ?? receivedTx.amountUsdc ?? '?';
+    const rxAmount = formatUsdcAmount(receivedTx.amount_usdc ?? receivedTx.amountUsdc ?? '?');
     const fromAddr = receivedTx.from_address || '';
+    const senderAgentName = receivedTx.meta?.senderAgentName || '';
     return (
       <div className="p-6 text-center">
         <CheckCircle size={40} className="mx-auto mb-3 text-arc-green" />
         <h2 className="mb-1 text-lg font-bold text-slate-900">Payment Received!</h2>
-        {agent.name && (
-          <p className="mb-1 text-sm font-semibold text-slate-600">{agent.name}</p>
+        {senderAgentName && (
+          <p className="mb-1 text-sm font-semibold text-slate-600">From {senderAgentName}</p>
         )}
         <p className="mb-1 text-2xl font-bold text-arc-green">+{rxAmount} USDC</p>
-        {fromAddr && (
+        {!senderAgentName && fromAddr && (
           <p className="mb-4 font-mono text-xs text-slate-500">
             from {fromAddr.slice(0, 8)}…{fromAddr.slice(-6)}
           </p>
