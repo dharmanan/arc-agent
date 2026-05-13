@@ -25,6 +25,12 @@ function _getPoolContract() {
 
 const DAILY_PAID_TASK_CAP = parseInt(process.env.DAILY_PAID_TASK_CAP || '5', 10);
 
+// Dev-only: wallet addresses that bypass all daily task limits
+const DEV_BYPASS_ADDRS = new Set(
+  (process.env.DEV_BYPASS_AGENT_ADDRESSES || '')
+    .split(',').map(a => a.trim().toLowerCase()).filter(Boolean),
+);
+
 // ── GET /api/tasks/featured ───────────────────────────────────────────────────
 // Returns today's 5 featured tasks, ordered deterministically by UTC date seed.
 // Same 5 tasks for all users on the same UTC day; changes at 00:00 UTC.
@@ -87,14 +93,19 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
     // Verify ownership
     const { rows: [agent] } = await db.query(
       `SELECT id, daily_tasks_enabled, daily_free_task_count, daily_paid_task_count,
-              daily_limit_reset_at
+              daily_limit_reset_at, wallet_address
        FROM agents WHERE id = $1 AND user_id = $2`,
       [agentId, req.user.userId],
     );
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
-    if (!agent.daily_tasks_enabled) return res.status(403).json({ error: 'daily_tasks_disabled' });
 
-    if (task.tier === 2) {
+    const isBypass = DEV_BYPASS_ADDRS.size > 0 &&
+      DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase());
+
+    if (!isBypass && !agent.daily_tasks_enabled)
+      return res.status(403).json({ error: 'daily_tasks_disabled' });
+
+    if (!isBypass && task.tier === 2) {
       // Daily reset check
       if ((new Date() - new Date(agent.daily_limit_reset_at)) >= 86_400_000) {
         await db.query(

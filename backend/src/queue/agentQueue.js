@@ -21,6 +21,12 @@ const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationSe
 const agentWalletService = require('../services/agentWalletService');
 const { ethers }         = require('ethers');
 
+// Dev-only: wallet addresses that bypass all daily task limits (comma-separated env var)
+const DEV_BYPASS_ADDRS = new Set(
+  (process.env.DEV_BYPASS_AGENT_ADDRESSES || '')
+    .split(',').map(a => a.trim().toLowerCase()).filter(Boolean),
+);
+
 // Upstash Redis: connect via URL (rediss://...)
 // Local Docker: connect via host/port
 const redisConnection = process.env.REDIS_URL
@@ -568,9 +574,9 @@ const BUILTIN_TIER2_TASKS = [
   {
     id:          'EXEC_CCTP_BRIDGE',
     title:       'CCTP Bridge',
-    description: 'Bridge USDC cross-chain via Circle CCTP V2',
-    tier:        2,
-    fee_usdc:    PAID_TASK_FEE_USDC,
+    description: 'Agent auto-bridges USDC cross-chain via Circle CCTP V2 (free, no platform fee)',
+    tier:        1,
+    fee_usdc:    0,
   },
   {
     id:          'EXEC_YIELD_MOVE',
@@ -630,11 +636,16 @@ async function ensureTaskCatalogSeeded() {
 // Helper: guard + day reset shared by all DAILY_* jobs
 async function _dailyTaskGuard(agentId) {
   const { rows: [agent] } = await db.query(
-    `SELECT id, daily_tasks_enabled, daily_free_task_count, daily_limit_reset_at
+    `SELECT id, daily_tasks_enabled, daily_free_task_count, daily_limit_reset_at,
+            wallet_address
      FROM agents WHERE id = $1`,
     [agentId],
   );
   if (!agent)                       return { ok: false, reason: 'agent_not_found' };
+  // Dev bypass: skip all limit checks for test addresses
+  if (DEV_BYPASS_ADDRS.size > 0 && DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase())) {
+    return { ok: true, agent };
+  }
   if (!agent.daily_tasks_enabled)   return { ok: false, reason: 'daily_tasks_disabled' };
 
   // Daily reset
@@ -684,6 +695,10 @@ async function _paidTaskGuard(agentId) {
     [agentId],
   );
   if (!agent)                     return { ok: false, reason: 'agent_not_found' };
+  // Dev bypass: skip all limit checks for test addresses
+  if (DEV_BYPASS_ADDRS.size > 0 && DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase())) {
+    return { ok: true, agent };
+  }
   if (!agent.daily_tasks_enabled) return { ok: false, reason: 'daily_tasks_disabled' };
 
   if ((new Date() - new Date(agent.daily_limit_reset_at)) >= 86_400_000) {
@@ -720,6 +735,31 @@ async function _depositPlatformFee() {
   } catch (err) {
     console.warn('[PAID_TASK] fee deposit failed (non-fatal):', err.message);
   }
+}
+
+// Write result only — no cap increment, no fee deposit (used for free execution tasks)
+async function _saveResultOnly(agentId, taskId, payload) {
+  await db.query(
+    `INSERT INTO agent_task_results (agent_id, task_id, payload) VALUES ($1, $2, $3::jsonb)`,
+    [agentId, taskId, JSON.stringify(payload)],
+  );
+  recordReputationEvent(agentId, EVENT_TYPES.DAILY_TASK).catch(() => {});
+}
+
+// Guard for free execution tasks (no daily cap check, only tasks_enabled flag)
+async function _freeExecGuard(agentId) {
+  const { rows: [agent] } = await db.query(
+    `SELECT id, daily_tasks_enabled, wallet_address, private_key_encrypted,
+            daily_limit_usdc, max_trade_usdc, slippage_percent
+     FROM agents WHERE id = $1`,
+    [agentId],
+  );
+  if (!agent) return { ok: false, reason: 'agent_not_found' };
+  if (DEV_BYPASS_ADDRS.size > 0 && DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase())) {
+    return { ok: true, agent };
+  }
+  if (!agent.daily_tasks_enabled) return { ok: false, reason: 'daily_tasks_disabled' };
+  return { ok: true, agent };
 }
 
 // Write result + increment daily_paid_task_count + fire-and-forget fee deposit
@@ -1036,9 +1076,10 @@ queue.process('EXEC_CURVE_SWAP', 2, async (job) => {
 });
 
 // ── EXEC_CCTP_BRIDGE ──────────────────────────────────────────────────────────
+// Free (Tier-1) — no platform fee charged.
 queue.process('EXEC_CCTP_BRIDGE', 1, async (job) => {
   const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
+  const guard = await _freeExecGuard(agentId);
   if (!guard.ok) return guard;
   const { agent } = guard;
 
@@ -1048,7 +1089,7 @@ queue.process('EXEC_CCTP_BRIDGE', 1, async (job) => {
 
   if (DRY_RUN) {
     const payload = { dryRun: true, fromChain, toChain, amountUsdc, executedAt: new Date().toISOString() };
-    await _savePaidTaskResult(agentId, 'EXEC_CCTP_BRIDGE', payload);
+    await _saveResultOnly(agentId, 'EXEC_CCTP_BRIDGE', payload);
     return { ok: true, payload };
   }
 
@@ -1061,7 +1102,7 @@ queue.process('EXEC_CCTP_BRIDGE', 1, async (job) => {
   });
 
   const payload = { ...result, fromChain, toChain, amountUsdc, executedAt: new Date().toISOString() };
-  await _savePaidTaskResult(agentId, 'EXEC_CCTP_BRIDGE', payload);
+  await _saveResultOnly(agentId, 'EXEC_CCTP_BRIDGE', payload);
   return { ok: true, payload };
 });
 

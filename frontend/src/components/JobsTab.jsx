@@ -7,16 +7,16 @@ import {
 import { Briefcase, Plus, CheckCircle, XCircle, Package, RefreshCw, ChevronDown, ChevronUp } from 'lucide-react';
 
 const STATUS_COLORS = {
-  open:       'bg-blue-500/20 text-blue-400 border-blue-500/30',
-  funded:     'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-  delivered:  'bg-purple-500/20 text-purple-400 border-purple-500/30',
-  completed:  'bg-green-500/20 text-green-400 border-green-500/30',
-  cancelled:  'bg-red-500/20 text-red-400 border-red-500/30',
+  open:       'bg-blue-50 text-blue-700 border-blue-200',
+  funded:     'bg-amber-50 text-amber-700 border-amber-200',
+  delivered:  'bg-purple-50 text-purple-700 border-purple-200',
+  completed:  'bg-green-50 text-green-700 border-green-200',
+  cancelled:  'bg-red-50 text-red-700 border-red-200',
 };
 
 function StatusBadge({ status }) {
   return (
-    <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${STATUS_COLORS[status] || 'bg-gray-500/20 text-gray-400 border-gray-500/30'}`}>
+    <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${STATUS_COLORS[status] || 'bg-slate-100 text-slate-500 border-slate-200'}`}>
       {status}
     </span>
   );
@@ -58,26 +58,26 @@ function JobRow({ job, agentId, onRefresh }) {
   }
 
   return (
-    <div className="border border-white/10 rounded-lg overflow-hidden">
+    <div className="border border-slate-200 rounded-xl overflow-hidden">
       {/* Header row */}
       <button
         onClick={() => setExpanded(v => !v)}
-        className="w-full flex items-center gap-3 p-3 text-left hover:bg-white/5 transition-colors"
+        className="w-full flex items-center gap-3 p-3 text-left hover:bg-slate-50 transition-colors"
       >
-        <Briefcase size={14} className="text-arc-accent shrink-0" />
-        <p className="flex-1 text-sm text-gray-200 truncate">{job.description}</p>
+        <Briefcase size={14} className="text-[#66D121] shrink-0" />
+        <p className="flex-1 text-sm text-slate-800 truncate">{job.description}</p>
         <StatusBadge status={job.status} />
-        <span className="text-xs text-gray-500">{job.amount_usdc} USDC</span>
-        {expanded ? <ChevronUp size={14} className="text-gray-500" /> : <ChevronDown size={14} className="text-gray-500" />}
+        <span className="text-xs text-slate-500">{job.amount_usdc} USDC</span>
+        {expanded ? <ChevronUp size={14} className="text-slate-400" /> : <ChevronDown size={14} className="text-slate-400" />}
       </button>
 
       {/* Expanded detail */}
       {expanded && (
-        <div className="px-4 pb-4 pt-1 border-t border-white/10 space-y-2">
+        <div className="px-4 pb-4 pt-1 border-t border-slate-100 space-y-2">
           {err && <Alert type="error">{err}</Alert>}
 
-          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400">
-            <span className="text-gray-500">Provider</span>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-600">
+            <span className="text-slate-500">Provider</span>
             <span className="font-mono truncate">{job.provider_address || '—'}</span>
             <span className="text-gray-500">On-chain ID</span>
             <span className="font-mono">{job.job_id_onchain || 'offline'}</span>
@@ -175,7 +175,7 @@ export default function JobsTab() {
   if (!agent) {
     return (
       <Card>
-        <p className="text-sm text-gray-400 text-center py-6">Connect your agent first.</p>
+        <p className="text-sm text-slate-500 text-center py-6">Connect your agent first.</p>
       </Card>
     );
   }
@@ -190,7 +190,7 @@ export default function JobsTab() {
             <SectionHeader className="mb-0">Agent Jobs</SectionHeader>
           </div>
           <div className="flex items-center gap-2">
-            <span className={`text-xs px-2 py-0.5 rounded-full border ${onchainEnabled ? 'bg-green-500/20 text-green-400 border-green-500/30' : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'}`}>
+            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${onchainEnabled ? 'bg-green-50 text-green-700 border-green-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
               {onchainEnabled ? 'On-chain' : 'Offline mode'}
             </span>
             <Button size="sm" variant="ghost" onClick={loadJobs} disabled={loading}>
@@ -202,7 +202,7 @@ export default function JobsTab() {
           </div>
         </div>
         {!onchainEnabled && (
-          <p className="text-xs text-yellow-400/80 mt-2">
+          <p className="text-xs text-amber-700/80 mt-2">
             AGENTIC_COMMERCE_ADDRESS not set — jobs are stored locally only until the contract is deployed.
           </p>
         )}
@@ -233,9 +233,9 @@ export default function JobsTab() {
               required
             />
             <div>
-              <label className="block text-xs text-gray-400 mb-1">Description</label>
+              <label className="block text-xs text-slate-500 mb-1">Description</label>
               <textarea
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-arc-accent resize-none"
+                className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:border-[#66D121] resize-none"
                 rows={3}
                 maxLength={500}
                 placeholder="Describe the task or deliverable…"
@@ -264,9 +264,9 @@ export default function JobsTab() {
       ) : jobList.length === 0 ? (
         <Card>
           <div className="flex flex-col items-center gap-3 py-8 text-center">
-            <Briefcase size={32} className="text-gray-600" />
-            <p className="text-sm text-gray-400">No jobs yet.</p>
-            <p className="text-xs text-gray-500">Create a job above to get started.</p>
+            <Briefcase size={32} className="text-slate-300" />
+            <p className="text-sm text-slate-500">No jobs yet.</p>
+            <p className="text-xs text-slate-400">Arc Jobs is a peer-to-peer task marketplace. Post a job, set a USDC bounty, and let agents compete to deliver.</p>
           </div>
         </Card>
       ) : (
