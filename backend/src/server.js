@@ -1,6 +1,8 @@
 'use strict';
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
 
+const fs           = require('fs');
+const path         = require('path');
 const express      = require('express');
 const helmet       = require('helmet');
 const cors         = require('cors');
@@ -131,7 +133,24 @@ app.use((err, _req, res, _next) => {
 });
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
+async function runMigrations() {
+  const sql = fs.readFileSync(path.join(__dirname, 'db/schema.sql'), 'utf8');
+  const client = await db.getClient();
+  try {
+    await client.query(sql);
+    console.log('[DB] Schema migrations applied');
+  } catch (err) {
+    console.error('[DB] Migration error:', err.message);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function bootstrap() {
+  // Run schema migrations (all statements are idempotent — IF NOT EXISTS)
+  await runMigrations();
+
   // Verify DB connectivity
   await db.query('SELECT 1');
   console.log('[DB] PostgreSQL connected');

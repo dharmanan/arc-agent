@@ -10,7 +10,7 @@ import SwapTab from './components/SwapTab.jsx';
 import SecurityTab from './components/SecurityTab.jsx';
 import JobsTab from './components/JobsTab.jsx';
 import TasksTab from './components/TasksTab.jsx';
-import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Send, Briefcase, Zap, ChevronDown } from 'lucide-react';
+import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Briefcase, Zap, ChevronDown } from 'lucide-react';
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
@@ -19,7 +19,6 @@ const TABS = [
   { id: 'agent',     label: 'Agent',     Icon: Bot             },
   { id: 'jobs',      label: 'Jobs',      Icon: Briefcase       },
   { id: 'tasks',     label: 'Tasks',     Icon: Zap             },
-  { id: 'security',  label: 'Send',      Icon: Send            },
 ];
 
 function NetworkSwitcher() {
