@@ -33,6 +33,13 @@ const GROQ_MODELS = new Set([
   'llama-3.1-8b-instant',
 ]);
 
+function getProviderName(model) {
+  if (model.startsWith('claude')) return 'Anthropic';
+  if (GROQ_MODELS.has(model)) return 'Groq';
+  if (model.startsWith('gemini')) return 'Google';
+  return 'OpenAI';
+}
+
 // ── Client factory ────────────────────────────────────────────────────────────
 function buildClient(model, apiKey) {
   if (model.startsWith('claude')) {
@@ -163,9 +170,67 @@ async function resolveApiKey(agent) {
   return decrypt(agent.llm_api_key_encrypted);
 }
 
+async function testConnection({ model, apiKey, agentId = null }) {
+  if (!ALLOWED_MODELS.has(model)) {
+    throw new Error(`Model "${model}" is not allowed on testnet.`);
+  }
+  if (!apiKey) {
+    throw new Error('No API key available for test');
+  }
+
+  const provider = getProviderName(model);
+  const challenge = crypto.randomBytes(3).toString('hex').toUpperCase();
+  const promptText = `Reply with exactly CONNECTED:${challenge}`;
+  const client = buildClient(model, apiKey);
+  let responseText = '';
+  const startedAt = Date.now();
+
+  if (model.startsWith('claude')) {
+    const msg = await client.messages.create({
+      model,
+      max_tokens: 16,
+      system: promptText,
+      messages: [{ role: 'user', content: promptText }],
+    });
+    responseText = msg.content?.[0]?.text || '';
+  } else {
+    const resp = await client.chat.completions.create({
+      model,
+      max_tokens: 16,
+      messages: [
+        { role: 'system', content: promptText },
+        { role: 'user', content: promptText },
+      ],
+    });
+    responseText = resp.choices?.[0]?.message?.content || '';
+  }
+
+  const latencyMs = Date.now() - startedAt;
+  const verified = new RegExp(`CONNECTED[:\\s-]*${challenge}`, 'i').test(responseText.trim());
+  if (!verified) {
+    throw new Error(`Provider responded, but verification challenge ${challenge} was not echoed back.`);
+  }
+
+  await auditLog(agentId, model, `test_connection:${challenge}`, responseText.trim(), latencyMs, false);
+  console.info(`[LLM TEST] agent=${agentId || 'none'} provider=${provider} model=${model} latencyMs=${latencyMs} challenge=${challenge} verified=true`);
+
+  return {
+    ok: true,
+    model,
+    provider,
+    responseText: responseText.trim(),
+    challenge,
+    latencyMs,
+    verifiedAt: new Date().toISOString(),
+    verifiedLive: true,
+  };
+}
+
 module.exports = {
   analyzeMarket,
   analyzeTransaction,
   getArbitrageDecision,
   resolveApiKey,
+  testConnection,
+  getProviderName,
 };

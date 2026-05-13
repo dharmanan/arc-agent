@@ -55,6 +55,7 @@ export const agents = {
   create:            (data)      => post('/agents', data),
   get:               (id)        => get(`/agents/${id}`),
   update:            (id, data)  => put(`/agents/${id}`, data),
+  testLlm:           (id, data)  => post(`/agents/${id}/test-llm`, data),
   updatePermissions: (id, perms) => put(`/agents/${id}/permissions`, perms),
   status:            (id)        => get(`/agents/${id}/status`),
   delete:            (id)        => del(`/agents/${id}`),
@@ -98,9 +99,11 @@ export const bridge = {
 
 // ── Tasks ─────────────────────────────────────────────────────────────────────
 export const tasks = {
-  featured:    ()                => get('/tasks/featured'),
-  runTask:     (agentId, taskId) => post(`/tasks/agents/${agentId}/tasks/run`, { taskId }),
-  results:     (agentId, limit)  => get(`/tasks/agents/${agentId}/tasks/results${limit ? `?limit=${limit}` : ''}`),
+  featured:    ()                        => get('/tasks/featured'),
+  catalog:     ()                        => get('/tasks/catalog'),
+  poolBalance: ()                        => get('/tasks/pool-balance'),
+  runTask:     (agentId, taskId, params) => post(`/tasks/agents/${agentId}/tasks/run`, { taskId, params }),
+  results:     (agentId, limit)          => get(`/tasks/agents/${agentId}/tasks/results${limit ? `?limit=${limit}` : ''}`),
 };
 
 // ── Jobs (ERC-8183 AgenticCommerce) ───────────────────────────────────────────

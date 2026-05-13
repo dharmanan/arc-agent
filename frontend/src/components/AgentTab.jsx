@@ -1,13 +1,92 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAccount } from 'wagmi';
 import { useAgent } from '../providers/AgentProvider.jsx';
 import { agents as agentApi, tasks as tasksApi } from '../lib/api.js';
 import { AGENT_PERMISSIONS } from '../lib/chains.js';
+import { fetchUsdcBalance } from '../lib/agentBalances.js';
 import { registerPasskey, authenticatePasskey, isPasskeySupported } from '../lib/passkey.js';
 import {
   Card, Button, Input, Badge, Alert, AddressBox, Spinner, SectionHeader, Select
 } from './ui/index.jsx';
-import { Bot, Plus, Trash2, Key, AlertTriangle, LogOut, Brain, Shield, Zap, CheckCircle, XCircle, RefreshCw, PlayCircle, Clock } from 'lucide-react';
+import { Bot, Plus, Trash2, Key, AlertTriangle, LogOut, Brain, Shield, Zap, CheckCircle, XCircle, RefreshCw, PlayCircle, Clock, FlaskConical } from 'lucide-react';
+
+function getProviderLabel(model) {
+  if (!model) return 'Unknown';
+  if (model.startsWith('claude')) return 'Anthropic';
+  if (model.startsWith('gemini')) return 'Google';
+  if (model.startsWith('gpt-')) return 'OpenAI';
+  if (model.startsWith('llama-')) return 'Groq';
+  return 'Unknown';
+}
+
+function formatTaskRunTime(iso) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString();
+}
+
+function summarizeTaskResult(result) {
+  if (!result?.payload || typeof result.payload !== 'object') return null;
+
+  const payload = result.payload;
+  if (typeof payload.summary === 'string' && payload.summary.trim()) {
+    return payload.summary.trim();
+  }
+
+  switch (result.task_id) {
+    case 'DAILY_PRICE_REPORT': {
+      const eurcRate = Number(payload.EURC_USDC?.rate);
+      const brlaRate = Number(payload.BRLA_USDC?.rate);
+      const pairs = [];
+      if (Number.isFinite(eurcRate)) pairs.push(`EURC/USDC ${eurcRate.toFixed(4)}`);
+      if (Number.isFinite(brlaRate)) pairs.push(`BRLA/USDC ${brlaRate.toFixed(4)}`);
+      return pairs.length ? `FX snapshot recorded: ${pairs.join(' · ')}` : 'FX snapshot recorded for stablecoin pairs.';
+    }
+
+    case 'DAILY_POOL_HEALTH': {
+      const spreadPct = Number(payload.spread) * 100;
+      const spreadLabel = Number.isFinite(spreadPct) ? `${spreadPct.toFixed(2)}% spread` : 'spread unavailable';
+      const healthLabel = payload.health || 'unknown';
+      return `Pool health: ${healthLabel} (${spreadLabel}).`;
+    }
+
+    case 'DAILY_YIELD_RANK': {
+      const topEntries = Array.isArray(payload.top3)
+        ? payload.top3
+            .map(entry => entry?.project || entry?.protocol || entry?.pool || entry?.symbol)
+            .filter(Boolean)
+            .slice(0, 3)
+        : [];
+      return topEntries.length
+        ? `Top yield set: ${topEntries.join(', ')}.`
+        : 'Yield ranking completed and saved.';
+    }
+
+    case 'DAILY_ARB_SCAN': {
+      const opportunity = payload.signal?.opportunity;
+      if (opportunity?.found) {
+        const profit = Number(opportunity.expectedProfitUsdc);
+        const confidence = opportunity.confidence || 'UNKNOWN';
+        return Number.isFinite(profit)
+          ? `Arbitrage signal found: ${confidence} confidence, est. ${profit.toFixed(2)} USDC profit.`
+          : `Arbitrage signal found: ${confidence} confidence.`;
+      }
+      return 'No profitable arbitrage opportunity found in the latest scan.';
+    }
+
+    case 'DAILY_WALLET_DIGEST': {
+      const tasksToday = Number(payload.tasksToday);
+      const autoTxCount = Number(payload.dailyAutoTxCount);
+      const safeTasks = Number.isFinite(tasksToday) ? tasksToday : 0;
+      const safeAutoTx = Number.isFinite(autoTxCount) ? autoTxCount : 0;
+      return `Wallet digest saved: ${safeTasks} task runs and ${safeAutoTx} auto tx in the last 24h.`;
+    }
+
+    default:
+      return 'Task completed and the latest result has been recorded.';
+  }
+}
 
 export default function AgentTab() {
   const { address: ownerAddress } = useAccount();
@@ -33,6 +112,8 @@ export default function AgentTab() {
   const [llmApiKey, setLlmApiKey] = useState('');
   const [llmModel, setLlmModel]   = useState('llama-3.3-70b-versatile');
   const [smartMode, setSmartMode] = useState(false);
+  const [testingLlm, setTestingLlm] = useState(false);
+  const [llmTestMsg, setLlmTestMsg] = useState('');
   const [features, setFeatures]   = useState({
     dailyTasksEnabled:     false,
     marketAnalysisEnabled: false,
@@ -48,6 +129,9 @@ export default function AgentTab() {
   const [taskRunning, setTaskRunning]       = useState(null);  // taskId currently running
   const [taskMsg, setTaskMsg]               = useState('');
   const [ranToday, setRanToday]             = useState(new Set()); // taskIds run today
+  const [taskResultsById, setTaskResultsById] = useState({});
+
+  const [agentUsdc, setAgentUsdc] = useState(null);
 
   const pendingAgent = useRef(null);
 
@@ -66,19 +150,54 @@ export default function AgentTab() {
     tasksApi.featured().then(data => setFeaturedTasks(data.tasks || [])).catch(() => {});
   }, []);
 
-  // Track which tasks the agent already ran today
+  // Fetch agent USDC balance for low-balance warning
   useEffect(() => {
-    if (!agent?.id) return;
-    tasksApi.results(agent.id, 50).then(data => {
+    if (!agent?.walletAddress) { setAgentUsdc(null); return; }
+    fetchUsdcBalance(agent.walletAddress, 5042002)
+      .then(v => setAgentUsdc(v))
+      .catch(() => setAgentUsdc(null));
+  }, [agent?.walletAddress]);
+
+  const loadTaskResults = useCallback(async () => {
+    if (!agent?.id) {
+      setRanToday(new Set());
+      setTaskResultsById({});
+      return;
+    }
+
+    try {
+      const data = await tasksApi.results(agent.id, 50);
+      const results = Array.isArray(data.results) ? data.results : [];
       const todayUtc = new Date().toISOString().slice(0, 10);
       const done = new Set(
-        (data.results || [])
-          .filter(r => r.created_at.startsWith(todayUtc))
+        results
+          .filter(r => r.created_at?.startsWith(todayUtc))
           .map(r => r.task_id),
       );
+      const latestByTask = {};
+      for (const result of results) {
+        if (!latestByTask[result.task_id]) {
+          latestByTask[result.task_id] = result;
+        }
+      }
       setRanToday(done);
-    }).catch(() => {});
+      setTaskResultsById(latestByTask);
+    } catch {
+      // Ignore transient polling failures here; the section already surfaces run errors.
+    }
   }, [agent?.id]);
+
+  useEffect(() => {
+    loadTaskResults();
+  }, [loadTaskResults]);
+
+  useEffect(() => {
+    if (!agent?.id) return undefined;
+    const intervalId = setInterval(() => {
+      loadTaskResults();
+    }, 15_000);
+    return () => clearInterval(intervalId);
+  }, [agent?.id, loadTaskResults]);
 
   if (!ownerAddress) {
     return (
@@ -211,6 +330,29 @@ export default function AgentTab() {
     }
   }
 
+  async function handleTestLlm() {
+    if (!agent?.id) return;
+    setTestingLlm(true);
+    setLlmTestMsg('');
+    try {
+      const result = await agentApi.testLlm(agent.id, {
+        llmModel,
+        ...(llmApiKey.trim() ? { llmApiKey: llmApiKey.trim() } : {}),
+      });
+
+      const sourceLabel = result.usingStoredKey ? 'stored key' : 'typed key (not saved yet)';
+      setLlmTestMsg(
+        `Live ${result.provider} check passed using ${sourceLabel}. ` +
+        `Model: ${result.model}. Challenge: ${result.challenge}. ` +
+        `Latency: ${result.latencyMs} ms. Response: ${result.responseText || 'CONNECTED'}`
+      );
+    } catch (e) {
+      setLlmTestMsg(`Error: ${e.message}`);
+    } finally {
+      setTestingLlm(false);
+    }
+  }
+
   async function handleSavePerms() {
     if (!agent?.id) return;
     setSavingPerms(true);
@@ -338,6 +480,9 @@ export default function AgentTab() {
     );
   }
 
+  const dailyTasksSaved = agent?.features?.dailyTasksEnabled ?? false;
+  const dailyTasksDirty = features.dailyTasksEnabled !== dailyTasksSaved;
+
   return (
     <div className="space-y-6">
       <SectionHeader title="Agent Settings" subtitle={'Managing: ' + (agent?.name || '')} />
@@ -363,6 +508,21 @@ export default function AgentTab() {
         <p className="mt-2 text-xs text-slate-400">
           Send ARC or ETH to this address to fund your agent operations.
         </p>
+
+        {agentUsdc !== null && parseFloat(agentUsdc) < 0.01 && (
+          <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2">
+            <AlertTriangle size={14} className="shrink-0 mt-0.5 text-amber-600" />
+            <div>
+              <p className="text-sm font-semibold text-amber-800">Agent wallet has no USDC</p>
+              <p className="text-xs text-amber-700 mt-0.5">
+                Send USDC to your agent wallet to enable paid tasks and autonomous operations.{' '}
+                <a href="https://faucet.circle.com" target="_blank" rel="noopener noreferrer" className="underline font-medium">
+                  Get testnet USDC →
+                </a>
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* ERC-8004 Identity status */}
         <div className="mt-4">
@@ -498,57 +658,89 @@ export default function AgentTab() {
         </p>
       </Card>
 
-      {/* Today's Featured Tasks */}
+      {/* Free Daily Tasks */}
       {featuredTasks.length > 0 && (
       <Card>
-        <div className="mb-4 flex items-center gap-2">
+        <div className="mb-4 flex flex-wrap items-center gap-2">
           <PlayCircle size={16} className="text-arc-green" />
-          <h3 className="font-bold text-slate-900">Today's Featured Tasks</h3>
-          <span className="ml-auto flex items-center gap-1 text-xs text-slate-400">
+          <h3 className="font-bold text-slate-900">Free Daily Tasks</h3>
+          <Badge variant="blue">No LLM Required</Badge>
+          <span className="flex items-center gap-1 text-xs text-slate-400">
             <Clock size={12} /> Rotates at midnight UTC
           </span>
+          <label className="ml-auto flex cursor-pointer items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5">
+            <span className="text-xs font-medium text-slate-500">{features.dailyTasksEnabled ? 'Enabled' : 'Disabled'}</span>
+            <div
+              onClick={() => setFeatures(f => ({ ...f, dailyTasksEnabled: !f.dailyTasksEnabled }))}
+              className={`relative h-6 w-11 rounded-full transition-colors ${features.dailyTasksEnabled ? 'bg-arc-green' : 'bg-slate-200'}`}
+            >
+              <div className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${features.dailyTasksEnabled ? 'translate-x-5' : ''}`} />
+            </div>
+          </label>
         </div>
-        {!features.dailyTasksEnabled && (
+        <p className="mb-4 text-xs text-slate-500">
+          These are deterministic agent tasks backed by static code and oracle/on-chain reads. When a task completes, its latest result appears directly under the task card.
+        </p>
+        {dailyTasksDirty && (
+          <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+            Click <strong>Save Settings</strong> below to {features.dailyTasksEnabled ? 'enable' : 'disable'} Free Daily Tasks for this agent.
+          </div>
+        )}
+        {!dailyTasksSaved && !dailyTasksDirty && (
           <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-            Enable <strong>Daily Tasks</strong> in Autonomous Features below to run these.
+            Enable <strong>Free Daily Tasks</strong> here, then click <strong>Save Settings</strong> below to run these.
           </div>
         )}
         <div className="space-y-2">
           {featuredTasks.map(task => {
             const alreadyRan = ranToday.has(task.id);
             const isRunning  = taskRunning === task.id;
-            const disabled   = !features.dailyTasksEnabled || alreadyRan || isRunning || !agent?.id;
+            const latestResult = taskResultsById[task.id];
+            const latestSummary = summarizeTaskResult(latestResult);
+            const latestRunTime = formatTaskRunTime(latestResult?.created_at);
+            const disabled   = !dailyTasksSaved || alreadyRan || isRunning || !agent?.id;
             return (
-              <div key={task.id} className="flex items-center justify-between rounded-xl border border-slate-100 p-3">
-                <div className="min-w-0 mr-3">
-                  <p className="text-sm font-semibold text-slate-800 truncate">{task.title}</p>
-                  <p className="text-xs text-slate-500 truncate">{task.description}</p>
+              <div key={task.id} className="rounded-xl border border-slate-100 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-slate-800">{task.title}</p>
+                    <p className="text-xs text-slate-500">{task.description}</p>
+                  </div>
+                  <button
+                    disabled={disabled}
+                    onClick={async () => {
+                      setTaskRunning(task.id);
+                      setTaskMsg('');
+                      try {
+                        await tasksApi.runTask(agent.id, task.id);
+                        setRanToday(s => new Set([...s, task.id]));
+                        setTaskMsg(`"${task.title}" queued successfully.`);
+                      } catch (e) {
+                        setTaskMsg(e.message || 'Failed to queue task.');
+                      } finally {
+                        setTaskRunning(null);
+                      }
+                    }}
+                    className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-semibold transition
+                      ${alreadyRan
+                        ? 'bg-slate-100 text-slate-400 cursor-default'
+                        : disabled
+                          ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                          : 'bg-arc-green text-white hover:opacity-90'
+                      }`}
+                  >
+                    {isRunning ? <Spinner size={12} /> : alreadyRan ? 'Done' : 'Run'}
+                  </button>
                 </div>
-                <button
-                  disabled={disabled}
-                  onClick={async () => {
-                    setTaskRunning(task.id);
-                    setTaskMsg('');
-                    try {
-                      await tasksApi.runTask(agent.id, task.id);
-                      setRanToday(s => new Set([...s, task.id]));
-                      setTaskMsg(`"${task.title}" queued successfully.`);
-                    } catch (e) {
-                      setTaskMsg(e.message || 'Failed to queue task.');
-                    } finally {
-                      setTaskRunning(null);
-                    }
-                  }}
-                  className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-semibold transition
-                    ${alreadyRan
-                      ? 'bg-slate-100 text-slate-400 cursor-default'
-                      : disabled
-                        ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
-                        : 'bg-arc-green text-white hover:opacity-90'
-                    }`}
-                >
-                  {isRunning ? <Spinner size={12} /> : alreadyRan ? 'Done' : 'Run'}
-                </button>
+                {latestSummary && (
+                  <div className="mt-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Latest Result</p>
+                    <p className="mt-1 text-xs text-slate-700">{latestSummary}</p>
+                    {latestRunTime && (
+                      <p className="mt-1 text-[11px] text-slate-400">Updated {latestRunTime}</p>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -569,11 +761,10 @@ export default function AgentTab() {
         </div>
         <p className="text-xs text-slate-500 mb-4">
           All features are <strong>off by default</strong>. Enable only what you want your agent to do autonomously.
-          Daily limits apply per feature — see the plan docs for Tier 1 / Tier 2 caps.
+          Free Daily Tasks are configured in the card above. This section is for background automation loops and data feeds.
         </p>
         <div className="space-y-3">
           {[
-            { key: 'dailyTasksEnabled',     label: 'Daily Tasks (Tier 1)',      desc: 'Agent runs up to 5 free tasks per day (oracle checks, analysis pings).' },
             { key: 'marketAnalysisEnabled', label: 'Market Analysis',           desc: 'Periodic price & opportunity scans via oracle feeds.' },
             { key: 'oracleEnabled',         label: 'Oracle Data Feed',          desc: 'Pull live forex, DeFi TVL, and on-chain price data.' },
             { key: 'defiLoopEnabled',       label: 'DeFi Loop Execution',       desc: 'Automated borrow-supply loops within daily limits.' },
@@ -619,8 +810,12 @@ export default function AgentTab() {
 
         {!smartMode ? (
           <div className="rounded-xl border border-slate-100 bg-slate-50 p-4 text-sm text-slate-600">
-            <p className="font-medium text-slate-800 mb-1">Basic Mode (default)</p>
+            <p className="font-medium text-slate-800 mb-1 flex items-center gap-2">
+              Basic Mode (default)
+              <Badge variant="green" className="text-xs">Rule engine active</Badge>
+            </p>
             <p>Agent runs with built-in rules: respects daily limit, auto-approves trades under the threshold, executes bridge/swap when you trigger them manually.</p>
+            <p className="mt-2 text-xs text-slate-500">No LLM key needed for Free Daily Tasks — the rule engine handles everything automatically.</p>
           </div>
         ) : (
           <div className="space-y-4">
@@ -645,10 +840,24 @@ export default function AgentTab() {
             <Input
               label={agent?.hasLlmKey ? 'LLM API Key (leave blank to keep current)' : 'LLM API Key'}
               type="password"
+              showPasswordToggle
               placeholder={agent?.hasLlmKey ? '••••••••••••••••••••••' : 'sk-ant-... / AIzaSy... / sk-... / gsk_...'}
               value={llmApiKey}
               onChange={e => setLlmApiKey(e.target.value)}
             />
+            <div className="rounded-xl border border-slate-100 bg-slate-50 p-3 text-xs text-slate-600 space-y-1">
+              <p>
+                <span className="font-semibold text-slate-800">Selected model:</span> {llmModel} ({getProviderLabel(llmModel)})
+              </p>
+              <p>
+                <span className="font-semibold text-slate-800">Current key behavior:</span>{' '}
+                {llmApiKey.trim()
+                  ? 'The typed key above will be tested now and will replace the stored key only if you click Save Settings.'
+                  : agent?.hasLlmKey
+                    ? 'No new key entered. Save Settings will keep the currently stored key.'
+                    : 'No key is stored yet. Smart Mode will fall back to Rule Engine until you save a valid key.'}
+              </p>
+            </div>
             {agent?.hasLlmKey && (
               <p className="text-xs text-arc-green">✓ API key is stored (encrypted at rest with AES-256-GCM)</p>
             )}
@@ -690,6 +899,11 @@ export default function AgentTab() {
         )}
 
         <div className="mt-4 flex items-center gap-4">
+          {smartMode && (
+            <Button variant="outline" onClick={handleTestLlm} loading={testingLlm}>
+              <FlaskConical size={14} /> Test API
+            </Button>
+          )}
           <Button onClick={handleSaveSettings} loading={savingSettings}>Save Settings</Button>
           {settingsMsg && (
             <span className={'text-sm font-medium ' + (settingsMsg.startsWith('Error') ? 'text-red-500' : 'text-arc-green')}>
@@ -697,6 +911,16 @@ export default function AgentTab() {
             </span>
           )}
         </div>
+        {llmTestMsg && (
+          <p className={'mt-3 text-sm font-medium ' + (llmTestMsg.startsWith('Error:') ? 'text-red-500' : 'text-arc-green')}>
+            {llmTestMsg}
+          </p>
+        )}
+        {smartMode && (
+          <p className="mt-2 text-xs text-slate-500">
+            Test API sends a live uncached provider request and verifies a one-time challenge in the response. This confirms the selected key and model can complete a real request now. It does not, by itself, guarantee that autonomous jobs will run later unless Smart Mode, permissions, balance, and trigger conditions are also satisfied.
+          </p>
+        )}
       </Card>
 
       {/* Permissions */}

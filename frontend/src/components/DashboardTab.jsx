@@ -265,7 +265,7 @@ export default function DashboardTab({ onNavigate }) {
           <div className="flex flex-col gap-4 sm:flex-row">
             {[
               { step: 1, title: 'Connect Wallet', desc: 'Use the button in the top-right corner to connect MetaMask or another EVM wallet.' },
-              { step: 2, title: 'Create Agent', desc: 'Go to the Agent tab, name your agent and choose permissions.' },
+              { step: 2, title: 'Create Agent', desc: 'Go to the Agent tab, name your agent, then configure limits and task access.' },
               { step: 3, title: 'Fund Agent', desc: 'Send ARC or ETH to the agent wallet address shown after creation.' },
               { step: 4, title: 'Bridge & Swap', desc: 'Use the Bridge and Swap tabs to move assets cross-chain.' },
             ].map(({ step, title, desc }) => (

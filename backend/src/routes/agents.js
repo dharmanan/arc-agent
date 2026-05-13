@@ -12,7 +12,16 @@ const router        = require('express').Router();
 const { z }         = require('zod');
 const { requireAuth } = require('../middleware/auth');
 const agentService  = require('../services/agentService');
-const { encrypt, decrypt } = require('../services/cryptoService');
+const llmService    = require('../services/llmService');
+const { encrypt }   = require('../services/cryptoService');
+
+const LLM_MODEL_OPTIONS = [
+  'claude-haiku-3-5-20241022',
+  'gemini-2.0-flash',
+  'gpt-4o-mini',
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+];
 
 router.use(requireAuth);
 
@@ -59,16 +68,11 @@ const updateSchema = z.object({
   maxTradeUsdc:      z.number().positive().max(100_000).optional(),
   autoLockMinutes:   z.number().int().min(1).max(60).optional(),
   contractGuard:     z.boolean().optional(),
+  isSmartMode:       z.boolean().optional(),
   // LLM — user provides their own key, encrypted at rest
   llmApiKey:         z.string().max(200).optional(),
   // Testnet-approved models only (cost-effective tier)
-  llmModel:          z.enum([
-    'claude-haiku-3-5-20241022',   // Anthropic — paid
-    'gemini-2.0-flash',            // Google — paid
-    'gpt-4o-mini',                 // OpenAI — paid
-    'llama-3.3-70b-versatile',     // Groq — FREE tier
-    'llama-3.1-8b-instant',        // Groq — FREE tier (fastest)
-  ]).optional(),
+  llmModel:          z.enum(LLM_MODEL_OPTIONS).optional(),
   // Faza 2.0: opt-in feature flags (all default OFF)
   dailyTasksEnabled:     z.boolean().optional(),
   marketAnalysisEnabled: z.boolean().optional(),
@@ -92,6 +96,38 @@ router.put('/:id', async (req, res, next) => {
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
     res.json(agent);
   } catch (err) { next(err); }
+});
+
+const testLlmSchema = z.object({
+  llmApiKey: z.string().max(200).optional(),
+  llmModel:  z.enum(LLM_MODEL_OPTIONS).optional(),
+}).strict();
+
+router.post('/:id/test-llm', async (req, res, next) => {
+  try {
+    const data = testLlmSchema.parse(req.body || {});
+    const agent = await agentService.getAgentWithKey(req.params.id, req.user.userId);
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    const model = data.llmModel || agent.llm_model || 'llama-3.3-70b-versatile';
+    const typedKey = String(data.llmApiKey || '').trim();
+    const usingStoredKey = typedKey.length === 0;
+
+    let apiKey = typedKey;
+    if (!apiKey) {
+      apiKey = await llmService.resolveApiKey(agent);
+    }
+
+    const result = await llmService.testConnection({ model, apiKey, agentId: agent.id });
+    res.json({
+      ok: true,
+      usingStoredKey,
+      ...result,
+    });
+  } catch (err) {
+    if (!err.status) err.status = 400;
+    next(err);
+  }
 });
 
 // ── Update smart permissions ──────────────────────────────────────────────────

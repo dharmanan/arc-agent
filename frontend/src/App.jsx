@@ -3,13 +3,14 @@ import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { useAccount, useSwitchChain } from 'wagmi';
 import { arcTestnet, SUPPORTED_CHAINS } from './lib/web3.js';
 import { AgentProvider, useAgent } from './providers/AgentProvider.jsx';
-import DashboardTab  from './components/DashboardTab.jsx';
-import AgentTab      from './components/AgentTab.jsx';
-import BridgeTab     from './components/BridgeTab.jsx';
-import SwapTab       from './components/SwapTab.jsx';
-import SecurityTab   from './components/SecurityTab.jsx';
-import JobsTab       from './components/JobsTab.jsx';
-import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Send, Briefcase, ChevronDown } from 'lucide-react';
+import DashboardTab from './components/DashboardTab.jsx';
+import AgentTab from './components/AgentTab.jsx';
+import BridgeTab from './components/BridgeTab.jsx';
+import SwapTab from './components/SwapTab.jsx';
+import SecurityTab from './components/SecurityTab.jsx';
+import JobsTab from './components/JobsTab.jsx';
+import TasksTab from './components/TasksTab.jsx';
+import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Send, Briefcase, Zap, ChevronDown } from 'lucide-react';
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
@@ -17,6 +18,7 @@ const TABS = [
   { id: 'swap',      label: 'Swap',      Icon: Repeat2         },
   { id: 'agent',     label: 'Agent',     Icon: Bot             },
   { id: 'jobs',      label: 'Jobs',      Icon: Briefcase       },
+  { id: 'tasks',     label: 'Tasks',     Icon: Zap             },
   { id: 'security',  label: 'Send',      Icon: Send            },
 ];
 
@@ -68,11 +70,13 @@ function Header({ activeTab, setTab }) {
     <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/80 backdrop-blur-md">
       <div className="mx-auto flex max-w-6xl items-center gap-4 px-4 py-3 sm:px-6 lg:px-8">
         {/* Logo */}
-        <div className="flex items-center gap-2.5 mr-2">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-arc-green">
-            <Bot size={16} className="text-white" />
-          </div>
-          <span className="font-extrabold text-slate-900 tracking-tight">Arc Machina</span>
+        <div className="mr-2 flex items-center gap-2.5">
+          <img
+            src="/arc-logo-icon.png"
+            alt=""
+            className="h-11 w-auto object-contain"
+          />
+          <span className="font-extrabold tracking-tight text-slate-900">Arc Machina</span>
         </div>
 
         {/* Tab navigation */}
@@ -135,12 +139,13 @@ function AppContent() {
     <div className="min-h-screen">
       <Header activeTab={tab} setTab={setTab} />
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
-        {tab === 'dashboard' && <DashboardTab  onNavigate={navigate} />}
-        {tab === 'bridge'    && <BridgeTab     onBack={back} />}
-        {tab === 'swap'      && <SwapTab       onBack={back} />}
-        {tab === 'agent'     && <AgentTab />}
-        {tab === 'jobs'      && <JobsTab />}
-        {tab === 'security'  && <SecurityTab   onBack={back} />}
+        {tab === 'dashboard' && <DashboardTab onNavigate={navigate} />}
+        {tab === 'bridge' && <BridgeTab onBack={back} />}
+        {tab === 'swap' && <SwapTab onBack={back} />}
+        {tab === 'agent' && <AgentTab />}
+        {tab === 'jobs' && <JobsTab />}
+        {tab === 'tasks' && <TasksTab />}
+        {tab === 'security' && <SecurityTab onBack={back} />}
       </main>
     </div>
   );

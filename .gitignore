@@ -11,3 +11,5 @@ cache/
 artifacts/build-info/
 frontend/dist/
 frontend/.vercel/
+.vercel
+.env*.local

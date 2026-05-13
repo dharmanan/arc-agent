@@ -12,6 +12,7 @@
  * GET  /api/transactions/tx/:txId/status     — poll status
  */
 const router              = require('express').Router();
+const { ethers }          = require('ethers');
 const { z }               = require('zod');
 const { requireAuth }     = require('../middleware/auth');
 const { txRateLimit }     = require('../middleware/rateLimit');
@@ -144,7 +145,24 @@ router.post('/bridge', async (req, res, next) => {
       mode:       body.mode || 'auto',   // 'auto' → agentic if within limit; 'manual' → always manual
     });
     res.status(202).json(tx);
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.code === 'INSUFFICIENT_DESTINATION_GAS') {
+      const recommendedTopUpWei = await agentWalletService.getRecommendedNativeTopUpWei(
+        err.toChain,
+        err.balanceWei || 0n,
+      ).catch(() => null);
+
+      return res.status(422).json({
+        error: err.message,
+        destinationGasLow: true,
+        toChain: err.toChain || null,
+        currentNativeBalance: err.balanceWei != null ? ethers.formatEther(err.balanceWei) : null,
+        requiredNativeBalance: err.requiredWei != null ? ethers.formatEther(err.requiredWei) : null,
+        recommendedTopUp: recommendedTopUpWei != null ? ethers.formatEther(recommendedTopUpWei) : null,
+      });
+    }
+    next(err);
+  }
 });
 
 const gasTopUpSchema = z.object({

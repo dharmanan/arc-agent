@@ -1,4 +1,7 @@
 'use strict';
+const crypto = require('crypto');
+const db = require('../db');
+
 /**
  * Rule Engine — static fallback decision engine for agents without LLM API keys.
  *
@@ -23,6 +26,7 @@ const MIN_SPREAD_PCT    = 0.5;     // A3     — minimum spread to attempt arb
 const MIN_PROFIT_USDC   = 1.0;     // A4     — minimum expected profit
 const MAX_ARB_USDC      = 100;     // A7     — suggested arb amount cap
 const DUST_USDC         = 0.01;    // T7     — dust threshold
+const AUDIT_MODEL       = 'rule_engine';
 
 const ADDRESS_RE   = /^0x[0-9a-fA-F]{40}$/;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -36,7 +40,20 @@ const VOLATILE_TOKENS = new Set(['cirBTC', 'WBTC', 'BTC', 'ETH', 'WETH']);
 const STABLE_TOKENS   = new Set(['USDC', 'EURC', 'USDT', 'DAI']);
 
 // ── Helper ────────────────────────────────────────────────────────────────────
-const ok = obj => ({ decision: JSON.stringify(obj), fromCache: false, engine: 'rule' });
+async function auditDecision(agentId, promptShape, decision) {
+  const promptHash = crypto.createHash('sha256').update(JSON.stringify(promptShape)).digest('hex');
+  await db.query(
+    `INSERT INTO llm_audit (agent_id, model, prompt_hash, decision, latency_ms, from_cache)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [agentId || null, AUDIT_MODEL, promptHash, decision, 0, false],
+  ).catch(err => console.error('[RULE AUDIT]', err.message));
+}
+
+async function ok(agentId, promptShape, obj) {
+  const decision = JSON.stringify(obj);
+  await auditDecision(agentId, promptShape, decision);
+  return { decision, fromCache: false, engine: 'rule' };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // analyzeMarket
@@ -52,9 +69,14 @@ const ok = obj => ({ decision: JSON.stringify(obj), fromCache: false, engine: 'r
 //   M6  Ethereum Sepolia                     → CCTP bridge opportunity
 //   M7  L2 testnets (Base/Optimism/Arb)      → multi-chain rebalancing opportunity
 // ─────────────────────────────────────────────────────────────────────────────
-function analyzeMarket({ chain, token } = {}) {
+async function analyzeMarket({ chain, token, agentId } = {}) {
   const c = (chain  || '').toLowerCase();
   const t =  token  || '';
+  const promptShape = {
+    task: 'analyzeMarket',
+    chain: chain || null,
+    token: token || null,
+  };
 
   // M1 / M2 / M3 — risk
   let risk;
@@ -86,7 +108,7 @@ function analyzeMarket({ chain, token } = {}) {
     action += ` (max ${MAX_TRADE_USDC} USDC per trade, ${DAILY_LIMIT_USDC} USDC daily limit)`;
   }
 
-  return ok({ opportunity, risk, action });
+  return ok(agentId, promptShape, { opportunity, risk, action });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,45 +128,51 @@ function analyzeMarket({ chain, token } = {}) {
 //   T9  Chain not in SAFE_CHAINS             → safe but elevated risk, score 5
 //   T10 All checks pass                      → safe, score 1
 // ─────────────────────────────────────────────────────────────────────────────
-function analyzeTransaction({ toAddress, amountUsdc, chain } = {}) {
+async function analyzeTransaction({ toAddress, amountUsdc, chain, agentId } = {}) {
   const amount = Number(amountUsdc) || 0;
   const c = (chain || '').toLowerCase();
+  const promptShape = {
+    task: 'analyzeTransaction',
+    toAddress: toAddress || null,
+    amountUsdc: amountUsdc ?? null,
+    chain: chain || null,
+  };
 
   // T1
   if (!toAddress) {
-    return ok({ safe: false, reason: '[T1] Missing destination address', riskScore: 10 });
+    return ok(agentId, promptShape, { safe: false, reason: '[T1] Missing destination address', riskScore: 10 });
   }
   // T2
   if (toAddress === ZERO_ADDRESS) {
-    return ok({ safe: false, reason: '[T2] Destination is the zero address', riskScore: 10 });
+    return ok(agentId, promptShape, { safe: false, reason: '[T2] Destination is the zero address', riskScore: 10 });
   }
   // T3
   if (!ADDRESS_RE.test(toAddress)) {
-    return ok({ safe: false, reason: '[T3] Destination address format invalid (expected 0x + 40 hex chars)', riskScore: 9 });
+    return ok(agentId, promptShape, { safe: false, reason: '[T3] Destination address format invalid (expected 0x + 40 hex chars)', riskScore: 9 });
   }
   // T4
   if (amount <= 0) {
-    return ok({ safe: false, reason: '[T4] Amount must be greater than zero', riskScore: 8 });
+    return ok(agentId, promptShape, { safe: false, reason: '[T4] Amount must be greater than zero', riskScore: 8 });
   }
   // T5
   if (amount > DAILY_LIMIT_USDC) {
-    return ok({ safe: false, reason: `[T5] Amount ${amount} USDC exceeds daily limit of ${DAILY_LIMIT_USDC} USDC`, riskScore: 9 });
+    return ok(agentId, promptShape, { safe: false, reason: `[T5] Amount ${amount} USDC exceeds daily limit of ${DAILY_LIMIT_USDC} USDC`, riskScore: 9 });
   }
   // T6
   if (amount > MAX_TRADE_USDC) {
-    return ok({ safe: false, reason: `[T6] Amount ${amount} USDC exceeds single-trade cap of ${MAX_TRADE_USDC} USDC`, riskScore: 7 });
+    return ok(agentId, promptShape, { safe: false, reason: `[T6] Amount ${amount} USDC exceeds single-trade cap of ${MAX_TRADE_USDC} USDC`, riskScore: 7 });
   }
   // T7
   if (amount < DUST_USDC) {
-    return ok({ safe: true, reason: `[T7] Dust amount ${amount} USDC — likely a connectivity test`, riskScore: 3 });
+    return ok(agentId, promptShape, { safe: true, reason: `[T7] Dust amount ${amount} USDC — likely a connectivity test`, riskScore: 3 });
   }
   // T9
   if (c && !SAFE_CHAINS.has(c)) {
-    return ok({ safe: true, reason: `[T9] Chain "${chain}" not in whitelist — proceed with caution`, riskScore: 5 });
+    return ok(agentId, promptShape, { safe: true, reason: `[T9] Chain "${chain}" not in whitelist — proceed with caution`, riskScore: 5 });
   }
   // T8 / T10
   const riskScore = amount <= 10 ? 1 : amount <= 100 ? 2 : 3; // T8 gradient
-  return ok({ safe: true, reason: '[T10] Transaction passes all static safety checks', riskScore });
+  return ok(agentId, promptShape, { safe: true, reason: '[T10] Transaction passes all static safety checks', riskScore });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,40 +190,45 @@ function analyzeTransaction({ toAddress, amountUsdc, chain } = {}) {
 //   A7  suggestedAmount capped at MAX_ARB_USDC (100)
 //   A8  All checks pass                     → execute
 // ─────────────────────────────────────────────────────────────────────────────
-function getArbitrageDecision({ opportunity } = {}) {
+async function getArbitrageDecision({ opportunity, agentId } = {}) {
+  const promptShape = {
+    task: 'getArbitrageDecision',
+    opportunity: opportunity || null,
+  };
+
   // A1
   if (!opportunity || typeof opportunity !== 'object') {
-    return ok({ execute: false, reason: '[A1] No opportunity data provided', suggestedAmount: 0 });
+    return ok(agentId, promptShape, { execute: false, reason: '[A1] No opportunity data provided', suggestedAmount: 0 });
   }
 
   const { spreadPct, amountUsdc, fromChain, expectedProfitUsdc } = opportunity;
 
   // A2
   if (spreadPct == null) {
-    return ok({ execute: false, reason: '[A2] Spread percentage not provided in opportunity', suggestedAmount: 0 });
+    return ok(agentId, promptShape, { execute: false, reason: '[A2] Spread percentage not provided in opportunity', suggestedAmount: 0 });
   }
   // A3
   if (Number(spreadPct) < MIN_SPREAD_PCT) {
-    return ok({ execute: false, reason: `[A3] Spread ${spreadPct}% is below minimum threshold of ${MIN_SPREAD_PCT}%`, suggestedAmount: 0 });
+    return ok(agentId, promptShape, { execute: false, reason: `[A3] Spread ${spreadPct}% is below minimum threshold of ${MIN_SPREAD_PCT}%`, suggestedAmount: 0 });
   }
   // A4
   if (expectedProfitUsdc != null && Number(expectedProfitUsdc) < MIN_PROFIT_USDC) {
-    return ok({ execute: false, reason: `[A4] Expected profit ${expectedProfitUsdc} USDC is below minimum of ${MIN_PROFIT_USDC} USDC`, suggestedAmount: 0 });
+    return ok(agentId, promptShape, { execute: false, reason: `[A4] Expected profit ${expectedProfitUsdc} USDC is below minimum of ${MIN_PROFIT_USDC} USDC`, suggestedAmount: 0 });
   }
   // A5
   if (amountUsdc != null && Number(amountUsdc) <= 0) {
-    return ok({ execute: false, reason: '[A5] Opportunity amount is zero or negative', suggestedAmount: 0 });
+    return ok(agentId, promptShape, { execute: false, reason: '[A5] Opportunity amount is zero or negative', suggestedAmount: 0 });
   }
   // A6
   if (fromChain && !SAFE_CHAINS.has((fromChain || '').toLowerCase())) {
-    return ok({ execute: false, reason: `[A6] Source chain "${fromChain}" is not in the safe-chain whitelist`, suggestedAmount: 0 });
+    return ok(agentId, promptShape, { execute: false, reason: `[A6] Source chain "${fromChain}" is not in the safe-chain whitelist`, suggestedAmount: 0 });
   }
 
   // A7 / A8 — cap amount and execute
   const raw       = Number(amountUsdc) || MAX_ARB_USDC;
   const suggested = Math.min(raw, MAX_ARB_USDC);
 
-  return ok({
+  return ok(agentId, promptShape, {
     execute: true,
     reason:  `[A8] Spread ${spreadPct}% clears threshold — executing with ${suggested} USDC (capped at ${MAX_ARB_USDC})`,
     suggestedAmount: suggested,

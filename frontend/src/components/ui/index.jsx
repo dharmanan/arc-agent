@@ -1,5 +1,5 @@
 import React from 'react';
-import { Loader2 } from 'lucide-react';
+import { Eye, EyeOff, Loader2 } from 'lucide-react';
 
 export function Card({ children, className = '' }) {
   return (
@@ -16,6 +16,8 @@ export function Button({ children, variant = 'primary', loading = false, classNa
     outline: 'border border-slate-200 bg-white text-slate-700 hover:border-[#66D121]/40 hover:bg-arc-greenBg hover:text-arc-green',
     danger:  'bg-red-600 text-white hover:bg-red-700',
     ghost:   'text-slate-600 hover:text-arc-green hover:bg-arc-greenBg/60',
+    warning: 'bg-yellow-500 text-black hover:bg-yellow-400',
+    success: 'bg-green-600 text-white hover:bg-green-700',
   };
   return (
     <button className={`${base} ${variants[variant]} ${className}`} disabled={loading || props.disabled} {...props}>
@@ -25,14 +27,31 @@ export function Button({ children, variant = 'primary', loading = false, classNa
   );
 }
 
-export function Input({ label, error, className = '', ...props }) {
+export function Input({ label, error, className = '', showPasswordToggle = false, type = 'text', ...props }) {
+  const [passwordVisible, setPasswordVisible] = React.useState(false);
+  const canTogglePassword = showPasswordToggle && type === 'password';
+  const inputType = canTogglePassword ? (passwordVisible ? 'text' : 'password') : type;
+
   return (
     <div className="flex flex-col gap-1.5">
       {label && <label className="text-sm font-semibold text-slate-700">{label}</label>}
-      <input
-        className={`w-full rounded-xl border bg-white px-4 py-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:ring-2 ${error ? 'border-red-400 focus:ring-red-200' : 'border-slate-200 focus:border-[#66D121]/60 focus:ring-[#66D121]/20'} ${className}`}
-        {...props}
-      />
+      <div className="relative">
+        <input
+          type={inputType}
+          className={`w-full rounded-xl border bg-white px-4 py-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:ring-2 ${canTogglePassword ? 'pr-12' : ''} ${error ? 'border-red-400 focus:ring-red-200' : 'border-slate-200 focus:border-[#66D121]/60 focus:ring-[#66D121]/20'} ${className}`}
+          {...props}
+        />
+        {canTogglePassword && (
+          <button
+            type="button"
+            onClick={() => setPasswordVisible((visible) => !visible)}
+            className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 transition hover:text-slate-700"
+            aria-label={passwordVisible ? 'Hide value' : 'Show value'}
+          >
+            {passwordVisible ? <EyeOff size={16} /> : <Eye size={16} />}
+          </button>
+        )}
+      </div>
       {error && <p className="text-xs text-red-500">{error}</p>}
     </div>
   );

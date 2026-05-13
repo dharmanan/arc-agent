@@ -6,7 +6,7 @@ import { CHAINS } from '../lib/chains.js';
 import { Card, Button, Input, Select, Alert } from './ui/index.jsx';
 import {
   ArrowLeftRight, ChevronLeft, CheckCircle, Loader, Clock,
-  Bot, Zap, ExternalLink, RefreshCw, HelpCircle, Bell, X, AlertCircle,
+  Bot, Zap, ExternalLink, RefreshCw, HelpCircle, Bell, X, AlertCircle, AlertTriangle,
 } from 'lucide-react';
 
 // ── Chain list ───────────────────────────────────────────────────────────────
@@ -599,6 +599,22 @@ function ActiveBridgeTracker({ activity, agentId, onClaim, onRefresh, claiming }
       </div>
 
       {execErr && <Alert type="error">{execErr}</Alert>}
+
+      {/* Attestation stuck warning */}
+      {status === 'pending_attestation' && (() => {
+        const ts = activity.createdAt || activity.startedAt || activity.updatedAt;
+        if (!ts) return null;
+        const elapsedMin = (Date.now() - new Date(ts).getTime()) / 60000;
+        if (elapsedMin < 28) return null;
+        return (
+          <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2">
+            <AlertTriangle size={13} className="shrink-0 mt-0.5 text-amber-600" />
+            <p className="text-xs text-amber-800">
+              Attestation is taking longer than usual ({Math.round(elapsedMin)} min). On testnet this can take up to 30 minutes. No action needed — the agent will mint automatically once the attestation is ready.
+            </p>
+          </div>
+        );
+      })()}
 
       {!isMinted && !isFailed && (
         <p className="text-xs text-slate-400">
