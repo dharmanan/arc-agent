@@ -1,34 +1,15 @@
 {
   "name": "arc-agent-contracts",
   "version": "1.0.0",
-  "description": "Arc Machina smart contracts – Hardhat workspace",
+  "description": "Arc Machina smart contracts – compiled artifacts committed; reinstall Hardhat when new deployments needed",
   "private": true,
   "scripts": {
-    "compile": "hardhat compile",
-    "test": "hardhat test",
-    "deploy:arc": "hardhat run scripts/deploy.js --network arc",
-    "deploy:revenue-pool": "hardhat run scripts/deploy-revenue-pool.js --network arc",
-    "deploy:local": "hardhat run scripts/deploy.js --network hardhat",
-    "audit": "npm audit --omit=dev",
-    "audit:all": "npm audit",
+    "audit": "npm audit",
     "frontend:dev": "cd frontend && npm run dev",
     "frontend:build": "cd frontend && npm run build",
     "backend:dev": "cd backend && npm run dev",
     "backend:start": "cd backend && npm start",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down"
-  },
-  "devDependencies": {
-    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
-    "@openzeppelin/contracts": "^5.0.2",
-    "dotenv": "^16.6.1",
-    "hardhat": "^2.22.16"
-  },
-  "overrides": {
-    "lodash": ">=4.18.0",
-    "serialize-javascript": ">=7.0.5",
-    "undici": ">=6.24.0",
-    "cookie": ">=0.7.0",
-    "bn.js": ">=4.12.3"
   }
 }
