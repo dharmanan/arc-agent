@@ -25,7 +25,7 @@ export default function SwapTab({ onBack }) {
   const [fromToken, setFromToken] = useState('USDC');
   const [toToken,   setToToken]   = useState('EURC');
   const [amountIn,  setAmountIn]  = useState('');
-  const [quote,     setQuote]     = useState(null);  // { amountOut, isDexQuote, quoteError }
+  const [quote,     setQuote]     = useState(null);  // { amountOut, isDexQuote, quoteError, routeStrategy, routeReason }
   const [quoting,   setQuoting]   = useState(false);
   const [result,    setResult]    = useState(null);  // completed tx
   const [status,    setStatus]    = useState(null);  // executing status string
@@ -48,10 +48,13 @@ export default function SwapTab({ onBack }) {
   const isNano       = usdEquivalentIn !== null && usdEquivalentIn < 0.01;
   const isAgentic    = usdEquivalentIn !== null && usdEquivalentIn <= maxTrade;
   const exceedsMax   = usdEquivalentIn !== null && usdEquivalentIn > maxTrade;
-  const limitAwaitingQuote = hasAmount && fromToken === 'cirBTC' && usdEquivalentIn === null;
+  const cirbtcPair = fromToken === 'cirBTC' || toToken === 'cirBTC';
+  const cirbtcNeedsSwapKit = cirbtcPair && quote?.routeStrategy === 'swap_kit_required';
+  const limitAwaitingQuote = hasAmount && fromToken === 'cirBTC' && usdEquivalentIn === null && !cirbtcNeedsSwapKit;
   const swapDisabledByDex = hasAmount && !quoting && !!quote && !quote.isDexQuote;
+  const routeReason = quote?.routeReason || null;
   const quoteWarning = swapDisabledByDex
-    ? (quote?.quoteError || 'Live Arc swap routing is unavailable right now.')
+    ? (quote?.quoteError || routeReason || 'Live Arc swap routing is unavailable right now.')
     : null;
   const suggestLowerAmount = Boolean(quoteWarning && quoteWarning.includes('Try a lower amount.'));
 
@@ -141,7 +144,7 @@ export default function SwapTab({ onBack }) {
   async function handleSwap() {
     if (!hasAmount) { setError('Enter a valid amount.'); return; }
     if (quoting || !quote) { setError('Waiting for a live swap quote from Arc Testnet…'); return; }
-    if (!quote.isDexQuote) { setError(quote?.quoteError || 'Live Arc swap routing is unavailable right now.'); return; }
+    if (!quote.isDexQuote) { setError(quote?.quoteError || quote?.routeReason || 'Live Arc swap routing is unavailable right now.'); return; }
     if (limitAwaitingQuote) { setError('Waiting for a live cirBTC quote to evaluate your agent limit…'); return; }
     if (exceedsMax) { setError(`Amount exceeds agent auto-approve limit (${maxTrade} USDC). Lower the amount or raise the limit in Agent Settings.`); return; }
 
@@ -352,6 +355,11 @@ export default function SwapTab({ onBack }) {
                 {quoteWarning}
               </Alert>
             )}
+            {!quoteWarning && cirbtcPair && routeReason && (
+              <Alert type={quote?.isDexQuote ? 'info' : 'warning'}>
+                {routeReason}
+              </Alert>
+            )}
           </div>
 
           {/* Agentic info panel */}
@@ -361,6 +369,8 @@ export default function SwapTab({ onBack }) {
               <span>
                 {isNano
                   ? <><strong className="text-slate-700">Nano payment</strong> — agent executes automatically ({'<'}$0.01)</>
+                  : cirbtcNeedsSwapKit
+                  ? 'cirBTC currently requires a live Swap Kit route on this deployment'
                   : limitAwaitingQuote
                   ? 'Waiting for a live cirBTC quote to evaluate your agent limit'
                   : isAgentic
@@ -389,7 +399,7 @@ export default function SwapTab({ onBack }) {
             className="w-full"
           >
             {swapDisabledByDex
-              ? (suggestLowerAmount ? 'Try a lower amount' : 'Swap unavailable right now')
+              ? (cirbtcNeedsSwapKit ? 'Swap Kit required' : suggestLowerAmount ? 'Try a lower amount' : 'Swap unavailable right now')
               : isNano
               ? '⚡ Nano Swap'
               : <><Bot size={15}/> Agent Swap {amountIn || '0'} {fromToken} → {toToken}</>}

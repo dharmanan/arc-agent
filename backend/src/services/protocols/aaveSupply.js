@@ -25,6 +25,10 @@ const ERC20_ABI = [
   'function balanceOf(address account) view returns (uint256)',
 ];
 
+function getArcRpcUrl() {
+  return process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
+}
+
 /**
  * Get current supply and borrow APY for an asset.
  *
@@ -40,8 +44,7 @@ async function getAaveApy(assetAddress, assetSymbol = 'USDC') {
 
   if (poolAddress) {
     try {
-      const rpcUrl  = process.env.ARC_RPC_URL;
-      if (!rpcUrl) throw new Error('ARC_RPC_URL is not defined');
+      const rpcUrl  = getArcRpcUrl();
 
       const provider = new ethers.JsonRpcProvider(rpcUrl);
       const pool     = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
@@ -88,8 +91,7 @@ async function executeAaveSupply({ assetAddress, amount, agentPrivateKey, decima
   const poolAddress = process.env.AAVE_POOL_ADDRESS;
   if (!poolAddress)     throw new Error('AAVE_POOL_ADDRESS is not configured');
 
-  const rpcUrl = process.env.ARC_RPC_URL;
-  if (!rpcUrl)          throw new Error('ARC_RPC_URL is not defined');
+  const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
   const provider  = new ethers.JsonRpcProvider(rpcUrl);
@@ -126,8 +128,7 @@ async function executeAaveWithdraw({ assetAddress, amount, agentPrivateKey, deci
   const poolAddress = process.env.AAVE_POOL_ADDRESS;
   if (!poolAddress)     throw new Error('AAVE_POOL_ADDRESS is not configured');
 
-  const rpcUrl = process.env.ARC_RPC_URL;
-  if (!rpcUrl)          throw new Error('ARC_RPC_URL is not defined');
+  const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
   const provider  = new ethers.JsonRpcProvider(rpcUrl);

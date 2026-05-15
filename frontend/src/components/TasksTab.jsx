@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useAgent } from '../providers/AgentProvider.jsx';
 import { tasks as tasksApi, agents as agentsApi } from '../lib/api.js';
+import { fetchAgentBalance, fetchUsdcBalance, fetchEurcBalance } from '../lib/agentBalances.js';
 import {
   Card, Button, Alert, Spinner, AddressBox,
 } from './ui/index.jsx';
@@ -15,22 +16,22 @@ const AUTOMATION_FEATURES = [
     key: 'marketAnalysisEnabled',
     statusKey: 'marketAnalysis',
     title: 'Market Analysis',
-    description: 'Periodic price and opportunity scans based on oracle signals.',
-    detail: 'Triggered by smart-mode market analysis jobs when the agent is evaluating activity.',
+    description: 'Periodic strategy scans for smart-mode agents before any autonomous execution happens.',
+    detail: 'This updates decision context only. It does not move funds or spend gas by itself; cost is limited to your LLM provider if you use a paid model.',
   },
   {
     key: 'oracleEnabled',
     statusKey: 'oracle',
     title: 'Oracle Data Feed',
-    description: 'Background oracle pulls for forex, TVL and price feed updates.',
-    detail: 'Scheduled server-side to refresh forex and stablecoin opportunity data.',
+    description: 'Background oracle pulls for forex, TVL and stablecoin opportunity updates.',
+    detail: 'This is a data collection layer. It records signals and permissions state but does not submit a trade on its own.',
   },
   {
     key: 'defiLoopEnabled',
     statusKey: 'defiLoop',
     title: 'DeFi Loop Execution',
     description: 'Background DeFi strategy execution within your configured limits.',
-    detail: 'Evaluates stablecoin opportunities and can simulate or execute swaps from the queue.',
+    detail: 'This is the automation that can actually submit swaps. Real runs consume gas and token balance; dry runs only record what would have happened.',
   },
   {
     key: 'reputationEnabled',
@@ -40,13 +41,44 @@ const AUTOMATION_FEATURES = [
     detail: 'Writes local reputation events and optionally relays them on-chain when configured.',
   },
 ];
+const FULL_AUTONOMY_FEATURE_KEYS = AUTOMATION_FEATURES.map(feature => feature.key);
 const EXECUTION_TASK_IDS = new Set([
   'EXEC_CURVE_SWAP',
+  'EXEC_CURVE_LIQUIDITY_ADD',
+  'EXEC_CURVE_LIQUIDITY_REMOVE',
+  'EXEC_CIRBTC_USDC_ZAP_IN',
+  'EXEC_CIRBTC_EURC_ZAP_IN',
+  'EXEC_CIRBTC_USDC_LP_REMOVE',
+  'EXEC_CIRBTC_EURC_LP_REMOVE',
   'EXEC_CCTP_BRIDGE',
   'EXEC_YIELD_MOVE',
   'EXEC_ARB',
   'EXEC_REBALANCE',
 ]);
+const DIRECT_PAIR_ZAP_PRESETS = {
+  EXEC_CIRBTC_USDC_ZAP_IN: {
+    token: 'USDC',
+    defaultAmountIn: '20',
+    maxAmountIn: 20,
+    maxSwapAmountIn: '10',
+  },
+  EXEC_CIRBTC_EURC_ZAP_IN: {
+    token: 'EURC',
+    defaultAmountIn: '16',
+    maxAmountIn: 16,
+    maxSwapAmountIn: '8',
+  },
+};
+const DIRECT_PAIR_EXIT_PRESETS = {
+  EXEC_CIRBTC_USDC_LP_REMOVE: {
+    token: 'USDC',
+    defaultWithdrawPct: '100',
+  },
+  EXEC_CIRBTC_EURC_LP_REMOVE: {
+    token: 'EURC',
+    defaultWithdrawPct: '100',
+  },
+};
 const CCTP_CHAIN_OPTIONS = [
   'Arc Testnet',
   'Sepolia',
@@ -146,6 +178,22 @@ function getTaskRunErrorMessage(message) {
       return 'Enter an amount for the curve swap.';
     case 'curve_swap_direction_required':
       return 'Choose a valid swap direction.';
+    case 'curve_liquidity_add_amount_required':
+      return 'Enter an amount for the liquidity add.';
+    case 'curve_liquidity_add_token_required':
+      return 'Choose the token used for the liquidity add.';
+    case 'curve_liquidity_remove_amount_required':
+      return 'Enter a Curve LP amount to withdraw.';
+    case 'curve_liquidity_remove_token_required':
+      return 'Choose which token should be withdrawn from Curve LP.';
+    case 'position_guard_unavailable':
+      return 'Live protocol positions could not be read right now. Retry after the positions view refreshes.';
+    case 'lp_position_not_found':
+      return 'This agent does not currently hold Curve LP in the selected pool.';
+    case 'insufficient_lp_position':
+      return 'The requested LP withdrawal is larger than the current live Curve LP balance.';
+    case 'lp_position_exit_required':
+      return 'This agent already has live Curve liquidity in the target stable pool. Exit or reduce that LP position before running rebalance.';
     case 'bridge_from_chain_required':
       return 'Choose a source chain.';
     case 'bridge_to_chain_required':
@@ -168,6 +216,20 @@ function getTaskRunErrorMessage(message) {
       return 'Choose the destination token for rebalancing.';
     case 'rebalance_route_invalid':
       return 'Choose different source and destination tokens for rebalancing.';
+    case 'pair_zap_amount_required':
+      return 'Enter a budget for the direct cirBTC LP bootstrap task.';
+    case 'pair_zap_amount_exceeds_max':
+      return 'This bootstrap task only supports the capped preset size for now.';
+    case 'pair_exit_pct_invalid':
+      return 'Enter a valid LP withdrawal percentage between 0 and 100.';
+    case 'swap_not_configured':
+      return 'No direct execution rail is configured for this task on this deployment.';
+    case 'direct_pair_not_configured':
+      return 'This direct cirBTC pair is not configured on the current deployment yet.';
+    case 'direct_pair_seed_required':
+      return 'The direct cirBTC pair exists but still needs initial seed liquidity before this task can run.';
+    case 'wallet_not_configured':
+      return 'This agent wallet is not ready for live protocol position checks yet.';
     case 'task_not_found':
       return 'This task is no longer available.';
     case 'agent_not_found':
@@ -185,6 +247,18 @@ function getInitialTaskParams(taskId) {
   switch (taskId) {
     case 'EXEC_CURVE_SWAP':
       return { amountIn: '', indexIn: 0, indexOut: 1 };
+    case 'EXEC_CURVE_LIQUIDITY_ADD':
+      return { tokenIn: 'USDC', amountIn: '' };
+    case 'EXEC_CURVE_LIQUIDITY_REMOVE':
+      return { tokenOut: 'USDC', lpAmount: '' };
+    case 'EXEC_CIRBTC_USDC_ZAP_IN':
+      return { amountIn: DIRECT_PAIR_ZAP_PRESETS.EXEC_CIRBTC_USDC_ZAP_IN.defaultAmountIn };
+    case 'EXEC_CIRBTC_EURC_ZAP_IN':
+      return { amountIn: DIRECT_PAIR_ZAP_PRESETS.EXEC_CIRBTC_EURC_ZAP_IN.defaultAmountIn };
+    case 'EXEC_CIRBTC_USDC_LP_REMOVE':
+      return { withdrawPct: DIRECT_PAIR_EXIT_PRESETS.EXEC_CIRBTC_USDC_LP_REMOVE.defaultWithdrawPct };
+    case 'EXEC_CIRBTC_EURC_LP_REMOVE':
+      return { withdrawPct: DIRECT_PAIR_EXIT_PRESETS.EXEC_CIRBTC_EURC_LP_REMOVE.defaultWithdrawPct };
     case 'EXEC_CCTP_BRIDGE':
       return { fromChain: 'Arc Testnet', toChain: 'Base Sepolia', amountUsdc: '' };
     case 'EXEC_YIELD_MOVE':
@@ -203,6 +277,27 @@ function getTaskParamError(taskId, params) {
     case 'EXEC_CURVE_SWAP':
       if (!(Number(params.amountIn) > 0)) return 'Enter an amount for the curve swap.';
       if (Number(params.indexIn) === Number(params.indexOut)) return 'Choose a valid swap direction.';
+      return '';
+    case 'EXEC_CURVE_LIQUIDITY_ADD':
+      if (!params.tokenIn) return 'Choose the token used for the liquidity add.';
+      if (!(Number(params.amountIn) > 0)) return 'Enter an amount for the liquidity add.';
+      return '';
+    case 'EXEC_CURVE_LIQUIDITY_REMOVE':
+      if (!params.tokenOut) return 'Choose which token should be withdrawn from Curve LP.';
+      if (!(Number(params.lpAmount) > 0)) return 'Enter a Curve LP amount to withdraw.';
+      return '';
+    case 'EXEC_CIRBTC_USDC_ZAP_IN':
+    case 'EXEC_CIRBTC_EURC_ZAP_IN': {
+      const preset = DIRECT_PAIR_ZAP_PRESETS[taskId];
+      if (!(Number(params.amountIn) > 0)) return 'Enter a budget for the LP bootstrap task.';
+      if (Number(params.amountIn) > Number(preset?.maxAmountIn || 0)) return `Keep this bootstrap task at or below ${preset?.maxAmountIn || 0} ${preset?.token || 'stable'}.`;
+      return '';
+    }
+    case 'EXEC_CIRBTC_USDC_LP_REMOVE':
+    case 'EXEC_CIRBTC_EURC_LP_REMOVE':
+      if (!(Number(params.withdrawPct) > 0) || Number(params.withdrawPct) > 100) {
+        return 'Enter an LP withdrawal percentage between 0 and 100.';
+      }
       return '';
     case 'EXEC_CCTP_BRIDGE':
       if (!params.fromChain) return 'Choose a source chain.';
@@ -234,6 +329,26 @@ function buildTaskParams(taskId, params) {
         amountIn: Number(params.amountIn),
         indexIn: Number(params.indexIn),
         indexOut: Number(params.indexOut),
+      };
+    case 'EXEC_CURVE_LIQUIDITY_ADD':
+      return {
+        tokenIn: params.tokenIn,
+        amountIn: Number(params.amountIn),
+      };
+    case 'EXEC_CURVE_LIQUIDITY_REMOVE':
+      return {
+        tokenOut: params.tokenOut,
+        lpAmount: Number(params.lpAmount),
+      };
+    case 'EXEC_CIRBTC_USDC_ZAP_IN':
+    case 'EXEC_CIRBTC_EURC_ZAP_IN':
+      return {
+        amountIn: Number(params.amountIn),
+      };
+    case 'EXEC_CIRBTC_USDC_LP_REMOVE':
+    case 'EXEC_CIRBTC_EURC_LP_REMOVE':
+      return {
+        withdrawPct: Number(params.withdrawPct),
       };
     case 'EXEC_CCTP_BRIDGE':
       return {
@@ -274,8 +389,10 @@ function humanizeAutomationStatus(status) {
     success: 'Healthy',
     db_only: 'Local Only',
     no_signal: 'No Signal',
+    gate_blocked: 'Gate Hold',
     executed: 'Executed',
     dry_run: 'Dry Run',
+    no_opportunity: 'No Opportunity',
     cap_reached: 'Daily Cap Reached',
     fetch_error: 'Fetch Error',
     decision_error: 'Decision Error',
@@ -297,18 +414,29 @@ function getAutomationStatusClasses(status, enabled) {
   if (status === 'running') return 'border-blue-200 bg-blue-50 text-blue-700';
   if (['success', 'executed', 'dry_run'].includes(status)) return 'border-green-200 bg-green-50 text-green-700';
   if (['idle', 'no_signal'].includes(status)) return 'border-slate-200 bg-slate-50 text-slate-600';
-  if (['cap_reached', 'disabled', 'pool_unconfigured', 'no_private_key'].includes(status)) {
+  if (['gate_blocked', 'cap_reached', 'disabled', 'pool_unconfigured', 'no_private_key'].includes(status)) {
     return 'border-amber-200 bg-amber-50 text-amber-700';
   }
   return 'border-red-200 bg-red-50 text-red-700';
 }
 
 function getAutomationSummary(feature, state) {
+  const bypassNote = state?.bypassDailyCap
+    ? ' Daily cap bypass is active for this whitelisted testnet agent, so the nominal cap is informational only.'
+    : '';
+
   switch (feature.statusKey) {
+    case 'marketAnalysis':
+      return state?.lastStatus === 'success'
+        ? 'Latest analysis completed. This stage only refreshes strategy context; later automation decides whether any on-chain action is worth taking.'
+        : 'Scheduled USDC strategy scans for smart-mode agents. No gas is spent here; only your selected LLM provider may incur usage cost.';
     case 'oracle':
-      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 48)} oracle cycles completed.`;
+      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 48)} oracle cycles completed. This layer only records EURC/USDC stablecoin signals plus execution-gate context; it does not submit a transaction by itself.${bypassNote}`;
     case 'defiLoop':
-      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} loop runs · ${Number(state?.autoTxToday || 0)} auto tx executed.`;
+      if (state?.lastStatus === 'dry_run') {
+        return `Simulation mode is active for this agent. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} loops ran and ${Number(state?.autoTxToday || 0)} real auto tx were submitted.${bypassNote}`;
+      }
+      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} loop runs · ${Number(state?.autoTxToday || 0)} auto tx executed. This loop now has one execution gate only: if an LLM key exists it returns EXECUTE/HOLD JSON, otherwise the rule engine does. Only approved Arc Testnet USDC -> EURC Curve swaps are submitted today.${bypassNote}`;
     case 'reputation':
       return state?.lastStatus === 'db_only'
         ? 'Writing local reputation events only. On-chain relay is currently not configured.'
@@ -378,6 +506,54 @@ function getTaskResultStatusMeta(task, payload) {
       };
     }
 
+    if (task.id === 'EXEC_CURVE_LIQUIDITY_ADD') {
+      return {
+        label: 'Simulation only',
+        buttonLabel: 'Simulated',
+        panelClasses: 'bg-amber-50/80',
+        iconClasses: 'text-amber-600',
+        titleClasses: 'text-amber-800',
+        detailClasses: 'text-amber-700',
+        summary: `Simulation only. Would add ${payload.amountIn || '0'} ${payload.tokenIn || 'token'} as Curve liquidity.`,
+      };
+    }
+
+    if (task.id === 'EXEC_CURVE_LIQUIDITY_REMOVE') {
+      return {
+        label: 'Simulation only',
+        buttonLabel: 'Simulated',
+        panelClasses: 'bg-amber-50/80',
+        iconClasses: 'text-amber-600',
+        titleClasses: 'text-amber-800',
+        detailClasses: 'text-amber-700',
+        summary: `Simulation only. Would withdraw ${payload.lpAmount || '0'} Curve LP into ${payload.tokenOut || 'token'}.`,
+      };
+    }
+
+    if (task.id === 'EXEC_CIRBTC_USDC_ZAP_IN' || task.id === 'EXEC_CIRBTC_EURC_ZAP_IN') {
+      return {
+        label: 'Simulation only',
+        buttonLabel: 'Simulated',
+        panelClasses: 'bg-amber-50/80',
+        iconClasses: 'text-amber-600',
+        titleClasses: 'text-amber-800',
+        detailClasses: 'text-amber-700',
+        summary: `Simulation only. Would swap part of ${payload.amountIn || '0'} ${payload.stableToken || 'stable'} into cirBTC, then mint LP on the configured direct pair.`,
+      };
+    }
+
+    if (task.id === 'EXEC_CIRBTC_USDC_LP_REMOVE' || task.id === 'EXEC_CIRBTC_EURC_LP_REMOVE') {
+      return {
+        label: 'Simulation only',
+        buttonLabel: 'Simulated',
+        panelClasses: 'bg-amber-50/80',
+        iconClasses: 'text-amber-600',
+        titleClasses: 'text-amber-800',
+        detailClasses: 'text-amber-700',
+        summary: `Simulation only. Would burn ${payload.withdrawPct || '0'}% of the current direct-pair LP position and return both underlying assets.`,
+      };
+    }
+
     if (task.id === 'EXEC_REBALANCE') {
       return {
         label: 'Simulation only',
@@ -422,6 +598,71 @@ function getTaskResultStatusMeta(task, payload) {
     detailClasses: 'text-slate-600',
     summary: payload?.summary || `${task.title} completed.`,
   };
+}
+
+function formatTaskMetricAmount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value || '0');
+  if (numeric === 0) return '0';
+  if (Math.abs(numeric) < 0.000001) return numeric.toExponential(6);
+  if (Math.abs(numeric) < 0.01) return numeric.toFixed(10).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+  return numeric.toFixed(6).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+}
+
+function getTaskExecutionFactLines(payload) {
+  const facts = [];
+  if (!payload || typeof payload !== 'object') return facts;
+
+  if (payload.swappedAmountIn && payload.amountOut && payload.stableToken) {
+    facts.push(`Swap leg: ${formatTaskMetricAmount(payload.swappedAmountIn)} ${payload.stableToken} -> ${formatTaskMetricAmount(payload.amountOut)} ${payload.volatileToken || 'cirBTC'}`);
+  }
+
+  if (payload.swapExecutionRail || payload.swapRouteStrategy) {
+    facts.push(`Swap route: ${payload.swapRouteStrategy || payload.swapExecutionRail}`);
+  }
+
+  if (payload.remainingAmountIn && payload.stableToken) {
+    facts.push(`Liquidity budget: ${formatTaskMetricAmount(payload.remainingAmountIn)} ${payload.stableToken} reserved for the LP leg.`);
+  }
+
+  if (payload.liquidityStableAmountUsed && payload.liquidityVolatileAmountUsed) {
+    facts.push(`LP leg used: ${formatTaskMetricAmount(payload.liquidityStableAmountUsed)} ${payload.stableToken} + ${formatTaskMetricAmount(payload.liquidityVolatileAmountUsed)} ${payload.volatileToken || 'cirBTC'}`);
+  }
+
+  if ((payload.liquidityStableAmountRemaining && Number(payload.liquidityStableAmountRemaining) > 0)
+    || (payload.liquidityVolatileAmountRemaining && Number(payload.liquidityVolatileAmountRemaining) > 0)) {
+    const leftovers = [
+      Number(payload.liquidityStableAmountRemaining || 0) > 0 ? `${formatTaskMetricAmount(payload.liquidityStableAmountRemaining)} ${payload.stableToken}` : null,
+      Number(payload.liquidityVolatileAmountRemaining || 0) > 0 ? `${formatTaskMetricAmount(payload.liquidityVolatileAmountRemaining)} ${payload.volatileToken || 'cirBTC'}` : null,
+    ].filter(Boolean);
+    facts.push(`Remainder kept in wallet: ${leftovers.join(' + ')}`);
+  }
+
+  if (payload.lpAmount) {
+    facts.push(`LP minted: ${formatTaskMetricAmount(payload.lpAmount)}`);
+  }
+
+  if (payload.token0Amount && payload.token0Symbol) {
+    facts.push(`Returned: ${formatTaskMetricAmount(payload.token0Amount)} ${payload.token0Symbol}`);
+  }
+
+  if (payload.token1Amount && payload.token1Symbol) {
+    facts.push(`Returned: ${formatTaskMetricAmount(payload.token1Amount)} ${payload.token1Symbol}`);
+  }
+
+  if (payload.swapTxHash) {
+    facts.push(`Swap tx: ${payload.swapTxHash}`);
+  }
+
+  if (payload.mintTxHash) {
+    facts.push(`Mint tx: ${payload.mintTxHash}`);
+  }
+
+  if (payload.burnTxHash) {
+    facts.push(`Burn tx: ${payload.burnTxHash}`);
+  }
+
+  return facts;
 }
 
 function buildInlineTaskResult(task, response) {
@@ -634,6 +875,7 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
   const pollRef                 = useRef(null);
   const startedAtRef            = useRef(null);
   const [params, setParams]     = useState(() => getInitialTaskParams(task.id));
+  const resultFacts = result ? getTaskExecutionFactLines(result.payload) : [];
 
   const isPaid    = task.tier === 2;
   const isBlocked = !tasksEnabled;
@@ -802,6 +1044,115 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
                 </div>
               )}
 
+              {task.id === 'EXEC_CURVE_LIQUIDITY_ADD' && (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Token In</span>
+                    <select
+                      value={params.tokenIn}
+                      onChange={e => setParams(current => ({ ...current, tokenIn: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                    >
+                      {REBALANCE_TOKEN_OPTIONS.map(token => (
+                        <option key={token} value={token}>{token}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Amount</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.000001"
+                      value={params.amountIn}
+                      onChange={e => setParams(current => ({ ...current, amountIn: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                      placeholder="1.00"
+                    />
+                  </label>
+                </div>
+              )}
+
+              {task.id === 'EXEC_CURVE_LIQUIDITY_REMOVE' && (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Token Out</span>
+                    <select
+                      value={params.tokenOut}
+                      onChange={e => setParams(current => ({ ...current, tokenOut: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                    >
+                      {REBALANCE_TOKEN_OPTIONS.map(token => (
+                        <option key={token} value={token}>{token}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Curve LP Amount</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.000001"
+                      value={params.lpAmount}
+                      onChange={e => setParams(current => ({ ...current, lpAmount: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                      placeholder="1.00"
+                    />
+                  </label>
+                </div>
+              )}
+
+              {(task.id === 'EXEC_CIRBTC_USDC_ZAP_IN' || task.id === 'EXEC_CIRBTC_EURC_ZAP_IN') && (() => {
+                const preset = DIRECT_PAIR_ZAP_PRESETS[task.id];
+                return (
+                  <div className="space-y-2">
+                    <label className="block">
+                      <span className="block text-[11px] font-medium text-slate-500 mb-1">Budget ({preset.token})</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.000001"
+                        max={preset.maxAmountIn}
+                        value={params.amountIn}
+                        onChange={e => setParams(current => ({ ...current, amountIn: e.target.value }))}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                        placeholder={preset.defaultAmountIn}
+                      />
+                    </label>
+                    <p className="text-[11px] text-slate-500">
+                      This task auto-swaps the optimal share into cirBTC and then adds both sides to the configured direct pair.
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                      Current cap: {preset.maxAmountIn} {preset.token} total budget, targeting up to {preset.maxSwapAmountIn} {preset.token} for the swap leg.
+                    </p>
+                  </div>
+                );
+              })()}
+
+              {(task.id === 'EXEC_CIRBTC_USDC_LP_REMOVE' || task.id === 'EXEC_CIRBTC_EURC_LP_REMOVE') && (() => {
+                const preset = DIRECT_PAIR_EXIT_PRESETS[task.id];
+                return (
+                  <div className="space-y-2">
+                    <label className="block">
+                      <span className="block text-[11px] font-medium text-slate-500 mb-1">Withdraw % of current LP position</span>
+                      <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="0.01"
+                        value={params.withdrawPct}
+                        onChange={e => setParams(current => ({ ...current, withdrawPct: e.target.value }))}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                        placeholder={preset.defaultWithdrawPct}
+                      />
+                    </label>
+                    <p className="text-[11px] text-slate-500">
+                      Burns the selected share of the current {preset.token}/cirBTC LP and returns both underlying assets to the agent wallet.
+                    </p>
+                  </div>
+                );
+              })()}
+
               {task.id === 'EXEC_CCTP_BRIDGE' && (
                 <div className="grid gap-2 sm:grid-cols-3">
                   <label className="block">
@@ -959,6 +1310,13 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
               {result.payload?.summary && (
                 <p className={`text-xs mt-0.5 ${resultMeta?.detailClasses || 'text-slate-600'}`}>{result.payload.summary}</p>
               )}
+              {resultFacts.length > 0 && (
+                <div className="mt-1 space-y-0.5">
+                  {resultFacts.map(line => (
+                    <p key={line} className="text-[11px] text-slate-500">{line}</p>
+                  ))}
+                </div>
+              )}
               {result.payload?.dryRun && isPaid && (
                 <p className="text-[11px] text-amber-700 mt-1">
                   No on-chain transaction was sent. Check dry-run mode, relayer funding and pool configuration before treating this as a live execution.
@@ -986,6 +1344,8 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
 function ResultRow({ result }) {
   const [expanded, setExpanded] = useState(false);
   const ts = new Date(result.created_at).toLocaleTimeString();
+  const factLines = getTaskExecutionFactLines(result.payload);
+  const expandedText = [result.payload?.summary, ...factLines].filter(Boolean).join('\n');
 
   return (
     <div className="border border-slate-200 rounded-xl overflow-hidden">
@@ -1002,8 +1362,8 @@ function ResultRow({ result }) {
       </button>
       {expanded && (
         <pre className="px-4 pb-3 pt-1 text-xs text-slate-500 overflow-x-auto border-t border-slate-100 max-h-40 whitespace-pre-wrap">
-          {result.payload?.summary
-            ? result.payload.summary
+          {expandedText
+            ? expandedText
             : JSON.stringify(result.payload, null, 2)}
         </pre>
       )}
@@ -1030,10 +1390,47 @@ export default function TasksTab() {
   const [saveMsg, setSaveMsg]           = useState('');
   const [automationSavingKey, setAutomationSavingKey] = useState('');
   const [automationMsg, setAutomationMsg]             = useState('');
+  const [automationWalletSnapshot, setAutomationWalletSnapshot] = useState(null);
 
   useEffect(() => {
     setTasksEnabled(agent?.features?.dailyTasksEnabled ?? false);
   }, [agent?.id, agent?.features?.dailyTasksEnabled]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!agent?.walletAddress) {
+      setAutomationWalletSnapshot(null);
+      return () => {};
+    }
+
+    Promise.all([
+      fetchAgentBalance(agent.walletAddress, 5042002),
+      fetchUsdcBalance(agent.walletAddress, 5042002),
+      fetchEurcBalance(agent.walletAddress, 5042002),
+    ]).then(([nativeBalance, usdcBalance, eurcBalance]) => {
+      if (!cancelled) {
+        setAutomationWalletSnapshot({ nativeBalance, usdcBalance, eurcBalance });
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setAutomationWalletSnapshot(null);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [agent?.walletAddress]);
+
+  const automationEnabledCount = AUTOMATION_FEATURES.filter(feature => agent?.features?.[feature.key]).length;
+  const allAutomationEnabled = automationEnabledCount === AUTOMATION_FEATURES.length;
+  const fullAutonomyBusy = automationSavingKey === 'fullAutonomous';
+
+  function buildFullAutonomyPayload(nextValue) {
+    return Object.fromEntries(FULL_AUTONOMY_FEATURE_KEYS.map(key => [key, nextValue]));
+  }
+
   const load = useCallback(async () => {
     setLoading(true); setError('');
     try {
@@ -1119,6 +1516,40 @@ export default function TasksTab() {
     }
   }
 
+  async function handleFullAutonomyToggle(nextValue) {
+    if (!agent?.id) return;
+
+    const payload = buildFullAutonomyPayload(nextValue);
+    setAutomationSavingKey('fullAutonomous');
+    setAutomationMsg('');
+
+    try {
+      await agentsApi.update(agent.id, payload);
+      const [latestStatus, latestReputation] = await Promise.all([
+        agentsApi.status(agent.id).catch(() => null),
+        agentsApi.reputation(agent.id, 8).catch(() => null),
+      ]);
+
+      setAgent(current => ({
+        ...current,
+        features: {
+          ...(current?.features || {}),
+          ...payload,
+        },
+      }));
+
+      if (latestStatus) setAgentStatus(latestStatus);
+      if (latestReputation) setReputationOverview(latestReputation);
+
+      setAutomationMsg(nextValue ? 'Full Autonomous mode enabled.' : 'Full Autonomous mode disabled.');
+      setTimeout(() => setAutomationMsg(''), 3000);
+    } catch (e) {
+      setAutomationMsg(`Error: ${e.message}`);
+    } finally {
+      setAutomationSavingKey('');
+    }
+  }
+
   const freeTasks  = catalog.filter(t => t.tier === 1);
   const paidTasks  = catalog.filter(t => t.tier === 2);
   const shownTasks = activeGroup === 'free'
@@ -1128,9 +1559,63 @@ export default function TasksTab() {
       : [];
   const taskSection = activeGroup === 'automation' ? (
     <div className="space-y-2">
+      <div className="border border-blue-200 rounded-xl p-4 bg-blue-50/70">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-sm font-semibold text-slate-800">Full Autonomous</p>
+              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${
+                allAutomationEnabled
+                  ? 'border-green-200 bg-green-50 text-green-700'
+                  : 'border-slate-200 bg-slate-50 text-slate-500'
+              }`}>
+                {allAutomationEnabled ? 'All automation features on' : `${automationEnabledCount}/${AUTOMATION_FEATURES.length} enabled`}
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">
+              Toggle Market Analysis, Oracle Data Feed, DeFi Loop Execution and Reputation Tracking in one action.
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              The Tasks enable switch remains separate. This control only manages background automation features.
+            </p>
+          </div>
+
+          <button
+            onClick={() => handleFullAutonomyToggle(!allAutomationEnabled)}
+            disabled={fullAutonomyBusy}
+            className={`shrink-0 flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition ${
+              allAutomationEnabled
+                ? 'bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-60'
+                : 'bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60'
+            }`}
+          >
+            {fullAutonomyBusy ? <Spinner size={11} /> : <Brain size={12} />}
+            {allAutomationEnabled ? 'Disable All Automation' : 'Enable Full Autonomous'}
+          </button>
+        </div>
+      </div>
+
+      <div className="border border-slate-200 rounded-xl p-4 bg-white">
+        <div className="flex items-center gap-2 flex-wrap">
+          <p className="text-sm font-semibold text-slate-800">Current Autonomy Policy</p>
+          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+            {agent?.isSmartMode ? 'Smart Mode on' : 'Smart Mode off'}
+          </span>
+        </div>
+        <div className="mt-2 space-y-1.5 text-xs text-slate-600">
+          <p>Market Analysis uses the selected LLM only to refresh context. It does not sign or submit on-chain transactions.</p>
+          <p>Oracle Data Feed currently watches the Arc Testnet EURC/USDC stablecoin strategy and records opportunities plus one execution-gate verdict.</p>
+          <p>DeFi Loop Execution is the only background feature that can currently move funds. It asks exactly one gate before every autonomous trade: LLM JSON if a key exists, otherwise the built-in rule engine.</p>
+          <p>Today the only autonomous on-chain trade is Arc Testnet USDC to EURC on the verified Curve pool. cirBTC LP bootstrap is still manual paid execution, not autonomous.</p>
+          <p>Maximum autonomous trade size is capped by your agent setting: <strong>{Number(agent?.settings?.maxTradeUsdc || 0).toFixed(2)} USDC</strong>. The loop uses the smaller of the strategy size and this cap.</p>
+          <p>Automation needs funds in the agent wallet. Current Arc wallet snapshot: <strong>{automationWalletSnapshot?.nativeBalance ?? '—'} ARC</strong>, <strong>{automationWalletSnapshot?.usdcBalance ?? '—'} USDC</strong>, <strong>{automationWalletSnapshot?.eurcBalance ?? '—'} EURC</strong>.</p>
+          <p>Runtime still starts here in Tasks → Automation. Today, DeFi Protocol Scanner gates Market Analysis, Arbitrage gates oracle-strategy eligibility plus DeFi Loop Execution, and the remaining strategy checkboxes are saved preferences only.</p>
+        </div>
+      </div>
+
       {AUTOMATION_FEATURES.map(feature => {
         const enabled = agent?.features?.[feature.key] ?? false;
-        const isSaving = automationSavingKey === feature.key;
+        const isSaving = automationSavingKey === feature.key || fullAutonomyBusy;
         const automationState = agentStatus?.automation?.[feature.statusKey] || null;
         const lastStatus = automationState?.lastStatus || (enabled ? 'idle' : 'disabled');
         const showReputationWarning = feature.statusKey === 'reputation' && agentStatus?.config?.reputationRegistryConfigured === false;
@@ -1152,6 +1637,11 @@ export default function TasksTab() {
                   <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getAutomationStatusClasses(lastStatus, enabled)}`}>
                     {humanizeAutomationStatus(lastStatus)}
                   </span>
+                  {automationState?.bypassDailyCap && ['oracle', 'defiLoop'].includes(feature.statusKey) && (
+                    <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700">
+                      Whitelist bypass active
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-slate-500 mt-1">{feature.description}</p>
                 <p className="text-xs text-slate-400 mt-1">{feature.detail}</p>

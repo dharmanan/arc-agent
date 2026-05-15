@@ -30,7 +30,16 @@ const quoteSchema = z.object({
 router.post('/swap/quote', txRateLimit, async (req, res, next) => {
   try {
     const body = quoteSchema.parse(req.body);
-    const { amountOut, quoteError } = await agentWalletService.getSwapQuoteResult(body);
+    const {
+      amountOut,
+      quoteError,
+      routeStrategy = null,
+      routeReason = null,
+      fallbackAvailable = false,
+      executionRail = null,
+      poolAddress = null,
+      poolSource = null,
+    } = await agentWalletService.getSwapQuoteResult(body);
     const stablePair = ['USDC', 'EURC'].includes(body.fromToken) && ['USDC', 'EURC'].includes(body.toToken);
 
     res.json({
@@ -40,6 +49,12 @@ router.post('/swap/quote', txRateLimit, async (req, res, next) => {
       amountOut:  amountOut ?? (stablePair ? body.amountIn : null),
       isDexQuote: amountOut !== null,
       quoteError: amountOut === null ? quoteError : null,
+      routeStrategy,
+      routeReason,
+      fallbackAvailable,
+      executionRail,
+      poolAddress,
+      poolSource,
     });
   } catch (err) { next(err); }
 });

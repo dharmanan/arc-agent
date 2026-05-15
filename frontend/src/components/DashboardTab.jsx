@@ -30,30 +30,259 @@ function formatTokenAmount(amount, token) {
   return `${numeric.toFixed(digits).replace(/\.0+$|(?<=\.\d*?)0+$/g, '')} ${token}`;
 }
 
+function formatTokenAmountWithZero(amount, token) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) return null;
+  if (numeric === 0) return `0 ${token}`;
+  return formatTokenAmount(numeric, token);
+}
+
+function summarizeActivityError(error) {
+  const raw = String(error || '').trim();
+  if (!raw) return null;
+
+  if (/nonce too low|nonce has already been used|NONCE_EXPIRED/i.test(raw)) {
+    return 'Another transaction already used this wallet nonce before this swap was submitted.';
+  }
+
+  if (/ERC20:\s*transfer amount exceeds balance/i.test(raw)) {
+    return 'Agent wallet balance was too low for this trade.';
+  }
+
+  if ((/transaction execution reverted/i.test(raw) || /CALL_EXCEPTION/i.test(raw)) && /reason=null/i.test(raw)) {
+    return 'The on-chain swap reverted, but the RPC node did not return a decoded contract reason.';
+  }
+
+  if (/exceeds agent auto-approve limit/i.test(raw)) {
+    return 'Trade size was above the current auto-approve limit.';
+  }
+
+  if (/Daily limit exceeded/i.test(raw)) {
+    return 'Daily spend limit blocked this autonomous trade.';
+  }
+
+  const compact = raw.replace(/\s+/g, ' ').trim();
+  const quotedReason = compact.match(/reason[=:]\s*["']([^"']+)["']/i)?.[1];
+  const primary = quotedReason || compact.split(' (action=')[0] || compact;
+
+  return primary.length > 180 ? `${primary.slice(0, 177)}...` : primary;
+}
+
+function getOracleStrategyFailureContext(meta, inputToken) {
+  const attemptedAmount = Number(meta.amountIn);
+  const requestedAmount = Number(meta.requestedAmountIn);
+  const availableAmount = Number(meta.availableBalanceUsdc);
+  const tradableAmount = Number(meta.availableToTradeUsdc);
+  const reservedAmount = Number(meta.walletReserveUsdc);
+  const attemptedAmountLabel = formatTokenAmountWithZero(meta.amountIn, inputToken);
+  const requestedAmountLabel = formatTokenAmount(meta.requestedAmountIn, inputToken);
+  const availableAmountLabel = formatTokenAmountWithZero(meta.availableBalanceUsdc, inputToken);
+  const tradableAmountLabel = formatTokenAmountWithZero(meta.availableToTradeUsdc, inputToken);
+  const reservedAmountLabel = formatTokenAmountWithZero(meta.walletReserveUsdc, inputToken);
+
+  if (/nonce too low|nonce has already been used|NONCE_EXPIRED/i.test(String(meta.error || ''))) {
+    return attemptedAmountLabel
+      ? ` The failed on-chain attempt size was ${attemptedAmountLabel}.`
+      : '';
+  }
+
+  if (
+    Number.isFinite(requestedAmount)
+    && Number.isFinite(attemptedAmount)
+    && Number.isFinite(tradableAmount)
+    && requestedAmount > attemptedAmount
+    && Math.abs(tradableAmount - attemptedAmount) < 0.000001
+    && /transaction execution reverted|CALL_EXCEPTION/i.test(String(meta.error || ''))
+  ) {
+    if (Number.isFinite(reservedAmount) && reservedAmount > 0) {
+      return ` The loop had already reduced the trade from ${requestedAmountLabel || `${requestedAmount} ${inputToken}`} to ${attemptedAmountLabel || `${attemptedAmount} ${inputToken}`} based on the wallet's tradable balance (${tradableAmountLabel || `${tradableAmount} ${inputToken}`}) after keeping ${reservedAmountLabel || `${reservedAmount} ${inputToken}`} reserved, so this was not blocked by the pre-trade balance guard.`;
+    }
+
+    return ` The loop had already reduced the trade from ${requestedAmountLabel || `${requestedAmount} ${inputToken}`} to ${attemptedAmountLabel || `${attemptedAmount} ${inputToken}`} based on the wallet's available balance (${availableAmountLabel || `${availableAmount} ${inputToken}`}), so this was not blocked by the pre-trade balance guard.`;
+  }
+
+  return attemptedAmountLabel
+    ? ` The failed on-chain attempt size was ${attemptedAmountLabel}.`
+    : '';
+}
+
+function formatPositionAmount(amount) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '0';
+  if (Math.abs(numeric) < 0.000001) return numeric.toExponential(6);
+  if (Math.abs(numeric) < 0.01) return numeric.toFixed(10).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+  return numeric.toFixed(6).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+}
+
+function formatLpAmount(amount) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '0';
+  if (Math.abs(numeric) < 0.001) return '<0.001';
+  return numeric.toFixed(3).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+}
+
+function formatPositionVenue(position) {
+  const chain = position?.chain || 'Arc Testnet';
+  const protocol = String(position?.protocol || '').toLowerCase();
+  const poolModel = String(position?.poolModel || '').toLowerCase();
+
+  let venueLabel = 'Liquidity pool';
+  if (protocol === 'curve') {
+    venueLabel = 'Curve stable pool';
+  } else if (protocol === 'uniswap_v2_like' && poolModel === 'constant_product') {
+    venueLabel = 'Direct liquidity pool';
+  } else if (protocol === 'uniswap_v2_like') {
+    venueLabel = 'Direct swap pool';
+  }
+
+  return `${chain} · ${venueLabel}`;
+}
+
 function getExplorerTxUrl(chainName, txHash) {
   const explorerBase = CHAINS[chainName]?.explorerUrl;
   if (!explorerBase || !isRealHash(txHash)) return null;
   return `${explorerBase}/tx/${txHash}`;
 }
 
-function getTxDisplay(tx) {
+function getOracleStrategyLabel(meta) {
+  return meta.signal?.strategy === 'stablecoin_fx'
+    ? 'EURC/USDC oracle strategy'
+    : 'Oracle strategy';
+}
+
+function getOracleSignalKey(meta) {
+  const timestamp = meta.signal?.timestamp;
+  if (!timestamp) return null;
+
+  return [
+    meta.signal?.strategy || 'oracle',
+    timestamp,
+    Number(meta.signal?.opportunity?.amountUsdc || 0),
+  ].join(':');
+}
+
+function getOracleSignalFollowUp(tx, allTxs) {
+  const signalKey = getOracleSignalKey(getTxMeta(tx));
+  if (!signalKey) return null;
+
+  return allTxs.find(candidate => {
+    if (!['defi_loop_swap', 'defi_loop_dry'].includes(candidate?.type)) return false;
+    return getOracleSignalKey(getTxMeta(candidate)) === signalKey;
+  }) || null;
+}
+
+function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
   const meta = getTxMeta(tx);
   const isOracleSignal = tx.type === 'oracle_signal';
+  const isOracleStrategyExecution = tx.type === 'defi_loop_swap';
+  const isOracleStrategyDryRun = tx.type === 'defi_loop_dry';
   const isSwap = tx.type === 'swap';
+  const isDirectLpAdd = tx.type === 'direct_lp_add';
+  const isDirectLpRemove = tx.type === 'direct_lp_remove';
 
   if (isOracleSignal) {
     const strategy = meta.signal?.strategy === 'stablecoin_fx'
       ? 'EURC/USDC oracle signal'
       : 'Oracle signal';
+    const isDailyCapReached = meta.executionState === 'daily_cap_reached';
+    const followUpTx = getOracleSignalFollowUp(tx, allTxs);
+    const signalCreatedAtMs = Date.parse(tx.created_at || meta.signal?.timestamp || '');
+    const lastDefiRunAtMs = Date.parse(agentStatus?.automation?.defiLoop?.lastRunAt || '');
+
+    let signalReason = meta.signalOnlyReason
+      || (meta.executionPermissionGranted
+        ? 'Autonomous execution is enabled, but this row is only the oracle snapshot. A separate oracle strategy row appears only when the DeFi loop records a result for this exact signal.'
+        : 'Signal only — this agent does not currently have permission to auto-execute oracle strategies.');
+
+    if (followUpTx) {
+      const followUpMeta = getTxMeta(followUpTx);
+      if (followUpMeta.executionState === 'daily_cap_reached') {
+        signalReason = `This signal later hit the daily DeFi loop cap at ${Number(followUpMeta.dailyCapCount || 0)}/${Number(followUpMeta.dailyCap || 10)}. See the matching oracle strategy hold row.`;
+      } else if (followUpMeta.executionState === 'insufficient_balance') {
+        const tradableAmountLabel = formatTokenAmountWithZero(followUpMeta.availableToTradeUsdc, 'USDC');
+        const reservedAmountLabel = formatTokenAmountWithZero(followUpMeta.walletReserveUsdc, 'USDC');
+        signalReason = tradableAmountLabel && reservedAmountLabel && Number(followUpMeta.walletReserveUsdc) > 0
+          ? `This signal later reached the DeFi loop, but only ${tradableAmountLabel} was tradable after keeping ${reservedAmountLabel} reserved in the agent wallet. See the matching oracle strategy hold row.`
+          : 'This signal later reached the DeFi loop, but the agent wallet did not have enough balance. See the matching oracle strategy hold row.';
+      } else if (followUpTx.status === 'confirmed') {
+        signalReason = 'This signal later produced the executed oracle strategy row below.';
+      } else if (followUpTx.status === 'failed') {
+        signalReason = 'This signal later produced a failed oracle strategy row below.';
+      } else {
+        signalReason = 'This signal later produced a separate DeFi loop result row below.';
+      }
+    } else if (meta.executionPermissionGranted) {
+      signalReason = Number.isFinite(signalCreatedAtMs) && Number.isFinite(lastDefiRunAtMs) && lastDefiRunAtMs < signalCreatedAtMs
+        ? 'Autonomous execution was approved, but the latest recorded DeFi loop run happened before this signal arrived. No execution result has been recorded for this exact opportunity yet.'
+        : 'Autonomous execution was approved for this signal, but no separate DeFi loop result was recorded for this exact opportunity.';
+    }
 
     return {
-      title: 'oracle opportunity',
+      title: isDailyCapReached ? 'oracle opportunity not executed' : 'oracle opportunity',
       routeLabel: `Arc Testnet · ${strategy}`,
       amountLabel: Number(tx.amount_usdc) > 0
         ? `${parseFloat(tx.amount_usdc).toFixed(2)} ${tx.token || 'USDC'}`
         : null,
-      phase: 'Signal only — no on-chain trade was submitted',
+      phase: signalReason,
       links: [],
+    };
+  }
+
+  if (isOracleStrategyExecution || isOracleStrategyDryRun) {
+    const inputToken = meta.fromToken || 'USDC';
+    const outputToken = meta.toToken || tx.token || 'EURC';
+    const inputAmountLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, inputToken);
+    const outputAmountLabel = formatTokenAmount(meta.amountOut, outputToken);
+    const requestedAmountLabel = formatTokenAmountWithZero(meta.requestedAmountIn, inputToken);
+    const availableBalanceLabel = formatTokenAmountWithZero(meta.availableBalanceUsdc, inputToken);
+    const tradableBalanceLabel = formatTokenAmountWithZero(meta.availableToTradeUsdc, inputToken);
+    const reservedBalanceLabel = formatTokenAmountWithZero(meta.walletReserveUsdc, inputToken);
+    const summarizedError = summarizeActivityError(meta.error);
+    const txHash = tx.tx_hash || tx.txHash || null;
+    const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+
+    let phase = null;
+    if (meta.executionState === 'daily_cap_reached') {
+      phase = `Autonomous execution did not run because this agent already used ${Number(meta.dailyCapCount || 0)}/${Number(meta.dailyCap || 10)} daily DeFi loop runs. No on-chain trade was submitted.`;
+    } else if (meta.executionState === 'insufficient_balance') {
+      phase = tradableBalanceLabel && reservedBalanceLabel && Number(meta.walletReserveUsdc) > 0
+        ? `Skipped before execution. Requested ${requestedAmountLabel || inputAmountLabel || `1 ${inputToken}`}, the wallet held ${availableBalanceLabel || `0 ${inputToken}`}, but ${reservedBalanceLabel} was kept reserved, leaving ${tradableBalanceLabel} available for autonomous trading. No on-chain trade was submitted.`
+        : availableBalanceLabel
+        ? `Skipped before execution. Requested ${requestedAmountLabel || inputAmountLabel || `1 ${inputToken}`}, but the agent wallet only had ${availableBalanceLabel}. No on-chain trade was submitted.`
+        : 'Skipped before execution because the agent wallet did not have enough balance for this trade.';
+    } else if (isOracleStrategyDryRun || meta.executionState === 'dry_run') {
+      phase = 'Autonomous execution is enabled, but this run stayed in dry-run mode and did not submit an on-chain trade.';
+    } else if (tx.status === 'confirmed') {
+      phase = outputAmountLabel
+        ? `Executed autonomously — received ${outputAmountLabel}`
+        : 'Executed autonomously on-chain';
+    } else if (tx.status === 'failed') {
+      phase = summarizedError
+        ? `Autonomous execution failed: ${summarizedError}${getOracleStrategyFailureContext(meta, inputToken)}`
+        : 'Autonomous execution failed before confirmation';
+    }
+
+    return {
+      title: meta.executionState === 'daily_cap_reached'
+        ? 'oracle strategy hold'
+        : meta.executionState === 'insufficient_balance'
+        ? 'oracle strategy hold'
+        : isOracleStrategyDryRun
+          ? 'oracle strategy dry run'
+          : 'executed oracle strategy',
+      routeLabel: `Arc Testnet · ${getOracleStrategyLabel(meta)}`,
+      amountLabel: inputAmountLabel || requestedAmountLabel,
+      phase,
+      links: txUrl
+        ? [{
+            key: `${tx.id}-oracle-strategy`,
+            label: 'Tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
     };
   }
 
@@ -80,6 +309,83 @@ function getTxDisplay(tx) {
             url: swapUrl,
           }]
         : [],
+    };
+  }
+
+  if (isDirectLpAdd) {
+    const stableToken = meta.stableToken || tx.token || 'USDC';
+    const volatileToken = meta.volatileToken || 'cirBTC';
+    const amountInLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, stableToken);
+    const swappedLabel = meta.swappedAmountIn && meta.amountOut
+      ? `${formatTokenAmount(meta.swappedAmountIn, stableToken)} -> ${formatTokenAmount(meta.amountOut, volatileToken)}`
+      : null;
+    const lpMintedLabel = meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP minted` : null;
+    const lpUsedLabel = meta.liquidityStableAmountUsed && meta.liquidityVolatileAmountUsed
+      ? `LP leg used ${formatTokenAmount(meta.liquidityStableAmountUsed, stableToken)} + ${formatTokenAmount(meta.liquidityVolatileAmountUsed, volatileToken)}`
+      : null;
+    const leftoverParts = [
+      Number(meta.liquidityStableAmountRemaining || 0) > 0 ? formatTokenAmount(meta.liquidityStableAmountRemaining, stableToken) : null,
+      Number(meta.liquidityVolatileAmountRemaining || 0) > 0 ? formatTokenAmount(meta.liquidityVolatileAmountRemaining, volatileToken) : null,
+    ].filter(Boolean);
+    const primaryHash = meta.mintTxHash || tx.tx_hash || null;
+    const swapUrl = getExplorerTxUrl('Arc Testnet', meta.swapTxHash);
+    const mintUrl = getExplorerTxUrl('Arc Testnet', primaryHash);
+
+    return {
+      title: 'direct pair lp add',
+      routeLabel: `Arc Testnet · ${stableToken}/${volatileToken} direct pair`,
+      amountLabel: amountInLabel,
+      phase: swappedLabel
+        ? `Swap leg ${swappedLabel}${meta.swapRouteStrategy ? ` via ${meta.swapRouteStrategy}` : ''}. ${lpUsedLabel || lpMintedLabel || 'LP minted.'}${leftoverParts.length > 0 ? ` Wallet kept ${leftoverParts.join(' + ')} unmatched to the pair ratio.` : ''}`
+        : (meta.summary || lpMintedLabel || 'Direct-pair LP minted on-chain'),
+      links: [
+        swapUrl ? {
+          key: `${tx.id}-direct-lp-add-swap`,
+          label: 'Swap tx',
+          hash: meta.swapTxHash,
+          url: swapUrl,
+        } : null,
+        mintUrl ? {
+          key: `${tx.id}-direct-lp-add-mint`,
+          label: 'Mint tx',
+          hash: primaryHash,
+          url: mintUrl,
+        } : null,
+      ].filter(Boolean),
+    };
+  }
+
+  if (isDirectLpRemove) {
+    const stableToken = meta.stableToken || tx.token || 'USDC';
+    const volatileToken = meta.volatileToken || 'cirBTC';
+    const burnHash = meta.burnTxHash || tx.tx_hash || null;
+    const burnUrl = getExplorerTxUrl('Arc Testnet', burnHash);
+    const returnedStable = meta.token0Symbol === stableToken
+      ? formatTokenAmount(meta.token0Amount, stableToken)
+      : meta.token1Symbol === stableToken
+        ? formatTokenAmount(meta.token1Amount, stableToken)
+        : null;
+    const returnedVolatile = meta.token0Symbol === volatileToken
+      ? formatTokenAmount(meta.token0Amount, volatileToken)
+      : meta.token1Symbol === volatileToken
+        ? formatTokenAmount(meta.token1Amount, volatileToken)
+        : null;
+
+    return {
+      title: 'direct pair lp exit',
+      routeLabel: `Arc Testnet · ${stableToken}/${volatileToken} direct pair`,
+      amountLabel: meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP burned` : null,
+      phase: [
+        Number(meta.withdrawPct) > 0 ? `Withdrew ${Number(meta.withdrawPct).toFixed(0)}% of the position.` : null,
+        returnedStable ? `Returned ${returnedStable}` : null,
+        returnedVolatile ? `Returned ${returnedVolatile}` : null,
+      ].filter(Boolean).join(' '),
+      links: burnUrl ? [{
+        key: `${tx.id}-direct-lp-remove-burn`,
+        label: 'Burn tx',
+        hash: burnHash,
+        url: burnUrl,
+      }] : [],
     };
   }
 
@@ -161,9 +467,14 @@ export default function DashboardTab({ onNavigate }) {
   const [portfolio, setPortfolio]         = useState([]);
   const [loadingPortfolio, setLoadingPortfolio] = useState(false);
   const [portfolioError, setPortfolioError] = useState('');
+  const [positions, setPositions] = useState([]);
+  const [loadingPositions, setLoadingPositions] = useState(false);
+  const [positionsError, setPositionsError] = useState('');
+  const [positionWarnings, setPositionWarnings] = useState([]);
   const [txs, setTxs]             = useState([]);
   const [loadingTxs, setLoadingTxs] = useState(false);
   const [txError, setTxError]     = useState('');
+  const [agentStatus, setAgentStatus] = useState(null);
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState('');
   const [paymentMode, setPaymentMode] = useState(null); // 'send' | 'receive' | null
@@ -212,6 +523,26 @@ export default function DashboardTab({ onNavigate }) {
     }
   }, [agentWalletAddress]);
 
+  const loadPositions = useCallback(async ({ silent = false } = {}) => {
+    if (!agent?.id || !isAuthenticated) {
+      setPositions([]);
+      setPositionWarnings([]);
+      return;
+    }
+
+    if (!silent) setLoadingPositions(true);
+    setPositionsError('');
+    try {
+      const data = await agents.positions(agent.id);
+      setPositions(Array.isArray(data.positions) ? data.positions : []);
+      setPositionWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+    } catch (e) {
+      setPositionsError(e.message || 'Failed to load live protocol positions');
+    } finally {
+      if (!silent) setLoadingPositions(false);
+    }
+  }, [agent?.id, isAuthenticated]);
+
   const loadTransactions = useCallback(async ({ silent = false } = {}) => {
     if (!agent?.id || !isAuthenticated) {
       setTxs([]);
@@ -230,9 +561,27 @@ export default function DashboardTab({ onNavigate }) {
     }
   }, [agent?.id, isAuthenticated]);
 
+  const loadAgentStatus = useCallback(async () => {
+    if (!agent?.id || !isAuthenticated) {
+      setAgentStatus(null);
+      return;
+    }
+
+    try {
+      const data = await agents.status(agent.id);
+      setAgentStatus(data || null);
+    } catch {
+      setAgentStatus(null);
+    }
+  }, [agent?.id, isAuthenticated]);
+
   useEffect(() => {
     loadPortfolio(agentWalletAddress);
   }, [agentWalletAddress, loadPortfolio]);
+
+  useEffect(() => {
+    loadPositions();
+  }, [loadPositions]);
 
   useEffect(() => {
     if (!agentWalletAddress) return;
@@ -245,8 +594,22 @@ export default function DashboardTab({ onNavigate }) {
   }, [agentWalletAddress, loadPortfolio]);
 
   useEffect(() => {
+    if (!agent?.id || !isAuthenticated) return undefined;
+
+    const intervalId = setInterval(() => {
+      loadPositions({ silent: true });
+    }, 30_000);
+
+    return () => clearInterval(intervalId);
+  }, [agent?.id, isAuthenticated, loadPositions]);
+
+  useEffect(() => {
     loadTransactions();
   }, [loadTransactions]);
+
+  useEffect(() => {
+    loadAgentStatus();
+  }, [loadAgentStatus]);
 
   useEffect(() => {
     if (!agent?.id || !isAuthenticated) return undefined;
@@ -257,6 +620,16 @@ export default function DashboardTab({ onNavigate }) {
 
     return () => clearInterval(intervalId);
   }, [agent?.id, isAuthenticated, loadTransactions]);
+
+  useEffect(() => {
+    if (!agent?.id || !isAuthenticated) return undefined;
+
+    const intervalId = setInterval(() => {
+      loadAgentStatus();
+    }, 30_000);
+
+    return () => clearInterval(intervalId);
+  }, [agent?.id, isAuthenticated, loadAgentStatus]);
 
   if (!ownerAddress) {
     return (
@@ -427,6 +800,91 @@ export default function DashboardTab({ onNavigate }) {
         </p>
       </Card>
 
+      <Card>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Activity size={16} className="text-slate-400" />
+            <div>
+              <h3 className="font-semibold text-slate-800">Agent Positions</h3>
+              <p className="text-xs text-slate-500">Live DeFi LP positions currently held by the agent wallet.</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            className="px-3 py-2 text-xs"
+            onClick={() => loadPositions()}
+            loading={loadingPositions}
+          >
+            <RefreshCw size={13} /> Refresh
+          </Button>
+        </div>
+
+        {positionsError && <Alert type="error">{positionsError}</Alert>}
+
+        {!positionsError && positionWarnings.length > 0 && (
+          <Alert type="warning" className="mb-3">
+            {positionWarnings[0].message}
+          </Alert>
+        )}
+
+        {loadingPositions ? (
+          <div className="flex justify-center py-8"><Spinner /></div>
+        ) : positions.length === 0 ? (
+          <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+            No live DeFi LP position is currently detected for this agent wallet.
+          </div>
+        ) : (
+          <div className="grid gap-3 lg:grid-cols-2">
+            {positions.map(position => (
+              <div key={`${position.protocol}-${position.poolAddress}`} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">{position.poolKey}</p>
+                    <p className="mt-1 text-xs text-slate-500">{formatPositionVenue(position)}</p>
+                  </div>
+                  <Badge variant="slate">{position.sharePct}% share</Badge>
+                </div>
+
+                <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">LP Balance</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">{formatLpAmount(position.lpToken?.balance || 0)}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">{position.lpToken?.symbol}</p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                      {position.protocol === 'curve' ? 'Virtual Price' : 'Pool Model'}
+                    </p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">
+                      {position.protocol === 'curve'
+                        ? (position.virtualPrice ? Number(position.virtualPrice).toFixed(6) : '—')
+                        : String(position.poolModel || 'constant_product').replace(/_/g, ' ')}
+                    </p>
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      {position.protocol === 'curve'
+                        ? position.liquidityState
+                        : `${Number(position.feePct || 0.3).toFixed(1)}% fee tier`}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-xl border border-slate-200 bg-white px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Underlying Assets</p>
+                  <div className="mt-2 space-y-1.5 text-sm text-slate-600">
+                    {position.underlying.map(asset => (
+                      <div key={`${position.poolAddress}-${asset.symbol}`} className="flex items-center justify-between gap-3">
+                        <span>{asset.symbol}</span>
+                        <span className="font-semibold text-slate-900">{formatPositionAmount(asset.amount || 0)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
       {/* Owner wallet */}
       <Card>
         <div className="flex items-center gap-3">
@@ -463,28 +921,37 @@ export default function DashboardTab({ onNavigate }) {
         ) : (
           <div className="space-y-2">
             {txs.map(tx => {
-              const { title, routeLabel, amountLabel, phase, links } = getTxDisplay(tx);
+              const { title, routeLabel, amountLabel, phase, links } = getTxDisplay(tx, { allTxs: txs, agentStatus });
               const isReceive = tx.type === 'receive';
               const isSend    = tx.type === 'send' || tx.type === 'nano_payment';
               const isSwap    = tx.type === 'swap';
+              const isDirectLpAdd = tx.type === 'direct_lp_add';
+              const isDirectLpRemove = tx.type === 'direct_lp_remove';
               const isOracleSignal = tx.type === 'oracle_signal';
+              const isOracleStrategy = tx.type === 'defi_loop_swap' || tx.type === 'defi_loop_dry';
               const isBridge  = tx.type === 'bridge' || tx.type === 'gas_topup';
 
               const TxIcon = isReceive ? ArrowDownLeft
                 : isSend    ? ArrowUpRight
                 : isSwap    ? Repeat2
-                : isOracleSignal ? Activity
+                : isDirectLpAdd || isDirectLpRemove ? Zap
+                : isOracleSignal || isOracleStrategy ? Activity
                 : Zap;
 
               const iconColor = isReceive ? 'text-arc-green'
                 : isSend    ? 'text-blue-500'
                 : isSwap    ? 'text-purple-500'
+                : isDirectLpAdd ? 'text-emerald-600'
+                : isDirectLpRemove ? 'text-amber-600'
                 : isOracleSignal ? 'text-sky-500'
+                : isOracleStrategy ? 'text-indigo-500'
                 : 'text-slate-400';
 
               const displayTitle = isReceive ? 'Received'
                 : isSend && tx.type === 'nano_payment' ? 'Nano payment'
                 : isSend ? 'Sent'
+                : isDirectLpAdd ? 'Direct Pair LP Add'
+                : isDirectLpRemove ? 'Direct Pair LP Exit'
                 : title;
 
               const statusLabel = isOracleSignal ? 'signal' : tx.status;
@@ -523,7 +990,7 @@ export default function DashboardTab({ onNavigate }) {
                         {counterpart.slice(0, 8)}…{counterpart.slice(-5)}
                       </span>
                     )}
-                    {phase && <span>{phase}</span>}
+                    {phase && <span className="min-w-0 break-all">{phase}</span>}
                     {links.map(link => (
                       <a key={link.key} href={link.url} target="_blank" rel="noopener noreferrer"
                         className="flex items-center gap-1 text-arc-green hover:underline font-mono">

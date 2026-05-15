@@ -97,6 +97,76 @@ function JobsEconomyBanner({ summary }) {
   );
 }
 
+function getJobsNextStep(jobList, onchainEnabled) {
+  const fundedJob = jobList.find(job => job.status === 'funded');
+  if (fundedJob) {
+    return 'Provider should submit a deliverable hash or URL next so the client can review the result.';
+  }
+
+  const deliveredJob = jobList.find(job => job.status === 'delivered');
+  if (deliveredJob) {
+    return 'Client should review the delivered work and mark the job complete when the result is accepted.';
+  }
+
+  if (jobList.length === 0) {
+    return onchainEnabled
+      ? 'Create the first job with a provider address, USDC amount and a clear deliverable.'
+      : 'Create the first job now; the same funded -> delivered -> completed flow will be tracked locally until on-chain escrow is configured.';
+  }
+
+  return 'Open any job row to inspect the payout rail, Gateway fee state and the next actionable status.';
+}
+
+function JobsWorkflowGuide({ onchainEnabled, nextStep }) {
+  return (
+    <Card>
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <SectionHeader className="mb-0">How Jobs Work</SectionHeader>
+            <p className="mt-1 text-xs text-slate-500">
+              Agentic jobs keep x402/Gateway on the economy rail, while the actual work still follows the matching provider delivery flow.
+            </p>
+          </div>
+          <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${onchainEnabled ? 'bg-green-50 text-green-700 border-green-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
+            {onchainEnabled ? 'Escrow live' : 'Local tracking only'}
+          </span>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Client</p>
+            <p className="mt-1 text-sm font-semibold text-slate-800">Creates the request</p>
+            <p className="mt-1 text-xs text-slate-500">Set the provider wallet, USDC bounty and the exact deliverable the agent must return.</p>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Provider</p>
+            <p className="mt-1 text-sm font-semibold text-slate-800">Delivers the result</p>
+            <p className="mt-1 text-xs text-slate-500">Once the job is funded, the provider submits a deliverable hash or URL to move the job to review.</p>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Settlement</p>
+            <p className="mt-1 text-sm font-semibold text-slate-800">Economy rail stays separate</p>
+            <p className="mt-1 text-xs text-slate-500">
+              {onchainEnabled
+                ? 'AgenticCommerce escrow handles payout state while x402/Gateway covers the service-fee rail.'
+                : 'The funded -> delivered -> completed workflow is recorded locally until AgenticCommerce escrow is configured.'}
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-500">Next Step</p>
+            <p className="mt-1 text-sm font-semibold text-blue-900">What to do now</p>
+            <p className="mt-1 text-xs text-blue-700">{nextStep}</p>
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function JobRow({ job, agentId, onRefresh }) {
   const [expanded, setExpanded] = useState(false);
   const [busy, setBusy]         = useState(false);
@@ -275,6 +345,8 @@ export default function JobsTab() {
     );
   }
 
+  const nextJobsStep = getJobsNextStep(jobList, onchainEnabled);
+
   return (
     <div className="space-y-4">
       {/* Header */}
@@ -303,6 +375,11 @@ export default function JobsTab() {
         )}
         <JobsEconomyBanner summary={jobEconomy} />
       </Card>
+
+      <JobsWorkflowGuide
+        onchainEnabled={onchainEnabled}
+        nextStep={nextJobsStep}
+      />
 
       {/* Create form */}
       {showForm && (
@@ -362,7 +439,8 @@ export default function JobsTab() {
           <div className="flex flex-col items-center gap-3 py-8 text-center">
             <Briefcase size={32} className="text-slate-300" />
             <p className="text-sm text-slate-500">No jobs yet.</p>
-            <p className="text-xs text-slate-400">Arc Jobs is a peer-to-peer task marketplace. Post a job, set a USDC bounty, and let agents compete to deliver.</p>
+            <p className="text-xs text-slate-400">Arc Jobs is a peer-to-peer task marketplace. Post a job, set a USDC bounty and point one provider wallet at a concrete deliverable.</p>
+            <p className="text-xs text-slate-400 max-w-md">The job starts funded, moves to delivered when the provider submits a result, and ends at completed after client review.</p>
           </div>
         </Card>
       ) : (

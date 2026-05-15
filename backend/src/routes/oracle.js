@@ -11,6 +11,7 @@
  * Other endpoints are informational (read-only, low cost).
  */
 const router          = require('express').Router();
+const rateLimit       = require('express-rate-limit');
 const { requireAuth } = require('../middleware/auth');
 const oracle          = require('../services/oracle');
 const agentService    = require('../services/agentService');
@@ -56,6 +57,15 @@ const ORACLE_RESERVE_STATE_SUPPORTED_ASSETS = Object.keys(ORACLE_RESERVE_STATE_A
 const ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS = ['aave', 'morpho', 'maple', 'centrifuge', 'superform'];
 const ORACLE_POOL_COMPARE_DEFAULT_TARGETS = ['curve:USDC-EURC', 'curve:EURC-WUSDC', 'uniswap_v2_like:QTM-WUSDC'];
 const ORACLE_ARB_SCAN_MULTI_DEFAULT_TARGETS = ['curve:EURC-USDC', 'curve:EURC-WUSDC', 'curve:WUSDC-USDC'];
+const ORACLE_PUBLIC_RATE_LIMIT_WINDOW_MS = Math.max(parseInt(process.env.ORACLE_PUBLIC_RATE_LIMIT_WINDOW_MS || '60000', 10), 1000);
+const ORACLE_PUBLIC_RATE_LIMIT_MAX = Math.max(parseInt(process.env.ORACLE_PUBLIC_RATE_LIMIT_MAX || '30', 10), 1);
+const ORACLE_PUBLIC_MAX_QUERY_KEYS = Math.max(parseInt(process.env.ORACLE_PUBLIC_MAX_QUERY_KEYS || '4', 10), 1);
+const ORACLE_PUBLIC_MAX_QUERY_LENGTH = Math.max(parseInt(process.env.ORACLE_PUBLIC_MAX_QUERY_LENGTH || '180', 10), 32);
+const ORACLE_PUBLIC_BLOCKED_UA_PATTERNS = (process.env.ORACLE_PUBLIC_BLOCKED_UA_PATTERNS
+  || 'sqlmap,nikto,masscan,nessus,acunetix,gobuster,dirbuster,zgrab')
+  .split(',')
+  .map(item => item.trim().toLowerCase())
+  .filter(Boolean);
 const ORACLE_PUBLIC_ENDPOINTS = [
   {
     key: 'stablecoin-fx',
@@ -286,6 +296,139 @@ function _normalizeArbScanTargets(value) {
       poolKey: oracle.normalizeCurvePoolKey(poolParts.join(':')),
     };
   });
+}
+
+function _normalizePublicOracleQueryValue(value) {
+  if (Array.isArray(value)) {
+    if (value.length !== 1) return null;
+    return String(value[0] || '').trim();
+  }
+
+  return String(value || '').trim();
+}
+
+function _rejectPublicOracleRequest(req, res, statusCode, error, detail) {
+  const meta = {
+    error,
+    detail: detail || null,
+    statusCode,
+    path: req.originalUrl || req.path || null,
+    method: req.method,
+    ip: req.ip || null,
+  };
+  const userAgent = req.get('user-agent') || null;
+
+  if (userAgent) {
+    meta.userAgent = userAgent;
+  }
+
+  oracle.recordOracleSignal('public_request_rejected', meta);
+  logOracleGateway(statusCode >= 429 ? 'warn' : 'info', 'Oracle public request rejected', meta);
+
+  return res.status(statusCode).json({
+    error,
+    detail: detail || null,
+    sellerMode: 'circle_gateway',
+  });
+}
+
+const PUBLIC_ORACLE_QUERY_RULES = Object.freeze({
+  'stablecoin-fx': {
+    pair: { maxLength: 24, pattern: /^[A-Za-z0-9]{2,12}\/[A-Za-z0-9]{2,12}$/ },
+  },
+  'pool-state': {
+    pool: { maxLength: 40, pattern: /^[A-Za-z0-9_-]{3,40}$/ },
+    venue: { maxLength: 20, allowedValues: ['curve', 'uniswap_v2_like', 'arcfx'] },
+  },
+  'peg-monitor': {
+    assets: { maxLength: 48, pattern: /^[A-Za-z0-9_,-]{3,48}$/ },
+  },
+  'reserve-state': {
+    assets: { maxLength: 48, pattern: /^[A-Za-z0-9_,-]{3,48}$/ },
+  },
+  'protocol-tvl': {
+    protocols: { maxLength: 96, pattern: /^[A-Za-z0-9_,-]{3,96}$/ },
+  },
+  'pool-compare': {
+    targets: { maxLength: 180, pattern: /^[A-Za-z0-9:_,-]{3,180}$/ },
+  },
+  'yield-rank': {
+    asset: { maxLength: 12, pattern: /^[A-Za-z0-9]{2,12}$/ },
+    minApy: { maxLength: 16, pattern: /^-?\d+(\.\d+)?$/ },
+  },
+  'arb-signal': {
+    strategy: { maxLength: 32, allowedValues: ['stablecoin_fx'] },
+  },
+  'arb-scan-multi': {
+    targets: { maxLength: 180, pattern: /^[A-Za-z0-9:_,-]{3,180}$/ },
+  },
+  revenue: {},
+});
+
+const publicOracleRateLimit = rateLimit({
+  windowMs: ORACLE_PUBLIC_RATE_LIMIT_WINDOW_MS,
+  max: ORACLE_PUBLIC_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res, _next, options) => _rejectPublicOracleRequest(
+    req,
+    res,
+    429,
+    'oracle_public_rate_limit_reached',
+    `Retry after ${Math.ceil(options.windowMs / 1000)} seconds.`,
+  ),
+});
+
+function _publicOracleAbuseGuard(req, res, next) {
+  const queryKeys = Object.keys(req.query || {});
+  const rawQuery = (req.originalUrl || '').split('?')[1] || '';
+  const userAgent = String(req.get('user-agent') || '').toLowerCase();
+
+  if (queryKeys.length > ORACLE_PUBLIC_MAX_QUERY_KEYS) {
+    return _rejectPublicOracleRequest(req, res, 400, 'oracle_public_query_too_wide', 'Too many query parameters.');
+  }
+
+  if (rawQuery.length > ORACLE_PUBLIC_MAX_QUERY_LENGTH) {
+    return _rejectPublicOracleRequest(req, res, 414, 'oracle_public_query_too_long', 'Query string exceeds the allowed length.');
+  }
+
+  if (userAgent && ORACLE_PUBLIC_BLOCKED_UA_PATTERNS.some(pattern => userAgent.includes(pattern))) {
+    return _rejectPublicOracleRequest(req, res, 403, 'oracle_public_request_blocked', 'Request signature is blocked.');
+  }
+
+  return next();
+}
+
+function _createPublicOracleQueryGuard(endpointKey) {
+  const rules = PUBLIC_ORACLE_QUERY_RULES[endpointKey] || {};
+
+  return (req, res, next) => {
+    for (const [key, rawValue] of Object.entries(req.query || {})) {
+      if (!Object.prototype.hasOwnProperty.call(rules, key)) {
+        return _rejectPublicOracleRequest(req, res, 400, 'oracle_public_query_param_not_allowed', `Unsupported query param: ${key}`);
+      }
+
+      const normalizedValue = _normalizePublicOracleQueryValue(rawValue);
+      if (!normalizedValue) {
+        return _rejectPublicOracleRequest(req, res, 400, 'oracle_public_query_param_invalid', `Invalid value for ${key}`);
+      }
+
+      const rule = rules[key];
+      if (normalizedValue.length > rule.maxLength) {
+        return _rejectPublicOracleRequest(req, res, 414, 'oracle_public_query_too_long', `Query value too long for ${key}`);
+      }
+
+      if (rule.allowedValues && !rule.allowedValues.includes(normalizedValue.toLowerCase())) {
+        return _rejectPublicOracleRequest(req, res, 400, 'oracle_public_query_param_invalid', `Unsupported value for ${key}`);
+      }
+
+      if (rule.pattern && !rule.pattern.test(normalizedValue)) {
+        return _rejectPublicOracleRequest(req, res, 400, 'oracle_public_query_param_invalid', `Invalid value for ${key}`);
+      }
+    }
+
+    return next();
+  };
 }
 
 async function _buildPegMonitorResponse(assetsValue) {
@@ -1398,9 +1541,11 @@ router.get('/arb-scan-multi', requireAuth, async (req, res, next) => {
 // These are accessible by anyone on the internet; payment is the only gate.
 
 const publicRouter = require('express').Router();  // no requireAuth
+publicRouter.use(publicOracleRateLimit);
+publicRouter.use(_publicOracleAbuseGuard);
 
 // GET /api/oracle/public/stablecoin-fx
-publicRouter.get('/stablecoin-fx', _createOraclePaymentAuditMiddleware('stablecoin-fx'), stablecoinFxGateway, async (req, res, next) => {
+publicRouter.get('/stablecoin-fx', _createPublicOracleQueryGuard('stablecoin-fx'), _createOraclePaymentAuditMiddleware('stablecoin-fx'), stablecoinFxGateway, async (req, res, next) => {
   try {
     const pairParam = (req.query.pair || 'EURC/USDC').toString().toUpperCase();
     const [base, quote = 'USDC'] = pairParam.split('/');
@@ -1409,7 +1554,7 @@ publicRouter.get('/stablecoin-fx', _createOraclePaymentAuditMiddleware('stableco
 });
 
 // GET /api/oracle/public/pool-state
-publicRouter.get('/pool-state', _createOraclePaymentAuditMiddleware('pool-state'), poolStateGateway, async (req, res, next) => {
+publicRouter.get('/pool-state', _createPublicOracleQueryGuard('pool-state'), _createOraclePaymentAuditMiddleware('pool-state'), poolStateGateway, async (req, res, next) => {
   try {
     const snapshot = await _getOraclePoolStateSnapshot(req.query.pool || 'USDC-EURC', req.query.venue || 'curve');
     res.json({
@@ -1434,35 +1579,35 @@ publicRouter.get('/pool-state', _createOraclePaymentAuditMiddleware('pool-state'
 });
 
 // GET /api/oracle/public/peg-monitor
-publicRouter.get('/peg-monitor', _createOraclePaymentAuditMiddleware('peg-monitor'), pegMonitorGateway, async (req, res, next) => {
+publicRouter.get('/peg-monitor', _createPublicOracleQueryGuard('peg-monitor'), _createOraclePaymentAuditMiddleware('peg-monitor'), pegMonitorGateway, async (req, res, next) => {
   try {
     res.json(await _buildPegMonitorResponse(req.query.assets));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/reserve-state
-publicRouter.get('/reserve-state', _createOraclePaymentAuditMiddleware('reserve-state'), reserveStateGateway, async (req, res, next) => {
+publicRouter.get('/reserve-state', _createPublicOracleQueryGuard('reserve-state'), _createOraclePaymentAuditMiddleware('reserve-state'), reserveStateGateway, async (req, res, next) => {
   try {
     res.json(await _buildReserveStateResponse(req.query.assets));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/protocol-tvl
-publicRouter.get('/protocol-tvl', _createOraclePaymentAuditMiddleware('protocol-tvl'), protocolTvlGateway, async (req, res, next) => {
+publicRouter.get('/protocol-tvl', _createPublicOracleQueryGuard('protocol-tvl'), _createOraclePaymentAuditMiddleware('protocol-tvl'), protocolTvlGateway, async (req, res, next) => {
   try {
     res.json(await _buildProtocolTvlResponse(req.query.protocols));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/pool-compare
-publicRouter.get('/pool-compare', _createOraclePaymentAuditMiddleware('pool-compare'), poolCompareGateway, async (req, res, next) => {
+publicRouter.get('/pool-compare', _createPublicOracleQueryGuard('pool-compare'), _createOraclePaymentAuditMiddleware('pool-compare'), poolCompareGateway, async (req, res, next) => {
   try {
     res.json(await _buildPoolCompareResponse(req.query.targets));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/yield-rank
-publicRouter.get('/yield-rank', _createOraclePaymentAuditMiddleware('yield-rank'), yieldRankGateway, async (req, res, next) => {
+publicRouter.get('/yield-rank', _createPublicOracleQueryGuard('yield-rank'), _createOraclePaymentAuditMiddleware('yield-rank'), yieldRankGateway, async (req, res, next) => {
   try {
     const asset     = (req.query.asset || 'USDC').toString().toUpperCase();
     const minApy    = parseFloat(req.query.minApy || '1.0');
@@ -1478,21 +1623,21 @@ publicRouter.get('/yield-rank', _createOraclePaymentAuditMiddleware('yield-rank'
 
 // GET /api/oracle/public/arb-signal
 // Redacted: confidence=LOW results only return summary; HIGH returns full signal (higher price)
-publicRouter.get('/arb-signal', _createOraclePaymentAuditMiddleware('arb-signal'), arbSignalGateway, async (req, res, next) => {
+publicRouter.get('/arb-signal', _createPublicOracleQueryGuard('arb-signal'), _createOraclePaymentAuditMiddleware('arb-signal'), arbSignalGateway, async (req, res, next) => {
   try {
     res.json(await _buildStablecoinArbSignalResponse('EURC-USDC', 'curve'));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/arb-scan-multi
-publicRouter.get('/arb-scan-multi', _createOraclePaymentAuditMiddleware('arb-scan-multi'), arbScanMultiGateway, async (req, res, next) => {
+publicRouter.get('/arb-scan-multi', _createPublicOracleQueryGuard('arb-scan-multi'), _createOraclePaymentAuditMiddleware('arb-scan-multi'), arbScanMultiGateway, async (req, res, next) => {
   try {
     res.json(await _buildArbScanMultiResponse(req.query.targets));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/revenue — total collected fees (public, no auth, transparency)
-publicRouter.get('/revenue', async (_req, res, next) => {
+publicRouter.get('/revenue', _createPublicOracleQueryGuard('revenue'), async (_req, res, next) => {
   try {
     res.json(await _getOracleRevenueStats());
   } catch (err) { next(err); }

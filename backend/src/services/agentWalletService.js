@@ -17,6 +17,8 @@
 const { ethers } = require('ethers');
 const https      = require('https');
 const { decrypt } = require('./cryptoService');
+const protocols = require('./protocols');
+const { resolveDirectSwapFallbackPool } = require('./oracle/pools');
 const gatewayBuyerService = require('./agenticEconomy/gatewayBuyer');
 const { createEthersAdapterFromPrivateKey } = require('@circle-fin/adapter-ethers-v6');
 const { SwapKit, SwapChain, getChainByEnum } = require('@circle-fin/swap-kit');
@@ -169,6 +171,116 @@ function getSwapKitKey() {
 
 function isSwapConfigured() {
   return Boolean(getSwapKitKey());
+}
+
+function getDirectSwapFallbackPool(fromToken, toToken) {
+  if (!fromToken || !toToken || fromToken === toToken) {
+    return null;
+  }
+
+  return resolveDirectSwapFallbackPool(`${fromToken}-${toToken}`);
+}
+
+function isCirbtcPair(fromToken, toToken) {
+  return fromToken === 'cirBTC' || toToken === 'cirBTC';
+}
+
+function getDirectFallbackRouteReason(fallbackPool) {
+  if (!fallbackPool?.address) {
+    return null;
+  }
+
+  if (fallbackPool.protocol === 'curve') {
+    return 'Verified direct Curve fallback is available for this stable pair on Arc Testnet.';
+  }
+
+  return 'A direct V2-style fallback pool is configured for this pair on Arc Testnet.';
+}
+
+function getSwapRouteStrategy({ fromToken, toToken }) {
+  const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+
+  if (fallbackPool?.address) {
+    const isCurveFallback = fallbackPool.protocol === 'curve';
+    return {
+      routeStrategy: isSwapConfigured()
+        ? (isCurveFallback ? 'swap_kit_primary_with_curve_fallback' : 'swap_kit_primary_with_v2_fallback')
+        : (isCurveFallback ? 'curve_fallback_only' : 'v2_fallback_only'),
+      routeReason: getDirectFallbackRouteReason(fallbackPool),
+      fallbackAvailable: true,
+      poolAddress: fallbackPool.address,
+      poolSource: fallbackPool.source || 'verified_default',
+    };
+  }
+
+  if (isCirbtcPair(fromToken, toToken)) {
+    return {
+      routeStrategy: isSwapConfigured() ? 'swap_kit_only' : 'swap_kit_required',
+      routeReason: 'cirBTC pairs currently require a live Swap Kit route on Arc Testnet unless you configure a direct pair address via ARC_V2_CIRBTC_USDC_PAIR or ARC_V2_CIRBTC_EURC_PAIR.',
+      fallbackAvailable: false,
+    };
+  }
+
+  return {
+    routeStrategy: isSwapConfigured() ? 'swap_kit_only' : 'route_unavailable',
+    routeReason: 'No verified direct fallback route is configured for this pair on Arc Testnet.',
+    fallbackAvailable: false,
+  };
+}
+
+async function getDirectSwapFallbackQuote({ fromToken, toToken, amountIn }) {
+  const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+  const strategy = getSwapRouteStrategy({ fromToken, toToken });
+  if (!fallbackPool?.address) {
+    return {
+      amountOut: null,
+      quoteError: strategy.routeReason || 'No direct Curve fallback is available for this pair.',
+      ...strategy,
+    };
+  }
+
+  try {
+    let quote = null;
+    let executionRail = 'curve_fallback';
+
+    if (fallbackPool.protocol === 'curve') {
+      quote = await protocols.getCurveQuote(
+        fallbackPool.address,
+        fallbackPool.baseToken.index,
+        fallbackPool.quoteToken.index,
+        amountIn,
+        fallbackPool.baseToken.decimals || 6,
+        fallbackPool.quoteToken.decimals || 6,
+      );
+    } else {
+      quote = await protocols.getConstantProductQuote({
+        pairAddress: fallbackPool.address,
+        tokenInAddress: fallbackPool.baseToken.address,
+        tokenOutAddress: fallbackPool.quoteToken.address,
+        amountIn,
+        decimalsIn: fallbackPool.baseToken.decimals || 6,
+        decimalsOut: fallbackPool.quoteToken.decimals || 6,
+        feePct: fallbackPool.feePct || 0.3,
+      });
+      executionRail = 'uniswap_v2_fallback';
+    }
+
+    return {
+      amountOut: quote.amountOut,
+      quoteError: null,
+      ...strategy,
+      executionRail,
+      poolAddress: fallbackPool.address,
+      poolSource: fallbackPool.source || 'verified_default',
+    };
+  } catch (error) {
+    console.warn('[AGENT-SWAP-QUOTE:FALLBACK]', error.message);
+    return {
+      amountOut: null,
+      quoteError: 'Direct fallback quote is unavailable right now.',
+      ...strategy,
+    };
+  }
 }
 
 function toSlippageBps(slippagePct = 0.5) {
@@ -677,7 +789,53 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 // AGENTIC SWAP (USDC / EURC / cirBTC on Arc Testnet)
 // ─────────────────────────────────────────────────────────────────────────────
 async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5 }) {
-  if (!isSwapConfigured()) throw new Error('CIRCLE_KIT_KEY is not configured');
+  if (!isSwapConfigured()) {
+    const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+    if (!fallbackPool?.address) {
+      const strategy = getSwapRouteStrategy({ fromToken, toToken });
+      throw new Error(strategy.routeReason || 'No direct Curve fallback is available for this pair.');
+    }
+
+    let result = null;
+    let executionRail = 'curve_fallback';
+
+    if (fallbackPool.protocol === 'curve') {
+      result = await protocols.executeCurveSwap({
+        poolAddress: fallbackPool.address,
+        tokenInAddress: fallbackPool.baseToken.address,
+        indexIn: fallbackPool.baseToken.index,
+        indexOut: fallbackPool.quoteToken.index,
+        amountIn: String(amountIn),
+        slippagePct,
+        agentPrivateKey: getAgentPrivateKey(agent),
+        decimalsIn: fallbackPool.baseToken.decimals || 6,
+        decimalsOut: fallbackPool.quoteToken.decimals || 6,
+      });
+    } else {
+      result = await protocols.executeConstantProductSwap({
+        pairAddress: fallbackPool.address,
+        tokenInAddress: fallbackPool.baseToken.address,
+        tokenOutAddress: fallbackPool.quoteToken.address,
+        amountIn: String(amountIn),
+        slippagePct,
+        agentPrivateKey: getAgentPrivateKey(agent),
+        decimalsIn: fallbackPool.baseToken.decimals || 6,
+        decimalsOut: fallbackPool.quoteToken.decimals || 6,
+        feePct: fallbackPool.feePct || 0.3,
+      });
+      executionRail = 'uniswap_v2_fallback';
+    }
+
+    console.log(`[AGENT-SWAP:CURVE] ✓ ${result.txHash} | out: ${result.amountOut} ${toToken}`);
+    return {
+      hash: result.txHash,
+      amountOut: result.amountOut,
+      ...getSwapRouteStrategy({ fromToken, toToken }),
+      executionRail,
+      poolAddress: fallbackPool.address,
+      poolSource: fallbackPool.source || 'verified_default',
+    };
+  }
 
   const adapter = createArcSwapAdapter(getAgentPrivateKey(agent));
   const quote = await estimateArcSwap({
@@ -702,15 +860,21 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
 
   const amountOut = result.amountOut || quote.estimatedOutput.amount;
   console.log(`[AGENT-SWAP] ✓ ${result.txHash} | out: ${amountOut} ${toToken}`);
-  return { hash: result.txHash, amountOut };
+  return {
+    hash: result.txHash,
+    amountOut,
+    executionRail: 'swap_kit',
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QUOTE (okuma, tx yok)
 // ─────────────────────────────────────────────────────────────────────────────
 async function getSwapQuoteResult({ fromToken, toToken, amountIn }) {
+  const strategy = getSwapRouteStrategy({ fromToken, toToken });
+
   if (!isSwapConfigured()) {
-    return { amountOut: null, quoteError: 'Swap is not configured on this deployment.' };
+    return getDirectSwapFallbackQuote({ fromToken, toToken, amountIn });
   }
 
   try {
@@ -722,10 +886,23 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn }) {
       amountIn,
       slippagePct: 0.5,
     });
-    return { amountOut: quote.estimatedOutput.amount, quoteError: null };
+    return {
+      amountOut: quote.estimatedOutput.amount,
+      quoteError: null,
+      ...strategy,
+      executionRail: 'swap_kit',
+    };
   } catch (error) {
     console.warn('[AGENT-SWAP-QUOTE]', error.message);
-    return { amountOut: null, quoteError: normalizeSwapQuoteError(error) };
+    const directFallback = await getDirectSwapFallbackQuote({ fromToken, toToken, amountIn });
+    if (directFallback.amountOut !== null) {
+      return directFallback;
+    }
+    return {
+      amountOut: null,
+      quoteError: normalizeSwapQuoteError(error),
+      ...strategy,
+    };
   }
 }
 
@@ -765,6 +942,7 @@ module.exports = {
   agentSend,
   getSwapQuote,
   getSwapQuoteResult,
+  getSwapRouteStrategy,
   isSwapConfigured,
   getAgentSigner,
   getCurrentBlockNumber,

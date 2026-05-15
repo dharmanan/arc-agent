@@ -2,6 +2,7 @@
 const { ethers } = require('ethers');
 const db = require('../db');
 const { encrypt, decrypt } = require('./cryptoService');
+const { getDailyLimitBypass } = require('./dailyLimitBypass');
 
 const DEFAULT_PERMISSIONS = [
   'defi_scan',
@@ -188,8 +189,8 @@ async function createAgent(userId, data) {
     const { rows } = await client.query(
       `INSERT INTO agents
          (user_id, name, wallet_address, private_key_encrypted,
-          daily_limit_usdc, max_gas_gwei, slippage_percent, max_trade_usdc)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         daily_limit_usdc, max_gas_gwei, slippage_percent, max_trade_usdc, defi_wallet_reserve_usdc)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
       [
         userId,
@@ -200,6 +201,7 @@ async function createAgent(userId, data) {
         data.maxGasGwei ?? 50,
         data.slippagePercent ?? 0.5,
         data.maxTradeUsdc ?? 200,
+        data.defiWalletReserveUsdc ?? 0,
       ],
     );
     const agent = rows[0];
@@ -265,6 +267,7 @@ async function updateAgent(agentId, userId, data) {
     maxGasGwei:              'max_gas_gwei',
     slippagePercent:         'slippage_percent',
     maxTradeUsdc:            'max_trade_usdc',
+    defiWalletReserveUsdc:   'defi_wallet_reserve_usdc',
     autoLockMinutes:         'auto_lock_minutes',
     contractGuard:           'contract_guard_enabled',
     llmApiKeyEncrypted:      'llm_api_key_encrypted',
@@ -298,7 +301,7 @@ async function updateAgent(agentId, userId, data) {
     `UPDATE agents SET ${setClauses.join(', ')} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
     values,
   );
-  return rows.length ? formatAgent(rows[0], []) : null;
+  return rows.length ? getAgent(agentId, userId) : null;
 }
 
 // ── Permissions ───────────────────────────────────────────────────────────────
@@ -318,7 +321,7 @@ async function updatePermissions(agentId, userId, permsMap) {
       );
     }
     await client.query('COMMIT');
-    return true;
+    return getAgent(agentId, userId);
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -356,6 +359,8 @@ async function getAgentStatus(agentId, userId) {
     a.daily_spent_usdc = '0';
   }
 
+  const dailyLimitBypass = getDailyLimitBypass(a);
+
   return {
     agentId:       a.id,
     status:        a.status,
@@ -365,8 +370,10 @@ async function getAgentStatus(agentId, userId) {
     isSmartMode:   a.is_smart_mode,
     llmModel:      a.llm_model,
     walletAddress: a.wallet_address,
+    dailyLimitBypass,
     config: {
       reputationRegistryConfigured: Boolean(process.env.REPUTATION_REGISTRY_ADDRESS),
+      swapConfigured: Boolean(process.env.CIRCLE_KIT_KEY || process.env.KIT_KEY),
     },
     automation: {
       marketAnalysis: {
@@ -380,6 +387,7 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: a.oracle_last_status || 'idle',
         todayCount: a.daily_market_analysis_count ?? 0,
         dailyCap: 48,
+        bypassDailyCap: dailyLimitBypass.enabled,
       },
       defiLoop: {
         enabled: a.defi_loop_enabled ?? false,
@@ -388,6 +396,7 @@ async function getAgentStatus(agentId, userId) {
         todayCount: a.daily_defi_loop_count ?? 0,
         dailyCap: 10,
         autoTxToday: a.daily_auto_tx_count ?? 0,
+        bypassDailyCap: dailyLimitBypass.enabled,
       },
       reputation: {
         enabled: a.reputation_enabled ?? false,
@@ -431,6 +440,7 @@ function formatAgent(row, perms) {
       maxGasGwei:      row.max_gas_gwei,
       slippagePercent: parseFloat(row.slippage_percent),
       maxTradeUsdc:    parseFloat(row.max_trade_usdc),
+      defiWalletReserveUsdc: parseFloat(row.defi_wallet_reserve_usdc || 0),
       autoLockMinutes: row.auto_lock_minutes,
       contractGuard:   row.contract_guard_enabled,
       passkeyEnabled:  row.passkey_enabled,

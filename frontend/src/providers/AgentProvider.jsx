@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
-import { setToken, getToken } from '../lib/api.js';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
+import { setToken, getToken, agents } from '../lib/api.js';
 
 const AgentContext = createContext(null);
 
@@ -27,6 +27,49 @@ export function AgentProvider({ children }) {
     setToken(null);
     setJwtState(null);
   }, []);
+
+  useEffect(() => {
+    if (!jwt || agent) return;
+
+    let cancelled = false;
+
+    async function hydrateAgent() {
+      try {
+        const list = await agents.list();
+        const firstAgent = list[0] || null;
+
+        if (!cancelled) {
+          if (!firstAgent?.id) {
+            setAgentState(null);
+            return;
+          }
+
+          try {
+            const fullAgent = await agents.get(firstAgent.id);
+            if (!cancelled) {
+              setAgentState(fullAgent || firstAgent);
+            }
+          } catch {
+            if (!cancelled) {
+              setAgentState(firstAgent);
+            }
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setAgentState(null);
+          setToken(null);
+          setJwtState(null);
+        }
+      }
+    }
+
+    hydrateAgent();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [agent, jwt]);
 
   return (
     <AgentContext.Provider value={{ agent, setAgent, jwt, setJwt, clearAgent, disconnectSession, isAuthenticated: !!jwt }}>

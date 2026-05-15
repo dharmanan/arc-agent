@@ -11,12 +11,14 @@ const { requireAuth } = require('../middleware/auth');
 const db              = require('../db');
 const queue           = require('../queue/agentQueue');
 const { ethers }      = require('ethers');
+const { isDailyLimitBypassed } = require('../services/dailyLimitBypass');
 
 // ── Minimal ABI for ArcRevenuePool.getPoolBalance() ──────────────────────────
 const _POOL_VIEW_ABI = ['function getPoolBalance() external view returns (uint256)'];
+const DEFAULT_REVENUE_POOL_ADDRESS = '0x7E84fFFAA5f0524CD55b13B6AEC7eE0785c07e5e';
 
 function _getPoolContract() {
-  const addr = process.env.REVENUE_POOL_ADDRESS;
+  const addr = process.env.REVENUE_POOL_ADDRESS || DEFAULT_REVENUE_POOL_ADDRESS;
   const rpc  = process.env.ARC_TESTNET_RPC || 'https://rpc.arc-testnet.io';
   if (!addr) return null;
   const provider = new ethers.JsonRpcProvider(rpc);
@@ -27,11 +29,22 @@ const DAILY_PAID_TASK_CAP = parseInt(process.env.DAILY_PAID_TASK_CAP || '5', 10)
 const DAILY_FREE_TASK_CAP = parseInt(process.env.DAILY_FREE_TASK_CAP || '5', 10);
 const EXECUTION_TASK_IDS = new Set([
   'EXEC_CURVE_SWAP',
+  'EXEC_CURVE_LIQUIDITY_ADD',
+  'EXEC_CURVE_LIQUIDITY_REMOVE',
+  'EXEC_CIRBTC_USDC_ZAP_IN',
+  'EXEC_CIRBTC_EURC_ZAP_IN',
+  'EXEC_CIRBTC_USDC_LP_REMOVE',
+  'EXEC_CIRBTC_EURC_LP_REMOVE',
   'EXEC_CCTP_BRIDGE',
   'EXEC_YIELD_MOVE',
   'EXEC_ARB',
   'EXEC_REBALANCE',
 ]);
+const CURVE_POOL_TOKENS = new Set(['USDC', 'EURC']);
+const DIRECT_PAIR_ZAP_LIMITS = {
+  EXEC_CIRBTC_USDC_ZAP_IN: 20,
+  EXEC_CIRBTC_EURC_ZAP_IN: 16,
+};
 const CCTP_CHAIN_NAMES = new Set([
   'Arc Testnet',
   'Sepolia',
@@ -40,12 +53,6 @@ const CCTP_CHAIN_NAMES = new Set([
   'Arbitrum Sepolia',
 ]);
 const REBALANCE_TOKENS = new Set(['USDC', 'EURC']);
-
-// Dev-only: wallet addresses that bypass all daily task limits
-const DEV_BYPASS_ADDRS = new Set(
-  (process.env.DEV_BYPASS_AGENT_ADDRESSES || '')
-    .split(',').map(a => a.trim().toLowerCase()).filter(Boolean),
-);
 
 function _isPositiveNumber(value) {
   const parsed = Number(value);
@@ -65,6 +72,28 @@ function _validateExecutionParams(taskId, params) {
       if (!_isPositiveNumber(params.amountIn)) return 'curve_swap_amount_required';
       if (!_isBinaryIndex(params.indexIn) || !_isBinaryIndex(params.indexOut)) return 'curve_swap_direction_required';
       if (Number(params.indexIn) === Number(params.indexOut)) return 'curve_swap_direction_required';
+      return null;
+
+    case 'EXEC_CURVE_LIQUIDITY_ADD':
+      if (!_isPositiveNumber(params.amountIn)) return 'curve_liquidity_add_amount_required';
+      if (!CURVE_POOL_TOKENS.has(String(params.tokenIn || ''))) return 'curve_liquidity_add_token_required';
+      return null;
+
+    case 'EXEC_CURVE_LIQUIDITY_REMOVE':
+      if (!_isPositiveNumber(params.lpAmount)) return 'curve_liquidity_remove_amount_required';
+      if (!CURVE_POOL_TOKENS.has(String(params.tokenOut || ''))) return 'curve_liquidity_remove_token_required';
+      return null;
+
+    case 'EXEC_CIRBTC_USDC_ZAP_IN':
+    case 'EXEC_CIRBTC_EURC_ZAP_IN':
+      if (!_isPositiveNumber(params.amountIn)) return 'pair_zap_amount_required';
+      if (Number(params.amountIn) > Number(DIRECT_PAIR_ZAP_LIMITS[taskId] || 0)) return 'pair_zap_amount_exceeds_max';
+      return null;
+
+    case 'EXEC_CIRBTC_USDC_LP_REMOVE':
+    case 'EXEC_CIRBTC_EURC_LP_REMOVE':
+      if (!_isPositiveNumber(params.withdrawPct)) return 'pair_exit_pct_invalid';
+      if (Number(params.withdrawPct) > 100) return 'pair_exit_pct_invalid';
       return null;
 
     case 'EXEC_CCTP_BRIDGE':
@@ -110,9 +139,21 @@ function _getInlineTaskFailureStatus(reason) {
     case 'oracle_fetch_error':
     case 'swap_error':
       return 502;
+    case 'position_guard_unavailable':
+      return 503;
+    case 'swap_not_configured':
+    case 'direct_pair_not_configured':
+      return 503;
+    case 'lp_position_not_found':
+    case 'insufficient_lp_position':
+    case 'lp_position_exit_required':
+    case 'direct_pair_lp_not_found':
+    case 'direct_pair_seed_required':
+      return 409;
     case 'curve_pool_not_configured':
     case 'pool_address_not_configured':
     case 'bridge_params_required':
+    case 'wallet_not_configured':
     case 'no_private_key':
     default:
       return 400;
@@ -157,7 +198,12 @@ router.get('/pool-balance', async (_req, res, next) => {
     if (!pool) return res.json({ balanceUsdc: null, note: 'REVENUE_POOL_ADDRESS not configured' });
     const raw  = await pool.getPoolBalance();
     const usdc = Number(raw) / 1_000_000;
-    res.json({ balanceUsdc: usdc, address: process.env.REVENUE_POOL_ADDRESS });
+    const address = process.env.REVENUE_POOL_ADDRESS || DEFAULT_REVENUE_POOL_ADDRESS;
+    res.json({
+      balanceUsdc: usdc,
+      address,
+      source: process.env.REVENUE_POOL_ADDRESS ? 'env' : 'verified_default',
+    });
   } catch (err) { next(err); }
 });
 
@@ -192,8 +238,7 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
     );
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
 
-    const isBypass = DEV_BYPASS_ADDRS.size > 0 &&
-      DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase());
+    const isBypass = isDailyLimitBypassed(agent);
 
     if (!isBypass && !agent.daily_tasks_enabled)
       return res.status(403).json({ error: 'daily_tasks_disabled' });

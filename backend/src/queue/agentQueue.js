@@ -13,6 +13,7 @@
  */
 const Bull        = require('bull');
 const Redis       = require('ioredis');
+const { ethers }  = require('ethers');
 const db          = require('../db');
 const llmService  = require('../services/llmService');
 const ruleEngine  = require('../services/ruleEngine');
@@ -21,12 +22,76 @@ const protocols   = require('../services/protocols');
 const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationService');
 const taskEconomyService = require('../services/agenticEconomy/taskEconomyService');
 const agenticTaskExecutionService = require('../services/agenticEconomy/agenticTaskExecutionService');
+const { getDailyLimitBypass, isDailyLimitBypassed } = require('../services/dailyLimitBypass');
 
-// Dev-only: wallet addresses that bypass all daily task limits (comma-separated env var)
-const DEV_BYPASS_ADDRS = new Set(
-  (process.env.DEV_BYPASS_AGENT_ADDRESSES || '')
-    .split(',').map(a => a.trim().toLowerCase()).filter(Boolean),
-);
+const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
+const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
+const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
+
+function shouldUseDryRun(agent) {
+  return GLOBAL_DRY_RUN;
+}
+
+function normalizeUsdcAmount(amount) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return Math.floor(numeric * 1_000_000) / 1_000_000;
+}
+
+async function getArcUsdcBalance(walletAddress) {
+  if (!walletAddress) return 0;
+
+  const provider = new ethers.JsonRpcProvider(ARC_RPC_URL);
+  const contract = new ethers.Contract(ARC_USDC_ADDRESS, ERC20_BALANCE_ABI, provider);
+  const rawBalance = await contract.balanceOf(walletAddress);
+  return normalizeUsdcAmount(ethers.formatUnits(rawBalance, 6));
+}
+
+async function getAgentPermissionMap(agentId) {
+  if (!agentId) return {};
+
+  const { rows } = await db.query(
+    'SELECT permission_key, is_enabled FROM agent_permissions WHERE agent_id = $1',
+    [agentId],
+  );
+
+  return Object.fromEntries(rows.map(row => [row.permission_key, row.is_enabled]));
+}
+
+function getErrorText(value) {
+  return value == null ? '' : String(value).trim();
+}
+
+function buildExecutionErrorDetails(err) {
+  const rawMessage = getErrorText(err?.message || err);
+  const reason = getErrorText(err?.reason);
+  const providerMessage = getErrorText(err?.info?.error?.message);
+  const shortMessage = getErrorText(err?.shortMessage);
+  const code = getErrorText(err?.code);
+  const haystack = [rawMessage, reason, providerMessage, shortMessage, code].filter(Boolean).join(' ');
+
+  let summary = reason || providerMessage || shortMessage || rawMessage || 'Transaction failed before confirmation.';
+  if (/ERC20:\s*transfer amount exceeds balance/i.test(haystack)) {
+    summary = 'Agent wallet balance was too low for this trade.';
+  } else if (/nonce too low|nonce has already been used|NONCE_EXPIRED/i.test(haystack)) {
+    summary = 'Another transaction already used this wallet nonce before this swap was submitted.';
+  } else if (/insufficient funds/i.test(haystack)) {
+    summary = 'Agent wallet did not have enough native gas token for this transaction.';
+  } else if ((/transaction execution reverted/i.test(rawMessage) || code === 'CALL_EXCEPTION') && !reason) {
+    summary = 'The on-chain swap reverted, but the RPC node did not return a decoded contract reason.';
+  }
+
+  return {
+    error: rawMessage || providerMessage || shortMessage || 'Unknown execution error',
+    errorSummary: summary,
+    errorCode: code || null,
+    errorReason: reason || null,
+    errorProviderMessage: providerMessage || null,
+    errorShortMessage: shortMessage || null,
+    errorTxHash: err?.receipt?.hash || err?.transactionHash || null,
+    errorReceiptStatus: err?.receipt?.status ?? null,
+  };
+}
 
 // Upstash Redis: connect via URL (rediss://...)
 // Local Docker: connect via host/port
@@ -52,9 +117,9 @@ function createBullRedisClient(type) {
         lazyConnect: false,
       });
 
-  // Bull attaches more than Node's default 10 startup listeners to ioredis.
-  // That is expected for these queue clients and should not emit noisy warnings.
-  client.setMaxListeners(25);
+  // Bull attaches a burst of startup listeners to each ioredis client.
+  // Keep the cap comfortably above observed production startup usage.
+  client.setMaxListeners(50);
 
   client.on('error', (err) => {
     console.error(`[QUEUE:${type}]`, err.message);
@@ -134,6 +199,53 @@ async function resolveEngine(agent) {
   } catch {
     return { engine: ruleEngine, apiKey: null };
   }
+}
+
+function parseStructuredDecision(rawDecision) {
+  if (!rawDecision) return null;
+  if (typeof rawDecision === 'object') return rawDecision;
+  if (typeof rawDecision !== 'string') return null;
+
+  const trimmed = rawDecision.trim();
+  const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const candidate = fencedMatch ? fencedMatch[1].trim() : trimmed;
+
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+}
+
+async function evaluateExecutionGate(agent, signal, agentId) {
+  const { engine, apiKey } = await resolveEngine(agent);
+  const opportunity = {
+    ...(signal?.opportunity || {}),
+    fromChain: signal?.opportunity?.fromChain || 'arc-testnet',
+    amountUsdc: signal?.opportunity?.amountUsdc ?? signal?.opportunity?.steps?.[0]?.amountUsdc ?? 0,
+  };
+
+  const result = await engine.getArbitrageDecision({
+    opportunity,
+    model: agent?.llm_model,
+    apiKey,
+    agentId,
+  });
+  const parsed = parseStructuredDecision(result?.decision);
+  const verdict = parsed && typeof parsed.execute === 'boolean'
+    ? parsed
+    : {
+        execute: false,
+        reason: 'Execution gate returned malformed JSON and was treated as HOLD.',
+        suggestedAmount: 0,
+      };
+
+  return {
+    engine: result?.engine || 'rule',
+    decision: result?.decision || null,
+    verdict,
+    opportunity,
+  };
 }
 
 const AUTOMATION_STATE_COLUMNS = {
@@ -261,6 +373,17 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
     return { ok: false, reason: 'agent not in smart mode' };
   }
 
+  const permissions = await getAgentPermissionMap(agentId);
+  if (permissions.defi_scan === false) {
+    await _setAutomationState(agentId, 'marketAnalysis', 'permission_blocked');
+    return {
+      ok: true,
+      action: 'hold',
+      reason: 'permission_blocked',
+      permission: 'defi_scan',
+    };
+  }
+
   try {
     const { engine, apiKey } = await resolveEngine(agent);
     const result = await engine.analyzeMarket({ chain, token, model: agent.llm_model, apiKey, agentId });
@@ -280,9 +403,11 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
 // Schedule: external caller (e.g. cron in server.js bootstrap) enqueues this
 // every ORACLE_LOOP_INTERVAL_MS (default 30 min) per eligible agent.
 const ORACLE_LOOP_INTERVAL_MS = parseInt(process.env.ORACLE_LOOP_INTERVAL_MS || '1800000', 10);
+const MARKET_ANALYSIS_LOOP_INTERVAL_MS = parseInt(process.env.MARKET_ANALYSIS_LOOP_INTERVAL_MS || '1800000', 10);
 const CURVE_USDC_EURC_POOL    = process.env.CURVE_USDC_EURC_POOL || null;
 const DEFI_LOOP_INTERVAL_MS   = parseInt(process.env.DEFI_LOOP_INTERVAL_MS   || '3600000',  10); // default 1h
 const DAILY_DEFI_LOOP_CAP     = 10;
+const GLOBAL_DRY_RUN          = process.env.DRY_RUN === 'true';
 
 function _getUsdcEurcCurvePool() {
   return oracle.resolveCurvePool('USDC-EURC');
@@ -315,7 +440,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   const { rows: [agent] } = await db.query(
     `SELECT id, llm_model, llm_api_key_encrypted, oracle_enabled,
             daily_market_analysis_count, daily_limit_reset_at,
-            daily_tasks_enabled
+            daily_tasks_enabled, defi_loop_enabled, daily_defi_loop_count, wallet_address
      FROM agents WHERE id = $1`,
     [agentId],
   );
@@ -341,7 +466,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
 
   // Daily cap: max 48 oracle queries per agent (every 30 min × 24h)
   const DAILY_ORACLE_CAP = 48;
-  if (agent.daily_market_analysis_count >= DAILY_ORACLE_CAP) {
+  if (!isDailyLimitBypassed(agent) && agent.daily_market_analysis_count >= DAILY_ORACLE_CAP) {
     console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} daily cap reached`);
     return finishOracle('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_market_analysis_count });
   }
@@ -368,17 +493,13 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   });
 
   // ── Run through engine ─────────────────────────────────────────────────────
-  const { engine, apiKey } = await resolveEngine(agent);
-  let decision = null;
+  let executionGate = null;
   let decisionError = false;
+  const permissions = await getAgentPermissionMap(agentId);
+  const arbitragePermissionGranted = permissions.arbitrage !== false;
   try {
-    const result = await engine.analyzeMarket({
-      chain: 'arc-testnet', token: 'USDC',
-      model: agent.llm_model, apiKey, agentId,
-      context: { signal, forexRate, poolState },
-    });
-    decision = result.decision;
-    console.log(`[QUEUE] ORACLE_QUERY decision (${result.engine || 'llm'}) agent=${agentId}:`, String(decision).slice(0, 120));
+    executionGate = await evaluateExecutionGate(agent, signal, agentId);
+    console.log(`[QUEUE] ORACLE_QUERY gate (${executionGate.engine}) agent=${agentId}:`, String(executionGate.decision).slice(0, 120));
   } catch (err) {
     console.error(`[QUEUE] ORACLE_QUERY engine error agent=${agentId}:`, err.message);
     decisionError = true;
@@ -392,6 +513,44 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
 
   // Log the signal + decision to transactions table as an 'oracle_signal' record
   if (signal.opportunity.found) {
+    const dailyLimitBypass = getDailyLimitBypass(agent);
+    const defiLoopCapReached = !dailyLimitBypass.enabled
+      && Number(agent.daily_defi_loop_count || 0) >= DAILY_DEFI_LOOP_CAP;
+    const executionPermissionGranted = Boolean(agent.defi_loop_enabled && arbitragePermissionGranted);
+    const gateAllowsExecution = executionPermissionGranted
+      && executionGate?.verdict?.execute === true
+      && !defiLoopCapReached;
+    const signalMeta = {
+      signal,
+      decision: executionGate?.decision || null,
+      executionGate,
+      permissions: {
+        arbitrage: arbitragePermissionGranted,
+      },
+      dailyLimitBypass,
+      dailyCap: DAILY_DEFI_LOOP_CAP,
+      dailyCapCount: agent.daily_defi_loop_count ?? 0,
+      executionPermissionGranted,
+      executionState: !executionPermissionGranted
+        ? 'signal_only'
+        : defiLoopCapReached
+          ? 'daily_cap_reached'
+        : gateAllowsExecution
+          ? 'eligible_for_defi_loop'
+          : 'gate_blocked',
+      signalOnlyReason: !arbitragePermissionGranted
+        ? 'Signal only — the Arbitrage strategy preference is disabled for this agent, so autonomous oracle strategy execution is blocked.'
+        : !agent.defi_loop_enabled
+        ? 'Signal only — autonomous DeFi execution is disabled for this agent, so no on-chain trade was submitted.'
+        : defiLoopCapReached
+        ? `Autonomous DeFi execution is enabled, but no on-chain trade was submitted because this agent already used ${agent.daily_defi_loop_count || 0}/${DAILY_DEFI_LOOP_CAP} daily DeFi loop runs.`
+        : executionPermissionGranted
+        ? (gateAllowsExecution
+          ? 'Autonomous DeFi execution is enabled for this agent and the execution gate currently approves this opportunity.'
+          : `Autonomous DeFi execution is enabled, but the execution gate returned HOLD${executionGate?.verdict?.reason ? `: ${executionGate.verdict.reason}` : '.'}`)
+        : 'Signal only — autonomous DeFi execution is disabled for this agent, so no on-chain trade was submitted.',
+    };
+
     await db.query(
       `INSERT INTO transactions
          (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
@@ -399,7 +558,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
       [
         agentId,
         signal.opportunity.expectedProfitUsdc,
-        JSON.stringify({ signal, decision }),
+        JSON.stringify(signalMeta),
       ],
     );
   }
@@ -409,7 +568,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
 
   return finishOracle(
     decisionError ? 'decision_error' : signal.opportunity.found ? 'success' : 'no_signal',
-    { ok: true, found: signal.opportunity.found, confidence: signal.opportunity.confidence, decision },
+    { ok: true, found: signal.opportunity.found, confidence: signal.opportunity.confidence, executionGate },
   );
 });
 
@@ -439,15 +598,42 @@ async function scheduleOracleLoop() {
   console.log(`[ORACLE_LOOP] Started — interval ${ORACLE_LOOP_INTERVAL_MS / 60000} min`);
 }
 
+async function scheduleMarketAnalysisLoop() {
+  if (!MARKET_ANALYSIS_LOOP_INTERVAL_MS || MARKET_ANALYSIS_LOOP_INTERVAL_MS < 60_000) return;
+
+  setInterval(async () => {
+    try {
+      const { rows } = await db.query(
+        `SELECT id FROM agents
+         WHERE market_analysis_enabled = TRUE
+           AND is_smart_mode = TRUE
+           AND status NOT IN ('locked', 'inactive')`,
+      );
+      for (const { id } of rows) {
+        await queue.add(
+          'MARKET_ANALYSIS',
+          { agentId: id, chain: 'arc-testnet', token: 'USDC' },
+          { jobId: `market-analysis-${id}-${Date.now()}` },
+        );
+      }
+      if (rows.length > 0) {
+        console.log(`[MARKET_ANALYSIS_LOOP] Queued ${rows.length} market analysis job(s)`);
+      }
+    } catch (err) {
+      console.error('[MARKET_ANALYSIS_LOOP] Schedule error:', err.message);
+    }
+  }, MARKET_ANALYSIS_LOOP_INTERVAL_MS);
+
+  console.log(`[MARKET_ANALYSIS_LOOP] Started — interval ${MARKET_ANALYSIS_LOOP_INTERVAL_MS / 60000} min`);
+}
+
 // ── DEFI_LOOP ─────────────────────────────────────────────────────────────────
 // Runs for agents with defi_loop_enabled = TRUE only.
-// Flow: oracle fetch → arb signal → engine decision → protocol tx (unless DRY_RUN).
+// Flow: oracle fetch → arb signal → engine decision → protocol tx (unless dry-run stays enabled for this agent).
 // Hard cap: 10 runs per agent per day (daily_defi_loop_count).
-const DRY_RUN   = process.env.DRY_RUN === 'true';
 
-queue.process('DEFI_LOOP', 2, async (job) => {
+queue.process('DEFI_LOOP', 1, async (job) => {
   const { agentId } = job.data;
-  console.log(`[QUEUE] DEFI_LOOP agent=${agentId} dry=${DRY_RUN}`);
   await _setAutomationState(agentId, 'defiLoop', 'running');
   const finishDefi = async (status, payload) => {
     await _setAutomationState(agentId, 'defiLoop', status);
@@ -459,7 +645,7 @@ queue.process('DEFI_LOOP', 2, async (job) => {
     `SELECT id, llm_model, llm_api_key_encrypted,
             defi_loop_enabled, oracle_enabled,
             daily_defi_loop_count, daily_limit_reset_at,
-            daily_limit_usdc, max_trade_usdc, slippage_percent,
+            daily_limit_usdc, max_trade_usdc, defi_wallet_reserve_usdc, slippage_percent,
             wallet_address, private_key_encrypted
      FROM agents WHERE id = $1`,
     [agentId],
@@ -467,6 +653,28 @@ queue.process('DEFI_LOOP', 2, async (job) => {
 
   if (!agent)                   return finishDefi('missing_agent', { ok: false, reason: 'agent_not_found' });
   if (!agent.defi_loop_enabled) return finishDefi('disabled', { ok: false, reason: 'defi_loop_disabled' });
+
+  const permissions = await getAgentPermissionMap(agentId);
+  if (permissions.arbitrage === false) {
+    await db.query(
+      `INSERT INTO transactions
+         (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
+       VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'dry_run', $2::jsonb)`,
+      [agentId, JSON.stringify({
+        executionState: 'permission_blocked',
+        executionSource: 'oracle_strategy',
+        reason: 'Arbitrage strategy preference is disabled for this agent.',
+        permission: 'arbitrage',
+      })],
+    );
+
+    return finishDefi('permission_blocked', {
+      ok: true,
+      action: 'hold',
+      reason: 'permission_blocked',
+      permission: 'arbitrage',
+    });
+  }
 
   // Reset daily counters if new day
   const resetAt = new Date(agent.daily_limit_reset_at);
@@ -483,9 +691,26 @@ queue.process('DEFI_LOOP', 2, async (job) => {
     agent.daily_defi_loop_count = 0;
   }
 
+  const dryRunEnabled = shouldUseDryRun(agent);
+  console.log(`[QUEUE] DEFI_LOOP agent=${agentId} dry=${dryRunEnabled}`);
+
   // Daily cap check
-  if (agent.daily_defi_loop_count >= DAILY_DEFI_LOOP_CAP) {
+  if (!isDailyLimitBypassed(agent) && agent.daily_defi_loop_count >= DAILY_DEFI_LOOP_CAP) {
     console.log(`[QUEUE] DEFI_LOOP agent=${agentId} daily cap reached (${DAILY_DEFI_LOOP_CAP})`);
+    await db.query(
+      `INSERT INTO transactions
+         (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
+       VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'failed', $2::jsonb)`,
+      [agentId, JSON.stringify({
+        executionState: 'daily_cap_reached',
+        executionSource: 'oracle_strategy',
+        reason: 'daily_cap_reached',
+        dailyCap: DAILY_DEFI_LOOP_CAP,
+        dailyCapCount: agent.daily_defi_loop_count,
+        fromToken: 'USDC',
+        toToken: 'EURC',
+      })],
+    );
     return finishDefi('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_defi_loop_count });
   }
 
@@ -511,15 +736,9 @@ queue.process('DEFI_LOOP', 2, async (job) => {
   });
 
   // ── Engine decision ────────────────────────────────────────────────────────
-  const { engine, apiKey } = await resolveEngine(agent);
-  let decision = null;
+  let executionGate = null;
   try {
-    const result = await engine.analyzeMarket({
-      chain: 'arc-testnet', token: 'USDC',
-      model: agent.llm_model, apiKey, agentId,
-      context: { signal, forexRate, poolState },
-    });
-    decision = result.decision;
+    executionGate = await evaluateExecutionGate(agent, signal, agentId);
   } catch (err) {
     console.error(`[QUEUE] DEFI_LOOP engine error agent=${agentId}:`, err.message);
     // Non-fatal — still increment counter and log
@@ -536,19 +755,89 @@ queue.process('DEFI_LOOP', 2, async (job) => {
     return finishDefi('no_opportunity', { ok: true, action: 'hold', reason: 'no_opportunity', confidence: signal.opportunity.confidence });
   }
 
-  // ── Execute swap ──────────────────────────────────────────────────────────
-  const swapAmountUsdc = Math.min(
-    signal.opportunity.steps?.[0]?.amountUsdc ?? 1000,
-    parseFloat(agent.max_trade_usdc) || 200,
-  );
+  if (executionGate?.verdict?.execute !== true) {
+    return finishDefi('gate_blocked', {
+      ok: true,
+      action: 'hold',
+      reason: 'execution_gate_blocked',
+      executionGate,
+    });
+  }
 
-  if (DRY_RUN) {
+  // ── Execute swap ──────────────────────────────────────────────────────────
+  const desiredSwapAmountUsdc = normalizeUsdcAmount(Math.min(
+    Number(executionGate?.verdict?.suggestedAmount || signal.opportunity.steps?.[0]?.amountUsdc || 1000),
+    parseFloat(agent.max_trade_usdc) || 200,
+  ));
+
+  let availableUsdcBalance = 0;
+  try {
+    availableUsdcBalance = await getArcUsdcBalance(agent.wallet_address);
+  } catch (err) {
+    console.error(`[QUEUE] DEFI_LOOP balance check error agent=${agentId}:`, err.message);
+    return finishDefi('balance_check_failed', {
+      ok: false,
+      reason: 'wallet_balance_unavailable',
+      error: err.message,
+    });
+  }
+
+  const walletReserveUsdc = normalizeUsdcAmount(Math.max(Number(agent.defi_wallet_reserve_usdc || 0), 0));
+  const availableToTradeUsdc = normalizeUsdcAmount(Math.max(availableUsdcBalance - walletReserveUsdc, 0));
+  const swapAmountUsdc = normalizeUsdcAmount(Math.min(desiredSwapAmountUsdc, availableToTradeUsdc));
+
+  if (swapAmountUsdc < 0.01) {
+    await db.query(
+      `INSERT INTO transactions
+         (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
+       VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', $2, 'dry_run', $3::jsonb)`,
+      [agentId, desiredSwapAmountUsdc, JSON.stringify({
+        signal,
+        executionGate,
+        dryRun: false,
+        executionState: 'insufficient_balance',
+        executionSource: 'oracle_strategy',
+        fromToken: 'USDC',
+        toToken: 'EURC',
+        requestedAmountIn: desiredSwapAmountUsdc,
+        availableBalanceUsdc: availableUsdcBalance,
+        walletReserveUsdc,
+        availableToTradeUsdc,
+        amountIn: 0,
+      })],
+    );
+
+    return finishDefi('insufficient_balance', {
+      ok: true,
+      action: 'hold',
+      reason: 'insufficient_balance',
+      requestedAmountUsdc: desiredSwapAmountUsdc,
+      availableBalanceUsdc: availableUsdcBalance,
+      walletReserveUsdc,
+      availableToTradeUsdc,
+    });
+  }
+
+  if (dryRunEnabled) {
     console.log(`[QUEUE] DEFI_LOOP DRY_RUN agent=${agentId} — would swap ${swapAmountUsdc} USDC→EURC`);
     await db.query(
       `INSERT INTO transactions
          (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
        VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', $2, 'dry_run', $3::jsonb)`,
-      [agentId, swapAmountUsdc, JSON.stringify({ signal, decision, dryRun: true })],
+      [agentId, swapAmountUsdc, JSON.stringify({
+        signal,
+        executionGate,
+        dryRun: true,
+        executionState: 'dry_run',
+        executionSource: 'oracle_strategy',
+        fromToken: 'USDC',
+        toToken: 'EURC',
+        amountIn: swapAmountUsdc,
+        requestedAmountIn: desiredSwapAmountUsdc,
+        availableBalanceUsdc: availableUsdcBalance,
+        walletReserveUsdc,
+        availableToTradeUsdc,
+      })],
     );
     return finishDefi('dry_run', { ok: true, action: 'dry_run', amountUsdc: swapAmountUsdc });
   }
@@ -593,7 +882,20 @@ queue.process('DEFI_LOOP', 2, async (job) => {
       `INSERT INTO transactions
          (agent_id, type, from_chain, to_chain, token, amount_usdc, status, tx_hash, meta)
        VALUES ($1, 'defi_loop_swap', 'arc-testnet', 'arc-testnet', 'EURC', $2, 'confirmed', $3, $4::jsonb)`,
-      [agentId, swapAmountUsdc, txResult.txHash, JSON.stringify({ signal, decision, amountOut: txResult.amountOut })],
+      [agentId, swapAmountUsdc, txResult.txHash, JSON.stringify({
+        signal,
+        executionGate,
+        executionState: 'executed',
+        executionSource: 'oracle_strategy',
+        fromToken: 'USDC',
+        toToken: 'EURC',
+        amountIn: swapAmountUsdc,
+        requestedAmountIn: desiredSwapAmountUsdc,
+        availableBalanceUsdc: availableUsdcBalance,
+        walletReserveUsdc,
+        availableToTradeUsdc,
+        amountOut: txResult.amountOut,
+      })],
     );
 
     console.log(`[QUEUE] DEFI_LOOP swap OK agent=${agentId} tx=${txResult.txHash}`);
@@ -601,14 +903,33 @@ queue.process('DEFI_LOOP', 2, async (job) => {
     return finishDefi('executed', { ok: true, action: 'swap_executed', txHash: txResult.txHash, amountOut: txResult.amountOut });
 
   } catch (err) {
-    console.error(`[QUEUE] DEFI_LOOP swap error agent=${agentId}:`, err.message);
+    const errorDetails = buildExecutionErrorDetails(err);
+    console.error(`[QUEUE] DEFI_LOOP swap error agent=${agentId}:`, errorDetails.error);
     await db.query(
       `INSERT INTO transactions
-         (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
-       VALUES ($1, 'defi_loop_swap', 'arc-testnet', 'arc-testnet', 'USDC', $2, 'failed', $3::jsonb)`,
-      [agentId, swapAmountUsdc, JSON.stringify({ error: err.message, signal })],
+         (agent_id, type, from_chain, to_chain, token, amount_usdc, status, tx_hash, meta)
+       VALUES ($1, 'defi_loop_swap', 'arc-testnet', 'arc-testnet', 'USDC', $2, 'failed', $3, $4::jsonb)`,
+      [agentId, swapAmountUsdc, errorDetails.errorTxHash, JSON.stringify({
+        ...errorDetails,
+        signal,
+        executionGate,
+        executionState: 'failed',
+        executionSource: 'oracle_strategy',
+        fromToken: 'USDC',
+        toToken: 'EURC',
+        amountIn: swapAmountUsdc,
+        requestedAmountIn: desiredSwapAmountUsdc,
+        availableBalanceUsdc: availableUsdcBalance,
+        walletReserveUsdc,
+        availableToTradeUsdc,
+      })],
     );
-    return finishDefi('swap_error', { ok: false, reason: 'swap_error', error: err.message });
+    return finishDefi('swap_error', {
+      ok: false,
+      reason: 'swap_error',
+      error: errorDetails.error,
+      errorSummary: errorDetails.errorSummary,
+    });
   }
 });
 
@@ -634,7 +955,7 @@ async function scheduleDefiLoop() {
     }
   }, DEFI_LOOP_INTERVAL_MS);
 
-  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, DRY_RUN=${DRY_RUN}`);
+  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, GLOBAL_DRY_RUN=${GLOBAL_DRY_RUN}`);
 }
 
 // ── DAILY FREE TASKS (Tier 1) ──────────────────────────────────────────────────
@@ -705,6 +1026,48 @@ const BUILTIN_TIER2_TASKS = [
     id:          'EXEC_CURVE_SWAP',
     title:       'Curve Swap',
     description: 'Execute a Curve stablecoin pool swap (e.g. USDC → EURC)',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_CURVE_LIQUIDITY_ADD',
+    title:       'Curve Liquidity Add',
+    description: 'Add one-sided USDC or EURC liquidity into the verified Curve stable pool',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_CURVE_LIQUIDITY_REMOVE',
+    title:       'Curve Liquidity Withdraw',
+    description: 'Burn Curve LP into one stable token from the verified Arc pool',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_CIRBTC_USDC_ZAP_IN',
+    title:       'cirBTC/USDC LP Bootstrap',
+    description: 'Use up to 20 USDC, swap part into cirBTC, then mint LP on the direct cirBTC/USDC pair',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_CIRBTC_EURC_ZAP_IN',
+    title:       'cirBTC/EURC LP Bootstrap',
+    description: 'Use up to 16 EURC, swap part into cirBTC, then mint LP on the direct cirBTC/EURC pair',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_CIRBTC_USDC_LP_REMOVE',
+    title:       'cirBTC/USDC LP Exit',
+    description: 'Burn a percentage of the current cirBTC/USDC LP position and return both assets to the agent wallet',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_CIRBTC_EURC_LP_REMOVE',
+    title:       'cirBTC/EURC LP Exit',
+    description: 'Burn a percentage of the current cirBTC/EURC LP position and return both assets to the agent wallet',
     tier:        2,
     fee_usdc:    PAID_TASK_FEE_USDC,
   },
@@ -780,7 +1143,7 @@ async function _dailyTaskGuard(agentId) {
   );
   if (!agent)                       return { ok: false, reason: 'agent_not_found' };
   // Dev bypass: skip all limit checks for test addresses
-  if (DEV_BYPASS_ADDRS.size > 0 && DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase())) {
+  if (isDailyLimitBypassed(agent)) {
     return { ok: true, agent };
   }
   if (!agent.daily_tasks_enabled)   return { ok: false, reason: 'daily_tasks_disabled' };
@@ -826,7 +1189,7 @@ async function _paidTaskGuard(agentId) {
   );
   if (!agent)                     return { ok: false, reason: 'agent_not_found' };
   // Dev bypass: skip all limit checks for test addresses
-  if (DEV_BYPASS_ADDRS.size > 0 && DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase())) {
+  if (isDailyLimitBypassed(agent)) {
     return { ok: true, agent };
   }
   if (!agent.daily_tasks_enabled) return { ok: false, reason: 'daily_tasks_disabled' };
@@ -862,7 +1225,7 @@ async function _freeExecGuard(agentId) {
     [agentId],
   );
   if (!agent) return { ok: false, reason: 'agent_not_found' };
-  if (DEV_BYPASS_ADDRS.size > 0 && DEV_BYPASS_ADDRS.has((agent.wallet_address || '').toLowerCase())) {
+  if (isDailyLimitBypassed(agent)) {
     return { ok: true, agent };
   }
   if (!agent.daily_tasks_enabled) return { ok: false, reason: 'daily_tasks_disabled' };
@@ -895,6 +1258,67 @@ async function _savePaidTaskResult(agentId, taskId, payload, agent) {
     `INSERT INTO agent_task_results (agent_id, task_id, payload) VALUES ($1, $2, $3::jsonb)`,
     [agentId, taskId, JSON.stringify({ ...payload, economy })],
   );
+
+  const executionMeta = {
+    taskId,
+    executionRail: payload?.executionRail || null,
+    swapExecutionRail: payload?.swapExecutionRail || null,
+    swapRouteStrategy: payload?.swapRouteStrategy || null,
+    swapRouteReason: payload?.swapRouteReason || null,
+    stableToken: payload?.stableToken || null,
+    volatileToken: payload?.volatileToken || null,
+    amountIn: payload?.amountIn || null,
+    swappedAmountIn: payload?.swappedAmountIn || null,
+    remainingAmountIn: payload?.remainingAmountIn || null,
+    amountOut: payload?.amountOut || null,
+    lpAmount: payload?.lpAmount || null,
+    liquidityStableAmountUsed: payload?.liquidityStableAmountUsed || null,
+    liquidityStableAmountRemaining: payload?.liquidityStableAmountRemaining || null,
+    liquidityVolatileAmountUsed: payload?.liquidityVolatileAmountUsed || null,
+    liquidityVolatileAmountRemaining: payload?.liquidityVolatileAmountRemaining || null,
+    withdrawPct: payload?.withdrawPct || null,
+    token0Amount: payload?.token0Amount || null,
+    token1Amount: payload?.token1Amount || null,
+    token0Symbol: payload?.token0Symbol || null,
+    token1Symbol: payload?.token1Symbol || null,
+    swapTxHash: payload?.swapTxHash || null,
+    swapPoolAddress: payload?.swapPoolAddress || null,
+    swapPoolSource: payload?.swapPoolSource || null,
+    mintTxHash: payload?.mintTxHash || null,
+    burnTxHash: payload?.burnTxHash || null,
+    summary: payload?.summary || null,
+    economy,
+  };
+
+  if (taskId === 'EXEC_CIRBTC_USDC_ZAP_IN' || taskId === 'EXEC_CIRBTC_EURC_ZAP_IN') {
+    await db.query(
+      `INSERT INTO transactions
+         (agent_id, type, from_chain, to_chain, token, amount_usdc, tx_hash, status, meta)
+       VALUES ($1, 'direct_lp_add', 'arc-testnet', 'arc-testnet', $2, $3, $4, 'confirmed', $5::jsonb)`,
+      [
+        agentId,
+        payload?.stableToken || 'USDC',
+        Number(payload?.amountIn || 0),
+        payload?.mintTxHash || payload?.txHash || null,
+        JSON.stringify(executionMeta),
+      ],
+    );
+  }
+
+  if (taskId === 'EXEC_CIRBTC_USDC_LP_REMOVE' || taskId === 'EXEC_CIRBTC_EURC_LP_REMOVE') {
+    await db.query(
+      `INSERT INTO transactions
+         (agent_id, type, from_chain, to_chain, token, amount_usdc, tx_hash, status, meta)
+       VALUES ($1, 'direct_lp_remove', 'arc-testnet', 'arc-testnet', $2, 0, $3, 'confirmed', $4::jsonb)`,
+      [
+        agentId,
+        payload?.stableToken || 'USDC',
+        payload?.burnTxHash || payload?.txHash || null,
+        JSON.stringify(executionMeta),
+      ],
+    );
+  }
+
   await db.query(
     `UPDATE agents SET daily_paid_task_count = daily_paid_task_count + 1 WHERE id = $1`,
     [agentId],
@@ -1169,12 +1593,118 @@ registerTaskProcessor('EXEC_CURVE_SWAP', 2, async (job) => {
   const result = await agenticTaskExecutionService.executeCurveSwapTask({
     agent,
     params,
-    dryRun: DRY_RUN,
+    dryRun: shouldUseDryRun(agent),
     defaultCurvePool: _getUsdcEurcCurvePool(),
   });
   if (!result.ok) return result;
 
   await _savePaidTaskResult(agentId, 'EXEC_CURVE_SWAP', result.payload, agent);
+  return result;
+});
+
+registerTaskProcessor('EXEC_CURVE_LIQUIDITY_ADD', 2, async (job) => {
+  const { agentId, params = {} } = job.data;
+  const guard = await _paidTaskGuard(agentId);
+  if (!guard.ok) return guard;
+  const { agent } = guard;
+
+  const result = await agenticTaskExecutionService.executeCurveLiquidityAddTask({
+    agent,
+    params,
+    dryRun: shouldUseDryRun(agent),
+  });
+  if (!result.ok) return result;
+
+  await _savePaidTaskResult(agentId, 'EXEC_CURVE_LIQUIDITY_ADD', result.payload, agent);
+  return result;
+});
+
+registerTaskProcessor('EXEC_CURVE_LIQUIDITY_REMOVE', 2, async (job) => {
+  const { agentId, params = {} } = job.data;
+  const guard = await _paidTaskGuard(agentId);
+  if (!guard.ok) return guard;
+  const { agent } = guard;
+
+  const result = await agenticTaskExecutionService.executeCurveLiquidityRemoveTask({
+    agent,
+    params,
+    dryRun: shouldUseDryRun(agent),
+  });
+  if (!result.ok) return result;
+
+  await _savePaidTaskResult(agentId, 'EXEC_CURVE_LIQUIDITY_REMOVE', result.payload, agent);
+  return result;
+});
+
+registerTaskProcessor('EXEC_CIRBTC_USDC_ZAP_IN', 2, async (job) => {
+  const { agentId, params = {} } = job.data;
+  const guard = await _paidTaskGuard(agentId);
+  if (!guard.ok) return guard;
+  const { agent } = guard;
+
+  const result = await agenticTaskExecutionService.executeDirectPairZapInTask({
+    agent,
+    params,
+    dryRun: shouldUseDryRun(agent),
+    stableToken: 'USDC',
+  });
+  if (!result.ok) return result;
+
+  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_USDC_ZAP_IN', result.payload, agent);
+  return result;
+});
+
+registerTaskProcessor('EXEC_CIRBTC_EURC_ZAP_IN', 2, async (job) => {
+  const { agentId, params = {} } = job.data;
+  const guard = await _paidTaskGuard(agentId);
+  if (!guard.ok) return guard;
+  const { agent } = guard;
+
+  const result = await agenticTaskExecutionService.executeDirectPairZapInTask({
+    agent,
+    params,
+    dryRun: shouldUseDryRun(agent),
+    stableToken: 'EURC',
+  });
+  if (!result.ok) return result;
+
+  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_EURC_ZAP_IN', result.payload, agent);
+  return result;
+});
+
+registerTaskProcessor('EXEC_CIRBTC_USDC_LP_REMOVE', 2, async (job) => {
+  const { agentId, params = {} } = job.data;
+  const guard = await _paidTaskGuard(agentId);
+  if (!guard.ok) return guard;
+  const { agent } = guard;
+
+  const result = await agenticTaskExecutionService.executeDirectPairRemoveLiquidityTask({
+    agent,
+    params,
+    dryRun: shouldUseDryRun(agent),
+    stableToken: 'USDC',
+  });
+  if (!result.ok) return result;
+
+  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_USDC_LP_REMOVE', result.payload, agent);
+  return result;
+});
+
+registerTaskProcessor('EXEC_CIRBTC_EURC_LP_REMOVE', 2, async (job) => {
+  const { agentId, params = {} } = job.data;
+  const guard = await _paidTaskGuard(agentId);
+  if (!guard.ok) return guard;
+  const { agent } = guard;
+
+  const result = await agenticTaskExecutionService.executeDirectPairRemoveLiquidityTask({
+    agent,
+    params,
+    dryRun: shouldUseDryRun(agent),
+    stableToken: 'EURC',
+  });
+  if (!result.ok) return result;
+
+  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_EURC_LP_REMOVE', result.payload, agent);
   return result;
 });
 
@@ -1189,7 +1719,7 @@ registerTaskProcessor('EXEC_CCTP_BRIDGE', 1, async (job) => {
   const result = await agenticTaskExecutionService.executeBridgeTask({
     agent,
     params,
-    dryRun: DRY_RUN,
+    dryRun: shouldUseDryRun(agent),
     onStep: (step) => console.log(`[EXEC_CCTP_BRIDGE] agent=${agentId} step=${step}`),
   });
   if (!result.ok) return result;
@@ -1208,7 +1738,7 @@ registerTaskProcessor('EXEC_YIELD_MOVE', 2, async (job) => {
   const result = await agenticTaskExecutionService.executeYieldMoveTask({
     agent,
     params,
-    dryRun: DRY_RUN,
+    dryRun: shouldUseDryRun(agent),
   });
   if (!result.ok) return result;
 
@@ -1226,7 +1756,7 @@ registerTaskProcessor('EXEC_ARB', 2, async (job) => {
   const result = await agenticTaskExecutionService.executeArbTask({
     agent,
     params,
-    dryRun: DRY_RUN,
+    dryRun: shouldUseDryRun(agent),
     pricingPool: _getEurcUsdcCurvePool(),
     swapPool: _getUsdcEurcCurvePool(),
   });
@@ -1246,7 +1776,7 @@ registerTaskProcessor('EXEC_REBALANCE', 2, async (job) => {
   const result = await agenticTaskExecutionService.executeRebalanceTask({
     agent,
     params,
-    dryRun: DRY_RUN,
+    dryRun: shouldUseDryRun(agent),
   });
   if (!result.ok) return result;
 
@@ -1265,6 +1795,7 @@ queue.on('completed', (job)      => console.log(`[QUEUE] Job ${job.id} completed
 
 // ── Export the queue for use in indexerService ─────────────────────────────────
 module.exports = queue;
+module.exports.scheduleMarketAnalysisLoop = scheduleMarketAnalysisLoop;
 module.exports.scheduleOracleLoop = scheduleOracleLoop;
 module.exports.scheduleDefiLoop   = scheduleDefiLoop;
 module.exports.scheduleDailyTasks = scheduleDailyTasks;

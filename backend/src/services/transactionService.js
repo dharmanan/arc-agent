@@ -794,10 +794,6 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
     throw Object.assign(new Error('Swap is only supported on Arc Testnet'), { status: 400 });
   }
 
-  if (!agentWalletService.isSwapConfigured()) {
-    throw Object.assign(new Error('Swap is not configured on this deployment. Set CIRCLE_KIT_KEY and try again.'), { status: 503 });
-  }
-
   const allowedTokens = ['USDC', 'EURC', 'cirBTC'];
   const pairValid = fromToken !== toToken && allowedTokens.includes(fromToken) && allowedTokens.includes(toToken);
   if (!pairValid) {
@@ -834,11 +830,11 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
     amountIn: parseFloat(amountIn),
     slippagePct: slippage ?? parseFloat(agent.settings?.slippagePercent ?? 0.5),
   })
-    .then(({ hash, amountOut }) => {
+    .then(({ hash, amountOut, executionRail, routeStrategy, routeReason, fallbackAvailable, poolAddress, poolSource }) => {
       updateTxStatus(txId, 'confirmed', hash);
       // Store output amount in meta
       db.query("UPDATE transactions SET meta = meta || $1::jsonb WHERE id = $2",
-        [JSON.stringify({ amountOut }), txId]).catch(() => {});
+        [JSON.stringify({ amountOut, executionRail, routeStrategy, routeReason, fallbackAvailable, poolAddress, poolSource }), txId]).catch(() => {});
     })
     .catch(err => {
       console.error('[AGENT SWAP]', err.message);

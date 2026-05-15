@@ -4,12 +4,28 @@
 
 const BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
-let _token = sessionStorage.getItem('arc_jwt') || null;
+function readStoredToken() {
+  const sessionToken = sessionStorage.getItem('arc_jwt');
+  if (sessionToken) return sessionToken;
+
+  const legacyPersistentToken = localStorage.getItem('arc_jwt');
+  if (!legacyPersistentToken) return null;
+
+  sessionStorage.setItem('arc_jwt', legacyPersistentToken);
+  localStorage.removeItem('arc_jwt');
+  return legacyPersistentToken;
+}
+
+let _token = readStoredToken();
 
 export function setToken(t) {
   _token = t;
-  if (t) sessionStorage.setItem('arc_jwt', t);
-  else   sessionStorage.removeItem('arc_jwt');
+  if (t) {
+    sessionStorage.setItem('arc_jwt', t);
+  } else {
+    localStorage.removeItem('arc_jwt');
+    sessionStorage.removeItem('arc_jwt');
+  }
 }
 
 export function getToken()  { return _token; }
@@ -58,6 +74,7 @@ export const agents = {
   testLlm:           (id, data)  => post(`/agents/${id}/test-llm`, data),
   updatePermissions: (id, perms) => put(`/agents/${id}/permissions`, perms),
   status:            (id)        => get(`/agents/${id}/status`),
+  positions:         (id)        => get(`/agents/${id}/positions`),
   reputation:        (id, limit) => get(`/agents/${id}/reputation${limit ? `?limit=${limit}` : ''}`),
   delete:            (id)        => del(`/agents/${id}`),
   retryIdentity:     (id)        => post(`/agents/${id}/register-identity`),

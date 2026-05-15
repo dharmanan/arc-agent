@@ -251,7 +251,7 @@ ORACLE_PUBLIC_TARGETS=curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC \
 node examples/oraclePublicBuyerExample.js --preview
 ```
 
-The API base URL is not an admin secret. These paid Oracle routes are public seller endpoints by design, so third-party buyers must be able to reach them. Protect private and operator-only routes separately with JWT or admin auth, keep rate limits enabled, and prefer a custom API domain in production instead of documenting a raw infrastructure hostname.
+The API base URL is not an admin secret. These paid Oracle routes are public seller endpoints by design, so third-party buyers must be able to reach them. Protect private and operator-only routes separately with JWT or admin auth, keep rate limits enabled, and during testnet prefer the Vercel public alias (`https://arcmachina.vercel.app/api`) instead of documenting a raw infrastructure hostname. Revisit a dedicated custom domain only after the testnet phase.
 
 ## Environment Variables Used By The Example
 

@@ -3,6 +3,7 @@
 const TOKENS = {
   USDC: '0x3600000000000000000000000000000000000000',
   EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
+  CIRBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
   WUSDC: '0x911b4000D3422F482F4062a913885f7b035382Df',
   USYC: '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
 };
@@ -100,6 +101,47 @@ const EXPERIMENTAL_EXTERNAL_POOLS = {
   },
 };
 
+const ENV_DIRECT_EXTERNAL_POOLS = {
+  uniswap_v2_like: {
+    'CIRBTC-USDC': {
+      envVar: 'ARC_V2_CIRBTC_USDC_PAIR',
+      protocol: 'uniswap_v2_like',
+      poolModel: 'constant_product',
+      feePct: 0.3,
+      note: 'Env-configured direct cirBTC/USDC pool for swap fallback and oracle visibility.',
+      baseToken: { symbol: 'cirBTC', address: TOKENS.CIRBTC, decimals: 8 },
+      quoteToken: { symbol: 'USDC', address: TOKENS.USDC, decimals: 6 },
+    },
+    'USDC-CIRBTC': {
+      envVar: 'ARC_V2_CIRBTC_USDC_PAIR',
+      protocol: 'uniswap_v2_like',
+      poolModel: 'constant_product',
+      feePct: 0.3,
+      note: 'Env-configured direct USDC/cirBTC pool for swap fallback and oracle visibility.',
+      baseToken: { symbol: 'USDC', address: TOKENS.USDC, decimals: 6 },
+      quoteToken: { symbol: 'cirBTC', address: TOKENS.CIRBTC, decimals: 8 },
+    },
+    'CIRBTC-EURC': {
+      envVar: 'ARC_V2_CIRBTC_EURC_PAIR',
+      protocol: 'uniswap_v2_like',
+      poolModel: 'constant_product',
+      feePct: 0.3,
+      note: 'Env-configured direct cirBTC/EURC pool for swap fallback and oracle visibility.',
+      baseToken: { symbol: 'cirBTC', address: TOKENS.CIRBTC, decimals: 8 },
+      quoteToken: { symbol: 'EURC', address: TOKENS.EURC, decimals: 6 },
+    },
+    'EURC-CIRBTC': {
+      envVar: 'ARC_V2_CIRBTC_EURC_PAIR',
+      protocol: 'uniswap_v2_like',
+      poolModel: 'constant_product',
+      feePct: 0.3,
+      note: 'Env-configured direct EURC/cirBTC pool for swap fallback and oracle visibility.',
+      baseToken: { symbol: 'EURC', address: TOKENS.EURC, decimals: 6 },
+      quoteToken: { symbol: 'cirBTC', address: TOKENS.CIRBTC, decimals: 8 },
+    },
+  },
+};
+
 function normalizeCurvePoolKey(poolKey = 'USDC-EURC') {
   return String(poolKey || 'USDC-EURC')
     .trim()
@@ -139,11 +181,55 @@ function resolveCurvePool(poolKey = 'USDC-EURC') {
   };
 }
 
+function resolveEnvExternalPool(poolKey = 'CIRBTC-USDC', venue = 'uniswap_v2_like') {
+  const normalizedVenue = normalizePoolVenue(venue);
+  const normalizedKey = normalizeCurvePoolKey(poolKey);
+  const definition = ENV_DIRECT_EXTERNAL_POOLS[normalizedVenue]?.[normalizedKey];
+
+  if (!definition) {
+    return null;
+  }
+
+  const envAddress = definition.envVar ? process.env[definition.envVar] : null;
+  if (!envAddress) {
+    return null;
+  }
+
+  return {
+    key: normalizedKey,
+    requestedKey: normalizedKey,
+    venue: normalizedVenue,
+    protocol: definition.protocol,
+    poolModel: definition.poolModel,
+    address: envAddress,
+    source: 'env',
+    liquidityState: 'unknown',
+    feePct: definition.feePct,
+    note: definition.note,
+    baseToken: { ...definition.baseToken },
+    quoteToken: { ...definition.quoteToken },
+  };
+}
+
+function resolveDirectSwapFallbackPool(poolKey = 'USDC-EURC') {
+  const curvePool = resolveCurvePool(poolKey);
+  if (curvePool) {
+    return curvePool;
+  }
+
+  return resolveEnvExternalPool(poolKey, 'uniswap_v2_like');
+}
+
 function resolveOraclePoolStateTarget(poolKey = 'USDC-EURC', venue = 'curve') {
   const normalizedVenue = normalizePoolVenue(venue);
 
   if (normalizedVenue === 'curve') {
     return resolveCurvePool(poolKey);
+  }
+
+  const envExternalPool = resolveEnvExternalPool(poolKey, normalizedVenue);
+  if (envExternalPool) {
+    return envExternalPool;
   }
 
   const normalizedKey = normalizeCurvePoolKey(poolKey);
@@ -171,9 +257,11 @@ function resolveOraclePoolStateTarget(poolKey = 'USDC-EURC', venue = 'curve') {
 
 module.exports = {
   EXPERIMENTAL_EXTERNAL_POOLS,
+  ENV_DIRECT_EXTERNAL_POOLS,
   TOKENS,
   normalizeCurvePoolKey,
   normalizePoolVenue,
+  resolveDirectSwapFallbackPool,
   resolveOraclePoolStateTarget,
   resolveCurvePool,
 };

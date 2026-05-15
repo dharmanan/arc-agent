@@ -85,12 +85,36 @@ export const UNISWAP_V2_ROUTER_SEPOLIA = '0xC532a74256D3Db42D0Bf7a0400fEFDbad769
 export const WETH_SEPOLIA              = '0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9';
 
 export const AGENT_PERMISSIONS = [
-  { key: 'defi_scan',        label: 'DeFi Protocol Scanner',  desc: 'Auto-scan yield opportunities' },
-  { key: 'arbitrage',        label: 'Arbitrage',              desc: 'Cross-chain price differences' },
-  { key: 'testnet_explorer', label: 'Testnet Explorer',       desc: 'ArcScan on-chain data reads' },
-  { key: 'contract_scanner', label: 'New Contract Scanner',   desc: 'Watch newly deployed contracts' },
-  { key: 'liquidations',     label: 'Liquidation Monitor',    desc: 'Watch liquidation events' },
-  { key: 'aggressive_mode',  label: 'Aggressive Mode',        desc: 'High risk / high reward strategies' },
+  {
+    key: 'defi_scan',
+    label: 'DeFi Protocol Scanner',
+    desc: 'Currently gates Market Analysis. Turn this off if you want Smart Mode saved but do not want background yield and venue scanning to run.',
+  },
+  {
+    key: 'arbitrage',
+    label: 'Arbitrage',
+    desc: 'Currently gates oracle-strategy eligibility and DeFi Loop Execution. Turn this off to keep oracle signals visible while blocking autonomous oracle trades.',
+  },
+  {
+    key: 'testnet_explorer',
+    label: 'Testnet Explorer',
+    desc: 'Saved preference for ArcScan-style on-chain reads and future explorer-driven automations. It is stored today, but it does not yet block a live background worker.',
+  },
+  {
+    key: 'contract_scanner',
+    label: 'New Contract Scanner',
+    desc: 'Saved preference for future contract discovery modules. It does not currently enable or disable a production automation path by itself.',
+  },
+  {
+    key: 'liquidations',
+    label: 'Liquidation Monitor',
+    desc: 'Saved preference for future liquidation watching and alerting logic. It is remembered now, but it is not yet wired to a live executor.',
+  },
+  {
+    key: 'aggressive_mode',
+    label: 'Aggressive Mode',
+    desc: 'Saved preference for future high-risk strategy sizing and policy variants. It is not yet allowed to expand trade size or bypass your existing safety limits.',
+  },
 ];
 
 export function getExplorerUrl(chainId, txHash) {

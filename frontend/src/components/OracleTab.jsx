@@ -37,9 +37,6 @@ function getOracleWarnings(oracleOverview) {
   if (!oracleOverview.config.pools?.eurcWusdcConfigured) {
     warnings.push('Verified EURC/WUSDC oracle reads are unavailable.');
   }
-  if (!oracleOverview.config.pools?.usdcUsycConfigured) {
-    warnings.push('CURVE_USDC_USYC_POOL is missing. USDC/USYC oracle reads are unavailable.');
-  }
 
   const seller = oracleOverview?.gateway?.seller;
   const facilitatorError = seller?.facilitator?.supportedCache?.lastError;

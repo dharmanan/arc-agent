@@ -19,6 +19,12 @@ function getProviderLabel(model) {
   return 'Unknown';
 }
 
+function parseNonNegativeUsdc(value) {
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return parsed;
+}
+
 export default function AgentTab() {
   const { address: ownerAddress } = useAccount();
   const { agent, setAgent, setJwt, clearAgent, disconnectSession } = useAgent();
@@ -185,6 +191,7 @@ export default function AgentTab() {
         maxGasGwei:      parseInt(settings.maxGasGwei)       || 50,
         slippagePercent: parseFloat(settings.slippagePercent) || 0.5,
         maxTradeUsdc:    parseFloat(settings.maxTradeUsdc)    || 200,
+        defiWalletReserveUsdc: parseNonNegativeUsdc(settings.defiWalletReserveUsdc),
         autoLockMinutes: parseInt(settings.autoLockMinutes)   || 5,
         contractGuard:   settings.contractGuard !== false,
       };
@@ -236,7 +243,11 @@ export default function AgentTab() {
     setSavingPerms(true);
     setPermMsg('');
     try {
-      await agentApi.updatePermissions(agent.id, perms);
+      await agentApi.update(agent.id, {
+        defiWalletReserveUsdc: parseNonNegativeUsdc(settings.defiWalletReserveUsdc),
+      });
+      const updated = await agentApi.updatePermissions(agent.id, perms);
+      setAgent(a => ({ ...(a || {}), ...(updated || {}), permissions: updated?.permissions || perms }));
       setPermMsg('Permissions saved.');
       setTimeout(() => setPermMsg(''), 3000);
     } catch (e) {
@@ -659,32 +670,75 @@ export default function AgentTab() {
         )}
         {smartMode && (
           <p className="mt-2 text-xs text-slate-500">
-            Test API sends a live uncached provider request and verifies a one-time challenge in the response. This confirms the selected key and model can complete a real request now. It does not, by itself, guarantee that autonomous jobs will run later unless Smart Mode, permissions, balance, and trigger conditions are also satisfied.
+            Test API sends a live uncached provider request and verifies a one-time challenge in the response. This confirms the selected key and model can complete a real request now. It does not, by itself, guarantee that autonomous jobs will run later unless Smart Mode, feature toggles, relevant strategy permissions, balance, and trigger conditions are also satisfied.
           </p>
         )}
       </Card>
 
       {/* Permissions */}
       <Card>
-        <h3 className="mb-4 font-bold text-slate-900">Agent Permissions</h3>
+        <div className="mb-4">
+          <h3 className="font-bold text-slate-900">Strategy Preferences</h3>
+          <p className="mt-1 text-xs text-slate-500">
+            These flags now act as a second layer on top of Tasks → Automation. They do not replace the automation toggles, but some of them do block specific background behaviors.
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            Today, <strong>DeFi Protocol Scanner</strong> gates Market Analysis, and <strong>Arbitrage</strong> gates oracle-strategy eligibility plus DeFi Loop Execution. The remaining checkboxes are still saved strategy preferences for future modules.
+          </p>
+        </div>
         <div className="space-y-3">
-          {AGENT_PERMISSIONS.map(({ key, label, desc }) => (
-            <label key={key} className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-100 p-3 hover:bg-arc-greenBg/30 transition">
-              <input
-                type="checkbox"
-                className="mt-0.5 h-4 w-4 rounded accent-arc-green"
-                checked={!!perms[key]}
-                onChange={e => setPerms(p => ({ ...p, [key]: e.target.checked }))}
-              />
-              <div>
-                <p className="text-sm font-semibold text-slate-800">{label}</p>
-                <p className="text-xs text-slate-500">{desc}</p>
+          {AGENT_PERMISSIONS.map(({ key, label, desc }) => {
+            const isArbitrage = key === 'arbitrage';
+
+            return (
+              <div key={key} className="rounded-xl border border-slate-100 p-3 transition hover:bg-arc-greenBg/30">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <label className="flex cursor-pointer items-start gap-3 sm:flex-1">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 rounded accent-arc-green"
+                      checked={!!perms[key]}
+                      onChange={e => setPerms(p => ({ ...p, [key]: e.target.checked }))}
+                    />
+                    <div>
+                      <p className="text-sm font-semibold text-slate-800">{label}</p>
+                      <p className="text-xs text-slate-500">{desc}</p>
+                    </div>
+                  </label>
+
+                  {isArbitrage && (
+                    <div className="sm:w-64">
+                      <Input
+                        label="Keep At Least (USDC)"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder="0"
+                        value={settings.defiWalletReserveUsdc ?? ''}
+                        onChange={e => setSettings(s => ({ ...s, defiWalletReserveUsdc: e.target.value }))}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {isArbitrage && (
+                  <div className="mt-3 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
+                    <p className="text-xs font-semibold text-slate-700">This is the live autonomous DeFi permission.</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      When <strong>Arbitrage</strong> is on, the DeFi loop uses the smaller of your live wallet balance minus this reserve and the global per-trade cap above.
+                      Current global cap: <strong>{Number(settings.maxTradeUsdc || 0).toFixed(2)} USDC</strong>.
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Example: if the wallet has 86 USDC and you keep 50 USDC reserved here, the next autonomous trade can use at most 36 USDC. After that, later signals will be held once the remaining tradable balance drops below the requested amount.
+                    </p>
+                  </div>
+                )}
               </div>
-            </label>
-          ))}
+            );
+          })}
         </div>
         <div className="mt-4 flex items-center gap-4">
-          <Button onClick={handleSavePerms} loading={savingPerms}>Save Permissions</Button>
+          <Button onClick={handleSavePerms} loading={savingPerms}>Save Strategy Preferences</Button>
           {permMsg && (
             <span className={'text-sm font-medium ' + (permMsg.startsWith('Error') ? 'text-red-500' : 'text-arc-green')}>
               {permMsg}

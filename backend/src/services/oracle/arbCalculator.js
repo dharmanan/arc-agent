@@ -59,6 +59,9 @@ function buildArbSignal({ strategy, forexRate, poolRate, poolFee, poolLiquidity,
     opportunity: {
       found,
       type:               'FX_CURVE_ARB',
+      fromChain:          'arc-testnet',
+      amountUsdc:         optimalSwap,
+      spreadPct,
       description:        found
         ? `${baseToken} is ${Math.abs(spreadPct).toFixed(2)}% ${spreadPct < 0 ? 'below' : 'above'} real FX rate on Curve`
         : 'No profitable arbitrage opportunity at this time',

@@ -14,6 +14,8 @@ const { requireAuth } = require('../middleware/auth');
 const agentService  = require('../services/agentService');
 const llmService    = require('../services/llmService');
 const reputationService = require('../services/reputationService');
+const positionsService = require('../services/positionsService');
+const agentQueue = require('../queue/agentQueue');
 const { encrypt }   = require('../services/cryptoService');
 
 const LLM_MODEL_OPTIONS = [
@@ -41,6 +43,7 @@ const createSchema = z.object({
   maxGasGwei:        z.number().positive().max(500).optional(),
   slippagePercent:   z.number().min(0.1).max(50).optional(),
   maxTradeUsdc:      z.number().positive().max(100_000).optional(),
+  defiWalletReserveUsdc: z.number().min(0).max(100_000).optional(),
 });
 
 router.post('/', async (req, res, next) => {
@@ -67,6 +70,7 @@ const updateSchema = z.object({
   maxGasGwei:        z.number().positive().max(500).optional(),
   slippagePercent:   z.number().min(0.1).max(50).optional(),
   maxTradeUsdc:      z.number().positive().max(100_000).optional(),
+  defiWalletReserveUsdc: z.number().min(0).max(100_000).optional(),
   autoLockMinutes:   z.number().int().min(1).max(60).optional(),
   contractGuard:     z.boolean().optional(),
   isSmartMode:       z.boolean().optional(),
@@ -95,6 +99,36 @@ router.put('/:id', async (req, res, next) => {
 
     const agent = await agentService.updateAgent(req.params.id, req.user.userId, data);
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    const kickoffJobs = [];
+    if (data.marketAnalysisEnabled === true && agent.isSmartMode) {
+      kickoffJobs.push(agentQueue.add('MARKET_ANALYSIS', {
+        agentId: agent.id,
+        chain: 'arc-testnet',
+        token: 'USDC',
+      }, {
+        jobId: `market-analysis-manual-${agent.id}-${Date.now()}`,
+      }));
+    }
+    if (data.oracleEnabled === true) {
+      kickoffJobs.push(agentQueue.add('ORACLE_QUERY', {
+        agentId: agent.id,
+      }, {
+        jobId: `oracle-manual-${agent.id}-${Date.now()}`,
+      }));
+    }
+    if (data.defiLoopEnabled === true) {
+      kickoffJobs.push(agentQueue.add('DEFI_LOOP', {
+        agentId: agent.id,
+      }, {
+        jobId: `defi-manual-${agent.id}-${Date.now()}`,
+      }));
+    }
+
+    if (kickoffJobs.length > 0) {
+      Promise.allSettled(kickoffJobs).catch(() => {});
+    }
+
     res.json(agent);
   } catch (err) { next(err); }
 });
@@ -138,7 +172,7 @@ router.put('/:id/permissions', async (req, res, next) => {
     const perms = schema.parse(req.body);
     const result = await agentService.updatePermissions(req.params.id, req.user.userId, perms);
     if (!result) return res.status(404).json({ error: 'Agent not found' });
-    res.json({ ok: true });
+    res.json(result);
   } catch (err) { next(err); }
 });
 
@@ -161,6 +195,15 @@ router.get('/:id/reputation', async (req, res, next) => {
     );
     if (!overview) return res.status(404).json({ error: 'Agent not found' });
     res.json(overview);
+  } catch (err) { next(err); }
+});
+
+// ── Live protocol positions ──────────────────────────────────────────────────
+router.get('/:id/positions', async (req, res, next) => {
+  try {
+    const positions = await positionsService.getAgentPositions(req.params.id, req.user.userId);
+    if (!positions) return res.status(404).json({ error: 'Agent not found' });
+    res.json(positions);
   } catch (err) { next(err); }
 });
 
