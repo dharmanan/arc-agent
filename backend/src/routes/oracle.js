@@ -1,7 +1,7 @@
 'use strict';
 /**
  * GET /api/oracle/stablecoin-fx?pair=EURC/USDC   — forex rate vs pool rate comparison
- * GET /api/oracle/pool-state?pool=USDC-EURC       — Curve pool on-chain state
+ * GET /api/oracle/pool-state?pool=USDC-EURC&venue=curve — on-chain pool state
  * GET /api/oracle/yield-rank?asset=USDC           — DeFi yield ranking
  * GET /api/oracle/arb-signal?strategy=stablecoin_fx — arbitrage opportunity signal
  * GET /api/oracle/status                          — service health + cache stats
@@ -14,74 +14,1314 @@ const router          = require('express').Router();
 const { requireAuth } = require('../middleware/auth');
 const oracle          = require('../services/oracle');
 const agentService    = require('../services/agentService');
+const db              = require('../db');
+const { ORACLE_PRICES } = require('../services/oracle/pricing');
+const {
+  createGatewayRouteConfig,
+  createGatewaySellerMiddleware,
+  getGatewaySellerSummary,
+} = require('../services/agenticEconomy/gatewaySeller');
+const { getGatewayFacilitatorSummary } = require('../services/agenticEconomy/gatewayFacilitator');
+const {
+  depositGatewayBalance,
+  getAgentGatewayBalances,
+  getGatewayBuyerSummary,
+  createGatewayClientForAgent,
+} = require('../services/agenticEconomy/gatewayBuyer');
+const { getTaskEconomyConfigSummary } = require('../services/agenticEconomy/taskEconomyService');
+const { getJobEconomyConfigSummary } = require('../services/agenticEconomy/jobEconomyService');
+const { logOracleGateway } = require('../services/agenticEconomy/logger');
 
-router.use(requireAuth);
-
-// Pool address lookup — from env (mirrors .env.example from oracle source)
-const CURVE_POOLS = {
-  'USDC-EURC':  process.env.CURVE_USDC_EURC_POOL  || null,
-  'EURC-USDC':  process.env.CURVE_USDC_EURC_POOL  || null,
-  'WUSDC-USDC': process.env.CURVE_WUSDC_USDC_POOL || null,
-  'USDC-USYC':  process.env.CURVE_USDC_USYC_POOL  || null,
+// Verified Arc Curve pools fall back to known-good live addresses when envs are absent.
+const ORACLE_PAY_ADDRESS = process.env.ORACLE_PAY_ADDRESS || null;
+const ORACLE_BUYER_DOCS_URL = process.env.ORACLE_BUYER_DOCS_URL
+  || 'https://arcmachina.vercel.app/oracle-public-buyer-guide.html';
+const ORACLE_BUYER_MACHINE_DOCS_URL = process.env.ORACLE_BUYER_MACHINE_DOCS_URL
+  || 'https://arcmachina.vercel.app/oracle-public-buyer-manifest.json';
+const ORACLE_BUYER_EXAMPLE_URL = process.env.ORACLE_BUYER_EXAMPLE_URL
+  || 'https://arcmachina.vercel.app/downloads/oraclePublicBuyerExample.js';
+const ORACLE_BUYER_HELPER_URL = process.env.ORACLE_BUYER_HELPER_URL
+  || 'https://arcmachina.vercel.app/downloads/arcOracleBuyerHelper.js';
+const ORACLE_MANUAL_GATEWAY_FUND_USDC = process.env.ORACLE_MANUAL_GATEWAY_FUND_USDC || '1';
+const USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
+const EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
+const WUSDC_ADDRESS = process.env.WUSDC_ADDRESS_ARC || '0x911b4000D3422F482F4062a913885f7b035382Df';
+const ORACLE_PEG_MONITOR_SUPPORTED_ASSETS = ['USDC', 'EURC', 'USDT'];
+const ORACLE_RESERVE_STATE_ASSET_MAP = Object.freeze({
+  USDC: { address: USDC_ADDRESS, decimals: 6, market: 'aave_v3' },
+  EURC: { address: EURC_ADDRESS, decimals: 6, market: 'aave_v3' },
+  WUSDC: { address: WUSDC_ADDRESS, decimals: 18, market: 'aave_v3' },
+});
+const ORACLE_RESERVE_STATE_SUPPORTED_ASSETS = Object.keys(ORACLE_RESERVE_STATE_ASSET_MAP);
+const ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS = ['aave', 'morpho', 'maple', 'centrifuge', 'superform'];
+const ORACLE_POOL_COMPARE_DEFAULT_TARGETS = ['curve:USDC-EURC', 'curve:EURC-WUSDC', 'uniswap_v2_like:QTM-WUSDC'];
+const ORACLE_ARB_SCAN_MULTI_DEFAULT_TARGETS = ['curve:EURC-USDC', 'curve:EURC-WUSDC', 'curve:WUSDC-USDC'];
+const ORACLE_PUBLIC_ENDPOINTS = [
+  {
+    key: 'stablecoin-fx',
+    title: 'Stablecoin FX',
+    path: '/api/oracle/public/stablecoin-fx',
+    priceUsdc: ORACLE_PRICES['stablecoin-fx'],
+    description: 'Forex rate, USDC peg, and live Arc Curve comparison for supported stablecoin pairs.',
+    supportedPairs: ['EURC/USDC', 'EURC/WUSDC'],
+    exampleQueries: [
+      '/api/oracle/public/stablecoin-fx?pair=EURC/USDC',
+      '/api/oracle/public/stablecoin-fx?pair=EURC/WUSDC',
+    ],
+  },
+  {
+    key: 'pool-state',
+    title: 'Pool State',
+    path: '/api/oracle/public/pool-state',
+    priceUsdc: ORACLE_PRICES['pool-state'],
+    description: 'Live Curve and filtered external-pool health, reserves and implied pricing.',
+    supportedVenues: ['curve', 'uniswap_v2_like', 'arcfx'],
+    supportedPools: ['USDC-EURC', 'EURC-USDC', 'EURC-WUSDC', 'WUSDC-EURC', 'WUSDC-USDC', 'USDC-WUSDC', 'USDC-USYC', 'USYC-USDC', 'QTM-WUSDC', 'BERA-WETH', 'MUSDC-MEURC'],
+    exampleQueries: [
+      '/api/oracle/public/pool-state?pool=USDC-EURC&venue=curve',
+      '/api/oracle/public/pool-state?pool=EURC-WUSDC&venue=curve',
+      '/api/oracle/public/pool-state?pool=QTM-WUSDC&venue=uniswap_v2_like',
+      '/api/oracle/public/pool-state?pool=MUSDC-MEURC&venue=arcfx',
+    ],
+  },
+  {
+    key: 'peg-monitor',
+    title: 'Peg Monitor',
+    path: '/api/oracle/public/peg-monitor',
+    priceUsdc: ORACLE_PRICES['peg-monitor'],
+    description: 'Spot peg health for the main stablecoins covered by the oracle catalog.',
+    supportedPairs: ORACLE_PEG_MONITOR_SUPPORTED_ASSETS,
+    exampleQueries: [
+      '/api/oracle/public/peg-monitor?assets=USDC,EURC,USDT',
+    ],
+  },
+  {
+    key: 'reserve-state',
+    title: 'Reserve State',
+    path: '/api/oracle/public/reserve-state',
+    priceUsdc: ORACLE_PRICES['reserve-state'],
+    description: 'Aave-style reserve APY and utilization surface for the supported stablecoin watchlist.',
+    supportedPairs: ORACLE_RESERVE_STATE_SUPPORTED_ASSETS,
+    exampleQueries: [
+      '/api/oracle/public/reserve-state?assets=USDC,EURC,WUSDC',
+    ],
+  },
+  {
+    key: 'protocol-tvl',
+    title: 'Protocol TVL',
+    path: '/api/oracle/public/protocol-tvl',
+    priceUsdc: ORACLE_PRICES['protocol-tvl'],
+    description: 'Current TVL and 24h change across the supported ARC protocol watchlist.',
+    supportedPairs: ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS,
+    exampleQueries: [
+      '/api/oracle/public/protocol-tvl?protocols=aave,morpho,maple',
+    ],
+  },
+  {
+    key: 'pool-compare',
+    title: 'Pool Compare',
+    path: '/api/oracle/public/pool-compare',
+    priceUsdc: ORACLE_PRICES['pool-compare'],
+    description: 'Side-by-side implied-rate, fee and liquidity comparison across multiple Oracle pool targets.',
+    supportedVenues: ['curve', 'uniswap_v2_like', 'arcfx'],
+    supportedPools: ['USDC-EURC', 'EURC-WUSDC', 'QTM-WUSDC', 'MUSDC-MEURC'],
+    exampleQueries: [
+      '/api/oracle/public/pool-compare?targets=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC',
+    ],
+  },
+  {
+    key: 'yield-rank',
+    title: 'Yield Rank',
+    path: '/api/oracle/public/yield-rank',
+    priceUsdc: ORACLE_PRICES['yield-rank'],
+    description: 'Top APY opportunities across supported stablecoin protocols.',
+  },
+  {
+    key: 'arb-signal',
+    title: 'Arb Signal',
+    path: '/api/oracle/public/arb-signal',
+    priceUsdc: ORACLE_PRICES['arb-signal'],
+    description: 'Stablecoin arbitrage summary with spread and confidence data.',
+  },
+  {
+    key: 'arb-scan-multi',
+    title: 'Arb Scan Multi',
+    path: '/api/oracle/public/arb-scan-multi',
+    priceUsdc: ORACLE_PRICES['arb-scan-multi'],
+    description: 'Multi-lane stablecoin arbitrage scan across supported Curve-style oracle targets.',
+    supportedVenues: ['curve'],
+    supportedPools: ['EURC-USDC', 'EURC-WUSDC', 'WUSDC-USDC'],
+    exampleQueries: [
+      '/api/oracle/public/arb-scan-multi?targets=curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC',
+    ],
+  },
+];
+const ORACLE_EXTERNAL_DEX_CATALOG = {
+  curve: {
+    verifiedLivePools: ['USDC-EURC', 'EURC-USDC', 'EURC-WUSDC', 'WUSDC-EURC', 'WUSDC-USDC', 'USDC-WUSDC'],
+    mappedButEmptyPools: ['USDC-USYC', 'USYC-USDC'],
+    note: 'Canonical stablecoin oracle lanes stay on verified Arc Curve pools.',
+  },
+  uniswapV2Like: {
+    discovery: 'ArcScan search plus on-chain allPairs scan',
+    factories: [
+      {
+        address: '0x9442cb5b2bBF2009b1933c762f5B89eDCD3eaE08',
+        activePoolCount: 20,
+        note: 'Active V2-style venue, but only filtered whitelist pairs are surfaced by pool-state.',
+      },
+    ],
+    whitelistedPools: [
+      {
+        pair: 'QTM/WUSDC',
+        key: 'QTM-WUSDC',
+        address: '0xD330Ae5713AF6507f43420e85C941a68BfbaD9D0',
+        stableSideLiquidity: 5795.621151,
+      },
+      {
+        pair: 'BERA/WETH',
+        key: 'BERA-WETH',
+        address: '0x26CB7a91AfdF38eeD6681585F80ee88ac1B90cb3',
+        stableSideLiquidity: null,
+      },
+    ],
+    filteredOutReason: 'Long-tail or meme-style pairs without a stable/known-asset whitelist match are excluded from pool-state.',
+    note: 'No cirBTC or canonical USDC/EURC pool was found in the scanned V2-style factories.',
+  },
+  arcFx: {
+    whitelistedPools: [
+      {
+        pair: 'mUSDC/mEURC',
+        key: 'MUSDC-MEURC',
+        address: '0x0183dd0195595757d187EEdB9C83d33B1C48235E',
+        reserve0: 566199.474901,
+        reserve1: 526280.783433,
+        note: 'Active mock-stable pool observed via ArcScan LP search.',
+      },
+    ],
+    note: 'ArcFX surfaced an active mock-stable lane; sampled ArcFX USDC/EURC LP entries were present but empty.',
+  },
+  aaveLike: {
+    explorerNamesVisible: true,
+    sampledAddressesHaveCodeOnArc: false,
+    note: 'ArcScan search can return Aave-like metadata tags, but sampled addresses did not have bytecode on Arc.',
+  },
 };
 
-// ── GET /api/oracle/status ────────────────────────────────────────────────────
-router.get('/status', (_req, res) => {
-  res.json({
-    service:    'ARC DeFi Oracle',
-    network:    'arc-testnet',
-    timestamp:  new Date().toISOString(),
-    cache:      oracle.getCacheStats(),
+function _roundTo(value, digits) {
+  if (!Number.isFinite(value)) return null;
+  const scale = 10 ** digits;
+  return Math.round(value * scale) / scale;
+}
+
+function _normalizeCsvValues(value, fallbackValues) {
+  const rawValues = Array.isArray(value)
+    ? value.flatMap(item => String(item).split(','))
+    : String(value || '').split(',');
+
+  const normalized = rawValues
+    .map(item => String(item || '').trim())
+    .filter(Boolean);
+
+  return normalized.length > 0 ? normalized : [...fallbackValues];
+}
+
+function _normalizePegMonitorAssets(value) {
+  const requested = _normalizeCsvValues(value, ORACLE_PEG_MONITOR_SUPPORTED_ASSETS)
+    .map(item => item.toUpperCase());
+
+  const filtered = requested.filter(asset => ORACLE_PEG_MONITOR_SUPPORTED_ASSETS.includes(asset));
+  return [...new Set(filtered.length > 0 ? filtered : ORACLE_PEG_MONITOR_SUPPORTED_ASSETS)];
+}
+
+function _normalizeReserveStateAssets(value) {
+  const requested = _normalizeCsvValues(value, ORACLE_RESERVE_STATE_SUPPORTED_ASSETS)
+    .map(item => item.toUpperCase());
+
+  const filtered = requested.filter(asset => ORACLE_RESERVE_STATE_SUPPORTED_ASSETS.includes(asset));
+  return [...new Set(filtered.length > 0 ? filtered : ORACLE_RESERVE_STATE_SUPPORTED_ASSETS)];
+}
+
+function _normalizeProtocolList(value) {
+  const requested = _normalizeCsvValues(value, ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS)
+    .map(item => item.toLowerCase());
+
+  const filtered = requested.filter(protocol => ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS.includes(protocol));
+  return [...new Set(filtered.length > 0 ? filtered : ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS)];
+}
+
+function _normalizePoolCompareTargets(value) {
+  const requested = _normalizeCsvValues(value, ORACLE_POOL_COMPARE_DEFAULT_TARGETS).slice(0, 5);
+
+  return requested.map((item) => {
+    const [maybeVenue, ...poolParts] = String(item || '').split(':');
+    if (poolParts.length === 0) {
+      return {
+        venue: 'curve',
+        poolKey: oracle.normalizeCurvePoolKey(maybeVenue),
+      };
+    }
+
+    return {
+      venue: oracle.normalizePoolVenue(maybeVenue),
+      poolKey: oracle.normalizeCurvePoolKey(poolParts.join(':')),
+    };
   });
+}
+
+function _normalizeArbScanTargets(value) {
+  const requested = _normalizeCsvValues(value, ORACLE_ARB_SCAN_MULTI_DEFAULT_TARGETS).slice(0, 5);
+
+  return requested.map((item) => {
+    const [maybeVenue, ...poolParts] = String(item || '').split(':');
+    if (poolParts.length === 0) {
+      return {
+        venue: 'curve',
+        poolKey: oracle.normalizeCurvePoolKey(maybeVenue),
+      };
+    }
+
+    return {
+      venue: oracle.normalizePoolVenue(maybeVenue),
+      poolKey: oracle.normalizeCurvePoolKey(poolParts.join(':')),
+    };
+  });
+}
+
+async function _buildPegMonitorResponse(assetsValue) {
+  const assets = _normalizePegMonitorAssets(assetsValue);
+  const [prices, eurcFx] = await Promise.all([
+    oracle.getMultipleTokenPrices(assets),
+    assets.includes('EURC') ? oracle.getForexRate('EURC', 'USDC') : Promise.resolve(null),
+  ]);
+
+  const monitors = assets.map((asset) => {
+    const price = prices[asset] || null;
+    const targetUsd = asset === 'EURC' ? eurcFx?.rate ?? 1 : 1;
+    const targetSource = asset === 'EURC' ? eurcFx?.source || 'frankfurter' : 'usd_parity';
+    const marketPriceUsd = typeof price?.usdPrice === 'number' ? price.usdPrice : targetUsd;
+    const deviationPct = targetUsd > 0
+      ? Math.abs((marketPriceUsd - targetUsd) / targetUsd) * 100
+      : 0;
+    const isFallback = Boolean(price?.isFallback) || Boolean(asset === 'EURC' && eurcFx?.isFallback);
+
+    return {
+      asset,
+      marketPriceUsd: _roundTo(marketPriceUsd, 6),
+      targetUsd: _roundTo(targetUsd, 6),
+      deviationPct: _roundTo(deviationPct, 4),
+      isDepegRisk: deviationPct > 0.5,
+      source: price?.source || 'coingecko',
+      targetSource,
+      isFallback,
+      fallbackReason: price?.fallbackReason || (asset === 'EURC' ? eurcFx?.fallbackReason || null : null),
+    };
+  });
+
+  const highestDeviation = monitors.slice().sort((left, right) => (right.deviationPct || 0) - (left.deviationPct || 0))[0] || null;
+
+  return {
+    assets,
+    monitors,
+    isFallback: monitors.some(item => item.isFallback),
+    summary: highestDeviation
+      ? {
+          highestDeviationAsset: highestDeviation.asset,
+          highestDeviationPct: highestDeviation.deviationPct,
+        }
+      : null,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function _buildReserveStateResponse(assetsValue) {
+  const assets = _normalizeReserveStateAssets(assetsValue);
+
+  const reserves = await Promise.all(assets.map(async (asset) => {
+    const config = ORACLE_RESERVE_STATE_ASSET_MAP[asset];
+    let onchainReserve = null;
+    let onchainError = null;
+
+    try {
+      onchainReserve = await oracle.getAaveReserveData(config.address);
+    } catch (error) {
+      onchainError = error;
+    }
+
+    if (onchainReserve) {
+      return {
+        asset,
+        assetAddress: config.address,
+        market: config.market,
+        supplyApy: onchainReserve.supplyApy,
+        borrowApy: onchainReserve.borrowApy,
+        utilization: onchainReserve.utilization,
+        source: 'aave_onchain',
+        isFallback: false,
+        fallbackReason: null,
+        fetchedAt: new Date().toISOString(),
+      };
+    }
+
+    const fallbackReason = onchainError
+      ? 'onchain_fetch_failed'
+      : (process.env.AAVE_POOL_ADDRESS ? 'reserve_not_available' : 'aave_pool_not_configured');
+    const fallbackYield = await oracle.getYieldOpportunities(asset, 0)
+      .then(entries => entries.find(entry => entry.name?.toLowerCase().includes('aave')) || null)
+      .catch(() => null);
+
+    oracle.recordOracleFallback('reserve_state', {
+      asset,
+      reason: fallbackReason,
+      detail: onchainError?.message || null,
+      provider: onchainError ? 'aave_onchain' : 'defillama',
+    });
+
+    return {
+      asset,
+      assetAddress: config.address,
+      market: config.market,
+      supplyApy: fallbackYield?.apy ?? null,
+      borrowApy: null,
+      utilization: null,
+      source: fallbackYield?.source || 'defillama',
+      isFallback: true,
+      fallbackReason,
+      fetchedAt: new Date().toISOString(),
+    };
+  }));
+
+  const highestSupply = reserves
+    .filter(item => Number.isFinite(item.supplyApy))
+    .sort((left, right) => right.supplyApy - left.supplyApy)[0] || null;
+
+  return {
+    assets,
+    reserves,
+    isFallback: reserves.some(item => item.isFallback),
+    summary: highestSupply
+      ? {
+          highestSupplyAsset: highestSupply.asset,
+          highestSupplyApy: highestSupply.supplyApy,
+        }
+      : null,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function _buildProtocolTvlResponse(protocolsValue) {
+  const protocols = _normalizeProtocolList(protocolsValue);
+  const entries = await Promise.all(protocols.map(protocol => oracle.getProtocolTvl(protocol)));
+
+  const protocolsWithSummary = entries.map((entry, index) => ({
+    protocol: protocols[index],
+    tvl: entry?.tvl ?? null,
+    change24h: entry?.change24h ?? null,
+    source: entry?.source || 'defillama',
+    isFallback: Boolean(entry?.isFallback),
+    fallbackReason: entry?.fallbackReason || null,
+    fetchedAt: entry?.fetchedAt || new Date().toISOString(),
+  }));
+
+  const recommendation = protocolsWithSummary
+    .filter(item => Number.isFinite(item.tvl))
+    .sort((left, right) => right.tvl - left.tvl)[0] || null;
+
+  return {
+    protocols: protocolsWithSummary,
+    recommendation: recommendation
+      ? {
+          protocol: recommendation.protocol,
+          tvl: recommendation.tvl,
+          reasoning: 'Highest currently available TVL in the configured ARC protocol watchlist.',
+        }
+      : null,
+    isFallback: protocolsWithSummary.some(item => item.isFallback),
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function _buildPoolCompareResponse(targetsValue) {
+  const targets = _normalizePoolCompareTargets(targetsValue);
+  const snapshots = await Promise.all(targets.map(target => _getOraclePoolStateSnapshot(target.poolKey, target.venue)));
+
+  const comparisons = snapshots.map((snapshot) => {
+    const state = snapshot.state;
+    const totalReserveUnits = (state?.reserves?.token0 ?? 0) + (state?.reserves?.token1 ?? 0);
+
+    return {
+      venue: snapshot.venue,
+      poolKey: snapshot.poolKey,
+      source: state?.source || snapshot.pool?.source || null,
+      isFallback: state?.isFallback === true || state?.source === 'mock_testnet',
+      fallbackReason: state?.fallbackReason || null,
+      liquidityState: state?.liquidityState || snapshot.pool?.liquidityState || null,
+      impliedRate: state?.impliedRate ?? null,
+      inverseRate: state?.inverseRate ?? null,
+      fee: state?.fee ?? null,
+      rateUnit: state?.rateUnit || null,
+      totalReserveUnits: _roundTo(totalReserveUnits, 6),
+      note: snapshot.note || null,
+    };
+  });
+
+  const deepestPool = comparisons
+    .filter(item => Number.isFinite(item.totalReserveUnits))
+    .sort((left, right) => right.totalReserveUnits - left.totalReserveUnits)[0] || null;
+
+  return {
+    targets,
+    pools: comparisons,
+    isFallback: comparisons.some(item => item.isFallback),
+    summary: deepestPool
+      ? {
+          deepestPool: deepestPool.poolKey,
+          deepestVenue: deepestPool.venue,
+          deepestReserveUnits: deepestPool.totalReserveUnits,
+        }
+      : null,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function _buildNoOpportunitySignal({ venue, poolKey, pair, note, reason, poolState, forex }) {
+  return {
+    timestamp: new Date().toISOString(),
+    strategy: 'stablecoin_fx',
+    venue,
+    poolKey,
+    pair: pair || null,
+    note: note || null,
+    skippedReason: reason,
+    opportunity: {
+      found: false,
+      type: 'FX_CURVE_ARB',
+      description: note || 'No profitable arbitrage opportunity at this time',
+      steps: [],
+      expectedProfitUsdc: 0,
+      expectedProfitPct: 0,
+      gasEstimateUsdc: 0,
+      netProfitUsdc: 0,
+      confidence: 'LOW',
+      expiresSeconds: 30,
+    },
+    isFallback: Boolean(forex?.isFallback)
+      || Boolean(poolState?.isFallback)
+      || poolState?.source === 'mock_testnet',
+    dataSources: {
+      forex: forex
+        ? {
+            source: forex.source,
+            isFallback: Boolean(forex.isFallback),
+            fallbackReason: forex.fallbackReason || null,
+          }
+        : null,
+      poolState: poolState
+        ? {
+            source: poolState.source,
+            isFallback: Boolean(poolState.isFallback) || poolState.source === 'mock_testnet',
+            fallbackReason: poolState.fallbackReason || null,
+          }
+        : null,
+    },
+  };
+}
+
+async function _buildStablecoinArbSignalResponse(poolKey = 'EURC-USDC', venue = 'curve') {
+  const snapshot = await _getOraclePoolStateSnapshot(poolKey, venue);
+  const poolState = snapshot.state;
+  const baseToken = poolState?.baseToken?.symbol || snapshot.pool?.baseToken?.symbol || null;
+  const quoteToken = poolState?.quoteToken?.symbol || snapshot.pool?.quoteToken?.symbol || null;
+  const pair = baseToken && quoteToken ? `${baseToken}/${quoteToken}` : null;
+
+  if (!poolState || !baseToken || !quoteToken || !Number.isFinite(poolState.impliedRate)) {
+    return _buildNoOpportunitySignal({
+      venue: snapshot.venue,
+      poolKey: snapshot.poolKey,
+      pair,
+      note: snapshot.note || 'Pool state is unavailable for arbitrage evaluation',
+      reason: 'pool_state_unavailable',
+      poolState,
+      forex: null,
+    });
+  }
+
+  let forexRate;
+  try {
+    forexRate = await oracle.getForexRate(baseToken, quoteToken);
+  } catch (error) {
+    return _buildNoOpportunitySignal({
+      venue: snapshot.venue,
+      poolKey: snapshot.poolKey,
+      pair,
+      note: snapshot.note || error.message,
+      reason: 'unsupported_forex_pair',
+      poolState,
+      forex: {
+        source: 'frankfurter',
+        isFallback: true,
+        fallbackReason: 'unsupported_pair',
+      },
+    });
+  }
+
+  const signal = oracle.buildArbSignal({
+    strategy: 'stablecoin_fx',
+    forexRate: forexRate.rate,
+    poolRate: poolState.impliedRate,
+    poolFee: poolState.fee,
+    poolLiquidity: (poolState.reserves?.token0 ?? 0) + (poolState.reserves?.token1 ?? 0),
+    priceImpacts: poolState.priceImpact,
+    baseToken,
+    quoteToken,
+  });
+
+  signal.venue = snapshot.venue;
+  signal.poolKey = snapshot.poolKey;
+  signal.pair = pair;
+  signal.note = snapshot.note || null;
+  signal.isFallback = Boolean(forexRate?.isFallback)
+    || Boolean(poolState?.isFallback)
+    || poolState?.source === 'mock_testnet';
+  signal.dataSources = {
+    forex: {
+      source: forexRate.source,
+      isFallback: Boolean(forexRate.isFallback),
+      fallbackReason: forexRate.fallbackReason || null,
+    },
+    poolState: {
+      source: poolState.source,
+      isFallback: Boolean(poolState.isFallback) || poolState.source === 'mock_testnet',
+      fallbackReason: poolState.fallbackReason || null,
+    },
+  };
+
+  return signal;
+}
+
+async function _buildArbScanMultiResponse(targetsValue) {
+  const targets = _normalizeArbScanTargets(targetsValue);
+  const scans = await Promise.all(targets.map(target => _buildStablecoinArbSignalResponse(target.poolKey, target.venue)));
+  const profitable = scans.filter(item => item.opportunity?.found);
+  const bestOpportunity = profitable
+    .slice()
+    .sort((left, right) => (right.opportunity?.netProfitUsdc || 0) - (left.opportunity?.netProfitUsdc || 0))[0] || null;
+
+  return {
+    targets,
+    scans,
+    isFallback: scans.some(item => item.isFallback),
+    summary: {
+      scannedCount: scans.length,
+      profitableCount: profitable.length,
+      bestOpportunity: bestOpportunity
+        ? {
+            venue: bestOpportunity.venue,
+            poolKey: bestOpportunity.poolKey,
+            pair: bestOpportunity.pair,
+            netProfitUsdc: bestOpportunity.opportunity.netProfitUsdc,
+            confidence: bestOpportunity.opportunity.confidence,
+          }
+        : null,
+    },
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function _getOracleCurvePool(poolKey = 'USDC-EURC') {
+  return oracle.resolveCurvePool(poolKey);
+}
+
+async function _getOracleCurvePoolSnapshot(poolKey = 'USDC-EURC', fallbackRate) {
+  const normalizedPoolKey = oracle.normalizeCurvePoolKey(poolKey);
+  const pool = _getOracleCurvePool(normalizedPoolKey);
+
+  if (!pool?.address) {
+    const [base] = normalizedPoolKey.split('-');
+    const mockRate = fallbackRate || (base === 'WUSDC' ? 1.001 : 1.0912);
+    oracle.recordOracleFallback('curve_pool_mock', {
+      poolKey: normalizedPoolKey,
+      reason: 'missing_live_pool_metadata',
+    });
+
+    const mockState = {
+      ...oracle.getMockPoolState(normalizedPoolKey, mockRate),
+      isFallback: true,
+      fallbackReason: 'missing_live_pool_metadata',
+    };
+
+    return {
+      poolKey: normalizedPoolKey,
+      pool: null,
+      note: 'No supported live pool metadata found — returning mock state',
+      state: mockState,
+    };
+  }
+
+  return {
+    poolKey: normalizedPoolKey,
+    pool,
+    note: pool.liquidityState === 'empty'
+      ? 'Verified Arc pool found, but current on-chain liquidity is empty'
+      : null,
+    state: await oracle.getCurvePoolState(pool),
+  };
+}
+
+async function _getOraclePoolStateSnapshot(poolKey = 'USDC-EURC', venue = 'curve') {
+  const normalizedVenue = oracle.normalizePoolVenue(venue);
+
+  if (normalizedVenue === 'curve') {
+    const snapshot = await _getOracleCurvePoolSnapshot(poolKey);
+    return {
+      venue: 'curve',
+      poolKey: snapshot.poolKey,
+      note: snapshot.note,
+      pool: snapshot.pool,
+      state: snapshot.state,
+    };
+  }
+
+  const pool = oracle.resolveOraclePoolStateTarget(poolKey, normalizedVenue);
+
+  if (!pool?.address) {
+    return {
+      venue: normalizedVenue,
+      poolKey: oracle.normalizeCurvePoolKey(poolKey),
+      note: 'No whitelisted external pool metadata found for the requested venue',
+      pool: null,
+      state: null,
+    };
+  }
+
+  return {
+    venue: normalizedVenue,
+    poolKey: pool.key,
+    note: pool.note || null,
+    pool,
+    state: await oracle.getConstantProductPoolState(pool),
+  };
+}
+
+async function _getOracleStablecoinFxCurveQuote(base, quote) {
+  const normalizedPoolKey = oracle.normalizeCurvePoolKey(`${base}-${quote}`);
+  const pool = _getOracleCurvePool(normalizedPoolKey);
+
+  if (!pool?.address) {
+    return {
+      poolKey: normalizedPoolKey,
+      note: 'No verified live Arc Curve pool is mapped for this pair',
+      pool: null,
+      state: null,
+    };
+  }
+
+  const snapshot = await _getOracleCurvePoolSnapshot(normalizedPoolKey);
+
+  return {
+    poolKey: snapshot.poolKey,
+    note: snapshot.note,
+    pool: {
+      address: snapshot.pool.address,
+      source: snapshot.pool.source,
+      liquidityState: snapshot.pool.liquidityState,
+      baseToken: snapshot.pool.baseToken.symbol,
+      quoteToken: snapshot.pool.quoteToken.symbol,
+    },
+    state: snapshot.state,
+  };
+}
+
+async function _buildStablecoinFxResponse(base, quote) {
+  const [forexRate, usdcPeg, arcCurvePool] = await Promise.all([
+    oracle.getForexRate(base, quote),
+    oracle.getUsdcPegDeviation(),
+    _getOracleStablecoinFxCurveQuote(base, quote),
+  ]);
+
+  return {
+    pair: `${base}/${quote}`,
+    forex: forexRate,
+    usdcPeg,
+    arcCurvePool,
+    isFallback: Boolean(forexRate?.isFallback)
+      || Boolean(usdcPeg?.isFallback)
+      || Boolean(arcCurvePool?.state?.isFallback)
+      || arcCurvePool?.state?.source === 'mock_testnet',
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function _formatGatewayPrice(priceUsdc) {
+  return `$${String(priceUsdc)}`;
+}
+
+function _normalizeOracleGatewayPayer(payer) {
+  const normalized = String(payer || '').trim();
+  return /^0x[a-fA-F0-9]{40}$/.test(normalized) ? normalized.toLowerCase() : null;
+}
+
+function _normalizeOracleGatewaySettlementId(transaction) {
+  const normalized = String(transaction || '').trim();
+
+  if (/^0x[a-fA-F0-9]{64}$/.test(normalized)) {
+    return normalized.toLowerCase();
+  }
+
+  if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(normalized)) {
+    return normalized.toLowerCase();
+  }
+
+  return null;
+}
+
+function _decodeOracleGatewayPaymentResponse(paymentResponseHeader) {
+  if (!paymentResponseHeader) return null;
+
+  try {
+    const decoded = Buffer.from(String(paymentResponseHeader), 'base64').toString('utf8');
+    const parsed = JSON.parse(decoded);
+
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function _recordOracleGatewaySettlement({ endpointKey, paymentResponseHeader, statusCode }) {
+  if (statusCode >= 400) return false;
+
+  const paymentResponse = _decodeOracleGatewayPaymentResponse(paymentResponseHeader);
+  const txHash = _normalizeOracleGatewaySettlementId(paymentResponse?.transaction);
+  const amountUsdc = Number(ORACLE_PRICES[endpointKey] || '0');
+
+  if (!paymentResponse?.success || !txHash) {
+    return false;
+  }
+
+  if (!Number.isFinite(amountUsdc) || amountUsdc <= 0) {
+    logOracleGateway('warn', 'Skipped oracle gateway payment persistence because price is invalid', {
+      endpoint: endpointKey,
+      rawPrice: ORACLE_PRICES[endpointKey] || null,
+      txHash,
+    });
+    return false;
+  }
+
+  try {
+    await db.query(
+      `INSERT INTO oracle_payments (tx_hash, endpoint, amount_usdc, from_addr)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tx_hash) DO NOTHING`,
+      [txHash, endpointKey, amountUsdc, _normalizeOracleGatewayPayer(paymentResponse.payer)],
+    );
+    return true;
+  } catch (error) {
+    logOracleGateway('warn', 'Failed to persist oracle gateway settlement', {
+      endpoint: endpointKey,
+      error: error.message,
+      txHash,
+    });
+    return false;
+  }
+}
+
+function _createOraclePaymentAuditMiddleware(endpointKey) {
+  return (req, res, next) => {
+    res.once('finish', () => {
+      const paymentRequiredHeader = res.getHeader('PAYMENT-REQUIRED') || res.getHeader('X-PAYMENT-REQUIRED');
+      const paymentResponseHeader = res.getHeader('PAYMENT-RESPONSE') || res.getHeader('X-PAYMENT-RESPONSE');
+      const normalizedHeader = Array.isArray(paymentResponseHeader)
+        ? paymentResponseHeader[0]
+        : paymentResponseHeader;
+
+      if (res.statusCode === 402) {
+        oracle.recordOracleSignal('payment_challenge', {
+          endpoint: endpointKey,
+          statusCode: res.statusCode,
+        });
+        logOracleGateway('warn', 'Oracle public route returned payment challenge', {
+          endpoint: endpointKey,
+          statusCode: res.statusCode,
+          method: req.method,
+          path: req.originalUrl || req.path || null,
+          priceUsdc: ORACLE_PRICES[endpointKey] || null,
+          docsUrlPresent: Boolean(ORACLE_BUYER_DOCS_URL),
+          machineDocsUrlPresent: Boolean(ORACLE_BUYER_MACHINE_DOCS_URL),
+          paymentRequiredHeaderPresent: Boolean(paymentRequiredHeader),
+        });
+      } else if (res.statusCode === 429) {
+        oracle.recordOracleSignal('rate_limited', {
+          endpoint: endpointKey,
+          statusCode: res.statusCode,
+        });
+        logOracleGateway('warn', 'Oracle public route returned rate limit', {
+          endpoint: endpointKey,
+          statusCode: res.statusCode,
+          method: req.method,
+          path: req.originalUrl || req.path || null,
+        });
+      } else if (res.statusCode >= 500) {
+        oracle.recordOracleSignal('server_error', {
+          endpoint: endpointKey,
+          statusCode: res.statusCode,
+        });
+        logOracleGateway('error', 'Oracle public route returned server error', {
+          endpoint: endpointKey,
+          statusCode: res.statusCode,
+          method: req.method,
+          path: req.originalUrl || req.path || null,
+        });
+      }
+
+      void _recordOracleGatewaySettlement({
+        endpointKey,
+        paymentResponseHeader: normalizedHeader,
+        statusCode: res.statusCode,
+      });
+    });
+
+    next();
+  };
+}
+
+function _getOracleGatewaySummary() {
+  try {
+    return {
+      seller: {
+        enabled: Boolean(ORACLE_PAY_ADDRESS),
+        sellerAddress: ORACLE_PAY_ADDRESS,
+        ...getGatewaySellerSummary(),
+        facilitator: getGatewayFacilitatorSummary(),
+      },
+      buyer: getGatewayBuyerSummary(),
+      taskEconomy: getTaskEconomyConfigSummary(),
+      jobEconomy: getJobEconomyConfigSummary(),
+    };
+  } catch (error) {
+    logOracleGateway('warn', 'Failed to build oracle gateway summary', {
+      error: error.message,
+      sellerAddress: ORACLE_PAY_ADDRESS,
+    });
+
+    return {
+      seller: {
+        enabled: false,
+        sellerAddress: ORACLE_PAY_ADDRESS,
+        mode: 'gateway-seller',
+        facilitator: {
+          supportedCache: {
+            ready: false,
+            networkCount: 0,
+            loadedAt: null,
+            lastError: null,
+          },
+        },
+      },
+      buyer: {
+        mode: 'gateway-buyer',
+        configured: false,
+        chainCount: 0,
+        supportedChains: [],
+      },
+      taskEconomy: {
+        mode: 'circle_gateway_task_fee',
+        configured: false,
+      },
+      jobEconomy: {
+        mode: 'job_escrow_with_gateway_fee',
+        configured: false,
+      },
+      error: error.message,
+    };
+  }
+}
+
+function _buildOracleUnpaidResponse(endpointKey, priceUsdc) {
+  return (context) => ({
+    contentType: 'application/json',
+    body: {
+      error: 'payment_required',
+      endpoint: endpointKey,
+      price: `${priceUsdc} USDC`,
+      sellerMode: 'circle_gateway',
+      callbackEndpoint: context.url || context.path || null,
+      docsUrl: ORACLE_BUYER_DOCS_URL,
+      machineDocsUrl: ORACLE_BUYER_MACHINE_DOCS_URL,
+      downloads: {
+        exampleUrl: ORACLE_BUYER_EXAMPLE_URL,
+        helperUrl: ORACLE_BUYER_HELPER_URL,
+      },
+      note: 'Retry with the payment headers returned by the Circle Gateway x402 flow.',
+    },
+  });
+}
+
+function _buildOracleSettlementFailedResponse(endpointKey) {
+  return (_context, settleResult) => {
+    const reason = settleResult?.errorReason || settleResult?.error || settleResult?.message || 'unknown_settlement_error';
+
+    oracle.recordOracleSignal('settlement_failure', {
+      endpoint: endpointKey,
+      reason,
+      statusCode: 402,
+    });
+
+    logOracleGateway('warn', 'Oracle gateway settlement failed', {
+      endpoint: endpointKey,
+      reason,
+      statusCode: 402,
+    });
+
+    return {
+      contentType: 'application/json',
+      body: {
+        error: 'payment_settlement_failed',
+        endpoint: endpointKey,
+        sellerMode: 'circle_gateway',
+        reason,
+      },
+    };
+  };
+}
+
+function _createGatewayUnavailableMiddleware(reason, detail) {
+  return (_req, res) => {
+    oracle.recordOracleSignal('gateway_unavailable', {
+      reason,
+      detail: detail || null,
+      statusCode: 503,
+    });
+
+    logOracleGateway('error', 'Oracle gateway middleware unavailable', {
+      reason,
+      detail: detail || null,
+      statusCode: 503,
+    });
+
+    res.status(503).json({
+      error: 'gateway_not_configured',
+      reason,
+      detail: detail || null,
+      sellerMode: 'circle_gateway',
+    });
+  };
+}
+
+function _createOracleGatewayMiddleware(path, endpointKey) {
+  if (!ORACLE_PAY_ADDRESS) {
+    return _createGatewayUnavailableMiddleware('oracle_pay_address_missing');
+  }
+
+  const endpoint = ORACLE_PUBLIC_ENDPOINTS.find(item => item.key === endpointKey);
+  if (!endpoint) {
+    return _createGatewayUnavailableMiddleware('unknown_endpoint', endpointKey);
+  }
+
+  try {
+    return createGatewaySellerMiddleware({
+      [`GET ${path}`]: createGatewayRouteConfig({
+        sellerAddress: ORACLE_PAY_ADDRESS,
+        price: _formatGatewayPrice(endpoint.priceUsdc),
+        description: endpoint.description,
+        resource: endpoint.path,
+        unpaidResponseBody: _buildOracleUnpaidResponse(endpointKey, endpoint.priceUsdc),
+        settlementFailedResponseBody: _buildOracleSettlementFailedResponse(endpointKey),
+      }),
+    });
+  } catch (error) {
+    return _createGatewayUnavailableMiddleware('gateway_middleware_init_failed', error.message);
+  }
+}
+
+const stablecoinFxGateway = _createOracleGatewayMiddleware('/stablecoin-fx', 'stablecoin-fx');
+const poolStateGateway = _createOracleGatewayMiddleware('/pool-state', 'pool-state');
+const pegMonitorGateway = _createOracleGatewayMiddleware('/peg-monitor', 'peg-monitor');
+const reserveStateGateway = _createOracleGatewayMiddleware('/reserve-state', 'reserve-state');
+const protocolTvlGateway = _createOracleGatewayMiddleware('/protocol-tvl', 'protocol-tvl');
+const poolCompareGateway = _createOracleGatewayMiddleware('/pool-compare', 'pool-compare');
+const yieldRankGateway = _createOracleGatewayMiddleware('/yield-rank', 'yield-rank');
+const arbSignalGateway = _createOracleGatewayMiddleware('/arb-signal', 'arb-signal');
+const arbScanMultiGateway = _createOracleGatewayMiddleware('/arb-scan-multi', 'arb-scan-multi');
+
+async function _getOracleRevenueStats() {
+  const { rows: [row] } = await db.query(
+    `SELECT COALESCE(SUM(amount_usdc),0)::float AS total_usdc,
+            COUNT(*)::int AS request_count
+     FROM oracle_payments`,
+  );
+
+  return {
+    totalUsdc: row.total_usdc,
+    requestCount: row.request_count,
+  };
+}
+
+async function _getAgenticPaymentAuditStats() {
+  const { rows: [row] } = await db.query(
+    `SELECT COUNT(*)::int AS total_events,
+            COUNT(*) FILTER (WHERE status = 'confirmed')::int AS confirmed_count,
+            COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_count,
+            COUNT(*) FILTER (WHERE status = 'skipped')::int AS skipped_count,
+            COUNT(*) FILTER (WHERE event_type = 'nano_payment')::int AS nano_events,
+            COUNT(*) FILTER (WHERE event_type = 'task_execution_fee')::int AS task_events,
+            COUNT(*) FILTER (WHERE event_type = 'job_create_fee')::int AS job_create_events,
+            COUNT(*) FILTER (WHERE event_type = 'job_payout')::int AS job_payout_events,
+            MAX(created_at) AS last_event_at
+     FROM agentic_payment_events`,
+  );
+
+  return {
+    totalEvents: row.total_events,
+    confirmedCount: row.confirmed_count,
+    failedCount: row.failed_count,
+    skippedCount: row.skipped_count,
+    nanoEvents: row.nano_events,
+    taskEvents: row.task_events,
+    jobCreateEvents: row.job_create_events,
+    jobPayoutEvents: row.job_payout_events,
+    lastEventAt: row.last_event_at ? new Date(row.last_event_at).toISOString() : null,
+  };
+}
+
+// ── GET /api/oracle/status ────────────────────────────────────────────────────
+router.get('/status', requireAuth, async (_req, res, next) => {
+  try {
+    const [revenue, agenticPaymentAudit] = await Promise.all([
+      _getOracleRevenueStats(),
+      _getAgenticPaymentAuditStats(),
+    ]);
+
+    res.json({
+      service:    'ARC DeFi Oracle',
+      network:    'arc-testnet',
+      timestamp:  new Date().toISOString(),
+      cache:      oracle.getCacheStats(),
+      revenue,
+      payment: {
+        address: ORACLE_PAY_ADDRESS,
+        token: 'USDC',
+        tokenAddress: USDC_ADDRESS,
+        chain: 'arc-testnet',
+        chainId: 5042002,
+      },
+      publicEndpoints: ORACLE_PUBLIC_ENDPOINTS,
+      marketCoverage: {
+        externalDexes: ORACLE_EXTERNAL_DEX_CATALOG,
+      },
+      observability: oracle.getOracleObservabilitySummary(),
+      gateway: {
+        ..._getOracleGatewaySummary(),
+        audit: agenticPaymentAudit,
+      },
+      config: {
+        payToConfigured: Boolean(ORACLE_PAY_ADDRESS),
+        pools: {
+          usdcEurcConfigured: Boolean(_getOracleCurvePool('USDC-EURC')?.address),
+          usdcEurcSource: _getOracleCurvePool('USDC-EURC')?.source || null,
+          usdcEurcLiquidityState: _getOracleCurvePool('USDC-EURC')?.liquidityState || null,
+          eurcWusdcConfigured: Boolean(_getOracleCurvePool('EURC-WUSDC')?.address),
+          eurcWusdcSource: _getOracleCurvePool('EURC-WUSDC')?.source || null,
+          eurcWusdcLiquidityState: _getOracleCurvePool('EURC-WUSDC')?.liquidityState || null,
+          wusdcUsdcConfigured: Boolean(_getOracleCurvePool('WUSDC-USDC')?.address),
+          wusdcUsdcSource: _getOracleCurvePool('WUSDC-USDC')?.source || null,
+          wusdcUsdcLiquidityState: _getOracleCurvePool('WUSDC-USDC')?.liquidityState || null,
+          usdcUsycConfigured: Boolean(_getOracleCurvePool('USDC-USYC')?.address),
+          usdcUsycSource: _getOracleCurvePool('USDC-USYC')?.source || null,
+          usdcUsycLiquidityState: _getOracleCurvePool('USDC-USYC')?.liquidityState || null,
+        },
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/oracle/gateway/fund ───────────────────────────────────────────
+router.post('/gateway/fund', requireAuth, async (req, res, next) => {
+  try {
+    const agentId = String(req.body?.agentId || '').trim();
+    const chainName = String(req.body?.chainName || 'Arc Testnet').trim() || 'Arc Testnet';
+    const amountUsdc = req.body?.amountUsdc || ORACLE_MANUAL_GATEWAY_FUND_USDC;
+
+    if (!agentId) {
+      return res.status(400).json({ error: 'agent_id_required' });
+    }
+
+    const agent = await agentService.getAgent(agentId, req.user.userId);
+    if (!agent) {
+      return res.status(404).json({ error: 'agent_not_found' });
+    }
+
+    const rawAgent = await agentService.getAgentWithKey(agentId, req.user.userId);
+    if (!rawAgent) {
+      return res.status(404).json({ error: 'agent_signer_not_found' });
+    }
+
+    const client = createGatewayClientForAgent(rawAgent, { chainName });
+    const funding = await depositGatewayBalance(client, amountUsdc);
+
+    res.json({
+      agentId,
+      chainName,
+      amountUsdc: funding.amountUsdc,
+      walletAddress: String(agent.walletAddress || rawAgent.wallet_address || '').toLowerCase(),
+      wallet: {
+        availableUsdc: funding.balancesAfter.wallet.formattedAvailable,
+        totalUsdc: funding.balancesAfter.wallet.formattedTotal,
+      },
+      gateway: {
+        availableUsdc: funding.balancesAfter.gateway.formattedAvailable,
+        totalUsdc: funding.balancesAfter.gateway.formattedTotal,
+        withdrawingUsdc: funding.balancesAfter.gateway.formattedWithdrawing,
+        withdrawableUsdc: funding.balancesAfter.gateway.formattedWithdrawable,
+      },
+      deposit: {
+        approvalTxHash: funding.depositResult?.approvalTxHash || null,
+        depositTxHash: funding.depositResult?.depositTxHash || null,
+      },
+      funded: funding.funded,
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    if (err.statusCode && !err.status) {
+      err.status = err.statusCode;
+    }
+    next(err);
+  }
+});
+
+// ── POST /api/oracle/debug/test-alert ───────────────────────────────────────
+router.post('/debug/test-alert', requireAuth, async (req, res, next) => {
+  try {
+    const note = String(req.body?.note || '').trim();
+    const ok = await oracle.dispatchOracleTestAlert({
+      source: 'private_oracle_route',
+      requestedByUserId: req.user.userId,
+      note: note || null,
+    });
+    const observability = oracle.getOracleObservabilitySummary();
+
+    res.json({
+      ok,
+      message: ok
+        ? 'Oracle alert test dispatched.'
+        : 'Oracle alert test stored, but at least one external sink failed.',
+      alerting: observability.alerting,
+      triggeredAt: new Date().toISOString(),
+    });
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/oracle/debug/gateway-balance ────────────────────────────────────
+// ?agentId=<uuid>&chainName=Arc%20Testnet
+router.get('/debug/gateway-balance', requireAuth, async (req, res, next) => {
+  try {
+    const agentId = String(req.query.agentId || '').trim();
+    const chainName = String(req.query.chainName || 'Arc Testnet').trim() || 'Arc Testnet';
+
+    if (!agentId) {
+      return res.status(400).json({ error: 'agent_id_required' });
+    }
+
+    const agent = await agentService.getAgent(agentId, req.user.userId);
+    if (!agent) {
+      return res.status(404).json({ error: 'agent_not_found' });
+    }
+
+    const rawAgent = await agentService.getAgentWithKey(agentId, req.user.userId);
+    if (!rawAgent) {
+      return res.status(404).json({ error: 'agent_signer_not_found' });
+    }
+
+    const balances = await getAgentGatewayBalances(rawAgent, { chainName });
+
+    res.json({
+      agentId,
+      chainName,
+      walletAddress: String(agent.walletAddress || rawAgent.wallet_address || '').toLowerCase(),
+      wallet: {
+        availableUsdc: balances.wallet.formattedAvailable,
+        totalUsdc: balances.wallet.formattedTotal,
+      },
+      gateway: {
+        availableUsdc: balances.gateway.formattedAvailable,
+        totalUsdc: balances.gateway.formattedTotal,
+        withdrawingUsdc: balances.gateway.formattedWithdrawing,
+        withdrawableUsdc: balances.gateway.formattedWithdrawable,
+      },
+      funded: balances.gateway.available > 0n,
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch (err) { next(err); }
 });
 
 // ── GET /api/oracle/stablecoin-fx ─────────────────────────────────────────────
 // ?pair=EURC/USDC   (default)
-router.get('/stablecoin-fx', async (req, res, next) => {
+router.get('/stablecoin-fx', requireAuth, async (req, res, next) => {
   try {
     const pairParam = (req.query.pair || 'EURC/USDC').toString().toUpperCase();
     const [base, quote = 'USDC'] = pairParam.split('/');
 
-    const [forexRate, usdcPeg] = await Promise.all([
-      oracle.getForexRate(base, quote),
-      oracle.getUsdcPegDeviation(),
-    ]);
-
-    res.json({
-      pair:       `${base}/${quote}`,
-      forex:      forexRate,
-      usdcPeg,
-      fetchedAt:  new Date().toISOString(),
-    });
+    res.json(await _buildStablecoinFxResponse(base, quote));
   } catch (err) { next(err); }
 });
 
 // ── GET /api/oracle/pool-state ────────────────────────────────────────────────
 // ?pool=USDC-EURC   (default)
-router.get('/pool-state', async (req, res, next) => {
+router.get('/pool-state', requireAuth, async (req, res, next) => {
   try {
-    const poolKey     = (req.query.pool || 'USDC-EURC').toString().toUpperCase();
-    const poolAddress = CURVE_POOLS[poolKey];
+    const snapshot = await _getOraclePoolStateSnapshot(req.query.pool || 'USDC-EURC', req.query.venue || 'curve');
+    res.json({
+      venue: snapshot.venue,
+      poolKey: snapshot.poolKey,
+      note: snapshot.note,
+      pool: snapshot.pool
+        ? {
+            address: snapshot.pool.address,
+            protocol: snapshot.pool.protocol,
+            venue: snapshot.pool.venue,
+            source: snapshot.pool.source,
+            liquidityState: snapshot.pool.liquidityState,
+            baseToken: snapshot.pool.baseToken.symbol,
+            quoteToken: snapshot.pool.quoteToken.symbol,
+          }
+        : null,
+      state: snapshot.state,
+      isFallback: snapshot.state?.isFallback === true || snapshot.state?.source === 'mock_testnet',
+    });
+  } catch (err) { next(err); }
+});
 
-    if (!poolAddress) {
-      // No on-chain address yet → return mock state with note
-      const [base] = poolKey.split('-');
-      const mockRate = base === 'WUSDC' ? 1.001 : 1.0912; // EURC fallback
-      return res.json({
-        note:      'Pool address not configured — returning mock state',
-        poolKey,
-        state:     oracle.getMockPoolState(poolKey, mockRate),
-      });
-    }
+// ── GET /api/oracle/peg-monitor ───────────────────────────────────────────────
+router.get('/peg-monitor', requireAuth, async (req, res, next) => {
+  try {
+    res.json(await _buildPegMonitorResponse(req.query.assets));
+  } catch (err) { next(err); }
+});
 
-    const state = await oracle.getCurvePoolState(poolKey, poolAddress);
-    res.json({ poolKey, state });
+// ── GET /api/oracle/reserve-state ───────────────────────────────────────────
+router.get('/reserve-state', requireAuth, async (req, res, next) => {
+  try {
+    res.json(await _buildReserveStateResponse(req.query.assets));
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/oracle/protocol-tvl ─────────────────────────────────────────────
+router.get('/protocol-tvl', requireAuth, async (req, res, next) => {
+  try {
+    res.json(await _buildProtocolTvlResponse(req.query.protocols));
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/oracle/pool-compare ─────────────────────────────────────────────
+router.get('/pool-compare', requireAuth, async (req, res, next) => {
+  try {
+    res.json(await _buildPoolCompareResponse(req.query.targets));
   } catch (err) { next(err); }
 });
 
 // ── GET /api/oracle/yield-rank ────────────────────────────────────────────────
 // ?asset=USDC&minApy=1.0   (defaults)
-router.get('/yield-rank', async (req, res, next) => {
+router.get('/yield-rank', requireAuth, async (req, res, next) => {
   try {
     const asset  = (req.query.asset  || 'USDC').toString().toUpperCase();
     const minApy = parseFloat(req.query.minApy || '1.0');
@@ -100,6 +1340,7 @@ router.get('/yield-rank', async (req, res, next) => {
       asset,
       timestamp:      new Date().toISOString(),
       protocols,
+      isFallback: protocols.some(item => item.isFallback),
       recommendation,
     });
   } catch (err) { next(err); }
@@ -108,7 +1349,7 @@ router.get('/yield-rank', async (req, res, next) => {
 // ── GET /api/oracle/arb-signal ────────────────────────────────────────────────
 // ?strategy=stablecoin_fx&agentId=<id>
 // Requires oracle_enabled = true on the agent (opt-in guard)
-router.get('/arb-signal', async (req, res, next) => {
+router.get('/arb-signal', requireAuth, async (req, res, next) => {
   try {
     const strategy = (req.query.strategy || 'stablecoin_fx').toString();
     const agentId  = req.query.agentId?.toString();
@@ -126,115 +1367,140 @@ router.get('/arb-signal', async (req, res, next) => {
     }
 
     if (strategy === 'stablecoin_fx') {
-      // Fetch forex + pool in parallel
-      const [forexRate, poolState] = await Promise.all([
-        oracle.getForexRate('EURC', 'USDC'),
-        oracle.getForexRate('EURC', 'USDC').then(fx => {
-          const poolAddress = CURVE_POOLS['USDC-EURC'];
-          if (!poolAddress) return oracle.getMockPoolState('USDC-EURC', fx.rate);
-          return oracle.getCurvePoolState('USDC-EURC', poolAddress);
-        }),
-      ]);
-
-      const signal = oracle.buildArbSignal({
-        strategy:      'stablecoin_fx',
-        forexRate:     forexRate.rate,
-        poolRate:      poolState.impliedRate,
-        poolFee:       poolState.fee,
-        poolLiquidity: (poolState.reserves?.token0 ?? 0) + (poolState.reserves?.token1 ?? 0),
-        priceImpacts:  poolState.priceImpact,
-        baseToken:     'EURC',
-        quoteToken:    'USDC',
-      });
-
-      return res.json(signal);
+      return res.json(await _buildStablecoinArbSignalResponse('EURC-USDC', 'curve'));
     }
 
     res.status(400).json({ error: `Unknown strategy: ${strategy}`, supported: ['stablecoin_fx'] });
   } catch (err) { next(err); }
 });
 
-// ── PUBLIC endpoints (x402 nanopayment — no JWT required) ────────────────────
+// ── GET /api/oracle/arb-scan-multi ──────────────────────────────────────────
+router.get('/arb-scan-multi', requireAuth, async (req, res, next) => {
+  try {
+    const agentId = req.query.agentId?.toString();
+
+    if (agentId) {
+      const agent = await agentService.getAgent(agentId, req.user.userId);
+      if (!agent) return res.status(404).json({ error: 'Agent not found' });
+      if (!agent.features?.oracleEnabled) {
+        return res.status(403).json({
+          error: 'oracle_disabled',
+          message: 'Enable the Oracle Data Feed feature on your agent first.',
+        });
+      }
+    }
+
+    res.json(await _buildArbScanMultiResponse(req.query.targets));
+  } catch (err) { next(err); }
+});
+
+// ── PUBLIC endpoints (Circle Gateway x402 — no JWT required) ─────────────────
 // These are accessible by anyone on the internet; payment is the only gate.
-// oraclePayment(endpointKey) middleware returns 402 if X-Payment-Tx is absent or invalid.
-const oraclePayment = require('../middleware/oraclePayment');
 
 const publicRouter = require('express').Router();  // no requireAuth
 
 // GET /api/oracle/public/stablecoin-fx
-publicRouter.get('/stablecoin-fx', oraclePayment('stablecoin-fx'), async (req, res, next) => {
+publicRouter.get('/stablecoin-fx', _createOraclePaymentAuditMiddleware('stablecoin-fx'), stablecoinFxGateway, async (req, res, next) => {
   try {
     const pairParam = (req.query.pair || 'EURC/USDC').toString().toUpperCase();
     const [base, quote = 'USDC'] = pairParam.split('/');
-    const [forexRate, usdcPeg] = await Promise.all([
-      oracle.getForexRate(base, quote),
-      oracle.getUsdcPegDeviation(),
-    ]);
-    res.json({ pair: `${base}/${quote}`, forex: forexRate, usdcPeg, fetchedAt: new Date().toISOString() });
+    res.json(await _buildStablecoinFxResponse(base, quote));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/pool-state
-publicRouter.get('/pool-state', oraclePayment('pool-state'), async (req, res, next) => {
+publicRouter.get('/pool-state', _createOraclePaymentAuditMiddleware('pool-state'), poolStateGateway, async (req, res, next) => {
   try {
-    const poolKey     = (req.query.pool || 'USDC-EURC').toString().toUpperCase();
-    const poolAddress = CURVE_POOLS[poolKey];
-    if (!poolAddress) {
-      const mockRate = 1.0912;
-      return res.json({ note: 'Pool address not configured — returning mock state', poolKey, state: oracle.getMockPoolState(poolKey, mockRate) });
-    }
-    const state = await oracle.getCurvePoolState(poolKey, poolAddress);
-    res.json({ poolKey, state });
+    const snapshot = await _getOraclePoolStateSnapshot(req.query.pool || 'USDC-EURC', req.query.venue || 'curve');
+    res.json({
+      venue: snapshot.venue,
+      poolKey: snapshot.poolKey,
+      note: snapshot.note,
+      pool: snapshot.pool
+        ? {
+            address: snapshot.pool.address,
+            protocol: snapshot.pool.protocol,
+            venue: snapshot.pool.venue,
+            source: snapshot.pool.source,
+            liquidityState: snapshot.pool.liquidityState,
+            baseToken: snapshot.pool.baseToken.symbol,
+            quoteToken: snapshot.pool.quoteToken.symbol,
+          }
+        : null,
+      state: snapshot.state,
+      isFallback: snapshot.state?.isFallback === true || snapshot.state?.source === 'mock_testnet',
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /api/oracle/public/peg-monitor
+publicRouter.get('/peg-monitor', _createOraclePaymentAuditMiddleware('peg-monitor'), pegMonitorGateway, async (req, res, next) => {
+  try {
+    res.json(await _buildPegMonitorResponse(req.query.assets));
+  } catch (err) { next(err); }
+});
+
+// GET /api/oracle/public/reserve-state
+publicRouter.get('/reserve-state', _createOraclePaymentAuditMiddleware('reserve-state'), reserveStateGateway, async (req, res, next) => {
+  try {
+    res.json(await _buildReserveStateResponse(req.query.assets));
+  } catch (err) { next(err); }
+});
+
+// GET /api/oracle/public/protocol-tvl
+publicRouter.get('/protocol-tvl', _createOraclePaymentAuditMiddleware('protocol-tvl'), protocolTvlGateway, async (req, res, next) => {
+  try {
+    res.json(await _buildProtocolTvlResponse(req.query.protocols));
+  } catch (err) { next(err); }
+});
+
+// GET /api/oracle/public/pool-compare
+publicRouter.get('/pool-compare', _createOraclePaymentAuditMiddleware('pool-compare'), poolCompareGateway, async (req, res, next) => {
+  try {
+    res.json(await _buildPoolCompareResponse(req.query.targets));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/yield-rank
-publicRouter.get('/yield-rank', oraclePayment('yield-rank'), async (req, res, next) => {
+publicRouter.get('/yield-rank', _createOraclePaymentAuditMiddleware('yield-rank'), yieldRankGateway, async (req, res, next) => {
   try {
     const asset     = (req.query.asset || 'USDC').toString().toUpperCase();
     const minApy    = parseFloat(req.query.minApy || '1.0');
     const protocols = await oracle.getYieldOpportunities(asset, isNaN(minApy) ? 1.0 : minApy);
-    res.json({ asset, protocols: protocols.slice(0, 5), fetchedAt: new Date().toISOString() });
+    res.json({
+      asset,
+      protocols: protocols.slice(0, 5),
+      isFallback: protocols.some(item => item.isFallback),
+      fetchedAt: new Date().toISOString(),
+    });
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/arb-signal
 // Redacted: confidence=LOW results only return summary; HIGH returns full signal (higher price)
-publicRouter.get('/arb-signal', oraclePayment('arb-signal'), async (req, res, next) => {
+publicRouter.get('/arb-signal', _createOraclePaymentAuditMiddleware('arb-signal'), arbSignalGateway, async (req, res, next) => {
   try {
-    const [forexRate, poolState] = await Promise.all([
-      oracle.getForexRate('EURC', 'USDC'),
-      oracle.getForexRate('EURC', 'USDC').then(fx => {
-        const poolAddress = CURVE_POOLS['USDC-EURC'];
-        return poolAddress
-          ? oracle.getCurvePoolState('USDC-EURC', poolAddress)
-          : oracle.getMockPoolState('USDC-EURC', fx.rate);
-      }),
-    ]);
-    const signal = oracle.buildArbSignal({
-      strategy: 'stablecoin_fx', forexRate: forexRate.rate, poolRate: poolState.impliedRate,
-      poolFee: poolState.fee, baseToken: 'EURC', quoteToken: 'USDC',
-      poolLiquidity: (poolState.reserves?.token0 ?? 0) + (poolState.reserves?.token1 ?? 0),
-      priceImpacts: poolState.priceImpact,
-    });
-    res.json(signal);
+    res.json(await _buildStablecoinArbSignalResponse('EURC-USDC', 'curve'));
+  } catch (err) { next(err); }
+});
+
+// GET /api/oracle/public/arb-scan-multi
+publicRouter.get('/arb-scan-multi', _createOraclePaymentAuditMiddleware('arb-scan-multi'), arbScanMultiGateway, async (req, res, next) => {
+  try {
+    res.json(await _buildArbScanMultiResponse(req.query.targets));
   } catch (err) { next(err); }
 });
 
 // GET /api/oracle/public/revenue — total collected fees (public, no auth, transparency)
 publicRouter.get('/revenue', async (_req, res, next) => {
   try {
-    const db = require('../db');
-    const { rows: [row] } = await db.query(
-      `SELECT COALESCE(SUM(amount_usdc),0)::float AS total_usdc,
-              COUNT(*)::int AS request_count
-       FROM oracle_payments`,
-    );
-    res.json({ totalUsdc: row.total_usdc, requestCount: row.request_count });
+    res.json(await _getOracleRevenueStats());
   } catch (err) { next(err); }
 });
 
 router.use('/public', publicRouter);
 
 module.exports = router;
+module.exports._decodeOracleGatewayPaymentResponse = _decodeOracleGatewayPaymentResponse;
+module.exports._recordOracleGatewaySettlement = _recordOracleGatewaySettlement;
 

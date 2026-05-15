@@ -1,6 +1,7 @@
 'use strict';
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
 
+const { once }   = require('events');
 const fs           = require('fs');
 const path         = require('path');
 const express      = require('express');
@@ -17,6 +18,7 @@ const jobsRoutes         = require('./routes/jobs');
 const agentQueue         = require('./queue/agentQueue');
 const { globalRateLimit }  = require('./middleware/rateLimit');
 const { startIndexer }     = require('./services/indexerService');
+const { startChainEventRetention } = require('./services/chainEventRetentionService');
 const bridgeActivityService = require('./services/bridgeActivityService');
 const agentWalletService    = require('./services/agentWalletService');
 const agentService          = require('./services/agentService');
@@ -99,7 +101,7 @@ app.get('/health', async (_req, res) => {
   }
 
   try {
-    const redisClient = require('./services/redisClient');
+    const redisClient = await ensureRedisReady();
     await redisClient.ping();
   } catch (err) {
     health.redis = 'error';
@@ -147,6 +149,29 @@ async function runMigrations() {
   }
 }
 
+async function ensureRedisReady() {
+  const redisClient = require('./services/redisClient');
+
+  if (redisClient.status === 'wait') {
+    await redisClient.connect();
+    return redisClient;
+  }
+
+  if (redisClient.status === 'connecting' || redisClient.status === 'reconnecting') {
+    await Promise.race([
+      once(redisClient, 'ready'),
+      once(redisClient, 'end').then(() => {
+        throw new Error('Redis connection ended before becoming ready');
+      }),
+      once(redisClient, 'error').then(([error]) => {
+        throw error;
+      }),
+    ]);
+  }
+
+  return redisClient;
+}
+
 async function bootstrap() {
   // Run schema migrations (all statements are idempotent — IF NOT EXISTS)
   await runMigrations();
@@ -154,6 +179,15 @@ async function bootstrap() {
   // Verify DB connectivity
   await db.query('SELECT 1');
   console.log('[DB] PostgreSQL connected');
+
+  try {
+    await ensureRedisReady();
+    console.log('[REDIS] ready');
+  } catch (err) {
+    console.error('[REDIS] startup warning:', err.message);
+  }
+
+  startChainEventRetention();
 
   // Start blockchain event indexer (non-blocking)
   startIndexer().catch(err => console.error('[INDEXER] startup error', err));

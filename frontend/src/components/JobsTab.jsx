@@ -14,6 +14,13 @@ const STATUS_COLORS = {
   cancelled:  'bg-red-50 text-red-700 border-red-200',
 };
 
+const ECONOMY_COLORS = {
+  confirmed: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  failed: 'bg-red-50 text-red-700 border-red-200',
+  skipped: 'bg-amber-50 text-amber-700 border-amber-200',
+  pending: 'bg-slate-100 text-slate-600 border-slate-200',
+};
+
 function StatusBadge({ status }) {
   return (
     <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${STATUS_COLORS[status] || 'bg-slate-100 text-slate-500 border-slate-200'}`}>
@@ -22,11 +29,80 @@ function StatusBadge({ status }) {
   );
 }
 
+function getJobEconomyBadge(job) {
+  const createFee = job.economy?.createFee;
+  if (!createFee) {
+    return {
+      label: 'Escrow only',
+      tone: ECONOMY_COLORS.pending,
+    };
+  }
+
+  if (createFee.status === 'confirmed') {
+    return {
+      label: 'Gateway fee settled',
+      tone: ECONOMY_COLORS.confirmed,
+    };
+  }
+
+  if (createFee.status === 'failed') {
+    return {
+      label: 'Gateway fee failed',
+      tone: ECONOMY_COLORS.failed,
+    };
+  }
+
+  if (createFee.reason === 'dry_run') {
+    return {
+      label: 'Gateway fee dry-run',
+      tone: ECONOMY_COLORS.skipped,
+    };
+  }
+
+  return {
+    label: 'Gateway fee skipped',
+    tone: ECONOMY_COLORS.skipped,
+  };
+}
+
+function JobsEconomyBanner({ summary }) {
+  if (!summary) return null;
+
+  const title = summary.createFeeUsdc > 0
+    ? 'Escrow + Gateway fee'
+    : 'Escrow only';
+  const tone = summary.createFeeUsdc > 0
+    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+    : 'bg-slate-100 text-slate-600 border-slate-200';
+  const description = summary.createFeeUsdc > 0
+    ? (summary.dryRun
+        ? `Jobs keep AgenticCommerce escrow and simulate a ${summary.createFeeUsdc} USDC Gateway service fee on create while DRY_RUN is enabled.`
+        : `Jobs keep AgenticCommerce escrow and add a ${summary.createFeeUsdc} USDC Gateway service fee on create.`)
+    : 'Jobs use the AgenticCommerce escrow flow only. No extra Gateway job fee is currently configured.';
+
+  return (
+    <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${tone}`}>
+          {title}
+        </span>
+        {summary.sellerAddress && (
+          <span className="text-[11px] text-slate-500 font-mono truncate max-w-full">
+            {summary.sellerAddress}
+          </span>
+        )}
+      </div>
+      <p className="mt-2 text-xs text-slate-600">{description}</p>
+    </div>
+  );
+}
+
 function JobRow({ job, agentId, onRefresh }) {
   const [expanded, setExpanded] = useState(false);
   const [busy, setBusy]         = useState(false);
   const [err, setErr]           = useState('');
   const [hashInput, setHashInput] = useState('');
+  const economyBadge = getJobEconomyBadge(job);
 
   async function handleDeliver() {
     if (!hashInput.trim()) return;
@@ -67,6 +143,9 @@ function JobRow({ job, agentId, onRefresh }) {
         <Briefcase size={14} className="text-[#66D121] shrink-0" />
         <p className="flex-1 text-sm text-slate-800 truncate">{job.description}</p>
         <StatusBadge status={job.status} />
+        <span className={`hidden sm:inline-flex text-[11px] px-2 py-0.5 rounded-full border font-medium ${economyBadge.tone}`}>
+          {economyBadge.label}
+        </span>
         <span className="text-xs text-slate-500">{job.amount_usdc} USDC</span>
         {expanded ? <ChevronUp size={14} className="text-slate-400" /> : <ChevronDown size={14} className="text-slate-400" />}
       </button>
@@ -81,6 +160,16 @@ function JobRow({ job, agentId, onRefresh }) {
             <span className="font-mono truncate">{job.provider_address || '—'}</span>
             <span className="text-gray-500">On-chain ID</span>
             <span className="font-mono">{job.job_id_onchain || 'offline'}</span>
+            <span className="text-gray-500">Economy rail</span>
+            <span>{job.economy?.rail || 'agentic_job_economy'}</span>
+            <span className="text-gray-500">Create fee</span>
+            <span>
+              {job.economy?.createFee
+                ? `${job.economy.createFee.status} · ${job.economy.createFee.feeUsdc} USDC`
+                : 'not configured'}
+            </span>
+            <span className="text-gray-500">Payout rail</span>
+            <span>{job.economy?.payout?.mode || 'agentic_commerce_escrow'} · {job.economy?.payout?.status || 'pending'}</span>
             {job.deliverable_hash && <>
               <span className="text-gray-500">Deliverable</span>
               <span className="font-mono truncate">{job.deliverable_hash}</span>
@@ -88,6 +177,10 @@ function JobRow({ job, agentId, onRefresh }) {
             {job.tx_hash_create && <>
               <span className="text-gray-500">Create tx</span>
               <span className="font-mono truncate">{job.tx_hash_create.slice(0, 20)}…</span>
+            </>}
+            {job.economy?.createFee?.gatewayMintTxHash && <>
+              <span className="text-gray-500">Gateway fee tx</span>
+              <span className="font-mono truncate">{job.economy.createFee.gatewayMintTxHash.slice(0, 20)}…</span>
             </>}
           </div>
 
@@ -133,6 +226,7 @@ export default function JobsTab() {
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [onchainEnabled, setOnchain] = useState(false);
+  const [jobEconomy, setJobEconomy] = useState(null);
 
   // Create form
   const [showForm, setShowForm]     = useState(false);
@@ -149,6 +243,7 @@ export default function JobsTab() {
       const data = await jobsApi.list(agent.id);
       setJobList(data.jobs || []);
       setOnchain(!!data.onchainEnabled);
+      setJobEconomy(data.jobEconomy || null);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
   }
@@ -206,6 +301,7 @@ export default function JobsTab() {
             AGENTIC_COMMERCE_ADDRESS not set — jobs are stored locally only until the contract is deployed.
           </p>
         )}
+        <JobsEconomyBanner summary={jobEconomy} />
       </Card>
 
       {/* Create form */}

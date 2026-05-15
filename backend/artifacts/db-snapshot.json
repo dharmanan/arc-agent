@@ -1,0 +1,45 @@
+{
+  "generatedAt": "2026-05-14T23:59:00.256Z",
+  "status": "ok",
+  "database": {
+    "dbBytes": 9854976,
+    "dbHuman": "9.40 MB"
+  },
+  "chainEvents": {
+    "bytes": 131072,
+    "human": "128.00 KB",
+    "rows": 225,
+    "pendingRows": 0,
+    "processedRows": 225,
+    "pendingRowsOlderThan24h": 0,
+    "pendingRowsOlderThan48h": 0,
+    "oldestPendingAt": null,
+    "newestPendingAt": null
+  },
+  "dailyBreakdown": [
+    {
+      "day": "2026-05-14",
+      "rows": 1,
+      "bytes": 336,
+      "human": "336 B"
+    },
+    {
+      "day": "2026-05-12",
+      "rows": 212,
+      "bytes": 71232,
+      "human": "69.56 KB"
+    },
+    {
+      "day": "2026-05-11",
+      "rows": 12,
+      "bytes": 4032,
+      "human": "3.94 KB"
+    }
+  ],
+  "thresholds": {
+    "maxDbBytes": null,
+    "maxChainEventsBytes": null,
+    "maxPendingRows": null,
+    "violations": []
+  }
+}

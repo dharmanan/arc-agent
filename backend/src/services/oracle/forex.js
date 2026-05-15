@@ -2,6 +2,7 @@
 
 const axios = require('axios');
 const { getCache, setCache, TTL } = require('./cache');
+const { recordOracleFallback } = require('./observability');
 
 const BASE_URL = 'https://api.frankfurter.app';
 
@@ -13,6 +14,7 @@ const STABLECOIN_TO_FIAT = {
   JPYC: 'JPY',
   PHPC: 'PHP',
   USDC: 'USD',
+  WUSDC: 'USD',
 };
 
 // Fallback rates when API is unreachable (testnet environment)
@@ -36,28 +38,42 @@ async function getForexRate(baseStablecoin, quoteStablecoin = 'USDC') {
   const cached   = getCache(cacheKey);
   if (cached) return cached;
 
-  let rateToUsd;
+  let finalRate;
   try {
-    const url      = `${BASE_URL}/latest?from=${baseFiat}&to=USD`;
-    const response = await axios.get(url, { timeout: 5000 });
-    rateToUsd      = response.data.rates['USD'];
+    const baseResponse = await axios.get(`${BASE_URL}/latest?from=${baseFiat}&to=USD`, { timeout: 5000 });
+    const baseToUsd = baseResponse.data.rates['USD'];
+
+    finalRate = baseToUsd;
+    if (quoteFiat !== 'USD') {
+      const quoteResponse = await axios.get(`${BASE_URL}/latest?from=${quoteFiat}&to=USD`, { timeout: 5000 });
+      const quoteToUsd = quoteResponse.data.rates['USD'];
+      finalRate = baseToUsd / quoteToUsd;
+    }
   } catch (err) {
     console.warn(`[Oracle/Forex] ${baseFiat}/${quoteFiat} fetch failed (${err.message}) — using fallback`);
-    rateToUsd = FALLBACK_RATES[`${baseFiat}/USD`] ?? 1.0;
+    recordOracleFallback('forex', {
+      pair: `${baseStablecoin}/${quoteStablecoin}`,
+      reason: 'api_unreachable',
+      detail: err.message,
+      provider: 'frankfurter',
+    });
+
+    const fallbackBaseToUsd = FALLBACK_RATES[`${baseFiat}/USD`] ?? 1.0;
+    const fallbackQuoteToUsd = quoteFiat === 'USD'
+      ? 1.0
+      : (FALLBACK_RATES[`${quoteFiat}/USD`] ?? 1.0);
+    finalRate = fallbackBaseToUsd / fallbackQuoteToUsd;
+
     const result = {
       base: baseStablecoin, quote: quoteStablecoin,
-      rate: Math.round(rateToUsd * 100000) / 100000,
-      source: 'frankfurter', fetchedAt: new Date().toISOString(),
+      rate: Math.round(finalRate * 100000) / 100000,
+      source: 'frankfurter',
+      isFallback: true,
+      fallbackReason: 'api_unreachable',
+      fetchedAt: new Date().toISOString(),
     };
     setCache(cacheKey, result, TTL.FX_RATE);
     return result;
-  }
-
-  let finalRate = rateToUsd;
-  if (quoteFiat !== 'USD') {
-    const quoteRes   = await axios.get(`${BASE_URL}/latest?from=${quoteFiat}&to=USD`, { timeout: 5000 });
-    const quoteToUsd = quoteRes.data.rates['USD'];
-    finalRate        = rateToUsd / quoteToUsd;
   }
 
   const result = {
@@ -65,6 +81,8 @@ async function getForexRate(baseStablecoin, quoteStablecoin = 'USDC') {
     quote:     quoteStablecoin,
     rate:      Math.round(finalRate * 100000) / 100000,
     source:    'frankfurter',
+    isFallback: false,
+    fallbackReason: null,
     fetchedAt: new Date().toISOString(),
   };
 

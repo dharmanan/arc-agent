@@ -11,13 +11,20 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "db:init": "node src/db/migrate.js",
-    "test": "jest --runInBand"
+    "db:snapshot": "node scripts/dbSnapshot.js",
+    "test": "jest --runInBand",
+    "oracle:buyer:example": "node examples/oraclePublicBuyerExample.js",
+    "oracle:buyer:preview": "node examples/oraclePublicBuyerExample.js --preview"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",
     "@circle-fin/adapter-ethers-v6": "^1.7.0",
     "@circle-fin/swap-kit": "^1.2.0",
+    "@circle-fin/x402-batching": "^3.0.4",
     "@coral-xyz/anchor": "^0.32.1",
+    "@x402/core": "^2.12.0",
+    "@x402/evm": "^2.12.0",
+    "@x402/express": "^2.12.0",
     "@simplewebauthn/server": "^11.0.0",
     "axios": "^1.16.0",
     "bcryptjs": "^3.0.3",
@@ -36,10 +43,12 @@
     "openai": "^4.77.3",
     "pg": "^8.13.1",
     "uuid": "^11.0.5",
+    "viem": "^2.38.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "jest": "^30.4.2",
-    "nodemon": "^3.1.7"
+    "nodemon": "^3.1.7",
+    "solc": "^0.8.24"
   }
 }

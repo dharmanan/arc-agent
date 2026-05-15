@@ -104,7 +104,7 @@ const nanoPaySchema = z.object({
   agentId:    z.string().uuid(),
   toAddress:  z.string().min(10).max(100),
   amountUsdc: z.number().positive().max(agentWalletService.NANO_THRESHOLD_USDC - 0.000001),
-  token:      z.enum(['USDC', 'EURC']).default('USDC'),
+  token:      z.literal('USDC').default('USDC'),
   memo:       z.string().max(200).optional(),  // purpose label for audit log
 });
 
@@ -112,14 +112,13 @@ router.post('/nano-pay', async (req, res, next) => {
   try {
     const body  = nanoPaySchema.parse(req.body);
     const agent = await assertAgentOwner(body.agentId, req.user.userId);
-    const tx    = await transactionService.sendPayment({
+    const tx    = await transactionService.nanoPay({
       agent,
       toAddress:  body.toAddress,
       amountUsdc: body.amountUsdc,
-      token:      body.token,
-      chain:      'Arc Testnet',  // nano payments always on Arc Testnet
+      memo:       body.memo,
     });
-    res.status(202).json({ ...tx, memo: body.memo });
+    res.status(202).json({ ...tx, memo: body.memo, token: body.token });
   } catch (err) { next(err); }
 });
 

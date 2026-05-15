@@ -17,6 +17,7 @@
 const { ethers } = require('ethers');
 const https      = require('https');
 const { decrypt } = require('./cryptoService');
+const gatewayBuyerService = require('./agenticEconomy/gatewayBuyer');
 const { createEthersAdapterFromPrivateKey } = require('@circle-fin/adapter-ethers-v6');
 const { SwapKit, SwapChain, getChainByEnum } = require('@circle-fin/swap-kit');
 
@@ -543,7 +544,9 @@ async function cctpMint({ agent, toChain, message, attestation }) {
 async function agentBridgeFull({ agent, fromChain, toChain, amountUsdc, onStep }) {
   const report = async (step, data) => {
     console.log(`[AGENTIC-BRIDGE] step=${step}`, data);
-    if (onStep) await onStep(step, data).catch(e => console.error('[BRIDGE STEP CB]', e.message));
+    if (onStep) {
+      await Promise.resolve(onStep(step, data)).catch(e => console.error('[BRIDGE STEP CB]', e.message));
+    }
   };
 
   // 1. Approve
@@ -645,6 +648,20 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
   if (amountUsdc >= NANO_THRESHOLD_USDC) {
     throw new Error(`nanoPayment requires amount < ${NANO_THRESHOLD_USDC} USDC (got ${amountUsdc})`);
   }
+
+  if (token === 'USDC') {
+    console.log(`[AGENT-NANO] ${agent.wallet_address} → ${toAddress}: ${amountUsdc} ${token} via Gateway`);
+    const result = await gatewayBuyerService.executeGatewayTransfer({
+      agent,
+      amountUsdc,
+      recipient: toAddress,
+      fromChain: 'Arc Testnet',
+      toChain: 'Arc Testnet',
+    });
+    console.log(`[AGENT-NANO] ✓ ${result.transferResult?.mintTxHash || 'gateway-transfer-confirmed'}`);
+    return result.transferResult?.mintTxHash || null;
+  }
+
   const signer    = getAgentSigner(agent);
   const tokenAddr = resolveTokenAddress(token);
   const contract  = new ethers.Contract(tokenAddr, ERC20_ABI, signer);

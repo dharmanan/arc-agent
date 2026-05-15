@@ -24,12 +24,100 @@ function _getPoolContract() {
 }
 
 const DAILY_PAID_TASK_CAP = parseInt(process.env.DAILY_PAID_TASK_CAP || '5', 10);
+const DAILY_FREE_TASK_CAP = parseInt(process.env.DAILY_FREE_TASK_CAP || '5', 10);
+const EXECUTION_TASK_IDS = new Set([
+  'EXEC_CURVE_SWAP',
+  'EXEC_CCTP_BRIDGE',
+  'EXEC_YIELD_MOVE',
+  'EXEC_ARB',
+  'EXEC_REBALANCE',
+]);
+const CCTP_CHAIN_NAMES = new Set([
+  'Arc Testnet',
+  'Sepolia',
+  'Base Sepolia',
+  'Optimism Sepolia',
+  'Arbitrum Sepolia',
+]);
+const REBALANCE_TOKENS = new Set(['USDC', 'EURC']);
 
 // Dev-only: wallet addresses that bypass all daily task limits
 const DEV_BYPASS_ADDRS = new Set(
   (process.env.DEV_BYPASS_AGENT_ADDRESSES || '')
     .split(',').map(a => a.trim().toLowerCase()).filter(Boolean),
 );
+
+function _isPositiveNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0;
+}
+
+function _isBinaryIndex(value) {
+  return Number(value) === 0 || Number(value) === 1;
+}
+
+function _validateExecutionParams(taskId, params) {
+  if (!EXECUTION_TASK_IDS.has(taskId)) return null;
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return 'params_required';
+
+  switch (taskId) {
+    case 'EXEC_CURVE_SWAP':
+      if (!_isPositiveNumber(params.amountIn)) return 'curve_swap_amount_required';
+      if (!_isBinaryIndex(params.indexIn) || !_isBinaryIndex(params.indexOut)) return 'curve_swap_direction_required';
+      if (Number(params.indexIn) === Number(params.indexOut)) return 'curve_swap_direction_required';
+      return null;
+
+    case 'EXEC_CCTP_BRIDGE':
+      if (!CCTP_CHAIN_NAMES.has(String(params.fromChain || ''))) return 'bridge_from_chain_required';
+      if (!CCTP_CHAIN_NAMES.has(String(params.toChain || ''))) return 'bridge_to_chain_required';
+      if (String(params.fromChain) === String(params.toChain)) return 'bridge_route_invalid';
+      if (!_isPositiveNumber(params.amountUsdc)) return 'bridge_amount_required';
+      return null;
+
+    case 'EXEC_YIELD_MOVE':
+      if (!_isPositiveNumber(params.amount)) return 'yield_amount_required';
+      if (!['supply', 'withdraw'].includes(String(params.action || ''))) return 'yield_action_required';
+      return null;
+
+    case 'EXEC_ARB':
+      if (!_isPositiveNumber(params.amountIn)) return 'arb_amount_required';
+      return null;
+
+    case 'EXEC_REBALANCE':
+      if (!_isPositiveNumber(params.amountIn)) return 'rebalance_amount_required';
+      if (!REBALANCE_TOKENS.has(String(params.fromToken || ''))) return 'rebalance_from_token_required';
+      if (!REBALANCE_TOKENS.has(String(params.toToken || ''))) return 'rebalance_to_token_required';
+      if (String(params.fromToken) === String(params.toToken)) return 'rebalance_route_invalid';
+      return null;
+
+    default:
+      return null;
+  }
+}
+
+function _getInlineTaskFailureStatus(reason) {
+  switch (reason) {
+    case 'agent_not_found':
+    case 'task_not_found':
+      return 404;
+    case 'daily_tasks_disabled':
+    case 'oracle_disabled':
+      return 403;
+    case 'daily_task_cap_reached':
+    case 'daily_paid_cap_reached':
+    case 'daily_cap_reached':
+      return 429;
+    case 'oracle_fetch_error':
+    case 'swap_error':
+      return 502;
+    case 'curve_pool_not_configured':
+    case 'pool_address_not_configured':
+    case 'bridge_params_required':
+    case 'no_private_key':
+    default:
+      return 400;
+  }
+}
 
 // ── GET /api/tasks/featured ───────────────────────────────────────────────────
 // Returns today's 5 featured tasks, ordered deterministically by UTC date seed.
@@ -90,6 +178,11 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
     );
     if (!task) return res.status(404).json({ error: 'task_not_found' });
 
+    const executionParamError = _validateExecutionParams(taskId, params);
+    if (executionParamError) {
+      return res.status(400).json({ error: executionParamError });
+    }
+
     // Verify ownership
     const { rows: [agent] } = await db.query(
       `SELECT id, daily_tasks_enabled, daily_free_task_count, daily_paid_task_count,
@@ -104,6 +197,24 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
 
     if (!isBypass && !agent.daily_tasks_enabled)
       return res.status(403).json({ error: 'daily_tasks_disabled' });
+
+    if (!isBypass && task.tier === 1) {
+      // Daily reset check
+      if ((new Date() - new Date(agent.daily_limit_reset_at)) >= 86_400_000) {
+        await db.query(
+          `UPDATE agents SET daily_free_task_count = 0, daily_limit_reset_at = NOW() WHERE id = $1`,
+          [agentId],
+        );
+        agent.daily_free_task_count = 0;
+      }
+      if (agent.daily_free_task_count >= DAILY_FREE_TASK_CAP) {
+        return res.status(429).json({
+          error:   'daily_task_cap_reached',
+          cap:     DAILY_FREE_TASK_CAP,
+          current: agent.daily_free_task_count,
+        });
+      }
+    }
 
     if (!isBypass && task.tier === 2) {
       // Daily reset check
@@ -123,17 +234,22 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
       }
     }
 
-    const job = await queue.add(taskId, { agentId, params }, {
-      jobId:            `${taskId.toLowerCase()}-${agentId}-${Date.now()}`,
-      removeOnComplete: 200,
-    });
+    const inlineResult = await queue.runTaskInline(taskId, { agentId, params });
 
-    res.status(202).json({
-      queued:  true,
-      jobId:   job.id,
+    if (inlineResult && inlineResult.ok === false) {
+      return res.status(_getInlineTaskFailureStatus(inlineResult.reason)).json({
+        error: inlineResult.reason || 'task_run_failed',
+        detail: inlineResult.error || null,
+      });
+    }
+
+    res.status(200).json({
+      queued:  false,
+      inline:  true,
       taskId,
       tier:    task.tier,
       feeUsdc: task.tier === 2 ? Number(task.fee_usdc) : 0,
+      result:  inlineResult?.payload || inlineResult || null,
     });
   } catch (err) { next(err); }
 });

@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Arc Oracle Public Buyer Guide</title>
+    <meta
+      name="description"
+      content="Public integration guide for paying Arc Oracle endpoints over x402 with Circle Gateway."
+    />
+    <style>
+      :root {
+        --bg: #f4f1ea;
+        --panel: #fffdf8;
+        --panel-strong: #fff7e8;
+        --ink: #171717;
+        --muted: #57534e;
+        --line: rgba(23, 23, 23, 0.12);
+        --accent: #0f766e;
+        --accent-soft: rgba(15, 118, 110, 0.12);
+        --warn: #b45309;
+        --shadow: 0 24px 60px rgba(23, 23, 23, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(15, 118, 110, 0.12), transparent 28%),
+          linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
+      }
+
+      a {
+        color: var(--accent);
+      }
+
+      .shell {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 40px 20px 80px;
+      }
+
+      .hero {
+        background: linear-gradient(135deg, rgba(15, 118, 110, 0.1), rgba(255, 247, 232, 0.95));
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .hero-grid {
+        display: grid;
+        gap: 24px;
+        padding: 32px;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.7);
+        border: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 18px 0 12px;
+        font-family: "IBM Plex Serif", Georgia, serif;
+        font-size: clamp(2.2rem, 5vw, 4rem);
+        line-height: 1.04;
+      }
+
+      .lead {
+        max-width: 760px;
+        font-size: 1.06rem;
+        line-height: 1.7;
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        gap: 20px;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        margin-top: 28px;
+      }
+
+      .card,
+      .section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+      }
+
+      .card {
+        padding: 20px;
+      }
+
+      .card h2 {
+        margin: 0 0 10px;
+        font-size: 1rem;
+      }
+
+      .card p,
+      .section p,
+      .section li {
+        color: var(--muted);
+        line-height: 1.7;
+      }
+
+      .section {
+        padding: 28px;
+        margin-top: 24px;
+      }
+
+      .section h2 {
+        margin: 0 0 12px;
+        font-family: "IBM Plex Serif", Georgia, serif;
+        font-size: 1.7rem;
+      }
+
+      .section h3 {
+        margin: 20px 0 10px;
+        font-size: 1.05rem;
+      }
+
+      ul {
+        padding-left: 20px;
+      }
+
+      pre {
+        margin: 16px 0 0;
+        padding: 16px;
+        overflow: auto;
+        background: #141414;
+        color: #f8fafc;
+        border-radius: 18px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        font-size: 0.92rem;
+        line-height: 1.6;
+      }
+
+      code {
+        font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+      }
+
+      .accent-box,
+      .warn-box {
+        margin-top: 18px;
+        padding: 16px 18px;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+      }
+
+      .accent-box {
+        background: var(--accent-soft);
+      }
+
+      .warn-box {
+        background: rgba(180, 83, 9, 0.1);
+        color: #78350f;
+      }
+
+      .downloads {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 16px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 12px 16px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: white;
+        color: var(--ink);
+        text-decoration: none;
+        font-weight: 600;
+      }
+
+      .button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: white;
+      }
+
+      .table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 12px;
+      }
+
+      .table th,
+      .table td {
+        text-align: left;
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      .foot {
+        margin-top: 28px;
+        font-size: 0.95rem;
+        color: var(--muted);
+      }
+
+      @media (max-width: 720px) {
+        .shell {
+          padding: 20px 14px 56px;
+        }
+
+        .hero-grid,
+        .section,
+        .card {
+          padding: 20px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero-grid">
+          <span class="eyebrow">Arc Oracle x402 Integration</span>
+          <div>
+            <h1>Public Buyer Guide</h1>
+            <p class="lead">
+              Arc exposes paid Oracle endpoints over x402 using Circle Gateway as the settlement rail.
+              You do not need an Arc account to buy these resources. You do need an EOA wallet,
+              USDC on a supported chain, and an x402-compatible buyer flow.
+            </p>
+          </div>
+
+          <div class="grid">
+            <article class="card">
+              <h2>What Arc Is</h2>
+              <p>
+                Arc is the seller. Your integration is the buyer. Public Oracle endpoints are ordinary
+                HTTP routes until the server returns <code>402 Payment Required</code> and the x402
+                payment flow begins.
+              </p>
+            </article>
+            <article class="card">
+              <h2>What Arc Adds</h2>
+              <p>
+                Arc keeps Circle Gateway compatibility but adds a clearer onboarding layer, a public
+                guide, a downloadable buyer example, and an auto-fund helper pattern for Gateway
+                balance gaps.
+              </p>
+            </article>
+            <article class="card">
+              <h2>Why It Is Easier</h2>
+              <p>
+                The raw Circle buyer flow leaves Gateway deposit timing to the integrator. Arc's helper
+                pattern closes the common case where the wallet has USDC but Gateway available balance
+                is still zero.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>How The Flow Works</h2>
+        <p>At the protocol level, Arc follows the same x402 pattern as Circle Gateway.</p>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>What happens</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1. Unpaid request</td>
+              <td>Call a public Oracle route such as <code>/api/oracle/public/pool-state</code>.</td>
+            </tr>
+            <tr>
+              <td>2. Seller challenge</td>
+              <td>Arc returns <code>402 Payment Required</code>, a JSON body, and a <code>PAYMENT-REQUIRED</code> header.</td>
+            </tr>
+            <tr>
+              <td>3. Buyer funding check</td>
+              <td>Your buyer ensures Gateway available balance is sufficient for the requested price.</td>
+            </tr>
+            <tr>
+              <td>4. Signed retry</td>
+              <td>Your buyer creates a payment payload and retries with a <code>Payment-Signature</code> header.</td>
+            </tr>
+            <tr>
+              <td>5. Settlement</td>
+              <td>Arc settles through Circle Gateway and returns the Oracle response.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="accent-box">
+          <strong>Arc vs raw Circle buyer flow:</strong>
+          Circle's standard quickstart is protocol-correct but leaves funding orchestration to the buyer.
+          Arc keeps the same wire protocol and improves the operational flow by advertising this guide and
+          by using an on-demand Gateway funding pattern in its managed buyer helpers.
+        </div>
+
+        <div class="warn-box">
+          <strong>EOA only:</strong>
+          buyer wallets must be EOAs. Smart contract accounts and EIP-1271 signatures are not supported by
+          this nanopayment flow because Gateway verification is based on off-chain <code>ecrecover</code>.
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Current Public Oracle Routes</h2>
+        <ul>
+          <li><code>/api/oracle/public/stablecoin-fx?pair=EURC/USDC</code></li>
+          <li><code>/api/oracle/public/stablecoin-fx?pair=EURC/WUSDC</code></li>
+          <li><code>/api/oracle/public/pool-state?pool=USDC-EURC</code></li>
+          <li><code>/api/oracle/public/pool-state?pool=EURC-WUSDC</code></li>
+          <li><code>/api/oracle/public/peg-monitor?assets=USDC,EURC,USDT</code></li>
+          <li><code>/api/oracle/public/reserve-state?assets=USDC,EURC,WUSDC</code></li>
+          <li><code>/api/oracle/public/protocol-tvl?protocols=aave,morpho,maple</code></li>
+          <li><code>/api/oracle/public/pool-compare?targets=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC</code></li>
+          <li><code>/api/oracle/public/yield-rank?asset=USDC</code></li>
+          <li><code>/api/oracle/public/arb-signal?strategy=stablecoin_fx</code></li>
+          <li><code>/api/oracle/public/arb-scan-multi?targets=curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC</code></li>
+        </ul>
+
+        <div class="accent-box">
+          <strong>Verified live Arc pair coverage:</strong>
+          <code>stablecoin-fx</code> currently supports <code>EURC/USDC</code> and <code>EURC/WUSDC</code> with a live
+          <code>arcCurvePool</code> snapshot in the paid response. <code>pool-state</code> currently maps
+          <code>USDC-EURC</code>, <code>EURC-USDC</code>, <code>EURC-WUSDC</code>, <code>WUSDC-EURC</code>,
+          <code>WUSDC-USDC</code>, and <code>USDC-WUSDC</code>. <code>USDC-USYC</code> remains mapped but the current
+          Arc Curve pools are empty on-chain.
+        </div>
+
+        <div class="accent-box">
+          <strong>New Oracle SKU additions:</strong>
+          <code>peg-monitor</code> returns spot stablecoin peg health with explicit fallback metadata,
+          <code>reserve-state</code> returns Aave-style reserve APY state with fallback yield hints,
+          <code>protocol-tvl</code> returns TVL and 24h change across the protocol watchlist,
+          and <code>pool-compare</code> compares multiple pool targets side by side across
+          <code>curve</code>, <code>uniswap_v2_like</code>, and <code>arcfx</code>. <code>arb-scan-multi</code>
+          scans several stable lanes at once and returns the strongest profitable lane.
+        </div>
+
+        <div class="accent-box">
+          <strong>Experimental paid pool-state coverage:</strong>
+          <code>QTM-WUSDC</code> on <code>uniswap_v2_like</code> and <code>MUSDC-MEURC</code> on <code>arcfx</code>
+          are available through the paid <code>pool-state</code> route.
+        </div>
+
+        <h3>Example unpaid response body</h3>
+        <pre><code>{
+  "error": "payment_required",
+  "endpoint": "pool-state",
+  "price": "0.001 USDC",
+  "sellerMode": "circle_gateway",
+  "callbackEndpoint": "/pool-state",
+  "docsUrl": "https://arcmachina.vercel.app/oracle-public-buyer-guide.html",
+  "note": "Retry with the payment headers returned by the Circle Gateway x402 flow."
+}</code></pre>
+      </section>
+
+      <section class="section">
+        <h2>Quick Start</h2>
+        <p>Install the dependencies used by the public reference files:</p>
+        <pre><code>npm install @circle-fin/x402-batching ethers</code></pre>
+
+        <div class="accent-box">
+          <strong>Tip:</strong>
+          use your public Arc Oracle API base URL here. If you received a <code>402</code> challenge first,
+          keep using the same seller base URL that returned the payment terms.
+        </div>
+
+        <p>Preview a live <code>402</code> response first:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+ORACLE_PUBLIC_ENDPOINT=pool-state \
+ORACLE_PUBLIC_POOL=USDC-EURC \
+node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the <code>EURC/WUSDC</code> lane:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+ORACLE_PUBLIC_ENDPOINT=stablecoin-fx \
+ORACLE_PUBLIC_PAIR=EURC/WUSDC \
+node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+ORACLE_PUBLIC_ENDPOINT=pool-state \
+ORACLE_PUBLIC_POOL=EURC-WUSDC \
+node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the peg health SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=peg-monitor \
+      ORACLE_PUBLIC_ASSETS=USDC,EURC,USDT \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the protocol TVL SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=protocol-tvl \
+      ORACLE_PUBLIC_PROTOCOLS=aave,morpho,maple \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the reserve-state SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=reserve-state \
+      ORACLE_PUBLIC_ASSETS=USDC,EURC,WUSDC \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the pool comparison SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=pool-compare \
+      ORACLE_PUBLIC_TARGETS=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the multi-lane arbitrage scanner SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=arb-scan-multi \
+      ORACLE_PUBLIC_TARGETS=curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Then execute the paid retry with an EOA private key:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+ORACLE_PUBLIC_ENDPOINT=pool-state \
+ORACLE_PUBLIC_POOL=USDC-EURC \
+ORACLE_BUYER_PRIVATE_KEY=0xyour_eoa_private_key \
+node oraclePublicBuyerExample.js</code></pre>
+
+        <div class="downloads">
+          <a class="button primary" href="/downloads/oraclePublicBuyerExample.js" download>Download buyer example</a>
+          <a class="button" href="/downloads/arcOracleBuyerHelper.js" download>Download helper</a>
+          <a class="button" href="/oracle-public-buyer-manifest.json" target="_blank" rel="noreferrer">Open machine manifest</a>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Environment Variables</h2>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Variable</th>
+              <th>Purpose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>ORACLE_BUYER_PRIVATE_KEY</code></td>
+              <td>EOA private key used for Gateway deposit and x402 signing.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_BASE_URL</code></td>
+              <td>Arc backend base URL.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_ENDPOINT</code></td>
+              <td>One of <code>stablecoin-fx</code>, <code>pool-state</code>, <code>peg-monitor</code>, <code>reserve-state</code>, <code>protocol-tvl</code>, <code>pool-compare</code>, <code>yield-rank</code>, <code>arb-signal</code>, <code>arb-scan-multi</code>.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_BUYER_CHAIN</code></td>
+              <td>Gateway chain name, defaults to <code>arcTestnet</code>.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_BUYER_RPC_URL</code></td>
+              <td>Optional RPC override for the selected chain.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_BUYER_FUNDING_BUFFER_USDC</code></td>
+              <td>Optional extra amount to deposit above the exact required payment.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_ASSETS</code></td>
+              <td>Comma-separated asset list for <code>peg-monitor</code> or <code>reserve-state</code>.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_PROTOCOLS</code></td>
+              <td>Comma-separated protocol list for <code>protocol-tvl</code>.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_TARGETS</code></td>
+              <td>Comma-separated <code>venue:pool</code> list for <code>pool-compare</code> or <code>arb-scan-multi</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section">
+        <h2>What The Helper Does</h2>
+        <p>The downloadable helper wraps the highest-friction parts of the buyer flow:</p>
+        <ul>
+          <li>Perform the unpaid preview request.</li>
+          <li>Parse the <code>PAYMENT-REQUIRED</code> header.</li>
+          <li>Check Gateway available balance.</li>
+          <li>Deposit on demand when Gateway balance is short.</li>
+          <li>Create a signed payment payload and retry the request.</li>
+        </ul>
+
+        <p class="foot">
+          Arc is not replacing Circle Gateway. It is packaging the same x402 settlement rail into a more
+          discoverable and lower-friction integration surface for Oracle buyers.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

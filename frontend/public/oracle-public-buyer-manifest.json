@@ -1,0 +1,152 @@
+{
+  "version": "1.0",
+  "product": "arc-oracle-public-buyer",
+  "sellerMode": "circle_gateway",
+  "humanDocsUrl": "https://arcmachina.vercel.app/oracle-public-buyer-guide.html",
+  "machineDocsUrl": "https://arcmachina.vercel.app/oracle-public-buyer-manifest.json",
+  "downloads": {
+    "exampleUrl": "https://arcmachina.vercel.app/downloads/oraclePublicBuyerExample.js",
+    "helperUrl": "https://arcmachina.vercel.app/downloads/arcOracleBuyerHelper.js"
+  },
+  "requirements": {
+    "walletType": "EOA",
+    "asset": "USDC",
+    "supportedChains": [
+      "arcTestnet",
+      "sepolia",
+      "baseSepolia",
+      "optimismSepolia",
+      "arbitrumSepolia"
+    ]
+  },
+  "requestFlow": {
+    "preview": {
+      "expectedStatus": 402,
+      "responseHeader": "PAYMENT-REQUIRED"
+    },
+    "pay": {
+      "requestHeader": "Payment-Signature",
+      "responseHeader": "PAYMENT-RESPONSE"
+    }
+  },
+  "environment": {
+    "required": [
+      "ORACLE_PUBLIC_BASE_URL",
+      "ORACLE_PUBLIC_ENDPOINT"
+    ],
+    "optional": [
+      "ORACLE_PUBLIC_POOL",
+      "ORACLE_PUBLIC_PAIR",
+      "ORACLE_PUBLIC_ASSETS",
+      "ORACLE_PUBLIC_PROTOCOLS",
+      "ORACLE_PUBLIC_TARGETS",
+      "ORACLE_PUBLIC_ASSET",
+      "ORACLE_PUBLIC_STRATEGY",
+      "ORACLE_BUYER_PRIVATE_KEY",
+      "ORACLE_BUYER_CHAIN",
+      "ORACLE_BUYER_RPC_URL",
+      "ORACLE_BUYER_FUNDING_BUFFER_USDC"
+    ]
+  },
+  "endpoints": [
+    {
+      "key": "stablecoin-fx",
+      "path": "/api/oracle/public/stablecoin-fx",
+      "query": [
+        {
+          "name": "pair",
+          "example": "EURC/USDC"
+        }
+      ]
+    },
+    {
+      "key": "pool-state",
+      "path": "/api/oracle/public/pool-state",
+      "query": [
+        {
+          "name": "pool",
+          "example": "USDC-EURC"
+        },
+        {
+          "name": "venue",
+          "example": "curve"
+        }
+      ]
+    },
+    {
+      "key": "peg-monitor",
+      "path": "/api/oracle/public/peg-monitor",
+      "query": [
+        {
+          "name": "assets",
+          "example": "USDC,EURC,USDT"
+        }
+      ]
+    },
+    {
+      "key": "reserve-state",
+      "path": "/api/oracle/public/reserve-state",
+      "query": [
+        {
+          "name": "assets",
+          "example": "USDC,EURC,WUSDC"
+        }
+      ]
+    },
+    {
+      "key": "protocol-tvl",
+      "path": "/api/oracle/public/protocol-tvl",
+      "query": [
+        {
+          "name": "protocols",
+          "example": "aave,morpho,maple"
+        }
+      ]
+    },
+    {
+      "key": "pool-compare",
+      "path": "/api/oracle/public/pool-compare",
+      "query": [
+        {
+          "name": "targets",
+          "example": "curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC"
+        }
+      ]
+    },
+    {
+      "key": "yield-rank",
+      "path": "/api/oracle/public/yield-rank",
+      "query": [
+        {
+          "name": "asset",
+          "example": "USDC"
+        }
+      ]
+    },
+    {
+      "key": "arb-signal",
+      "path": "/api/oracle/public/arb-signal",
+      "query": [
+        {
+          "name": "strategy",
+          "example": "stablecoin_fx"
+        }
+      ]
+    },
+    {
+      "key": "arb-scan-multi",
+      "path": "/api/oracle/public/arb-scan-multi",
+      "query": [
+        {
+          "name": "targets",
+          "example": "curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "Use the same public seller base URL that returned the 402 challenge.",
+    "If Gateway available balance is short, fund Gateway before the paid retry.",
+    "EOA wallets are required for this payment flow."
+  ]
+}

@@ -2,6 +2,7 @@
 
 const axios = require('axios');
 const { getCache, setCache, TTL } = require('./cache');
+const { recordOracleFallback } = require('./observability');
 
 const BASE_URL   = 'https://api.llama.fi';
 const YIELDS_URL = 'https://yields.llama.fi';
@@ -15,12 +16,12 @@ function assessRisk(tvl, apy) {
   return 'HIGH';
 }
 
-function getFallbackYields(asset) {
+function getFallbackYields(asset, fallbackReason = 'api_unreachable') {
   const now = new Date().toISOString();
   return [
-    { name: 'Aave V3',       chain: 'ARC Testnet', apy: 4.2, tvlUsd: 45_000_000, asset, risk: 'LOW',        contractHint: 'deploy-from-arcscan', source: 'defillama', fetchedAt: now },
-    { name: 'Morpho',        chain: 'ARC Testnet', apy: 5.1, tvlUsd: 8_900_000,  asset, risk: 'LOW-MEDIUM', contractHint: 'deploy-from-arcscan', source: 'defillama', fetchedAt: now },
-    { name: 'Maple Finance', chain: 'ARC Testnet', apy: 6.8, tvlUsd: 12_500_000, asset, risk: 'MEDIUM',     contractHint: 'deploy-from-arcscan', source: 'defillama', fetchedAt: now },
+    { name: 'Aave V3',       chain: 'ARC Testnet', apy: 4.2, tvlUsd: 45_000_000, asset, risk: 'LOW',        contractHint: 'deploy-from-arcscan', source: 'defillama', isFallback: true, fallbackReason, fetchedAt: now },
+    { name: 'Morpho',        chain: 'ARC Testnet', apy: 5.1, tvlUsd: 8_900_000,  asset, risk: 'LOW-MEDIUM', contractHint: 'deploy-from-arcscan', source: 'defillama', isFallback: true, fallbackReason, fetchedAt: now },
+    { name: 'Maple Finance', chain: 'ARC Testnet', apy: 6.8, tvlUsd: 12_500_000, asset, risk: 'MEDIUM',     contractHint: 'deploy-from-arcscan', source: 'defillama', isFallback: true, fallbackReason, fetchedAt: now },
   ];
 }
 
@@ -33,9 +34,15 @@ async function getYieldOpportunities(asset = 'USDC', minApy = 1.0) {
   try {
     const response = await axios.get(`${YIELDS_URL}/pools`, { timeout: 8000 });
     pools = response.data.data;
-  } catch {
+  } catch (error) {
     console.warn('[Oracle/DefiLlama] API unreachable — using fallback yield data');
-    const result = getFallbackYields(asset);
+    recordOracleFallback('yield_rank', {
+      asset,
+      reason: 'api_unreachable',
+      detail: error.message,
+      provider: 'defillama',
+    });
+    const result = getFallbackYields(asset, 'api_unreachable');
     setCache(cacheKey, result, TTL.YIELD_RANK);
     return result;
   }
@@ -59,11 +66,21 @@ async function getYieldOpportunities(asset = 'USDC', minApy = 1.0) {
       risk:         assessRisk(pool.tvlUsd ?? 0, pool.apy ?? 0),
       contractHint: pool.pool,
       source:       'defillama',
+      isFallback:   false,
+      fallbackReason: null,
       fetchedAt:    new Date().toISOString(),
     }))
     .sort((a, b) => b.apy - a.apy);
 
-  const result = filtered.length > 0 ? filtered : getFallbackYields(asset);
+  if (filtered.length === 0) {
+    recordOracleFallback('yield_rank', {
+      asset,
+      reason: 'no_matching_protocols',
+      provider: 'defillama',
+    });
+  }
+
+  const result = filtered.length > 0 ? filtered : getFallbackYields(asset, 'no_matching_protocols');
   setCache(cacheKey, result, TTL.YIELD_RANK);
   return result;
 }
@@ -85,14 +102,35 @@ async function getProtocolTvl(protocol) {
       : 0;
 
     const result = {
+      protocol,
       tvl:      latest.totalLiquidityUSD,
       change24h: Math.round(change24h * 100) / 100,
+      source: 'defillama',
+      isFallback: false,
+      fallbackReason: null,
     };
 
     setCache(cacheKey, result, TTL.YIELD_RANK);
     return result;
-  } catch {
-    return null;
+  } catch (error) {
+    recordOracleFallback('protocol_tvl', {
+      protocol,
+      reason: 'api_unreachable',
+      detail: error.message,
+      provider: 'defillama',
+    });
+
+    const result = {
+      protocol,
+      tvl: null,
+      change24h: null,
+      source: 'defillama',
+      isFallback: true,
+      fallbackReason: 'api_unreachable',
+      fetchedAt: new Date().toISOString(),
+    };
+    setCache(cacheKey, result, TTL.YIELD_RANK);
+    return result;
   }
 }
 

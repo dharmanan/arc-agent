@@ -12,6 +12,9 @@ const defiLlama    = require('./defiLlama');
 const coingecko    = require('./coingecko');
 const arcRpc       = require('./arcRpc');
 const arbCalculator = require('./arbCalculator');
+const pools        = require('./pools');
+const observability = require('./observability');
+const alerts       = require('./alerts');
 const { TTL, getCache, setCache, clearCache, getCacheStats } = require('./cache');
 
 module.exports = {
@@ -30,9 +33,18 @@ module.exports = {
 
   // On-chain Curve/Aave/Band data (requires ARC_RPC_URL)
   getCurvePoolState:   arcRpc.getCurvePoolState,
+  getConstantProductPoolState: arcRpc.getConstantProductPoolState,
   getAaveReserveData:  arcRpc.getAaveReserveData,
   getBandFeed:         arcRpc.getBandFeed,
   getMockPoolState:    arcRpc.getMockPoolState,
+  resolveOraclePoolStateTarget: pools.resolveOraclePoolStateTarget,
+  resolveCurvePool:    pools.resolveCurvePool,
+  normalizeCurvePoolKey: pools.normalizeCurvePoolKey,
+  normalizePoolVenue: pools.normalizePoolVenue,
+  getOracleObservabilitySummary: observability.getOracleObservabilitySummary,
+  recordOracleFallback: observability.recordOracleFallback,
+  recordOracleSignal: observability.recordOracleSignal,
+  dispatchOracleTestAlert: alerts.dispatchOracleTestAlert,
 
   // Arbitrage calculations (pure functions, no I/O)
   calculateSpread:       arbCalculator.calculateSpread,

@@ -10,7 +10,8 @@ import SwapTab from './components/SwapTab.jsx';
 import SecurityTab from './components/SecurityTab.jsx';
 import JobsTab from './components/JobsTab.jsx';
 import TasksTab from './components/TasksTab.jsx';
-import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Briefcase, Zap, ChevronDown } from 'lucide-react';
+import OracleTab from './components/OracleTab.jsx';
+import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Briefcase, Zap, ChevronDown, Brain } from 'lucide-react';
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
@@ -19,6 +20,7 @@ const TABS = [
   { id: 'agent',     label: 'Agent',     Icon: Bot             },
   { id: 'jobs',      label: 'Jobs',      Icon: Briefcase       },
   { id: 'tasks',     label: 'Tasks',     Icon: Zap             },
+  { id: 'oracle',    label: 'Oracle',    Icon: Brain           },
 ];
 
 function NetworkSwitcher() {
@@ -144,6 +146,7 @@ function AppContent() {
         {tab === 'agent' && <AgentTab />}
         {tab === 'jobs' && <JobsTab />}
         {tab === 'tasks' && <TasksTab />}
+        {tab === 'oracle' && <OracleTab />}
         {tab === 'security' && <SecurityTab onBack={back} />}
       </main>
     </div>

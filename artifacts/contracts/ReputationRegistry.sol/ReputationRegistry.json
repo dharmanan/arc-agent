@@ -1,0 +1,216 @@
+{
+  "contractName": "ReputationRegistry",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "initialRecorder",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "previousOwner",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "newOwner",
+          "type": "address"
+        }
+      ],
+      "name": "OwnershipTransferred",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "recorder",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "bool",
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "name": "RecorderUpdated",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "tokenId",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "string",
+          "name": "eventType",
+          "type": "string"
+        },
+        {
+          "indexed": false,
+          "internalType": "int256",
+          "name": "scoreDelta",
+          "type": "int256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "newScore",
+          "type": "uint256"
+        }
+      ],
+      "name": "ReputationRecorded",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "tokenId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getScore",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "owner",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "tokenId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "string",
+          "name": "eventType",
+          "type": "string"
+        },
+        {
+          "internalType": "int256",
+          "name": "scoreDelta",
+          "type": "int256"
+        }
+      ],
+      "name": "recordEvent",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "recorders",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "recorder",
+          "type": "address"
+        },
+        {
+          "internalType": "bool",
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "name": "setRecorder",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "totalEvents",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "newOwner",
+          "type": "address"
+        }
+      ],
+      "name": "transferOwnership",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x608060405234801561000f575f80fd5b506040516107f33803806107f383398101604081905261002e916100c1565b5f80546001600160a01b031916331790556001600160a01b0381161580159061006057506001600160a01b0381163314155b156100bb576001600160a01b0381165f81815260016020818152604092839020805460ff19168317905591519081527f6a89877a284cfdc505260b8a48e49b65cb85c8668646e1c0e332fac355134db7910160405180910390a25b506100ee565b5f602082840312156100d1575f80fd5b81516001600160a01b03811681146100e7575f80fd5b9392505050565b6106f8806100fb5f395ff3fe608060405234801561000f575f80fd5b506004361061007a575f3560e01c80637bc136b6116100585780637bc136b6146100e457806381fabe97146101075780638da5cb5b14610129578063f2fde38b14610153575f80fd5b80630e1af57b1461007e5780632737093c146100b05780636b39349f146100cf575b5f80fd5b61009d61008c3660046104dd565b5f9081526002602052604090205490565b6040519081526020015b60405180910390f35b61009d6100be3660046104dd565b60036020525f908152604090205481565b6100e26100dd36600461050f565b610166565b005b6100f76100f2366004610548565b610256565b60405190151581526020016100a7565b6100f76101153660046105c3565b60016020525f908152604090205460ff1681565b5f5461013b906001600160a01b031681565b6040516001600160a01b0390911681526020016100a7565b6100e26101613660046105c3565b610405565b5f546001600160a01b031633146101985760405162461bcd60e51b815260040161018f906105e3565b60405180910390fd5b6001600160a01b0382166101f85760405162461bcd60e51b815260206004820152602160248201527f52657075746174696f6e52656769737472793a207a65726f207265636f7264656044820152603960f91b606482015260840161018f565b6001600160a01b0382165f81815260016020908152604091829020805460ff191685151590811790915591519182527f6a89877a284cfdc505260b8a48e49b65cb85c8668646e1c0e332fac355134db7910160405180910390a25050565b5f80546001600160a01b031633148061027d5750335f9081526001602052604090205460ff165b6102dc5760405162461bcd60e51b815260206004820152602a60248201527f52657075746174696f6e52656769737472793a2063616c6c6572206973206e6f6044820152693a103932b1b7b93232b960b11b606482015260840161018f565b845f036103375760405162461bcd60e51b8152602060048201526024808201527f52657075746174696f6e52656769737472793a20696e76616c696420746f6b656044820152631b881a5960e21b606482015260840161018f565b5f85815260026020526040812054908084121561037b575f6103588561063e565b9050828110156103715761036c8184610658565b610373565b5f5b915050610388565b6103858483610671565b90505b5f878152600260209081526040808320849055600390915281208054600192906103b3908490610671565b92505081905550867fc0220900e4f9794f267762cb28647c07eac93b0f7fe65863fe6702b691599bfd878787856040516103f09493929190610684565b60405180910390a25060019695505050505050565b5f546001600160a01b0316331461042e5760405162461bcd60e51b815260040161018f906105e3565b6001600160a01b0381166104845760405162461bcd60e51b815260206004820152601e60248201527f52657075746174696f6e52656769737472793a207a65726f206f776e65720000604482015260640161018f565b5f80546040516001600160a01b03808516939216917f8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e091a35f80546001600160a01b0319166001600160a01b0392909216919091179055565b5f602082840312156104ed575f80fd5b5035919050565b80356001600160a01b038116811461050a575f80fd5b919050565b5f8060408385031215610520575f80fd5b610529836104f4565b91506020830135801515811461053d575f80fd5b809150509250929050565b5f805f806060858703121561055b575f80fd5b84359350602085013567ffffffffffffffff80821115610579575f80fd5b818701915087601f83011261058c575f80fd5b81358181111561059a575f80fd5b8860208285010111156105ab575f80fd5b95986020929092019750949560400135945092505050565b5f602082840312156105d3575f80fd5b6105dc826104f4565b9392505050565b60208082526027908201527f52657075746174696f6e52656769737472793a2063616c6c6572206973206e6f6040820152663a1037bbb732b960c91b606082015260800190565b634e487b7160e01b5f52601160045260245ffd5b5f600160ff1b82016106525761065261062a565b505f0390565b8181038181111561066b5761066b61062a565b92915050565b8082018082111561066b5761066b61062a565b60608152836060820152838560808301375f608085830101525f6080601f19601f87011683010190508360208301528260408301529594505050505056fea2646970667358221220f8cf0c3bd9b0ffc2e7dc403b57fd01aa90b43cc6b10780b564a074441529b37364736f6c63430008180033"
+}

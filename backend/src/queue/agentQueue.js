@@ -12,14 +12,15 @@
  * Concurrency: 5 workers. Failed jobs retry 3× with exponential backoff.
  */
 const Bull        = require('bull');
+const Redis       = require('ioredis');
 const db          = require('../db');
 const llmService  = require('../services/llmService');
 const ruleEngine  = require('../services/ruleEngine');
 const oracle      = require('../services/oracle');
 const protocols   = require('../services/protocols');
 const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationService');
-const agentWalletService = require('../services/agentWalletService');
-const { ethers }         = require('ethers');
+const taskEconomyService = require('../services/agenticEconomy/taskEconomyService');
+const agenticTaskExecutionService = require('../services/agenticEconomy/agenticTaskExecutionService');
 
 // Dev-only: wallet addresses that bypass all daily task limits (comma-separated env var)
 const DEV_BYPASS_ADDRS = new Set(
@@ -37,7 +38,33 @@ const redisConnection = process.env.REDIS_URL
       password: process.env.REDIS_PASSWORD || undefined,
     };
 
-const queue = new Bull('agent-jobs', redisConnection, {
+function createBullRedisClient(type) {
+  const client = typeof redisConnection === 'string'
+    ? new Redis(redisConnection, {
+        maxRetriesPerRequest: null,
+        enableReadyCheck: false,
+        lazyConnect: false,
+      })
+    : new Redis({
+        ...redisConnection,
+        maxRetriesPerRequest: null,
+        enableReadyCheck: false,
+        lazyConnect: false,
+      });
+
+  // Bull attaches more than Node's default 10 startup listeners to ioredis.
+  // That is expected for these queue clients and should not emit noisy warnings.
+  client.setMaxListeners(25);
+
+  client.on('error', (err) => {
+    console.error(`[QUEUE:${type}]`, err.message);
+  });
+
+  return client;
+}
+
+const queue = new Bull('agent-jobs', {
+  createClient: createBullRedisClient,
   defaultJobOptions: {
     attempts:    3,
     backoff:     { type: 'exponential', delay: 2000 },
@@ -54,6 +81,49 @@ const queue = new Bull('agent-jobs', redisConnection, {
   },
 });
 
+const REGISTERED_MANUAL_TASK_PROCESSORS = new Map();
+const MANUAL_TASK_READY_TIMEOUT_MS = parseInt(process.env.MANUAL_TASK_READY_TIMEOUT_MS || '1200', 10);
+
+function registerTaskProcessor(name, concurrency, handler) {
+  REGISTERED_MANUAL_TASK_PROCESSORS.set(name, handler);
+  queue.process(name, concurrency, handler);
+}
+
+function _withTimeout(promise, timeoutMs, code) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => {
+        const error = new Error(code);
+        error.code = code;
+        reject(error);
+      }, timeoutMs);
+    }),
+  ]);
+}
+
+async function canQueueManualTasks(timeoutMs = MANUAL_TASK_READY_TIMEOUT_MS) {
+  try {
+    await _withTimeout(queue.isReady(), timeoutMs, 'manual_task_queue_timeout');
+    return true;
+  } catch (err) {
+    console.error('[QUEUE] Manual task queue unavailable:', err.message);
+    return false;
+  }
+}
+
+async function runTaskInline(taskName, data) {
+  const handler = REGISTERED_MANUAL_TASK_PROCESSORS.get(taskName);
+  if (!handler) {
+    throw new Error(`manual_task_processor_missing:${taskName}`);
+  }
+
+  return handler({
+    id: `inline-${taskName}-${Date.now()}`,
+    data,
+  });
+}
+
 // ── Engine selector — use LLM when key is available, fall back to rule engine ──
 async function resolveEngine(agent) {
   if (!agent?.llm_api_key_encrypted) return { engine: ruleEngine, apiKey: null };
@@ -64,6 +134,33 @@ async function resolveEngine(agent) {
   } catch {
     return { engine: ruleEngine, apiKey: null };
   }
+}
+
+const AUTOMATION_STATE_COLUMNS = {
+  marketAnalysis: {
+    lastRunAt: 'market_analysis_last_run_at',
+    lastStatus: 'market_analysis_last_status',
+  },
+  oracle: {
+    lastRunAt: 'oracle_last_run_at',
+    lastStatus: 'oracle_last_status',
+  },
+  defiLoop: {
+    lastRunAt: 'defi_loop_last_run_at',
+    lastStatus: 'defi_loop_last_status',
+  },
+};
+
+async function _setAutomationState(agentId, automationKey, status) {
+  const columns = AUTOMATION_STATE_COLUMNS[automationKey];
+  if (!columns || !agentId) return;
+
+  await db.query(
+    `UPDATE agents
+     SET ${columns.lastRunAt} = NOW(), ${columns.lastStatus} = $1
+     WHERE id = $2`,
+    [status, agentId],
+  ).catch(() => {});
 }
 
 // ── Job processor ─────────────────────────────────────────────────────────────
@@ -153,17 +250,27 @@ queue.process('INCOMING_TRANSFER', 5, async (job) => {
 queue.process('MARKET_ANALYSIS', 2, async (job) => {
   const { agentId, chain, token } = job.data;
   console.log(`[QUEUE] MARKET_ANALYSIS agent=${agentId}`);
+  await _setAutomationState(agentId, 'marketAnalysis', 'running');
 
   const { rows: [agent] } = await db.query(
     'SELECT llm_model, llm_api_key_encrypted FROM agents WHERE id = $1 AND is_smart_mode = TRUE',
     [agentId],
   );
-  if (!agent) return { ok: false, reason: 'agent not in smart mode' };
+  if (!agent) {
+    await _setAutomationState(agentId, 'marketAnalysis', 'disabled');
+    return { ok: false, reason: 'agent not in smart mode' };
+  }
 
-  const { engine, apiKey } = await resolveEngine(agent);
-  const result = await engine.analyzeMarket({ chain, token, model: agent.llm_model, apiKey, agentId });
-  console.log(`[QUEUE] MARKET_ANALYSIS (${result.engine || 'llm'}) for agent ${agentId}`);
-  return result;
+  try {
+    const { engine, apiKey } = await resolveEngine(agent);
+    const result = await engine.analyzeMarket({ chain, token, model: agent.llm_model, apiKey, agentId });
+    console.log(`[QUEUE] MARKET_ANALYSIS (${result.engine || 'llm'}) for agent ${agentId}`);
+    await _setAutomationState(agentId, 'marketAnalysis', 'success');
+    return result;
+  } catch (err) {
+    await _setAutomationState(agentId, 'marketAnalysis', 'error');
+    throw err;
+  }
 });
 
 // ── ORACLE_QUERY ───────────────────────────────────────────────────────────────
@@ -177,9 +284,32 @@ const CURVE_USDC_EURC_POOL    = process.env.CURVE_USDC_EURC_POOL || null;
 const DEFI_LOOP_INTERVAL_MS   = parseInt(process.env.DEFI_LOOP_INTERVAL_MS   || '3600000',  10); // default 1h
 const DAILY_DEFI_LOOP_CAP     = 10;
 
+function _getUsdcEurcCurvePool() {
+  return oracle.resolveCurvePool('USDC-EURC');
+}
+
+function _getEurcUsdcCurvePool() {
+  return oracle.resolveCurvePool('EURC-USDC');
+}
+
+async function _getOracleStablePoolState(forexRate) {
+  const pool = _getEurcUsdcCurvePool();
+
+  if (!pool?.address) {
+    return oracle.getMockPoolState('EURC-USDC', forexRate.rate);
+  }
+
+  return oracle.getCurvePoolState(pool);
+}
+
 queue.process('ORACLE_QUERY', 2, async (job) => {
   const { agentId } = job.data;
   console.log(`[QUEUE] ORACLE_QUERY agent=${agentId}`);
+  await _setAutomationState(agentId, 'oracle', 'running');
+  const finishOracle = async (status, payload) => {
+    await _setAutomationState(agentId, 'oracle', status);
+    return payload;
+  };
 
   // Reload agent — double-check flag (may have been toggled off since job was queued)
   const { rows: [agent] } = await db.query(
@@ -190,8 +320,8 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
     [agentId],
   );
 
-  if (!agent)                  return { ok: false, reason: 'agent_not_found' };
-  if (!agent.oracle_enabled)   return { ok: false, reason: 'oracle_disabled' };
+  if (!agent)                return finishOracle('missing_agent', { ok: false, reason: 'agent_not_found' });
+  if (!agent.oracle_enabled) return finishOracle('disabled', { ok: false, reason: 'oracle_disabled' });
 
   // Reset daily counter if it's a new day
   const resetAt   = new Date(agent.daily_limit_reset_at);
@@ -213,19 +343,17 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   const DAILY_ORACLE_CAP = 48;
   if (agent.daily_market_analysis_count >= DAILY_ORACLE_CAP) {
     console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} daily cap reached`);
-    return { ok: false, reason: 'daily_cap_reached', count: agent.daily_market_analysis_count };
+    return finishOracle('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_market_analysis_count });
   }
 
   // ── Fetch oracle data ──────────────────────────────────────────────────────
   let forexRate, poolState;
   try {
     forexRate = await oracle.getForexRate('EURC', 'USDC');
-    poolState  = CURVE_USDC_EURC_POOL
-      ? await oracle.getCurvePoolState('USDC-EURC', CURVE_USDC_EURC_POOL)
-      : oracle.getMockPoolState('USDC-EURC', forexRate.rate);
+    poolState  = await _getOracleStablePoolState(forexRate);
   } catch (err) {
     console.error(`[QUEUE] ORACLE_QUERY fetch error agent=${agentId}:`, err.message);
-    return { ok: false, reason: 'oracle_fetch_error', error: err.message };
+    return finishOracle('fetch_error', { ok: false, reason: 'oracle_fetch_error', error: err.message });
   }
 
   const signal = oracle.buildArbSignal({
@@ -242,6 +370,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   // ── Run through engine ─────────────────────────────────────────────────────
   const { engine, apiKey } = await resolveEngine(agent);
   let decision = null;
+  let decisionError = false;
   try {
     const result = await engine.analyzeMarket({
       chain: 'arc-testnet', token: 'USDC',
@@ -252,6 +381,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
     console.log(`[QUEUE] ORACLE_QUERY decision (${result.engine || 'llm'}) agent=${agentId}:`, String(decision).slice(0, 120));
   } catch (err) {
     console.error(`[QUEUE] ORACLE_QUERY engine error agent=${agentId}:`, err.message);
+    decisionError = true;
   }
 
   // ── Increment counter + log ────────────────────────────────────────────────
@@ -277,7 +407,10 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   // Reputation hook — fire-and-forget, never blocks
   recordReputationEvent(agentId, EVENT_TYPES.ORACLE_QUERY).catch(() => {});
 
-  return { ok: true, found: signal.opportunity.found, confidence: signal.opportunity.confidence, decision };
+  return finishOracle(
+    decisionError ? 'decision_error' : signal.opportunity.found ? 'success' : 'no_signal',
+    { ok: true, found: signal.opportunity.found, confidence: signal.opportunity.confidence, decision },
+  );
 });
 
 // ── Schedule oracle queries for all eligible agents ──────────────────────────
@@ -315,6 +448,11 @@ const DRY_RUN   = process.env.DRY_RUN === 'true';
 queue.process('DEFI_LOOP', 2, async (job) => {
   const { agentId } = job.data;
   console.log(`[QUEUE] DEFI_LOOP agent=${agentId} dry=${DRY_RUN}`);
+  await _setAutomationState(agentId, 'defiLoop', 'running');
+  const finishDefi = async (status, payload) => {
+    await _setAutomationState(agentId, 'defiLoop', status);
+    return payload;
+  };
 
   // Reload agent — verify flag still on + fetch encrypted key
   const { rows: [agent] } = await db.query(
@@ -322,13 +460,13 @@ queue.process('DEFI_LOOP', 2, async (job) => {
             defi_loop_enabled, oracle_enabled,
             daily_defi_loop_count, daily_limit_reset_at,
             daily_limit_usdc, max_trade_usdc, slippage_percent,
-            wallet_address, encrypted_private_key
+            wallet_address, private_key_encrypted
      FROM agents WHERE id = $1`,
     [agentId],
   );
 
-  if (!agent)                   return { ok: false, reason: 'agent_not_found' };
-  if (!agent.defi_loop_enabled) return { ok: false, reason: 'defi_loop_disabled' };
+  if (!agent)                   return finishDefi('missing_agent', { ok: false, reason: 'agent_not_found' });
+  if (!agent.defi_loop_enabled) return finishDefi('disabled', { ok: false, reason: 'defi_loop_disabled' });
 
   // Reset daily counters if new day
   const resetAt = new Date(agent.daily_limit_reset_at);
@@ -348,19 +486,17 @@ queue.process('DEFI_LOOP', 2, async (job) => {
   // Daily cap check
   if (agent.daily_defi_loop_count >= DAILY_DEFI_LOOP_CAP) {
     console.log(`[QUEUE] DEFI_LOOP agent=${agentId} daily cap reached (${DAILY_DEFI_LOOP_CAP})`);
-    return { ok: false, reason: 'daily_cap_reached', count: agent.daily_defi_loop_count };
+    return finishDefi('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_defi_loop_count });
   }
 
   // ── Oracle data ────────────────────────────────────────────────────────────
   let forexRate, poolState;
   try {
     forexRate = await oracle.getForexRate('EURC', 'USDC');
-    poolState  = CURVE_USDC_EURC_POOL
-      ? await oracle.getCurvePoolState('USDC-EURC', CURVE_USDC_EURC_POOL)
-      : oracle.getMockPoolState('USDC-EURC', forexRate.rate);
+    poolState  = await _getOracleStablePoolState(forexRate);
   } catch (err) {
     console.error(`[QUEUE] DEFI_LOOP oracle error agent=${agentId}:`, err.message);
-    return { ok: false, reason: 'oracle_fetch_error', error: err.message };
+    return finishDefi('fetch_error', { ok: false, reason: 'oracle_fetch_error', error: err.message });
   }
 
   const signal = oracle.buildArbSignal({
@@ -397,7 +533,7 @@ queue.process('DEFI_LOOP', 2, async (job) => {
 
   // No opportunity or engine said hold → stop here
   if (!signal.opportunity.found || signal.opportunity.confidence === 'LOW') {
-    return { ok: true, action: 'hold', reason: 'no_opportunity', confidence: signal.opportunity.confidence };
+    return finishDefi('no_opportunity', { ok: true, action: 'hold', reason: 'no_opportunity', confidence: signal.opportunity.confidence });
   }
 
   // ── Execute swap ──────────────────────────────────────────────────────────
@@ -414,32 +550,33 @@ queue.process('DEFI_LOOP', 2, async (job) => {
        VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', $2, 'dry_run', $3::jsonb)`,
       [agentId, swapAmountUsdc, JSON.stringify({ signal, decision, dryRun: true })],
     );
-    return { ok: true, action: 'dry_run', amountUsdc: swapAmountUsdc };
+    return finishDefi('dry_run', { ok: true, action: 'dry_run', amountUsdc: swapAmountUsdc });
   }
 
   // Real swap — requires decrypted private key
-  if (!agent.encrypted_private_key) {
-    return { ok: false, reason: 'no_private_key' };
+  if (!agent.private_key_encrypted) {
+    return finishDefi('no_private_key', { ok: false, reason: 'no_private_key' });
   }
 
   let txResult;
   try {
     const { decrypt } = require('../services/cryptoService');
-    const privateKey  = decrypt(agent.encrypted_private_key);
+    const privateKey  = decrypt(agent.private_key_encrypted);
 
+    const swapPool           = _getUsdcEurcCurvePool();
     const EURC_ADDRESS       = process.env.EURC_ADDRESS || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
     const USDC_ADDRESS       = process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
-    const poolAddress        = CURVE_USDC_EURC_POOL;
+    const poolAddress        = swapPool?.address || CURVE_USDC_EURC_POOL;
 
     if (!poolAddress) {
-      return { ok: false, reason: 'pool_address_not_configured' };
+      return finishDefi('pool_unconfigured', { ok: false, reason: 'pool_address_not_configured' });
     }
 
     txResult = await protocols.executeCurveSwap({
       poolAddress,
       tokenInAddress: USDC_ADDRESS,
-      indexIn:        0,
-      indexOut:       1,
+      indexIn:        swapPool?.baseToken.index ?? 0,
+      indexOut:       swapPool?.quoteToken.index ?? 1,
       amountIn:       String(swapAmountUsdc),
       slippagePct:    parseFloat(agent.slippage_percent) || 0.5,
       agentPrivateKey: privateKey,
@@ -461,7 +598,7 @@ queue.process('DEFI_LOOP', 2, async (job) => {
 
     console.log(`[QUEUE] DEFI_LOOP swap OK agent=${agentId} tx=${txResult.txHash}`);
     recordReputationEvent(agentId, EVENT_TYPES.DEFI_LOOP).catch(() => {});
-    return { ok: true, action: 'swap_executed', txHash: txResult.txHash, amountOut: txResult.amountOut };
+    return finishDefi('executed', { ok: true, action: 'swap_executed', txHash: txResult.txHash, amountOut: txResult.amountOut });
 
   } catch (err) {
     console.error(`[QUEUE] DEFI_LOOP swap error agent=${agentId}:`, err.message);
@@ -471,7 +608,7 @@ queue.process('DEFI_LOOP', 2, async (job) => {
        VALUES ($1, 'defi_loop_swap', 'arc-testnet', 'arc-testnet', 'USDC', $2, 'failed', $3::jsonb)`,
       [agentId, swapAmountUsdc, JSON.stringify({ error: err.message, signal })],
     );
-    return { ok: false, reason: 'swap_error', error: err.message };
+    return finishDefi('swap_error', { ok: false, reason: 'swap_error', error: err.message });
   }
 });
 
@@ -678,19 +815,12 @@ async function _saveTaskResult(agentId, taskId, payload) {
 // ── TIER-2 PAID TASK HELPERS ──────────────────────────────────────────────────
 
 const DAILY_PAID_TASK_CAP  = parseInt(process.env.DAILY_PAID_TASK_CAP || '5', 10);
-const _REVENUE_POOL_ADDR   = process.env.REVENUE_POOL_ADDRESS;
-const _POOL_ABI            = ['function depositFee(uint256 amount) external'];
-const _USDC_POOL_ABI       = [
-  'function approve(address spender, uint256 amount) external returns (bool)',
-  'function balanceOf(address account) external view returns (uint256)',
-];
-const _PAID_FEE_UNITS = BigInt(Math.round(PAID_TASK_FEE_USDC * 1_000_000)); // 6 decimals
 
 // Check daily paid cap; reset if a new UTC day has started
 async function _paidTaskGuard(agentId) {
   const { rows: [agent] } = await db.query(
     `SELECT id, daily_tasks_enabled, daily_paid_task_count, daily_limit_reset_at,
-            wallet_address, encrypted_private_key
+            wallet_address, private_key_encrypted
      FROM agents WHERE id = $1`,
     [agentId],
   );
@@ -712,29 +842,6 @@ async function _paidTaskGuard(agentId) {
     return { ok: false, reason: 'daily_paid_cap_reached', count: agent.daily_paid_task_count };
   }
   return { ok: true, agent };
-}
-
-// Deposit 0.10 USDC from relayer into ArcRevenuePool (best-effort, fire-and-forget)
-async function _depositPlatformFee() {
-  if (DRY_RUN || !_REVENUE_POOL_ADDR || !process.env.RELAYER_PRIVATE_KEY) return;
-  try {
-    const rpc      = process.env.ARC_TESTNET_RPC || 'https://rpc.arc-testnet.io';
-    const provider = new ethers.JsonRpcProvider(rpc);
-    const relayer  = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY, provider);
-    const usdcAddr = process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000';
-    const usdcCtr  = new ethers.Contract(usdcAddr, _USDC_POOL_ABI, relayer);
-    const bal      = await usdcCtr.balanceOf(relayer.address);
-    if (bal < _PAID_FEE_UNITS) {
-      console.warn(`[PAID_TASK] Relayer USDC=${bal} < fee=${_PAID_FEE_UNITS} — deposit skipped`);
-      return;
-    }
-    await (await usdcCtr.approve(_REVENUE_POOL_ADDR, _PAID_FEE_UNITS)).wait(1);
-    const pool = new ethers.Contract(_REVENUE_POOL_ADDR, _POOL_ABI, relayer);
-    await (await pool.depositFee(_PAID_FEE_UNITS)).wait(1);
-    console.log(`[PAID_TASK] depositFee(${_PAID_FEE_UNITS}) → ArcRevenuePool OK`);
-  } catch (err) {
-    console.warn('[PAID_TASK] fee deposit failed (non-fatal):', err.message);
-  }
 }
 
 // Write result only — no cap increment, no fee deposit (used for free execution tasks)
@@ -762,22 +869,41 @@ async function _freeExecGuard(agentId) {
   return { ok: true, agent };
 }
 
-// Write result + increment daily_paid_task_count + fire-and-forget fee deposit
-async function _savePaidTaskResult(agentId, taskId, payload) {
+// Write result + increment daily_paid_task_count + attach task economy fee metadata
+async function _savePaidTaskResult(agentId, taskId, payload, agent) {
+  let economy = null;
+
+  try {
+    economy = await taskEconomyService.settleTaskExecutionFee({
+      agent,
+      taskId,
+      feeUsdc: PAID_TASK_FEE_USDC,
+    });
+  } catch (err) {
+    economy = {
+      mode: 'circle_gateway_task_fee',
+      rail: 'agentic_task_economy',
+      taskId,
+      feeUsdc: PAID_TASK_FEE_USDC,
+      status: 'failed',
+      error: err.message,
+    };
+    console.warn(`[TASK_ECONOMY] ${taskId} fee settlement failed:`, err.message);
+  }
+
   await db.query(
     `INSERT INTO agent_task_results (agent_id, task_id, payload) VALUES ($1, $2, $3::jsonb)`,
-    [agentId, taskId, JSON.stringify(payload)],
+    [agentId, taskId, JSON.stringify({ ...payload, economy })],
   );
   await db.query(
     `UPDATE agents SET daily_paid_task_count = daily_paid_task_count + 1 WHERE id = $1`,
     [agentId],
   );
   recordReputationEvent(agentId, EVENT_TYPES.DAILY_TASK).catch(() => {});
-  _depositPlatformFee().catch(() => {}); // non-blocking
 }
 
 // ── DAILY_PRICE_REPORT ────────────────────────────────────────────────────────
-queue.process('DAILY_PRICE_REPORT', 3, async (job) => {
+registerTaskProcessor('DAILY_PRICE_REPORT', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -800,15 +926,13 @@ queue.process('DAILY_PRICE_REPORT', 3, async (job) => {
 });
 
 // ── DAILY_POOL_HEALTH ─────────────────────────────────────────────────────────
-queue.process('DAILY_POOL_HEALTH', 3, async (job) => {
+registerTaskProcessor('DAILY_POOL_HEALTH', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
 
   const forexRate = await oracle.getForexRate('EURC', 'USDC');
-  const poolState  = CURVE_USDC_EURC_POOL
-    ? await oracle.getCurvePoolState('USDC-EURC', CURVE_USDC_EURC_POOL)
-    : oracle.getMockPoolState('USDC-EURC', forexRate.rate);
+  const poolState  = await _getOracleStablePoolState(forexRate);
 
   const spread = Math.abs(poolState.impliedRate - forexRate.rate) / forexRate.rate;
   const health  = spread > 0.02 ? 'alert' : spread > 0.005 ? 'opportunity' : 'healthy';
@@ -825,7 +949,7 @@ queue.process('DAILY_POOL_HEALTH', 3, async (job) => {
 });
 
 // ── DAILY_YIELD_RANK ──────────────────────────────────────────────────────────
-queue.process('DAILY_YIELD_RANK', 3, async (job) => {
+registerTaskProcessor('DAILY_YIELD_RANK', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -845,15 +969,13 @@ queue.process('DAILY_YIELD_RANK', 3, async (job) => {
 });
 
 // ── DAILY_ARB_SCAN ────────────────────────────────────────────────────────────
-queue.process('DAILY_ARB_SCAN', 3, async (job) => {
+registerTaskProcessor('DAILY_ARB_SCAN', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
 
   const forexRate = await oracle.getForexRate('EURC', 'USDC');
-  const poolState  = CURVE_USDC_EURC_POOL
-    ? await oracle.getCurvePoolState('USDC-EURC', CURVE_USDC_EURC_POOL)
-    : oracle.getMockPoolState('USDC-EURC', forexRate.rate);
+  const poolState  = await _getOracleStablePoolState(forexRate);
 
   const signal = oracle.buildArbSignal({
     strategy:      'stablecoin_fx',
@@ -878,7 +1000,7 @@ queue.process('DAILY_ARB_SCAN', 3, async (job) => {
 });
 
 // ── DAILY_WALLET_DIGEST ───────────────────────────────────────────────────────
-queue.process('DAILY_WALLET_DIGEST', 3, async (job) => {
+registerTaskProcessor('DAILY_WALLET_DIGEST', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -904,7 +1026,7 @@ queue.process('DAILY_WALLET_DIGEST', 3, async (job) => {
 });
 
 // ── DAILY_FOREX_MATRIX ───────────────────────────────────────────────────────
-queue.process('DAILY_FOREX_MATRIX', 3, async (job) => {
+registerTaskProcessor('DAILY_FOREX_MATRIX', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -925,7 +1047,7 @@ queue.process('DAILY_FOREX_MATRIX', 3, async (job) => {
 });
 
 // ── DAILY_USDC_PEG_CHECK ─────────────────────────────────────────────────────
-queue.process('DAILY_USDC_PEG_CHECK', 3, async (job) => {
+registerTaskProcessor('DAILY_USDC_PEG_CHECK', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -943,7 +1065,7 @@ queue.process('DAILY_USDC_PEG_CHECK', 3, async (job) => {
 });
 
 // ── DAILY_MARKET_TAPE ────────────────────────────────────────────────────────
-queue.process('DAILY_MARKET_TAPE', 3, async (job) => {
+registerTaskProcessor('DAILY_MARKET_TAPE', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -964,7 +1086,7 @@ queue.process('DAILY_MARKET_TAPE', 3, async (job) => {
 });
 
 // ── DAILY_PROTOCOL_TVL ───────────────────────────────────────────────────────
-queue.process('DAILY_PROTOCOL_TVL', 3, async (job) => {
+registerTaskProcessor('DAILY_PROTOCOL_TVL', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -994,7 +1116,7 @@ queue.process('DAILY_PROTOCOL_TVL', 3, async (job) => {
 });
 
 // ── DAILY_ACTIVITY_RECAP ─────────────────────────────────────────────────────
-queue.process('DAILY_ACTIVITY_RECAP', 3, async (job) => {
+registerTaskProcessor('DAILY_ACTIVITY_RECAP', 3, async (job) => {
   const { agentId } = job.data;
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
@@ -1038,186 +1160,98 @@ queue.process('DAILY_ACTIVITY_RECAP', 3, async (job) => {
 // Each processor: guard → execute DeFi op → save result + fee deposit (fire-and-forget)
 
 // ── EXEC_CURVE_SWAP ───────────────────────────────────────────────────────────
-queue.process('EXEC_CURVE_SWAP', 2, async (job) => {
+registerTaskProcessor('EXEC_CURVE_SWAP', 2, async (job) => {
   const { agentId, params = {} } = job.data;
   const guard = await _paidTaskGuard(agentId);
   if (!guard.ok) return guard;
   const { agent } = guard;
 
-  const poolAddress = params.poolAddress || process.env.CURVE_USDC_EURC_POOL || null;
-  if (!poolAddress) return { ok: false, reason: 'curve_pool_not_configured' };
-
-  const indexIn   = params.indexIn  ?? 0;                   // 0 = USDC
-  const indexOut  = params.indexOut ?? 1;                   // 1 = EURC
-  const amountIn  = String(params.amountIn ?? '1');         // 1 USDC default
-  const tokenIn   = params.tokenInAddress
-    || (indexIn === 0 ? (process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000')
-                      : process.env.EURC_ADDRESS_ARC || '');
-
-  if (DRY_RUN) {
-    const payload = { dryRun: true, poolAddress, indexIn, indexOut, amountIn, executedAt: new Date().toISOString() };
-    await _savePaidTaskResult(agentId, 'EXEC_CURVE_SWAP', payload);
-    return { ok: true, payload };
-  }
-
-  const { decrypt } = require('../services/cryptoService');
-  const result = await protocols.executeCurveSwap({
-    poolAddress,
-    tokenInAddress: tokenIn,
-    indexIn,
-    indexOut,
-    amountIn,
-    agentPrivateKey: decrypt(agent.encrypted_private_key),
+  const result = await agenticTaskExecutionService.executeCurveSwapTask({
+    agent,
+    params,
+    dryRun: DRY_RUN,
+    defaultCurvePool: _getUsdcEurcCurvePool(),
   });
+  if (!result.ok) return result;
 
-  const payload = { ...result, poolAddress, indexIn, indexOut, amountIn, executedAt: new Date().toISOString() };
-  await _savePaidTaskResult(agentId, 'EXEC_CURVE_SWAP', payload);
-  return { ok: true, payload };
+  await _savePaidTaskResult(agentId, 'EXEC_CURVE_SWAP', result.payload, agent);
+  return result;
 });
 
 // ── EXEC_CCTP_BRIDGE ──────────────────────────────────────────────────────────
 // Free (Tier-1) — no platform fee charged.
-queue.process('EXEC_CCTP_BRIDGE', 1, async (job) => {
+registerTaskProcessor('EXEC_CCTP_BRIDGE', 1, async (job) => {
   const { agentId, params = {} } = job.data;
   const guard = await _freeExecGuard(agentId);
   if (!guard.ok) return guard;
   const { agent } = guard;
 
-  const fromChain  = params.fromChain  || 'arc';
-  const toChain    = params.toChain    || 'base';
-  const amountUsdc = params.amountUsdc || 1;
-
-  if (DRY_RUN) {
-    const payload = { dryRun: true, fromChain, toChain, amountUsdc, executedAt: new Date().toISOString() };
-    await _saveResultOnly(agentId, 'EXEC_CCTP_BRIDGE', payload);
-    return { ok: true, payload };
-  }
-
-  const result = await agentWalletService.agentBridgeFull({
+  const result = await agenticTaskExecutionService.executeBridgeTask({
     agent,
-    fromChain,
-    toChain,
-    amountUsdc,
+    params,
+    dryRun: DRY_RUN,
     onStep: (step) => console.log(`[EXEC_CCTP_BRIDGE] agent=${agentId} step=${step}`),
   });
+  if (!result.ok) return result;
 
-  const payload = { ...result, fromChain, toChain, amountUsdc, executedAt: new Date().toISOString() };
-  await _saveResultOnly(agentId, 'EXEC_CCTP_BRIDGE', payload);
-  return { ok: true, payload };
+  await _saveResultOnly(agentId, 'EXEC_CCTP_BRIDGE', result.payload);
+  return result;
 });
 
 // ── EXEC_YIELD_MOVE ───────────────────────────────────────────────────────────
-queue.process('EXEC_YIELD_MOVE', 2, async (job) => {
+registerTaskProcessor('EXEC_YIELD_MOVE', 2, async (job) => {
   const { agentId, params = {} } = job.data;
   const guard = await _paidTaskGuard(agentId);
   if (!guard.ok) return guard;
   const { agent } = guard;
 
-  const assetAddress = params.assetAddress
-    || process.env.USDC_ADDRESS_ARC
-    || '0x3600000000000000000000000000000000000000';
-  const amount = String(params.amount ?? '1');  // 1 USDC default
-  const action = params.action || 'supply';     // 'supply' | 'withdraw'
+  const result = await agenticTaskExecutionService.executeYieldMoveTask({
+    agent,
+    params,
+    dryRun: DRY_RUN,
+  });
+  if (!result.ok) return result;
 
-  if (DRY_RUN) {
-    const payload = { dryRun: true, assetAddress, amount, action, executedAt: new Date().toISOString() };
-    await _savePaidTaskResult(agentId, 'EXEC_YIELD_MOVE', payload);
-    return { ok: true, payload };
-  }
-
-  const { decrypt } = require('../services/cryptoService');
-  const privateKey  = decrypt(agent.encrypted_private_key);
-  const result = action === 'withdraw'
-    ? await protocols.executeAaveWithdraw({ assetAddress, amount, agentPrivateKey: privateKey })
-    : await protocols.executeAaveSupply({ assetAddress, amount, agentPrivateKey: privateKey });
-
-  const payload = { ...result, assetAddress, amount, action, executedAt: new Date().toISOString() };
-  await _savePaidTaskResult(agentId, 'EXEC_YIELD_MOVE', payload);
-  return { ok: true, payload };
+  await _savePaidTaskResult(agentId, 'EXEC_YIELD_MOVE', result.payload, agent);
+  return result;
 });
 
 // ── EXEC_ARB ──────────────────────────────────────────────────────────────────
-queue.process('EXEC_ARB', 2, async (job) => {
+registerTaskProcessor('EXEC_ARB', 2, async (job) => {
   const { agentId, params = {} } = job.data;
   const guard = await _paidTaskGuard(agentId);
   if (!guard.ok) return guard;
   const { agent } = guard;
 
-  const poolAddress = params.poolAddress || process.env.CURVE_USDC_EURC_POOL || null;
-  const amountIn    = String(params.amountIn ?? '1');
-
-  // Fetch oracle arb signal
-  const [forexRate] = await Promise.all([oracle.getForexRate('EURC', 'USDC')]);
-  const arbSignal   = oracle.buildArbSignal({
-    strategy:      'stablecoin_fx',
-    forexRate:     forexRate.rate,
-    poolRate:      forexRate.rate,
-    poolFee:       0.0004,
-    baseToken:     'EURC',
-    quoteToken:    'USDC',
-    poolLiquidity: 0,
-    priceImpacts:  {},
+  const result = await agenticTaskExecutionService.executeArbTask({
+    agent,
+    params,
+    dryRun: DRY_RUN,
+    pricingPool: _getEurcUsdcCurvePool(),
+    swapPool: _getUsdcEurcCurvePool(),
   });
+  if (!result.ok) return result;
 
-  const payload = { signal: arbSignal, poolAddress, amountIn, executedAt: new Date().toISOString() };
-
-  if (DRY_RUN || !poolAddress || arbSignal.confidence === 'LOW') {
-    payload.dryRun  = DRY_RUN || !poolAddress;
-    payload.skipped = !DRY_RUN && !!poolAddress && arbSignal.confidence === 'LOW';
-    await _savePaidTaskResult(agentId, 'EXEC_ARB', payload);
-    return { ok: true, payload };
-  }
-
-  const { decrypt } = require('../services/cryptoService');
-  const privateKey  = decrypt(agent.encrypted_private_key);
-  const indexIn     = arbSignal.action === 'buy_eurc' ? 0 : 1;
-  const indexOut    = arbSignal.action === 'buy_eurc' ? 1 : 0;
-  const tokenIn     = indexIn === 0
-    ? (process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000')
-    : (process.env.EURC_ADDRESS_ARC || '');
-
-  const swapResult = await protocols.executeCurveSwap({
-    poolAddress,
-    tokenInAddress: tokenIn,
-    indexIn,
-    indexOut,
-    amountIn,
-    agentPrivateKey: privateKey,
-  });
-  payload.swap = swapResult;
-  await _savePaidTaskResult(agentId, 'EXEC_ARB', payload);
-  return { ok: true, payload };
+  await _savePaidTaskResult(agentId, 'EXEC_ARB', result.payload, agent);
+  return result;
 });
 
 // ── EXEC_REBALANCE ────────────────────────────────────────────────────────────
-queue.process('EXEC_REBALANCE', 2, async (job) => {
+registerTaskProcessor('EXEC_REBALANCE', 2, async (job) => {
   const { agentId, params = {} } = job.data;
   const guard = await _paidTaskGuard(agentId);
   if (!guard.ok) return guard;
   const { agent } = guard;
 
-  const fromToken = params.fromToken || 'USDC';
-  const toToken   = params.toToken   || 'EURC';
-  const amountIn  = params.amountIn  || 1;
-  const slippage  = params.slippage  || 0.5;
-
-  if (DRY_RUN) {
-    const payload = { dryRun: true, fromToken, toToken, amountIn, executedAt: new Date().toISOString() };
-    await _savePaidTaskResult(agentId, 'EXEC_REBALANCE', payload);
-    return { ok: true, payload };
-  }
-
-  const result = await agentWalletService.agentSwap({
+  const result = await agenticTaskExecutionService.executeRebalanceTask({
     agent,
-    fromToken,
-    toToken,
-    amountIn,
-    slippagePct: slippage,
+    params,
+    dryRun: DRY_RUN,
   });
+  if (!result.ok) return result;
 
-  const payload = { ...result, fromToken, toToken, amountIn, executedAt: new Date().toISOString() };
-  await _savePaidTaskResult(agentId, 'EXEC_REBALANCE', payload);
-  return { ok: true, payload };
+  await _savePaidTaskResult(agentId, 'EXEC_REBALANCE', result.payload, agent);
+  return result;
 });
 
 async function scheduleDailyTasks() {
@@ -1234,3 +1268,5 @@ module.exports = queue;
 module.exports.scheduleOracleLoop = scheduleOracleLoop;
 module.exports.scheduleDefiLoop   = scheduleDefiLoop;
 module.exports.scheduleDailyTasks = scheduleDailyTasks;
+module.exports.canQueueManualTasks = canQueueManualTasks;
+module.exports.runTaskInline = runTaskInline;

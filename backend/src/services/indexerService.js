@@ -21,6 +21,10 @@ const POLL_INTERVAL_MS        = 30_000;
 const STARTUP_BACKFILL_BLOCKS = 300;
 const BLOCK_CHUNK_SIZE        = 250;
 const WALLET_CHUNK_SIZE       = 20;
+const STALE_PENDING_EVENT_AGE_HOURS = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_HOURS || '48', 10);
+const STALE_PENDING_RESTORE_BATCH_SIZE = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_RESTORE_BATCH_SIZE || '500', 10);
+const STALE_PENDING_DELETE_BATCH_SIZE = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_DELETE_BATCH_SIZE || '10000', 10);
+const STALE_PENDING_DELETE_MAX_BATCHES = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_DELETE_MAX_BATCHES || '120', 10);
 
 const WATCHED_CONTRACTS = {
   'Arc Testnet': {
@@ -38,6 +42,10 @@ const lastPolledBlock = new Map();
 
 let pollInFlight = false;
 let lastWatcherCount = null;
+
+function readPositiveInteger(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
 
 function getHttpProvider(chain, rpcHttp) {
   let provider = httpProviders.get(chain);
@@ -217,6 +225,109 @@ async function reconcilePendingEvents() {
   }
 }
 
+async function reconcileStalePendingEvents() {
+  const staleAgeHours = readPositiveInteger(STALE_PENDING_EVENT_AGE_HOURS, 48);
+  const restoreBatchSize = readPositiveInteger(STALE_PENDING_RESTORE_BATCH_SIZE, 500);
+  const deleteBatchSize = readPositiveInteger(STALE_PENDING_DELETE_BATCH_SIZE, 10_000);
+  const deleteMaxBatches = readPositiveInteger(STALE_PENDING_DELETE_MAX_BATCHES, 120);
+
+  let restored = 0;
+  let processed = 0;
+  let deleted = 0;
+
+  while (true) {
+    const { rows } = await db.query(
+      `SELECT ce.id, ce.chain, ce.tx_hash, ce.data, a.id AS agent_id
+         FROM chain_events ce
+         JOIN agents a ON LOWER(a.wallet_address) = LOWER(ce.data->>'to')
+        WHERE ce.event_type = 'Transfer'
+          AND ce.processed = FALSE
+          AND ce.created_at < NOW() - ($1::int * INTERVAL '1 hour')
+        ORDER BY ce.created_at ASC
+        LIMIT $2`,
+      [staleAgeHours, restoreBatchSize],
+    );
+
+    if (rows.length === 0) break;
+
+    const events = new Map();
+    for (const row of rows) {
+      if (!events.has(row.id)) {
+        events.set(row.id, {
+          id: row.id,
+          chain: row.chain,
+          txHash: row.tx_hash,
+          data: row.data || {},
+          agentIds: [],
+        });
+      }
+      events.get(row.id).agentIds.push(row.agent_id);
+    }
+
+    for (const event of events.values()) {
+      const from = event.data?.from;
+      const to = event.data?.to;
+      const amountUsdc = Number(event.data?.amountUsdc || 0);
+
+      if (event.txHash && from && to && amountUsdc > 0) {
+        for (const agentId of event.agentIds) {
+          const inserted = await ensureReceiveTransaction(
+            agentId,
+            event.chain,
+            amountUsdc,
+            from,
+            to,
+            event.txHash,
+          );
+          if (inserted) restored += 1;
+        }
+      }
+
+      await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [event.id]);
+      processed += 1;
+    }
+
+    if (rows.length < restoreBatchSize) break;
+  }
+
+  for (let batch = 0; batch < deleteMaxBatches; batch += 1) {
+    const { rows: [row] } = await db.query(
+      `WITH doomed AS (
+         SELECT ce.id
+           FROM chain_events ce
+          WHERE ce.event_type = 'Transfer'
+            AND ce.processed = FALSE
+            AND ce.created_at < NOW() - ($1::int * INTERVAL '1 hour')
+            AND NOT EXISTS (
+              SELECT 1
+                FROM agents a
+               WHERE LOWER(a.wallet_address) = LOWER(ce.data->>'to')
+            )
+          LIMIT $2
+       ), deleted AS (
+         DELETE FROM chain_events ce
+         USING doomed
+         WHERE ce.id = doomed.id
+         RETURNING 1
+       )
+       SELECT COUNT(*)::int AS deleted_count
+         FROM deleted`,
+      [staleAgeHours, deleteBatchSize],
+    );
+
+    const batchDeletedCount = Number(row?.deleted_count || 0);
+    deleted += batchDeletedCount;
+
+    if (batchDeletedCount < deleteBatchSize) break;
+  }
+
+  if (restored > 0 || processed > 0 || deleted > 0) {
+    console.log(
+      `[INDEXER] Reconciled stale pending events: restored=${restored} processed=${processed} deleted=${deleted}`,
+    );
+  }
+}
+
 async function getTransferLogs(provider, config, walletAddresses, fromBlock, toBlock) {
   const logs = [];
 
@@ -307,6 +418,9 @@ async function startIndexer() {
   console.log('[INDEXER] Starting HTTP polling indexer');
   await reconcilePendingEvents().catch(err =>
     console.error('[INDEXER] reconcile error:', err.message),
+  );
+  await reconcileStalePendingEvents().catch(err =>
+    console.error('[INDEXER] stale reconcile error:', err.message),
   );
   await pollAllChains().catch(err =>
     console.error('[INDEXER] startup error:', err.message),

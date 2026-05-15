@@ -38,7 +38,24 @@ function getExplorerTxUrl(chainName, txHash) {
 
 function getTxDisplay(tx) {
   const meta = getTxMeta(tx);
+  const isOracleSignal = tx.type === 'oracle_signal';
   const isSwap = tx.type === 'swap';
+
+  if (isOracleSignal) {
+    const strategy = meta.signal?.strategy === 'stablecoin_fx'
+      ? 'EURC/USDC oracle signal'
+      : 'Oracle signal';
+
+    return {
+      title: 'oracle opportunity',
+      routeLabel: `Arc Testnet · ${strategy}`,
+      amountLabel: Number(tx.amount_usdc) > 0
+        ? `${parseFloat(tx.amount_usdc).toFixed(2)} ${tx.token || 'USDC'}`
+        : null,
+      phase: 'Signal only — no on-chain trade was submitted',
+      links: [],
+    };
+  }
 
   if (isSwap) {
     const fromToken = meta.fromToken || tx.token || 'USDC';
@@ -450,22 +467,34 @@ export default function DashboardTab({ onNavigate }) {
               const isReceive = tx.type === 'receive';
               const isSend    = tx.type === 'send' || tx.type === 'nano_payment';
               const isSwap    = tx.type === 'swap';
+              const isOracleSignal = tx.type === 'oracle_signal';
               const isBridge  = tx.type === 'bridge' || tx.type === 'gas_topup';
 
               const TxIcon = isReceive ? ArrowDownLeft
                 : isSend    ? ArrowUpRight
                 : isSwap    ? Repeat2
+                : isOracleSignal ? Activity
                 : Zap;
 
               const iconColor = isReceive ? 'text-arc-green'
                 : isSend    ? 'text-blue-500'
                 : isSwap    ? 'text-purple-500'
+                : isOracleSignal ? 'text-sky-500'
                 : 'text-slate-400';
 
               const displayTitle = isReceive ? 'Received'
                 : isSend && tx.type === 'nano_payment' ? 'Nano payment'
                 : isSend ? 'Sent'
                 : title;
+
+              const statusLabel = isOracleSignal ? 'signal' : tx.status;
+              const statusVariant = isOracleSignal
+                ? 'slate'
+                : tx.status === 'confirmed'
+                  ? 'green'
+                  : tx.status === 'failed'
+                    ? 'red'
+                    : 'yellow';
 
               const meta = getTxMeta(tx);
               const counterpart = isReceive
@@ -478,12 +507,12 @@ export default function DashboardTab({ onNavigate }) {
                     <TxIcon size={15} className={`shrink-0 ${iconColor}`} />
                     <span className="font-semibold text-slate-800 capitalize">{displayTitle}</span>
                     {amountLabel && (
-                      <span className={`font-semibold ${isReceive ? 'text-arc-green' : 'text-slate-700'}`}>
+                      <span className={`font-semibold ${isReceive ? 'text-arc-green' : isOracleSignal ? 'text-sky-700' : 'text-slate-700'}`}>
                         {isReceive ? '+' : isSend ? '-' : ''}{amountLabel}
                       </span>
                     )}
-                    <Badge variant={tx.status === 'confirmed' ? 'green' : tx.status === 'failed' ? 'red' : 'yellow'} className="ml-auto">
-                      {tx.status}
+                    <Badge variant={statusVariant} className="ml-auto">
+                      {statusLabel}
                     </Badge>
                   </div>
                   <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 pl-[23px] text-xs text-slate-500">

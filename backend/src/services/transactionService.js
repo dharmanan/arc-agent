@@ -24,6 +24,8 @@ const relayerService        = require('./relayerService');
 const agentService          = require('./agentService');
 const agentWalletService    = require('./agentWalletService');
 const bridgeActivityService = require('./bridgeActivityService');
+const gatewayAuditService   = require('./agenticEconomy/gatewayAuditService');
+const gatewayBuyerService   = require('./agenticEconomy/gatewayBuyer');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 /**
@@ -83,6 +85,35 @@ async function rollbackDailyLimit(agentId, amountUsdc) {
   ).catch(() => {});
 }
 
+async function recordNanoAuditEvent({
+  agentId,
+  txId,
+  amountUsdc,
+  token = 'USDC',
+  fromChain,
+  toChain,
+  toAddress,
+  status,
+  txHash = null,
+  payload = {},
+}) {
+  await gatewayAuditService.recordAgenticPaymentEventSafe({
+    agentId,
+    eventType: 'nano_payment',
+    rail: 'circle_gateway',
+    referenceType: 'transaction',
+    referenceId: txId,
+    txHash,
+    amountUsdc,
+    token,
+    status,
+    sourceChain: fromChain,
+    destinationChain: toChain,
+    counterpartyAddress: toAddress,
+    payload,
+  });
+}
+
 async function recordTx(agentId, type, fields, status = 'pending') {
   const id = uuidv4();
   await db.query(
@@ -106,6 +137,34 @@ async function updateTxStatus(txId, status, txHash = null) {
   await db.query(
     'UPDATE transactions SET status=$1, tx_hash=$2, confirmed_at=NOW() WHERE id=$3',
     [status, txHash, txId],
+  );
+}
+
+async function updateTxMeta(txId, meta) {
+  await db.query(
+    "UPDATE transactions SET meta = COALESCE(meta, '{}'::jsonb) || $1::jsonb WHERE id = $2",
+    [JSON.stringify(meta || {}), txId],
+  );
+}
+
+async function reserveNanoDailyLimit(agentId, amountUsdc) {
+  const { rows } = await db.query(
+    'SELECT daily_spent_usdc, daily_limit_usdc FROM agents WHERE id = $1',
+    [agentId],
+  );
+  const row = rows[0];
+
+  if (!row) {
+    throw Object.assign(new Error('Agent not found'), { status: 404 });
+  }
+
+  if (parseFloat(row.daily_spent_usdc) + amountUsdc > parseFloat(row.daily_limit_usdc)) {
+    throw Object.assign(new Error('Daily limit exceeded'), { status: 422, code: 'DAILY_LIMIT_EXCEEDED' });
+  }
+
+  await db.query(
+    'UPDATE agents SET daily_spent_usdc = daily_spent_usdc + $1 WHERE id = $2',
+    [amountUsdc, agentId],
   );
 }
 
@@ -158,16 +217,7 @@ async function sendPayment({ agent, toAddress, amountUsdc, chain, token = 'USDC'
 
   // Check limits (nano payments skip per-trade max but still count toward daily)
   if (isNano) {
-    // Just check daily, no per-trade check for nano
-    const { rows } = await db.query(
-      'SELECT daily_spent_usdc, daily_limit_usdc FROM agents WHERE id = $1',
-      [agent.id],
-    );
-    const row = rows[0];
-    if (parseFloat(row.daily_spent_usdc) + amountUsdc > parseFloat(row.daily_limit_usdc)) {
-      throw Object.assign(new Error('Daily limit exceeded'), { status: 422 });
-    }
-    await db.query('UPDATE agents SET daily_spent_usdc = daily_spent_usdc + $1 WHERE id = $2', [amountUsdc, agent.id]);
+    await reserveNanoDailyLimit(agent.id, amountUsdc);
   } else {
     await checkAndReserveDailyLimit(agent, amountUsdc);
   }
@@ -188,14 +238,159 @@ async function sendPayment({ agent, toAddress, amountUsdc, chain, token = 'USDC'
     : agentWalletService.agentSend({ agent: rawAgent, toAddress, amountUsdc, token });
 
   executePromise
-    .then(hash => updateTxStatus(txId, 'confirmed', hash))
-    .catch(err => {
+    .then(async (hash) => {
+      if (isNano && token === 'USDC') {
+        await recordNanoAuditEvent({
+          agentId: agent.id,
+          txId,
+          amountUsdc,
+          token,
+          fromChain: chain,
+          toChain: chain,
+          toAddress,
+          status: 'confirmed',
+          txHash: hash,
+          payload: {
+            route: 'send',
+            isNano: true,
+          },
+        });
+      }
+      await updateTxStatus(txId, 'confirmed', hash);
+    })
+    .catch(async (err) => {
       console.error(`[TX ${txType.toUpperCase()}]`, err.message);
+      if (isNano && token === 'USDC') {
+        await recordNanoAuditEvent({
+          agentId: agent.id,
+          txId,
+          amountUsdc,
+          token,
+          fromChain: chain,
+          toChain: chain,
+          toAddress,
+          status: 'failed',
+          payload: {
+            route: 'send',
+            isNano: true,
+            error: err.message,
+          },
+        });
+      }
       updateTxStatus(txId, 'failed').catch(() => {});
       rollbackDailyLimit(agent.id, amountUsdc);
     });
 
   return { txId, status: 'executing', isAgentic: true, isNano };
+}
+
+async function nanoPay({ agent, toAddress, amountUsdc, memo = null }) {
+  if (amountUsdc >= agentWalletService.NANO_THRESHOLD_USDC) {
+    throw Object.assign(
+      new Error(`nanoPay requires amount < ${agentWalletService.NANO_THRESHOLD_USDC} USDC`),
+      { status: 422 },
+    );
+  }
+
+  await reserveNanoDailyLimit(agent.id, amountUsdc);
+
+  const rawAgent = await agentService.getAgentWithKey(agent.id, agent.userId || agent.user_id);
+  if (!rawAgent) throw new Error('Agent not found');
+
+  const fromAddress = agent.walletAddress || agent.wallet_address;
+  const txId = await recordTx(agent.id, 'nano_payment', {
+    fromChain: 'Arc Testnet',
+    toChain: 'Arc Testnet',
+    amountUsdc,
+    token: 'USDC',
+    fromAddress,
+    toAddress,
+    meta: {
+      isAgentic: true,
+      isNano: true,
+      rail: 'circle_gateway',
+      memo,
+    },
+  });
+
+  gatewayBuyerService.executeGatewayTransfer({
+    agent: rawAgent,
+    amountUsdc,
+    recipient: toAddress,
+    fromChain: 'Arc Testnet',
+    toChain: 'Arc Testnet',
+  })
+    .then(async ({ deposited, depositResult, transferResult }) => {
+      const auditPayload = {
+        route: 'nano-pay',
+        deposited,
+        memo,
+        gatewayTransferTxHash: transferResult?.mintTxHash || null,
+        gatewaySourceChain: transferResult?.sourceChain || 'Arc Testnet',
+        gatewayDestinationChain: transferResult?.destinationChain || 'Arc Testnet',
+        gatewayRecipient: transferResult?.recipient || toAddress,
+        gatewayDepositTxHash: depositResult?.depositTxHash || null,
+        gatewayDepositApprovalTxHash: depositResult?.approvalTxHash || null,
+      };
+      await updateTxMeta(txId, {
+        rail: 'circle_gateway',
+        deposited,
+        memo,
+        gatewayTransferTxHash: transferResult?.mintTxHash || null,
+        gatewaySourceChain: transferResult?.sourceChain || 'Arc Testnet',
+        gatewayDestinationChain: transferResult?.destinationChain || 'Arc Testnet',
+        gatewayRecipient: transferResult?.recipient || toAddress,
+        gatewayDepositTxHash: depositResult?.depositTxHash || null,
+        gatewayDepositApprovalTxHash: depositResult?.approvalTxHash || null,
+      });
+      await recordNanoAuditEvent({
+        agentId: agent.id,
+        txId,
+        amountUsdc,
+        token: 'USDC',
+        fromChain: 'Arc Testnet',
+        toChain: 'Arc Testnet',
+        toAddress,
+        status: 'confirmed',
+        txHash: transferResult?.mintTxHash || null,
+        payload: auditPayload,
+      });
+      await updateTxStatus(txId, 'confirmed', transferResult?.mintTxHash || null);
+    })
+    .catch(async (err) => {
+      console.error('[TX NANO_PAY_GATEWAY]', err.message);
+      updateTxMeta(txId, {
+        rail: 'circle_gateway',
+        memo,
+        gatewayFailed: true,
+        lastError: err.message,
+      }).catch(() => {});
+      await recordNanoAuditEvent({
+        agentId: agent.id,
+        txId,
+        amountUsdc,
+        token: 'USDC',
+        fromChain: 'Arc Testnet',
+        toChain: 'Arc Testnet',
+        toAddress,
+        status: 'failed',
+        payload: {
+          route: 'nano-pay',
+          memo,
+          error: err.message,
+        },
+      });
+      updateTxStatus(txId, 'failed').catch(() => {});
+      rollbackDailyLimit(agent.id, amountUsdc);
+    });
+
+  return {
+    txId,
+    status: 'executing',
+    isAgentic: true,
+    isNano: true,
+    rail: 'circle_gateway',
+  };
 }
 
 /**
@@ -673,6 +868,7 @@ async function getTransactionStatus(txId, userId) {
 }
 
 module.exports = {
+  nanoPay,
   sendPayment,
   bridgeTokens,
   bridgeNativeGasTopUp,

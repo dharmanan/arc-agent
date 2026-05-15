@@ -13,6 +13,7 @@ const { z }         = require('zod');
 const { requireAuth } = require('../middleware/auth');
 const agentService  = require('../services/agentService');
 const llmService    = require('../services/llmService');
+const reputationService = require('../services/reputationService');
 const { encrypt }   = require('../services/cryptoService');
 
 const LLM_MODEL_OPTIONS = [
@@ -147,6 +148,19 @@ router.get('/:id/status', async (req, res, next) => {
     const status = await agentService.getAgentStatus(req.params.id, req.user.userId);
     if (!status) return res.status(404).json({ error: 'Agent not found' });
     res.json(status);
+  } catch (err) { next(err); }
+});
+
+// ── Reputation overview ──────────────────────────────────────────────────────
+router.get('/:id/reputation', async (req, res, next) => {
+  try {
+    const overview = await reputationService.getReputationOverview(
+      req.params.id,
+      req.user.userId,
+      req.query.limit,
+    );
+    if (!overview) return res.status(404).json({ error: 'Agent not found' });
+    res.json(overview);
   } catch (err) { next(err); }
 });
 

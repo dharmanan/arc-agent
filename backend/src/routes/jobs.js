@@ -18,6 +18,8 @@ const { ethers }      = require('ethers');
 const { requireAuth } = require('../middleware/auth');
 const db              = require('../db');
 const { decrypt }     = require('../services/cryptoService');
+const gatewayAuditService = require('../services/agenticEconomy/gatewayAuditService');
+const jobEconomyService = require('../services/agenticEconomy/jobEconomyService');
 const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationService');
 
 router.use(requireAuth);
@@ -57,6 +59,15 @@ async function _getProviderAndSigner(privateKey) {
   return { provider, signer };
 }
 
+function _decorateJob(job) {
+  if (!job) return job;
+
+  return {
+    ...job,
+    economy: jobEconomyService.buildJobEconomy({ economy: job.economy, job }),
+  };
+}
+
 // ── GET /api/agents/:id/jobs ──────────────────────────────────────────────────
 router.get('/', async (req, res, next) => {
   try {
@@ -69,7 +80,7 @@ router.get('/', async (req, res, next) => {
 
     const { rows } = await db.query(
       `SELECT id, job_id_onchain, client_address, provider_address, amount_usdc,
-              description, status, deliverable_hash, tx_hash_create, tx_hash_settle, created_at, updated_at
+              description, status, deliverable_hash, tx_hash_create, tx_hash_settle, economy, created_at, updated_at
        FROM agent_jobs
        WHERE agent_id = $1 ${status ? 'AND status = $3' : ''}
        ORDER BY created_at DESC
@@ -77,7 +88,11 @@ router.get('/', async (req, res, next) => {
       status ? [agentId, limit, status] : [agentId, limit],
     );
 
-    res.json({ jobs: rows, onchainEnabled: !!AGENTIC_COMMERCE_ADDRESS });
+    res.json({
+      jobs: rows.map(_decorateJob),
+      onchainEnabled: !!AGENTIC_COMMERCE_ADDRESS,
+      jobEconomy: jobEconomyService.getJobEconomyConfigSummary(),
+    });
   } catch (err) { next(err); }
 });
 
@@ -94,7 +109,7 @@ router.get('/:jobId', async (req, res, next) => {
     );
     if (!job) return res.status(404).json({ error: 'job_not_found' });
 
-    res.json(job);
+    res.json(_decorateJob(job));
   } catch (err) { next(err); }
 });
 
@@ -117,11 +132,12 @@ router.post('/', async (req, res, next) => {
 
     let jobIdOnchain = null;
     let txHashCreate = null;
+    const initialStatus = 'funded';
 
     // On-chain: only if contract deployed
-    if (AGENTIC_COMMERCE_ADDRESS && agent.encrypted_private_key) {
+    if (AGENTIC_COMMERCE_ADDRESS && agent.private_key_encrypted) {
       try {
-        const privateKey      = decrypt(agent.encrypted_private_key);
+        const privateKey      = decrypt(agent.private_key_encrypted);
         const { signer }      = await _getProviderAndSigner(privateKey);
         const contract        = _getContract(signer);
         const amountWei       = ethers.parseUnits(String(amountUsdc), 6); // USDC 6 dec
@@ -147,15 +163,64 @@ router.post('/', async (req, res, next) => {
       }
     }
 
+    let createFee = null;
+    try {
+      createFee = await jobEconomyService.settleJobCreateFee({
+        agent,
+        jobId: jobIdOnchain,
+        amountUsdc,
+        providerAddress,
+        description,
+      });
+    } catch (err) {
+      console.warn('[JOB_ECONOMY] create fee settlement failed:', err.message);
+      createFee = jobEconomyService.buildJobCreateFeeFailure({
+        jobId: jobIdOnchain,
+        amountUsdc,
+        providerAddress,
+        description,
+        error: err.message,
+      });
+    }
+
+    const economy = jobEconomyService.buildJobEconomy({
+      economy: { createFee },
+      job: {
+        job_id_onchain: jobIdOnchain,
+        status: initialStatus,
+        tx_hash_settle: null,
+      },
+    });
+
     const { rows: [job] } = await db.query(
       `INSERT INTO agent_jobs
-         (agent_id, job_id_onchain, client_address, provider_address, amount_usdc, description, status, tx_hash_create)
-       VALUES ($1, $2, $3, $4, $5, $6, 'open', $7)
+         (agent_id, job_id_onchain, client_address, provider_address, amount_usdc, description, status, tx_hash_create, economy)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
        RETURNING *`,
-      [agentId, jobIdOnchain, agent.wallet_address, providerAddress, amountUsdc, description, txHashCreate],
+      [agentId, jobIdOnchain, agent.wallet_address, providerAddress, amountUsdc, description, initialStatus, txHashCreate, JSON.stringify(economy)],
     );
 
-    res.status(201).json({ job, onchainEnabled: !!AGENTIC_COMMERCE_ADDRESS });
+    await gatewayAuditService.recordAgenticPaymentEventSafe({
+      agentId,
+      eventType: 'job_create_fee',
+      rail: createFee?.rail || 'agentic_job_economy',
+      referenceType: 'job',
+      referenceId: job.id,
+      txHash: createFee?.gatewayMintTxHash || null,
+      amountUsdc: createFee?.feeUsdc ?? null,
+      token: 'USDC',
+      status: createFee?.status || 'skipped',
+      sourceChain: createFee?.sourceChain || 'Arc Testnet',
+      destinationChain: createFee?.destinationChain || 'Arc Testnet',
+      counterpartyAddress: createFee?.recipient || createFee?.sellerAddress || null,
+      payload: createFee || { status: 'missing' },
+    });
+
+    res.status(201).json({
+      job: _decorateJob(job),
+      onchainEnabled: !!AGENTIC_COMMERCE_ADDRESS,
+      jobEconomy: jobEconomyService.getJobEconomyConfigSummary(),
+    });
   } catch (err) { next(err); }
 });
 
@@ -178,9 +243,9 @@ router.put('/:jobId/deliver', async (req, res, next) => {
 
     let txHashDeliver = null;
 
-    if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.encrypted_private_key) {
+    if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.private_key_encrypted) {
       try {
-        const privateKey  = decrypt(agent.encrypted_private_key);
+        const privateKey  = decrypt(agent.private_key_encrypted);
         const { signer }  = await _getProviderAndSigner(privateKey);
         const contract    = _getContract(signer);
         const hashBytes   = deliverableHash.startsWith('0x')
@@ -223,9 +288,9 @@ router.put('/:jobId/complete', async (req, res, next) => {
 
     let txHashSettle = null;
 
-    if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.encrypted_private_key) {
+    if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.private_key_encrypted) {
       try {
-        const privateKey = decrypt(agent.encrypted_private_key);
+        const privateKey = decrypt(agent.private_key_encrypted);
         const { signer } = await _getProviderAndSigner(privateKey);
         const contract   = _getContract(signer);
 
@@ -237,18 +302,43 @@ router.put('/:jobId/complete', async (req, res, next) => {
       }
     }
 
+    const completedEconomy = jobEconomyService.buildJobEconomy({
+      economy: job.economy,
+      job: {
+        ...job,
+        status: 'completed',
+        tx_hash_settle: txHashSettle,
+      },
+    });
+
     const { rows: [updated] } = await db.query(
       `UPDATE agent_jobs
-       SET status = 'completed', tx_hash_settle = $1, updated_at = NOW()
-       WHERE id = $2
+       SET status = 'completed', tx_hash_settle = $1, economy = $2::jsonb, updated_at = NOW()
+       WHERE id = $3
        RETURNING *`,
-      [txHashSettle, jobId],
+      [txHashSettle, JSON.stringify(completedEconomy), jobId],
     );
+
+    await gatewayAuditService.recordAgenticPaymentEventSafe({
+      agentId,
+      eventType: 'job_payout',
+      rail: completedEconomy.payout?.rail || 'agentic_job_escrow',
+      referenceType: 'job',
+      referenceId: updated.id,
+      txHash: txHashSettle,
+      amountUsdc: updated.amount_usdc,
+      token: 'USDC',
+      status: completedEconomy.payout?.status || 'completed',
+      sourceChain: 'Arc Testnet',
+      destinationChain: 'Arc Testnet',
+      counterpartyAddress: updated.provider_address || null,
+      payload: completedEconomy.payout || {},
+    });
 
     // Reputation event — fire-and-forget
     recordReputationEvent(agentId, EVENT_TYPES.TX_COMPLETED).catch(() => {});
 
-    res.json(updated);
+    res.json(_decorateJob(updated));
   } catch (err) { next(err); }
 });
 
@@ -268,9 +358,9 @@ router.put('/:jobId/cancel', async (req, res, next) => {
       return res.status(409).json({ error: 'job_already_finalized', status: job.status });
     }
 
-    if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.encrypted_private_key) {
+    if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.private_key_encrypted) {
       try {
-        const privateKey = decrypt(agent.encrypted_private_key);
+        const privateKey = decrypt(agent.private_key_encrypted);
         const { signer } = await _getProviderAndSigner(privateKey);
         const contract   = _getContract(signer);
         const tx = await contract.cancel(BigInt(job.job_id_onchain));

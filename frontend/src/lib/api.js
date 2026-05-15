@@ -58,6 +58,7 @@ export const agents = {
   testLlm:           (id, data)  => post(`/agents/${id}/test-llm`, data),
   updatePermissions: (id, perms) => put(`/agents/${id}/permissions`, perms),
   status:            (id)        => get(`/agents/${id}/status`),
+  reputation:        (id, limit) => get(`/agents/${id}/reputation${limit ? `?limit=${limit}` : ''}`),
   delete:            (id)        => del(`/agents/${id}`),
   retryIdentity:     (id)        => post(`/agents/${id}/register-identity`),
 };
@@ -104,6 +105,18 @@ export const tasks = {
   poolBalance: ()                        => get('/tasks/pool-balance'),
   runTask:     (agentId, taskId, params) => post(`/tasks/agents/${agentId}/tasks/run`, { taskId, params }),
   results:     (agentId, limit)          => get(`/tasks/agents/${agentId}/tasks/results${limit ? `?limit=${limit}` : ''}`),
+};
+
+// ── Oracle ───────────────────────────────────────────────────────────────────
+export const oracle = {
+  status: () => get('/oracle/status'),
+  gatewayBalance: (agentId, chainName) => {
+    const params = new URLSearchParams({ agentId });
+    if (chainName) params.set('chainName', chainName);
+    return get(`/oracle/debug/gateway-balance?${params.toString()}`);
+  },
+  fundGateway: (agentId, body = {}) => post('/oracle/gateway/fund', { agentId, ...body }),
+  testAlert: (body = {}) => post('/oracle/debug/test-alert', body),
 };
 
 // ── Jobs (ERC-8183 AgenticCommerce) ───────────────────────────────────────────

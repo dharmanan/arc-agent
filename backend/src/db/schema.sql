@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS agents (
   status                    VARCHAR(20)    NOT NULL DEFAULT 'idle',  -- idle|active|locked
   daily_spent_usdc          NUMERIC(20,6)  NOT NULL DEFAULT 0,
   last_reset_day            DATE           NOT NULL DEFAULT CURRENT_DATE,
+  market_analysis_last_run_at TIMESTAMPTZ,
+  market_analysis_last_status VARCHAR(30) NOT NULL DEFAULT 'idle',
+  oracle_last_run_at         TIMESTAMPTZ,
+  oracle_last_status         VARCHAR(30) NOT NULL DEFAULT 'idle',
+  defi_loop_last_run_at      TIMESTAMPTZ,
+  defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle',
+  reputation_last_run_at     TIMESTAMPTZ,
+  reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle',
 
   -- ERC-8004 onchain identity (Arc Testnet IdentityRegistry)
   -- status: 'pending' | 'registered' | 'failed'
@@ -128,6 +136,14 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_defi_loop_count       INTEGER 
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_market_analysis_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_auto_tx_count         INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_limit_reset_at        TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_run_at TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_status VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_last_run_at         TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_last_status         VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_run_at      TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_run_at     TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 5. AGENT PERMISSIONS (only relevant in smart mode)
@@ -193,6 +209,7 @@ CREATE TABLE IF NOT EXISTS chain_events (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_events_processed ON chain_events(processed) WHERE NOT processed;
+CREATE INDEX IF NOT EXISTS idx_events_processed_created_at ON chain_events(created_at) WHERE processed = TRUE;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 9. LLM AUDIT LOG (every AI decision recorded for transparency)
@@ -281,6 +298,24 @@ CREATE TABLE IF NOT EXISTS oracle_payments (
 CREATE INDEX IF NOT EXISTS idx_oracle_payments_endpoint ON oracle_payments(endpoint, created_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 13.1 ORACLE ALERT EVENTS (threshold-triggered observability + alarm ledger)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS oracle_alert_events (
+  id             BIGSERIAL PRIMARY KEY,
+  event_type     TEXT NOT NULL,
+  event_count    INTEGER NOT NULL,
+  delivery       TEXT NOT NULL DEFAULT 'database',
+  delivery_state TEXT NOT NULL,
+  message        TEXT,
+  payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_oracle_alert_events_type
+  ON oracle_alert_events(event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_oracle_alert_events_state
+  ON oracle_alert_events(delivery_state, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- 14. AGENT REPUTATION EVENTS (local record of ERC-8004 reputation calls)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS agent_reputation_events (
@@ -303,15 +338,21 @@ CREATE TABLE IF NOT EXISTS agent_jobs (
   provider_address  VARCHAR(42),         -- agent wallet (fulfills the job)
   amount_usdc       NUMERIC(20,6),
   description       TEXT,
-  status            VARCHAR(20) NOT NULL DEFAULT 'open',
-                                         -- open|funded|delivered|completed|cancelled
+  status            VARCHAR(20) NOT NULL DEFAULT 'funded',
+                                         -- funded|delivered|completed|cancelled (legacy open rows may still exist)
   deliverable_hash  VARCHAR(100),        -- keccak256 hash of deliverable
   tx_hash_create    VARCHAR(100),
   tx_hash_deliver   VARCHAR(100),
   tx_hash_settle    VARCHAR(100),
+  economy           JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE agent_jobs ALTER COLUMN status SET DEFAULT 'funded';
+ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS economy JSONB NOT NULL DEFAULT '{}'::jsonb;
+UPDATE agent_jobs
+SET status = 'funded', updated_at = NOW()
+WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_jobs_agent  ON agent_jobs(agent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON agent_jobs(status);
 
@@ -319,3 +360,30 @@ DROP TRIGGER IF EXISTS trg_jobs_updated_at ON agent_jobs;
 CREATE TRIGGER trg_jobs_updated_at
   BEFORE UPDATE ON agent_jobs
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 16. AGENTIC PAYMENT EVENTS (central audit log for gateway-backed economy)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agentic_payment_events (
+  id                   BIGSERIAL PRIMARY KEY,
+  agent_id             UUID REFERENCES agents(id) ON DELETE SET NULL,
+  event_type           TEXT NOT NULL,
+  rail                 TEXT NOT NULL,
+  reference_type       TEXT NOT NULL,
+  reference_id         TEXT,
+  tx_hash              TEXT,
+  amount_usdc          NUMERIC(20,6),
+  token                TEXT NOT NULL DEFAULT 'USDC',
+  status               TEXT NOT NULL,
+  source_chain         TEXT,
+  destination_chain    TEXT,
+  counterparty_address TEXT,
+  payload              JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agentic_payment_events_agent
+  ON agentic_payment_events(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agentic_payment_events_reference
+  ON agentic_payment_events(reference_type, reference_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agentic_payment_events_rail
+  ON agentic_payment_events(rail, created_at DESC);

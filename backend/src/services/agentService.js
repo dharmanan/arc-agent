@@ -331,7 +331,13 @@ async function updatePermissions(agentId, userId, permsMap) {
 async function getAgentStatus(agentId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
-            a.llm_model, a.wallet_address, a.last_reset_day
+            a.llm_model, a.wallet_address, a.last_reset_day,
+            a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.reputation_enabled,
+            a.daily_market_analysis_count, a.daily_defi_loop_count, a.daily_auto_tx_count,
+            a.market_analysis_last_run_at, a.market_analysis_last_status,
+            a.oracle_last_run_at, a.oracle_last_status,
+            a.defi_loop_last_run_at, a.defi_loop_last_status,
+            a.reputation_last_run_at, a.reputation_last_status
      FROM agents a
      WHERE a.id = $1 AND a.user_id = $2`,
     [agentId, userId],
@@ -359,6 +365,36 @@ async function getAgentStatus(agentId, userId) {
     isSmartMode:   a.is_smart_mode,
     llmModel:      a.llm_model,
     walletAddress: a.wallet_address,
+    config: {
+      reputationRegistryConfigured: Boolean(process.env.REPUTATION_REGISTRY_ADDRESS),
+    },
+    automation: {
+      marketAnalysis: {
+        enabled: a.market_analysis_enabled ?? false,
+        lastRunAt: a.market_analysis_last_run_at,
+        lastStatus: a.market_analysis_last_status || 'idle',
+      },
+      oracle: {
+        enabled: a.oracle_enabled ?? false,
+        lastRunAt: a.oracle_last_run_at,
+        lastStatus: a.oracle_last_status || 'idle',
+        todayCount: a.daily_market_analysis_count ?? 0,
+        dailyCap: 48,
+      },
+      defiLoop: {
+        enabled: a.defi_loop_enabled ?? false,
+        lastRunAt: a.defi_loop_last_run_at,
+        lastStatus: a.defi_loop_last_status || 'idle',
+        todayCount: a.daily_defi_loop_count ?? 0,
+        dailyCap: 10,
+        autoTxToday: a.daily_auto_tx_count ?? 0,
+      },
+      reputation: {
+        enabled: a.reputation_enabled ?? false,
+        lastRunAt: a.reputation_last_run_at,
+        lastStatus: a.reputation_last_status || 'idle',
+      },
+    },
   };
 }
 
