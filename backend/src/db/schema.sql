@@ -285,6 +285,36 @@ CREATE INDEX IF NOT EXISTS idx_task_results_agent ON agent_task_results(agent_id
 CREATE INDEX IF NOT EXISTS idx_task_results_task  ON agent_task_results(task_id, created_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 12.1 AGENT TASK RUNS (queued/running/completed manual task execution state)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_task_runs (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id      UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  task_id       TEXT NOT NULL REFERENCES task_catalog(id),
+  status        TEXT NOT NULL DEFAULT 'queued',
+  stage_key     TEXT,
+  stage_label   TEXT,
+  stage_detail  TEXT,
+  params        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error         TEXT,
+  result_payload JSONB,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_agent_created
+  ON agent_task_runs(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runs_agent_status
+  ON agent_task_runs(agent_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_status
+  ON agent_task_runs(task_id, status, created_at DESC);
+
+DROP TRIGGER IF EXISTS trg_task_runs_updated_at ON agent_task_runs;
+CREATE TRIGGER trg_task_runs_updated_at
+  BEFORE UPDATE ON agent_task_runs
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- 13. ORACLE PAYMENTS (x402 nanopayment audit log — one row per verified tx)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS oracle_payments (

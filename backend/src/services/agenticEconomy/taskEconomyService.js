@@ -3,57 +3,73 @@
 const gatewayAuditService = require('./gatewayAuditService');
 const gatewayBuyerService = require('./gatewayBuyer');
 const { logTaskEconomy } = require('./logger');
+const { getRevenuePoolAddress, getRevenuePoolSource } = require('./revenuePoolConfig');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 const TASK_ECONOMY_CHAIN = process.env.TASK_ECONOMY_CHAIN || 'Arc Testnet';
-const TASK_ECONOMY_PAY_ADDRESS = process.env.TASK_ECONOMY_PAY_ADDRESS
-  || process.env.AGENTIC_ECONOMY_PAY_ADDRESS
-  || process.env.ORACLE_PAY_ADDRESS
-  || null;
+const TASK_ECONOMY_PAY_ADDRESS = process.env.TASK_ECONOMY_PAY_ADDRESS || null;
 
-function getTaskEconomyAddressSource() {
-  if (process.env.TASK_ECONOMY_PAY_ADDRESS) return 'TASK_ECONOMY_PAY_ADDRESS';
-  if (process.env.AGENTIC_ECONOMY_PAY_ADDRESS) return 'AGENTIC_ECONOMY_PAY_ADDRESS';
-  if (process.env.ORACLE_PAY_ADDRESS) return 'ORACLE_PAY_ADDRESS';
-  return 'missing';
+function getTaskEconomyRecipientConfig() {
+  if (TASK_ECONOMY_PAY_ADDRESS) {
+    return {
+      address: TASK_ECONOMY_PAY_ADDRESS,
+      configured: true,
+      kind: 'explicit_address',
+      source: 'TASK_ECONOMY_PAY_ADDRESS',
+    };
+  }
+
+  return {
+    address: getRevenuePoolAddress(),
+    configured: true,
+    kind: 'revenue_pool',
+    source: getRevenuePoolSource() === 'env'
+      ? 'REVENUE_POOL_ADDRESS'
+      : 'verified_default_revenue_pool',
+  };
 }
 
 function getTaskEconomyConfigSummary() {
+  const recipient = getTaskEconomyRecipientConfig();
+
   return {
-    mode: 'circle_gateway_task_fee',
+    mode: 'circle_gateway_execution_fee',
     chain: TASK_ECONOMY_CHAIN,
-    sellerAddress: TASK_ECONOMY_PAY_ADDRESS,
-    configured: Boolean(TASK_ECONOMY_PAY_ADDRESS),
-    payAddressSource: getTaskEconomyAddressSource(),
+    sellerAddress: recipient.address,
+    recipientAddress: recipient.address,
+    recipientKind: recipient.kind,
+    configured: recipient.configured,
+    payAddressSource: recipient.source,
     dryRun: DRY_RUN,
   };
 }
 
-async function finalizeTaskEconomyResult(result, { agentId, taskId }) {
+async function finalizeExecutionEconomyResult(result, { agentId, referenceId, referenceType }) {
   const logMeta = {
     agentId,
     feeUsdc: result.feeUsdc,
     rail: result.rail,
     reason: result.reason || null,
     status: result.status,
-    taskId,
+    referenceId,
+    referenceType,
     txHash: result.gatewayMintTxHash || null,
   };
 
   if (result.status === 'confirmed') {
-    logTaskEconomy('info', 'Task fee settlement confirmed', logMeta);
+    logTaskEconomy('info', 'Execution fee settlement confirmed', logMeta);
   } else if (result.status === 'failed') {
-    logTaskEconomy('warn', 'Task fee settlement failed', logMeta);
+    logTaskEconomy('warn', 'Execution fee settlement failed', logMeta);
   } else {
-    logTaskEconomy('info', 'Task fee settlement skipped', logMeta);
+    logTaskEconomy('info', 'Execution fee settlement skipped', logMeta);
   }
 
   await gatewayAuditService.recordAgenticPaymentEventSafe({
     agentId,
     eventType: 'task_execution_fee',
     rail: result.rail,
-    referenceType: 'task',
-    referenceId: taskId,
+    referenceType,
+    referenceId,
     txHash: result.gatewayMintTxHash || null,
     amountUsdc: result.feeUsdc,
     token: 'USDC',
@@ -67,6 +83,83 @@ async function finalizeTaskEconomyResult(result, { agentId, taskId }) {
   return result;
 }
 
+async function settleExecutionFee({
+  agent,
+  referenceId,
+  referenceType = 'task',
+  feeUsdc,
+  fromChain = TASK_ECONOMY_CHAIN,
+  toChain = TASK_ECONOMY_CHAIN,
+  mode = 'circle_gateway_execution_fee',
+  rail = 'agentic_task_economy',
+}) {
+  const summary = getTaskEconomyConfigSummary();
+  const normalizedFeeUsdc = Number(feeUsdc);
+  const base = {
+    mode,
+    rail,
+    referenceId,
+    referenceType,
+    feeUsdc: normalizedFeeUsdc,
+    sourceChain: fromChain,
+    destinationChain: toChain,
+    sellerAddress: summary.sellerAddress,
+    recipientAddress: summary.recipientAddress,
+    recipientKind: summary.recipientKind,
+  };
+
+  if (!Number.isFinite(normalizedFeeUsdc) || normalizedFeeUsdc <= 0) {
+    return finalizeExecutionEconomyResult({
+      ...base,
+      status: 'skipped',
+      reason: 'execution_fee_disabled',
+    }, { agentId: agent?.id || null, referenceId, referenceType });
+  }
+
+  if (DRY_RUN) {
+    return finalizeExecutionEconomyResult({
+      ...base,
+      status: 'skipped',
+      reason: 'dry_run',
+    }, { agentId: agent?.id || null, referenceId, referenceType });
+  }
+
+  if (!summary.sellerAddress) {
+    return finalizeExecutionEconomyResult({
+      ...base,
+      status: 'skipped',
+      reason: 'task_economy_pay_address_missing',
+    }, { agentId: agent?.id || null, referenceId, referenceType });
+  }
+
+  if (!agent) {
+    return finalizeExecutionEconomyResult({
+      ...base,
+      status: 'failed',
+      reason: 'agent_missing',
+    }, { agentId: null, referenceId, referenceType });
+  }
+
+  const result = await gatewayBuyerService.executeGatewayTransfer({
+    agent,
+    amountUsdc: normalizedFeeUsdc,
+    recipient: summary.sellerAddress,
+    fromChain,
+    toChain,
+  });
+
+  return finalizeExecutionEconomyResult({
+    ...base,
+    status: 'confirmed',
+    deposited: result.deposited,
+    gatewayApprovalTxHash: result.depositResult?.approvalTxHash || null,
+    gatewayDepositTxHash: result.depositResult?.depositTxHash || null,
+    gatewayMintTxHash: result.transferResult?.mintTxHash || null,
+    formattedAmount: result.transferResult?.formattedAmount || String(normalizedFeeUsdc),
+    recipient: result.transferResult?.recipient || summary.sellerAddress,
+  }, { agentId: agent.id, referenceId, referenceType });
+}
+
 async function settleTaskExecutionFee({
   agent,
   taskId,
@@ -74,62 +167,20 @@ async function settleTaskExecutionFee({
   fromChain = TASK_ECONOMY_CHAIN,
   toChain = TASK_ECONOMY_CHAIN,
 }) {
-  const summary = getTaskEconomyConfigSummary();
-  const base = {
-    mode: summary.mode,
-    rail: 'agentic_task_economy',
-    taskId,
-    feeUsdc: Number(feeUsdc),
-    sourceChain: fromChain,
-    destinationChain: toChain,
-    sellerAddress: summary.sellerAddress,
-  };
-
-  if (DRY_RUN) {
-    return finalizeTaskEconomyResult({
-      ...base,
-      status: 'skipped',
-      reason: 'dry_run',
-    }, { agentId: agent?.id || null, taskId });
-  }
-
-  if (!summary.sellerAddress) {
-    return finalizeTaskEconomyResult({
-      ...base,
-      status: 'skipped',
-      reason: 'task_economy_pay_address_missing',
-    }, { agentId: agent?.id || null, taskId });
-  }
-
-  if (!agent) {
-    return finalizeTaskEconomyResult({
-      ...base,
-      status: 'failed',
-      reason: 'agent_missing',
-    }, { agentId: null, taskId });
-  }
-
-  const result = await gatewayBuyerService.executeGatewayTransfer({
+  return settleExecutionFee({
     agent,
-    amountUsdc: feeUsdc,
-    recipient: summary.sellerAddress,
+    referenceId: taskId,
+    referenceType: 'task',
+    feeUsdc,
     fromChain,
     toChain,
+    mode: 'circle_gateway_task_fee',
+    rail: 'agentic_task_economy',
   });
-
-  return finalizeTaskEconomyResult({
-    ...base,
-    status: 'confirmed',
-    deposited: result.deposited,
-    gatewayApprovalTxHash: result.depositResult?.approvalTxHash || null,
-    gatewayDepositTxHash: result.depositResult?.depositTxHash || null,
-    gatewayMintTxHash: result.transferResult?.mintTxHash || null,
-    formattedAmount: result.transferResult?.formattedAmount || String(feeUsdc),
-    recipient: result.transferResult?.recipient || summary.sellerAddress,
-  }, { agentId: agent.id, taskId });
 }
 
 module.exports = {
   getTaskEconomyConfigSummary,
+  settleExecutionFee,
   settleTaskExecutionFee,
 };

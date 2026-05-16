@@ -9,6 +9,10 @@ const { resolveDirectSwapFallbackPool } = require('../oracle/pools');
 
 const DEFAULT_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000';
 const DEFAULT_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
+const SEPOLIA_GAS_FANOUT_AMOUNT_ETH = String(process.env.SEPOLIA_GAS_FANOUT_AMOUNT_ETH || '0.01');
+const SEPOLIA_GAS_FANOUT_CHAINS = ['Optimism Sepolia', 'Base Sepolia', 'Arbitrum Sepolia'];
+const NATIVE_TOPUP_POLL_MS = parseInt(process.env.NATIVE_TOPUP_POLL_MS || '5000', 10);
+const NATIVE_TOPUP_WAIT_MS = parseInt(process.env.NATIVE_TOPUP_WAIT_MS || '600000', 10);
 const DIRECT_PAIR_ZAP_LIMITS = {
   USDC: {
     pairKey: 'USDC-cirBTC',
@@ -29,6 +33,25 @@ function _timestamped(payload) {
     ...payload,
     executedAt: new Date().toISOString(),
   };
+}
+
+function _delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function _waitForNativeTopUpArrival({ chainName, address, balanceBeforeWei }) {
+  const deadline = Date.now() + NATIVE_TOPUP_WAIT_MS;
+
+  while (Date.now() < deadline) {
+    const currentBalanceWei = await agentWalletService.getNativeBalance(chainName, address);
+    if (currentBalanceWei > balanceBeforeWei) {
+      return currentBalanceWei;
+    }
+
+    await _delay(NATIVE_TOPUP_POLL_MS);
+  }
+
+  throw new Error(`Destination native top-up timed out on ${chainName}`);
 }
 
 function _resolveCurveTokenInAddress(indexIn, pool) {
@@ -493,6 +516,94 @@ async function executeBridgeTask({ agent, params = {}, dryRun = false, onStep })
   };
 }
 
+async function executeSepoliaGasFanoutTask({ agent, dryRun = false, onStep }) {
+  const amountEth = SEPOLIA_GAS_FANOUT_AMOUNT_ETH;
+  const report = async (step, data = {}) => {
+    if (!onStep) return;
+    await Promise.resolve(onStep(step, data)).catch(() => {});
+  };
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        dryRun: true,
+        fromChain: 'Sepolia',
+        amountEth,
+        targets: SEPOLIA_GAS_FANOUT_CHAINS.map((toChain) => ({ toChain, amountEth })),
+        summary: `Simulation only. Would bridge ${amountEth} ETH from Sepolia to ${SEPOLIA_GAS_FANOUT_CHAINS.join(', ')}.`,
+      }),
+    };
+  }
+
+  try {
+    const targets = [];
+    const recipient = agent.wallet_address || agent.walletAddress;
+
+    await report('preparing', { amountEth, fromChain: 'Sepolia' });
+
+    for (const toChain of SEPOLIA_GAS_FANOUT_CHAINS) {
+      const balanceBeforeWei = await agentWalletService.getNativeBalance(toChain, recipient);
+
+      await report('bridging', { toChain, amountEth });
+      const result = await agentWalletService.bridgeNativeGasTopUp({
+        agent,
+        toChain,
+        amountEth,
+      });
+
+      await report('awaiting_arrival', {
+        toChain,
+        amountEth,
+        topUpTxHash: result.topUpTxHash,
+      });
+
+      const balanceAfterWei = await _waitForNativeTopUpArrival({
+        chainName: toChain,
+        address: recipient,
+        balanceBeforeWei,
+      });
+
+      await report('arrived', {
+        toChain,
+        amountEth,
+        topUpTxHash: result.topUpTxHash,
+      });
+
+      targets.push({
+        toChain,
+        amountEth,
+        topUpTxHash: result.topUpTxHash,
+        bridgeKind: result.bridgeKind,
+        bridgeAddress: result.bridgeAddress,
+        balanceBeforeWei: balanceBeforeWei.toString(),
+        balanceAfterWei: balanceAfterWei.toString(),
+      });
+    }
+
+    await report('complete', {
+      amountEth,
+      targetCount: targets.length,
+    });
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        fromChain: 'Sepolia',
+        amountEth,
+        targets,
+        summary: `Bridged ${amountEth} ETH each from Sepolia to ${SEPOLIA_GAS_FANOUT_CHAINS.join(', ')} and waited for each destination balance update.`,
+      }),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'bridge_native_topup_error',
+      error: error.message,
+    };
+  }
+}
+
 async function executeYieldMoveTask({ agent, params = {}, dryRun = false }) {
   const assetAddress = params.assetAddress || DEFAULT_USDC_ADDRESS;
   const amount = String(params.amount ?? '1');
@@ -539,29 +650,85 @@ async function executeArbTask({ agent, params = {}, dryRun = false, pricingPool,
   });
 
   const buyEurcFromPool = Number(poolState.impliedRate) < Number(forexRate.rate);
+  const opportunity = signal.opportunity || {};
   const confidence = signal.opportunity?.confidence || 'LOW';
+  const spreadPct = Number(opportunity.spreadPct || 0);
+  const inputAmountNumeric = Number(amountIn);
+  const requestedRouteEstimate = buyEurcFromPool && Number.isFinite(inputAmountNumeric) && inputAmountNumeric > 0
+    ? oracle.calcArbProfit(inputAmountNumeric, forexRate.rate, poolState.impliedRate, poolState.fee)
+    : null;
+  const requestedExpectedProfitUsdc = requestedRouteEstimate?.expectedProfitUsdc ?? null;
+  const requestedNetProfitUsdc = requestedRouteEstimate?.netProfitUsdc ?? null;
+  const signalModelExpectedProfitUsdc = opportunity.expectedProfitUsdc ?? null;
+  const signalModelNetProfitUsdc = opportunity.netProfitUsdc ?? null;
+  const hasRequestedRouteEstimate = Number.isFinite(Number(requestedNetProfitUsdc));
+  const expectedProfitUsdc = hasRequestedRouteEstimate
+    ? requestedExpectedProfitUsdc
+    : signalModelExpectedProfitUsdc ?? 0;
+  const netProfitUsdc = hasRequestedRouteEstimate
+    ? requestedNetProfitUsdc
+    : signalModelNetProfitUsdc ?? expectedProfitUsdc;
+  const formatMetric = (value, digits = 2) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return String(value || '0');
+    return numeric.toFixed(digits).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+  };
+  const requestedSizeLabel = `${formatMetric(amountIn, 6)} USDC`;
+  const signalSummary = `${confidence} confidence with ${formatMetric(spreadPct)}% spread`;
   const payload = _timestamped({
     signal,
     poolAddress,
     amountIn,
+    requestedAmountIn: amountIn,
+    fromToken: 'USDC',
+    toToken: 'EURC',
     direction: buyEurcFromPool ? 'buy_eurc' : 'sell_eurc',
+    confidence,
+    spreadPct,
+    signalRouteFound: Boolean(opportunity.found),
+    signalModelAmountUsdc: opportunity.amountUsdc ?? null,
+    signalModelExpectedProfitUsdc,
+    signalModelNetProfitUsdc,
+    requestedExpectedProfitUsdc,
+    requestedNetProfitUsdc,
+    executionScope: 'curve_entry_leg_only',
+    expectedProfitUsdc,
+    netProfitUsdc,
   });
 
-  if (dryRun || !poolAddress || confidence === 'LOW') {
-    payload.dryRun = dryRun || !poolAddress;
-    payload.skipped = !dryRun && Boolean(poolAddress) && confidence === 'LOW';
+  if (dryRun) {
+    payload.dryRun = true;
+    payload.summary = `Simulation only. Would evaluate the latest arbitrage signal for a ${requestedSizeLabel} Curve entry leg. This task does not claim realized profit because it does not execute the bridge or exit leg.`;
     return { ok: true, payload };
   }
 
-  const indexIn = buyEurcFromPool
-    ? (swapTarget?.baseToken?.index ?? 0)
-    : (swapTarget?.quoteToken?.index ?? 1);
-  const indexOut = buyEurcFromPool
-    ? (swapTarget?.quoteToken?.index ?? 1)
-    : (swapTarget?.baseToken?.index ?? 0);
-  const tokenInAddress = buyEurcFromPool
-    ? (swapTarget?.baseToken?.address || DEFAULT_USDC_ADDRESS)
-    : (swapTarget?.quoteToken?.address || DEFAULT_EURC_ADDRESS);
+  if (!poolAddress) {
+    payload.skipped = true;
+    payload.summary = `No on-chain trade was sent because the Curve pool is not configured. Requested size: ${requestedSizeLabel}.`;
+    return { ok: true, payload };
+  }
+
+  if (!buyEurcFromPool) {
+    payload.skipped = true;
+    payload.summary = `No on-chain trade was sent. The current signal would require selling EURC into Curve, but this task only executes the USDC -> EURC Curve entry leg for the requested ${requestedSizeLabel}.`;
+    return { ok: true, payload };
+  }
+
+  if (hasRequestedRouteEstimate && Number(requestedNetProfitUsdc) <= 0) {
+    payload.skipped = true;
+    payload.summary = `No on-chain trade was sent. The requested ${requestedSizeLabel} Curve entry leg is not profitable after Curve fees, so this task did not execute at the user-entered size.`;
+    return { ok: true, payload };
+  }
+
+  if (!opportunity.found || confidence === 'LOW') {
+    payload.skipped = true;
+    payload.summary = `No on-chain trade was sent. The latest full-route oracle model is not profitable for the requested ${requestedSizeLabel} Curve entry leg.`;
+    return { ok: true, payload };
+  }
+
+  const indexIn = swapTarget?.baseToken?.index ?? 0;
+  const indexOut = swapTarget?.quoteToken?.index ?? 1;
+  const tokenInAddress = swapTarget?.baseToken?.address || DEFAULT_USDC_ADDRESS;
 
   payload.swap = await protocols.executeCurveSwap({
     poolAddress,
@@ -571,6 +738,8 @@ async function executeArbTask({ agent, params = {}, dryRun = false, pricingPool,
     amountIn,
     agentPrivateKey: decrypt(agent.private_key_encrypted),
   });
+  payload.swapTxHash = payload.swap?.txHash || payload.swap?.hash || null;
+  payload.summary = `Executed the Curve entry leg for ${requestedSizeLabel} on a ${signalSummary}. This task does not complete the bridge or exit leg, so no realized arbitrage profit is claimed here.`;
 
   return { ok: true, payload };
 }
@@ -670,5 +839,6 @@ module.exports = {
   executeCurveLiquidityRemoveTask,
   executeCurveSwapTask,
   executeRebalanceTask,
+  executeSepoliaGasFanoutTask,
   executeYieldMoveTask,
 };

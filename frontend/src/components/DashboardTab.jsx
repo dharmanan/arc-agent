@@ -181,6 +181,11 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
   const isSwap = tx.type === 'swap';
   const isDirectLpAdd = tx.type === 'direct_lp_add';
   const isDirectLpRemove = tx.type === 'direct_lp_remove';
+  const isCurveLpAdd = tx.type === 'curve_lp_add';
+  const isCurveLpRemove = tx.type === 'curve_lp_remove';
+  const isTaskArb = tx.type === 'task_arb';
+  const isRebalance = tx.type === 'rebalance';
+  const isGasFanout = tx.type === 'gas_topup' && Array.isArray(meta.targets) && meta.targets.length > 0;
 
   if (isOracleSignal) {
     const strategy = meta.signal?.strategy === 'stablecoin_fx'
@@ -386,6 +391,155 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
         hash: burnHash,
         url: burnUrl,
       }] : [],
+    };
+  }
+
+  if (isCurveLpAdd) {
+    const tokenIn = meta.tokenIn || tx.token || 'USDC';
+    const amountInLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, tokenIn);
+    const lpMintedLabel = meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP minted` : null;
+    const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
+    const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+
+    return {
+      title: 'curve liquidity add',
+      routeLabel: `Arc Testnet · ${tokenIn} -> Curve stable pool`,
+      amountLabel: amountInLabel,
+      phase: tx.status === 'dry_run'
+        ? 'Simulation only. No on-chain liquidity add was submitted.'
+        : tx.status === 'skipped'
+          ? (meta.summary || 'No on-chain liquidity add was submitted.')
+          : meta.minLpAmount
+            ? `${lpMintedLabel || 'LP minted.'} Minimum protected LP: ${formatLpAmount(meta.minLpAmount)}.`
+            : (lpMintedLabel || meta.summary || 'Curve liquidity added on-chain'),
+      links: txUrl
+        ? [{
+            key: `${tx.id}-curve-lp-add`,
+            label: 'Add tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
+    };
+  }
+
+  if (isCurveLpRemove) {
+    const tokenOut = meta.tokenOut || tx.token || 'USDC';
+    const burnLabel = meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP burned` : null;
+    const returnedLabel = formatTokenAmount(meta.amountOut, tokenOut);
+    const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
+    const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+
+    return {
+      title: 'curve liquidity remove',
+      routeLabel: `Arc Testnet · Curve stable pool -> ${tokenOut}`,
+      amountLabel: burnLabel,
+      phase: tx.status === 'dry_run'
+        ? 'Simulation only. No on-chain liquidity removal was submitted.'
+        : tx.status === 'skipped'
+          ? (meta.summary || 'No on-chain liquidity removal was submitted.')
+          : [
+              burnLabel,
+              returnedLabel ? `Returned ${returnedLabel}` : null,
+              meta.minAmountOut ? `Minimum protected output ${formatTokenAmount(meta.minAmountOut, tokenOut)}` : null,
+            ].filter(Boolean).join('. '),
+      links: txUrl
+        ? [{
+            key: `${tx.id}-curve-lp-remove`,
+            label: 'Withdraw tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
+    };
+  }
+
+  if (isTaskArb) {
+    const fromToken = meta.fromToken || 'USDC';
+    const toToken = meta.toToken || 'EURC';
+    const amountLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, fromToken);
+    const outputAmountLabel = formatTokenAmount(meta.amountOut, toToken);
+    const txHash = meta.swapTxHash || tx.tx_hash || tx.txHash || null;
+    const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+
+    let phase = meta.summary || null;
+    if (tx.status === 'confirmed') {
+      phase = outputAmountLabel
+        ? `Executed the Curve entry leg and received ${outputAmountLabel}.`
+        : 'Executed the Curve entry leg on-chain.';
+    } else if (tx.status === 'dry_run') {
+      phase = 'Simulation only. No on-chain trade was submitted.';
+    }
+
+    return {
+      title: 'signal trade',
+      routeLabel: `Arc Testnet · ${fromToken} -> ${toToken} Curve entry`,
+      amountLabel,
+      phase,
+      links: txUrl
+        ? [{
+            key: `${tx.id}-task-arb`,
+            label: 'Swap tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
+    };
+  }
+
+  if (isRebalance) {
+    const fromToken = meta.fromToken || tx.token || 'USDC';
+    const toToken = meta.toToken || 'EURC';
+    const amountLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, fromToken);
+    const outputAmountLabel = formatTokenAmount(meta.amountOut, toToken);
+    const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
+    const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+
+    return {
+      title: 'rebalance',
+      routeLabel: `Arc Testnet · ${fromToken} -> ${toToken}`,
+      amountLabel,
+      phase: tx.status === 'dry_run'
+        ? 'Simulation only. No on-chain rebalance was submitted.'
+        : tx.status === 'skipped'
+          ? (meta.summary || 'No on-chain rebalance was submitted.')
+          : outputAmountLabel
+            ? `Received ${outputAmountLabel}${meta.executionRail ? ` via ${getExecutionRailLabel(meta.executionRail)}` : ''}`
+            : (meta.summary || 'Portfolio rebalanced on-chain'),
+      links: txUrl
+        ? [{
+            key: `${tx.id}-rebalance`,
+            label: 'Swap tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
+    };
+  }
+
+  if (isGasFanout) {
+    const sourceChain = tx.from_chain || meta.fromChain || 'Sepolia';
+    const amountEach = meta.amountEth ? `${Number(meta.amountEth).toFixed(4).replace(/\.0+$|(?<=\.\d*?)0+$/g, '')} ETH each` : null;
+    const targetChains = meta.targets.map(target => target.toChain).filter(Boolean);
+
+    return {
+      title: 'gas fanout',
+      routeLabel: `${sourceChain} -> ${targetChains.join(', ')}`,
+      amountLabel: amountEach,
+      phase: tx.status === 'dry_run'
+        ? 'Simulation only. No on-chain gas top-ups were submitted.'
+        : `Confirmed native gas top-ups for ${targetChains.join(', ')}.`,
+      links: meta.targets.map((target, index) => {
+        const url = getExplorerTxUrl(target.toChain, target.topUpTxHash);
+        if (!url) return null;
+
+        return {
+          key: `${tx.id}-gas-fanout-${index}`,
+          label: `${target.toChain} tx`,
+          hash: target.topUpTxHash,
+          url,
+        };
+      }).filter(Boolean),
     };
   }
 
@@ -927,22 +1081,28 @@ export default function DashboardTab({ onNavigate }) {
               const isSwap    = tx.type === 'swap';
               const isDirectLpAdd = tx.type === 'direct_lp_add';
               const isDirectLpRemove = tx.type === 'direct_lp_remove';
+              const isCurveLpAdd = tx.type === 'curve_lp_add';
+              const isCurveLpRemove = tx.type === 'curve_lp_remove';
+              const isTaskArb = tx.type === 'task_arb';
+              const isRebalance = tx.type === 'rebalance';
               const isOracleSignal = tx.type === 'oracle_signal';
               const isOracleStrategy = tx.type === 'defi_loop_swap' || tx.type === 'defi_loop_dry';
               const isBridge  = tx.type === 'bridge' || tx.type === 'gas_topup';
 
               const TxIcon = isReceive ? ArrowDownLeft
                 : isSend    ? ArrowUpRight
-                : isSwap    ? Repeat2
-                : isDirectLpAdd || isDirectLpRemove ? Zap
+                : isSwap || isTaskArb || isRebalance ? Repeat2
+                : isDirectLpAdd || isDirectLpRemove || isCurveLpAdd || isCurveLpRemove ? Zap
                 : isOracleSignal || isOracleStrategy ? Activity
                 : Zap;
 
               const iconColor = isReceive ? 'text-arc-green'
                 : isSend    ? 'text-blue-500'
-                : isSwap    ? 'text-purple-500'
+                : isSwap || isTaskArb || isRebalance ? 'text-purple-500'
                 : isDirectLpAdd ? 'text-emerald-600'
                 : isDirectLpRemove ? 'text-amber-600'
+                : isCurveLpAdd ? 'text-emerald-600'
+                : isCurveLpRemove ? 'text-amber-600'
                 : isOracleSignal ? 'text-sky-500'
                 : isOracleStrategy ? 'text-indigo-500'
                 : 'text-slate-400';
@@ -952,6 +1112,10 @@ export default function DashboardTab({ onNavigate }) {
                 : isSend ? 'Sent'
                 : isDirectLpAdd ? 'Direct Pair LP Add'
                 : isDirectLpRemove ? 'Direct Pair LP Exit'
+                : isCurveLpAdd ? 'Curve LP Add'
+                : isCurveLpRemove ? 'Curve LP Exit'
+                : isTaskArb ? 'Signal Trade'
+                : isRebalance ? 'Rebalance'
                 : title;
 
               const statusLabel = isOracleSignal ? 'signal' : tx.status;

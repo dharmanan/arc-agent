@@ -12,6 +12,7 @@ const db              = require('../db');
 const queue           = require('../queue/agentQueue');
 const { ethers }      = require('ethers');
 const { isDailyLimitBypassed } = require('../services/dailyLimitBypass');
+const taskRunService = require('../services/taskRunService');
 
 // ── Minimal ABI for ArcRevenuePool.getPoolBalance() ──────────────────────────
 const _POOL_VIEW_ABI = ['function getPoolBalance() external view returns (uint256)'];
@@ -36,7 +37,7 @@ const EXECUTION_TASK_IDS = new Set([
   'EXEC_CIRBTC_USDC_LP_REMOVE',
   'EXEC_CIRBTC_EURC_LP_REMOVE',
   'EXEC_CCTP_BRIDGE',
-  'EXEC_YIELD_MOVE',
+  'EXEC_SEPOLIA_GAS_FANOUT',
   'EXEC_ARB',
   'EXEC_REBALANCE',
 ]);
@@ -103,11 +104,6 @@ function _validateExecutionParams(taskId, params) {
       if (!_isPositiveNumber(params.amountUsdc)) return 'bridge_amount_required';
       return null;
 
-    case 'EXEC_YIELD_MOVE':
-      if (!_isPositiveNumber(params.amount)) return 'yield_amount_required';
-      if (!['supply', 'withdraw'].includes(String(params.action || ''))) return 'yield_action_required';
-      return null;
-
     case 'EXEC_ARB':
       if (!_isPositiveNumber(params.amountIn)) return 'arb_amount_required';
       return null;
@@ -138,8 +134,10 @@ function _getInlineTaskFailureStatus(reason) {
       return 429;
     case 'oracle_fetch_error':
     case 'swap_error':
+    case 'bridge_native_topup_error':
       return 502;
     case 'position_guard_unavailable':
+    case 'manual_task_queue_unavailable':
       return 503;
     case 'swap_not_configured':
     case 'direct_pair_not_configured':
@@ -149,6 +147,7 @@ function _getInlineTaskFailureStatus(reason) {
     case 'lp_position_exit_required':
     case 'direct_pair_lp_not_found':
     case 'direct_pair_seed_required':
+    case 'task_already_running':
       return 409;
     case 'curve_pool_not_configured':
     case 'pool_address_not_configured':
@@ -159,6 +158,25 @@ function _getInlineTaskFailureStatus(reason) {
       return 400;
   }
 }
+
+// ── GET /api/agents/:id/tasks/runs ───────────────────────────────────────────
+// Returns recent task runs or only active ones for UI recovery and progress.
+router.get('/agents/:id/tasks/runs', requireAuth, async (req, res, next) => {
+  try {
+    const agentId = req.params.id;
+    const status = String(req.query.status || 'recent').toLowerCase();
+    const limit = Math.min(parseInt(req.query.limit || '20', 10), 100);
+
+    const { rows: [agent] } = await db.query(
+      `SELECT id FROM agents WHERE id = $1 AND user_id = $2`,
+      [agentId, req.user.userId],
+    );
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const runs = await taskRunService.listTaskRuns(agentId, { status, limit });
+    res.json({ runs });
+  } catch (err) { next(err); }
+});
 
 // ── GET /api/tasks/featured ───────────────────────────────────────────────────
 // Returns today's 5 featured tasks, ordered deterministically by UTC date seed.
@@ -194,6 +212,9 @@ router.get('/catalog', async (_req, res, next) => {
 // On-chain ArcRevenuePool balance. No auth required (public transparency).
 router.get('/pool-balance', async (_req, res, next) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
     const pool = _getPoolContract();
     if (!pool) return res.json({ balanceUsdc: null, note: 'REVENUE_POOL_ADDRESS not configured' });
     const raw  = await pool.getPoolBalance();
@@ -279,22 +300,45 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
       }
     }
 
-    const inlineResult = await queue.runTaskInline(taskId, { agentId, params });
-
-    if (inlineResult && inlineResult.ok === false) {
-      return res.status(_getInlineTaskFailureStatus(inlineResult.reason)).json({
-        error: inlineResult.reason || 'task_run_failed',
-        detail: inlineResult.error || null,
+    const existingRun = await taskRunService.findActiveTaskRun(agentId, taskId);
+    if (existingRun) {
+      return res.status(409).json({
+        error: 'task_already_running',
+        run: existingRun,
       });
     }
 
-    res.status(200).json({
-      queued:  false,
-      inline:  true,
+    const run = await taskRunService.createTaskRun({
+      agentId,
+      taskId,
+      params,
+      stageKey: 'queued',
+      stageLabel: 'Queued',
+      stageDetail: 'Task request accepted. This card will stay locked until the worker finishes or fails.',
+    });
+
+    try {
+      await queue.queueManualTask(taskId, { agentId, params, taskRunId: run.id });
+    } catch (err) {
+      await taskRunService.failTaskRun(run.id, {
+        error: err.code || err.message || 'manual_task_queue_unavailable',
+        stageKey: 'queue_unavailable',
+        stageLabel: 'Queue Unavailable',
+        stageDetail: 'The task worker was not ready to accept this run request.',
+      });
+
+      return res.status(_getInlineTaskFailureStatus(err.code || err.message)).json({
+        error: err.code || err.message || 'manual_task_queue_unavailable',
+      });
+    }
+
+    res.status(202).json({
+      queued:  true,
+      inline:  false,
       taskId,
       tier:    task.tier,
       feeUsdc: task.tier === 2 ? Number(task.fee_usdc) : 0,
-      result:  inlineResult?.payload || inlineResult || null,
+      run,
     });
   } catch (err) { next(err); }
 });

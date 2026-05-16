@@ -46,6 +46,7 @@ async function request(method, path, body) {
   if (!res.ok) {
     const err = new Error(data.error || `HTTP ${res.status}`);
     err.status = res.status;
+    err.data = data;
     throw err;
   }
   return data;
@@ -119,8 +120,9 @@ export const bridge = {
 export const tasks = {
   featured:    ()                        => get('/tasks/featured'),
   catalog:     ()                        => get('/tasks/catalog'),
-  poolBalance: ()                        => get('/tasks/pool-balance'),
+  poolBalance: ()                        => get(`/tasks/pool-balance?ts=${Date.now()}`),
   runTask:     (agentId, taskId, params) => post(`/tasks/agents/${agentId}/tasks/run`, { taskId, params }),
+  runs:        (agentId, status = 'recent', limit) => get(`/tasks/agents/${agentId}/tasks/runs?status=${encodeURIComponent(status)}${limit ? `&limit=${limit}` : ''}`),
   results:     (agentId, limit)          => get(`/tasks/agents/${agentId}/tasks/results${limit ? `?limit=${limit}` : ''}`),
 };
 

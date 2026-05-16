@@ -17,8 +17,8 @@ const CURVE_EXCHANGE_ABI = [
   'function get_dy(int128 i, int128 j, uint256 dx) view returns (uint256)',
   // Write: exchange coins[i] → coins[j], min_dy protects against slippage
   'function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) returns (uint256)',
-  'function calc_token_amount(uint256[2] amounts, bool is_deposit) view returns (uint256)',
-  'function add_liquidity(uint256[2] amounts, uint256 min_mint_amount) returns (uint256)',
+  'function calc_token_amount(uint256[] amounts, bool is_deposit) view returns (uint256)',
+  'function add_liquidity(uint256[] amounts, uint256 min_mint_amount) returns (uint256)',
   'function calc_withdraw_one_coin(uint256 token_amount, int128 i) view returns (uint256)',
   'function remove_liquidity_one_coin(uint256 token_amount, int128 i, uint256 min_amount) returns (uint256)',
   'function balanceOf(address account) view returns (uint256)',

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAgent } from '../providers/AgentProvider.jsx';
 import { tasks as tasksApi, agents as agentsApi } from '../lib/api.js';
 import { fetchAgentBalance, fetchUsdcBalance, fetchEurcBalance } from '../lib/agentBalances.js';
@@ -8,8 +8,9 @@ import {
 import {
   Zap, Lock, CheckCircle, RefreshCw, Coins,
   Play, ChevronDown, ChevronUp, AlertTriangle, Clock, Brain,
-  ShieldCheck,
+  ShieldCheck, ExternalLink,
 } from 'lucide-react';
+import { CHAINS } from '../lib/chains.js';
 
 const AUTOMATION_FEATURES = [
   {
@@ -42,6 +43,7 @@ const AUTOMATION_FEATURES = [
   },
 ];
 const FULL_AUTONOMY_FEATURE_KEYS = AUTOMATION_FEATURES.map(feature => feature.key);
+const ACTIVE_TASK_RUN_STATUSES = new Set(['queued', 'running']);
 const EXECUTION_TASK_IDS = new Set([
   'EXEC_CURVE_SWAP',
   'EXEC_CURVE_LIQUIDITY_ADD',
@@ -51,7 +53,6 @@ const EXECUTION_TASK_IDS = new Set([
   'EXEC_CIRBTC_USDC_LP_REMOVE',
   'EXEC_CIRBTC_EURC_LP_REMOVE',
   'EXEC_CCTP_BRIDGE',
-  'EXEC_YIELD_MOVE',
   'EXEC_ARB',
   'EXEC_REBALANCE',
 ]);
@@ -202,10 +203,6 @@ function getTaskRunErrorMessage(message) {
       return 'Choose different source and destination chains.';
     case 'bridge_amount_required':
       return 'Enter a bridge amount.';
-    case 'yield_amount_required':
-      return 'Enter an amount for the yield move.';
-    case 'yield_action_required':
-      return 'Choose whether the agent should supply or withdraw.';
     case 'arb_amount_required':
       return 'Enter an amount for arbitrage execution.';
     case 'rebalance_amount_required':
@@ -234,6 +231,12 @@ function getTaskRunErrorMessage(message) {
       return 'This task is no longer available.';
     case 'agent_not_found':
       return 'This agent is no longer available.';
+    case 'task_already_running':
+      return 'This task is already running. Wait for the current run to finish before starting it again.';
+    case 'manual_task_queue_unavailable':
+      return 'The task worker is not ready right now. Retry in a moment.';
+    case 'bridge_native_topup_error':
+      return 'The native gas bridge did not complete successfully.';
     default:
       return message || 'Failed to run task';
   }
@@ -261,8 +264,6 @@ function getInitialTaskParams(taskId) {
       return { withdrawPct: DIRECT_PAIR_EXIT_PRESETS.EXEC_CIRBTC_EURC_LP_REMOVE.defaultWithdrawPct };
     case 'EXEC_CCTP_BRIDGE':
       return { fromChain: 'Arc Testnet', toChain: 'Base Sepolia', amountUsdc: '' };
-    case 'EXEC_YIELD_MOVE':
-      return { action: 'supply', amount: '' };
     case 'EXEC_ARB':
       return { amountIn: '' };
     case 'EXEC_REBALANCE':
@@ -304,10 +305,6 @@ function getTaskParamError(taskId, params) {
       if (!params.toChain) return 'Choose a destination chain.';
       if (params.fromChain === params.toChain) return 'Choose different source and destination chains.';
       if (!(Number(params.amountUsdc) > 0)) return 'Enter a bridge amount.';
-      return '';
-    case 'EXEC_YIELD_MOVE':
-      if (!params.action) return 'Choose whether the agent should supply or withdraw.';
-      if (!(Number(params.amount) > 0)) return 'Enter an amount for the yield move.';
       return '';
     case 'EXEC_ARB':
       if (!(Number(params.amountIn) > 0)) return 'Enter an amount for arbitrage execution.';
@@ -355,11 +352,6 @@ function buildTaskParams(taskId, params) {
         fromChain: params.fromChain,
         toChain: params.toChain,
         amountUsdc: Number(params.amountUsdc),
-      };
-    case 'EXEC_YIELD_MOVE':
-      return {
-        action: params.action,
-        amount: Number(params.amount),
       };
     case 'EXEC_ARB':
       return {
@@ -480,6 +472,196 @@ function getOnchainReputationMessage(onchain) {
   }
 }
 
+function getCurveStableTokenLabel(index) {
+  const numeric = Number(index);
+  if (numeric === 0) return 'USDC';
+  if (numeric === 1) return 'EURC';
+  return `coin ${index}`;
+}
+
+function getExecutionRailLabel(executionRail) {
+  switch (String(executionRail || '').toLowerCase()) {
+    case 'swap_kit':
+      return 'Swap Kit';
+    case 'curve_fallback':
+      return 'Curve fallback';
+    case 'uniswap_v2_fallback':
+      return 'Uniswap V2 fallback';
+    default:
+      return executionRail || 'configured route';
+  }
+}
+
+function isRealHash(hash) {
+  return /^0x[0-9a-fA-F]{64}$/.test(hash || '');
+}
+
+function getTaskExplorerTxUrl(chainName, txHash) {
+  const explorerBase = CHAINS[chainName]?.explorerUrl;
+  if (!explorerBase || !isRealHash(txHash)) return null;
+  return `${explorerBase}/tx/${txHash}`;
+}
+
+function pushTaskExecutionLink(links, { label, chainName = 'Arc Testnet', hash }) {
+  const url = getTaskExplorerTxUrl(chainName, hash);
+  if (!url) return;
+
+  const key = `${label}:${hash}`;
+  if (links.some(link => link.key === key)) return;
+
+  links.push({ key, label, hash, url });
+}
+
+function getArbExecutionTokens(payload) {
+  if (payload?.direction === 'sell_eurc') {
+    return {
+      fromToken: payload?.fromToken || 'EURC',
+      toToken: payload?.toToken || 'USDC',
+    };
+  }
+
+  return {
+    fromToken: payload?.fromToken || 'USDC',
+    toToken: payload?.toToken || 'EURC',
+  };
+}
+
+function getTaskExecutionLinks(payload) {
+  const links = [];
+  if (!payload || typeof payload !== 'object') return links;
+
+  const isCurveStableSwap = payload.poolAddress
+    && payload.indexIn != null
+    && payload.indexOut != null
+    && payload.amountIn != null
+    && !payload.signal;
+
+  if (isCurveStableSwap) {
+    pushTaskExecutionLink(links, {
+      label: 'Swap tx',
+      chainName: 'Arc Testnet',
+      hash: payload.txHash || payload.hash,
+    });
+  }
+
+  const isRebalancePayload = payload.fromToken
+    && payload.toToken
+    && payload.amountIn != null
+    && payload.executionRail
+    && !payload.signal;
+
+  if (isRebalancePayload) {
+    pushTaskExecutionLink(links, {
+      label: 'Swap tx',
+      chainName: 'Arc Testnet',
+      hash: payload.txHash || payload.hash,
+    });
+  }
+
+  if (payload.executionRail === 'curve_liquidity_add') {
+    pushTaskExecutionLink(links, {
+      label: 'Add liquidity tx',
+      chainName: 'Arc Testnet',
+      hash: payload.txHash || payload.hash,
+    });
+  }
+
+  if (payload.executionRail === 'curve_liquidity_remove') {
+    pushTaskExecutionLink(links, {
+      label: 'Withdraw liquidity tx',
+      chainName: 'Arc Testnet',
+      hash: payload.txHash || payload.hash,
+    });
+  }
+
+  pushTaskExecutionLink(links, {
+    label: 'Swap tx',
+    chainName: 'Arc Testnet',
+    hash: payload.swapTxHash || payload.swap?.txHash || payload.swap?.hash,
+  });
+
+  pushTaskExecutionLink(links, {
+    label: 'Burn tx',
+    chainName: payload.fromChain || 'Arc Testnet',
+    hash: payload.burnTxHash,
+  });
+
+  pushTaskExecutionLink(links, {
+    label: 'Mint tx',
+    chainName: payload.toChain || 'Arc Testnet',
+    hash: payload.mintTxHash,
+  });
+
+  if (Array.isArray(payload.targets)) {
+    payload.targets.forEach((target) => {
+      pushTaskExecutionLink(links, {
+        label: `${target.toChain} tx`,
+        chainName: target.toChain,
+        hash: target.topUpTxHash,
+      });
+    });
+  }
+
+  pushTaskExecutionLink(links, {
+    label: 'Fee settlement tx',
+    chainName: payload.economy?.destinationChain || 'Arc Testnet',
+    hash: payload.economy?.gatewayMintTxHash,
+  });
+
+  return links;
+}
+
+function TaskExecutionLinks({ links }) {
+  if (!Array.isArray(links) || links.length === 0) return null;
+
+  return (
+    <div className="mt-1.5 flex flex-wrap gap-2">
+      {links.map(link => (
+        <a
+          key={link.key}
+          href={link.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-white px-2 py-1 text-[11px] font-mono text-emerald-700 hover:border-emerald-300 hover:text-emerald-800"
+        >
+          <span>{link.label}</span>
+          <span>{link.hash.slice(0, 10)}…</span>
+          <ExternalLink size={10} />
+        </a>
+      ))}
+    </div>
+  );
+}
+
+function getCompletedTaskLabel(task, payload) {
+  switch (task?.id) {
+    case 'EXEC_CURVE_SWAP':
+      return 'Swap executed';
+    case 'EXEC_REBALANCE':
+      return 'Portfolio rebalanced';
+    case 'EXEC_ARB':
+      return payload?.swapTxHash || payload?.swap?.txHash || payload?.swap?.hash
+        ? 'Signal trade executed'
+        : 'Arbitrage evaluated';
+    case 'EXEC_CCTP_BRIDGE':
+      return 'Bridge completed';
+    case 'EXEC_SEPOLIA_GAS_FANOUT':
+      return 'Gas fanout completed';
+    case 'EXEC_CURVE_LIQUIDITY_ADD':
+      return 'Liquidity added';
+    case 'EXEC_CURVE_LIQUIDITY_REMOVE':
+      return 'Liquidity withdrawn';
+    case 'EXEC_CIRBTC_USDC_ZAP_IN':
+    case 'EXEC_CIRBTC_EURC_ZAP_IN':
+      return 'LP bootstrap completed';
+    case 'EXEC_CIRBTC_USDC_LP_REMOVE':
+    case 'EXEC_CIRBTC_EURC_LP_REMOVE':
+      return 'LP exit completed';
+    default:
+      return 'Task completed';
+  }
+}
+
 function getTaskResultStatusMeta(task, payload) {
   if (payload?.dryRun) {
     if (task.id === 'EXEC_CCTP_BRIDGE') {
@@ -590,13 +772,36 @@ function getTaskResultStatusMeta(task, payload) {
   }
 
   return {
-    label: 'Task completed',
+    label: getCompletedTaskLabel(task, payload),
     buttonLabel: 'Done',
     panelClasses: 'bg-green-50/60',
     iconClasses: 'text-green-600',
     titleClasses: 'text-green-800',
     detailClasses: 'text-slate-600',
     summary: payload?.summary || `${task.title} completed.`,
+  };
+}
+
+function isTaskRunActive(run) {
+  return ACTIVE_TASK_RUN_STATUSES.has(String(run?.status || '').toLowerCase());
+}
+
+function buildTaskRunResult(task, run) {
+  if (!run || run.status !== 'completed') return null;
+
+  const payload = run.result_payload || {};
+  const meta = getTaskResultStatusMeta(task, payload);
+
+  return {
+    id: run.id,
+    task_id: run.task_id || task.id,
+    title: run.title || task.title,
+    description: run.description || task.description,
+    created_at: run.completed_at || run.updated_at || run.created_at,
+    payload: {
+      ...payload,
+      summary: getTaskPayloadSummary(task, payload) || meta.summary,
+    },
   };
 }
 
@@ -609,9 +814,162 @@ function formatTaskMetricAmount(value) {
   return numeric.toFixed(6).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
 }
 
+function formatTaskPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value || '0');
+  return numeric.toFixed(2).replace(/\.00$/, '');
+}
+
+function getTaskPayloadSummary(task, payload) {
+  if (!payload || typeof payload !== 'object') return '';
+
+  if (task?.id === 'EXEC_ARB') {
+    const { fromToken, toToken } = getArbExecutionTokens(payload);
+    const requestedAmount = formatTaskMetricAmount(payload.requestedAmountIn || payload.amountIn || 0);
+    const hasExecutionTx = Boolean(
+      payload.swapTxHash
+      || payload.txHash
+      || payload.bridgeTxHash
+      || payload.swap?.txHash
+      || payload.swap?.hash,
+    );
+
+    if (payload.dryRun) {
+      return `Simulation only. Evaluated the latest signal for a requested ${requestedAmount} ${fromToken} Curve leg. This task does not complete the bridge or exit leg.`;
+    }
+
+    if (hasExecutionTx) {
+      return `Executed a signal-driven Curve swap from ${requestedAmount} ${fromToken} to ${toToken}. This task does not complete the bridge or exit leg, so no realized arbitrage profit is claimed here.`;
+    }
+
+    if (payload.summary) return payload.summary;
+
+    return `Evaluated the latest signal for a requested ${requestedAmount} ${fromToken} Curve leg. No on-chain trade was sent.`;
+  }
+
+  if (task?.id === 'EXEC_CURVE_SWAP') {
+    const fromToken = getCurveStableTokenLabel(payload.indexIn);
+    const toToken = getCurveStableTokenLabel(payload.indexOut);
+
+    if (payload.txHash || payload.hash) {
+      const amountIn = formatTaskMetricAmount(payload.amountIn || 0);
+      const amountOut = payload.amountOut
+        ? ` and received ${formatTaskMetricAmount(payload.amountOut)} ${toToken}`
+        : '';
+      return `Swapped ${amountIn} ${fromToken} to ${toToken} through the live Curve stable pool${amountOut}.`;
+    }
+  }
+
+  if (task?.id === 'EXEC_REBALANCE' && (payload.txHash || payload.hash) && payload.fromToken && payload.toToken) {
+    const amountIn = formatTaskMetricAmount(payload.amountIn || 0);
+    const executionRail = getExecutionRailLabel(payload.executionRail);
+
+    if (payload.amountOut) {
+      return `Rebalanced ${amountIn} ${payload.fromToken} to ${formatTaskMetricAmount(payload.amountOut)} ${payload.toToken} via ${executionRail}.`;
+    }
+
+    return `Rebalanced ${amountIn} ${payload.fromToken} to ${payload.toToken} via ${executionRail}.`;
+  }
+
+  if (payload.summary) return payload.summary;
+
+  return '';
+}
+
 function getTaskExecutionFactLines(payload) {
   const facts = [];
   if (!payload || typeof payload !== 'object') return facts;
+
+  const isCurveStableSwap = payload.poolAddress
+    && payload.indexIn != null
+    && payload.indexOut != null
+    && payload.amountIn != null
+    && !payload.signal;
+
+  if (isCurveStableSwap) {
+    const fromToken = getCurveStableTokenLabel(payload.indexIn);
+    const toToken = getCurveStableTokenLabel(payload.indexOut);
+    facts.push(`Swap route: ${fromToken} -> ${toToken} via Curve stable pool`);
+    if (payload.amountOut) {
+      facts.push(`Received: ${formatTaskMetricAmount(payload.amountOut)} ${toToken}`);
+    }
+    if (payload.minDy) {
+      facts.push(`Minimum protected output: ${formatTaskMetricAmount(payload.minDy)} ${toToken}`);
+    }
+  }
+
+  const isRebalancePayload = payload.fromToken
+    && payload.toToken
+    && payload.amountIn != null
+    && payload.executionRail
+    && !payload.signal;
+
+  if (isRebalancePayload) {
+    facts.push(`Rebalance route: ${payload.fromToken} -> ${payload.toToken}`);
+    facts.push(`Execution rail: ${getExecutionRailLabel(payload.executionRail)}`);
+    if (payload.amountOut) {
+      facts.push(`Received: ${formatTaskMetricAmount(payload.amountOut)} ${payload.toToken}`);
+    }
+  }
+
+  if (payload.executionRail === 'curve_liquidity_add') {
+    facts.push(`Liquidity route: ${payload.tokenIn || 'token'} -> Curve stable pool`);
+    if (payload.lpAmount) {
+      facts.push(`LP minted: ${formatTaskMetricAmount(payload.lpAmount)}`);
+    }
+    if (payload.minLpAmount) {
+      facts.push(`Minimum LP protected: ${formatTaskMetricAmount(payload.minLpAmount)}`);
+    }
+  }
+
+  if (payload.executionRail === 'curve_liquidity_remove') {
+    facts.push(`Liquidity route: Curve LP -> ${payload.tokenOut || 'token'}`);
+    if (payload.lpAmount) {
+      facts.push(`LP burned: ${formatTaskMetricAmount(payload.lpAmount)}`);
+    }
+    if (payload.amountOut) {
+      facts.push(`Returned: ${formatTaskMetricAmount(payload.amountOut)} ${payload.tokenOut || 'token'}`);
+    }
+    if (payload.minAmountOut) {
+      facts.push(`Minimum protected output: ${formatTaskMetricAmount(payload.minAmountOut)} ${payload.tokenOut || 'token'}`);
+    }
+  }
+
+  const arbOpportunity = payload.signal?.opportunity;
+
+  if (arbOpportunity) {
+    const { fromToken, toToken } = getArbExecutionTokens(payload);
+    const hasExecutionTx = Boolean(
+      payload.swapTxHash
+      || payload.txHash
+      || payload.bridgeTxHash
+      || payload.swap?.txHash
+      || payload.swap?.hash,
+    );
+
+    facts.push(`Signal: ${arbOpportunity.confidence || 'LOW'} confidence · spread ${formatTaskPercent(arbOpportunity.spreadPct || 0)}%`);
+    facts.push(`Requested size: ${formatTaskMetricAmount(payload.requestedAmountIn || payload.amountIn || 0)} ${fromToken}`);
+    if (hasExecutionTx) {
+      facts.push(`Executed route: ${fromToken} -> ${toToken} via Curve stable pool`);
+      if (payload.amountOut || payload.swap?.amountOut) {
+        facts.push(`Received: ${formatTaskMetricAmount(payload.amountOut || payload.swap?.amountOut)} ${toToken}`);
+      }
+    } else if (payload.direction) {
+      facts.push(`Current signal direction: ${payload.direction === 'buy_eurc' ? 'USDC -> EURC' : 'EURC -> USDC'}`);
+    }
+    if (arbOpportunity.found === false) {
+      facts.push('Signal outcome: the full-route oracle model is not profitable right now.');
+    }
+    facts.push('Execution scope: this task only covers the Curve swap leg; bridge and exit legs are not executed here.');
+  }
+
+  if (payload.fromChain && payload.toChain && Number(payload.amountUsdc) > 0) {
+    facts.push(`Bridge route: ${payload.fromChain} -> ${payload.toChain} · ${formatTaskMetricAmount(payload.amountUsdc)} USDC`);
+  }
+
+  if (payload.fromChain === 'Sepolia' && Array.isArray(payload.targets) && payload.targets.length > 0) {
+    facts.push(`Fanout route: ${payload.targets.map(target => `${target.toChain} ${target.amountEth} ETH`).join(' · ')}`);
+  }
 
   if (payload.swappedAmountIn && payload.amountOut && payload.stableToken) {
     facts.push(`Swap leg: ${formatTaskMetricAmount(payload.swappedAmountIn)} ${payload.stableToken} -> ${formatTaskMetricAmount(payload.amountOut)} ${payload.volatileToken || 'cirBTC'}`);
@@ -638,8 +996,13 @@ function getTaskExecutionFactLines(payload) {
     facts.push(`Remainder kept in wallet: ${leftovers.join(' + ')}`);
   }
 
-  if (payload.lpAmount) {
+  if (payload.lpAmount && !['curve_liquidity_add', 'curve_liquidity_remove'].includes(payload.executionRail)) {
     facts.push(`LP minted: ${formatTaskMetricAmount(payload.lpAmount)}`);
+  }
+
+  if (payload.economy?.feeUsdc) {
+    facts.push('Fee rail: x402 / Circle Gateway -> Arc revenue pool');
+    facts.push(`Fee settled: ${formatTaskMetricAmount(payload.economy.feeUsdc)} USDC (${payload.economy.status || 'unknown'})`);
   }
 
   if (payload.token0Amount && payload.token0Symbol) {
@@ -650,36 +1013,7 @@ function getTaskExecutionFactLines(payload) {
     facts.push(`Returned: ${formatTaskMetricAmount(payload.token1Amount)} ${payload.token1Symbol}`);
   }
 
-  if (payload.swapTxHash) {
-    facts.push(`Swap tx: ${payload.swapTxHash}`);
-  }
-
-  if (payload.mintTxHash) {
-    facts.push(`Mint tx: ${payload.mintTxHash}`);
-  }
-
-  if (payload.burnTxHash) {
-    facts.push(`Burn tx: ${payload.burnTxHash}`);
-  }
-
   return facts;
-}
-
-function buildInlineTaskResult(task, response) {
-  const payload = response?.result || {};
-  const meta = getTaskResultStatusMeta(task, payload);
-
-  return {
-    id: `inline-${task.id}-${Date.now()}`,
-    task_id: task.id,
-    title: task.title,
-    description: task.description,
-    created_at: new Date().toISOString(),
-    payload: {
-      ...payload,
-      summary: payload?.summary || meta.summary,
-    },
-  };
 }
 
 function formatSignedScore(value) {
@@ -866,43 +1200,33 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
   );
 }
 
-// ── Task Card with result polling ─────────────────────────────────────────────
-function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
+// ── Task Card with persistent run status ──────────────────────────────────────
+function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQueued }) {
   const [busy, setBusy]         = useState(false);
   const [err, setErr]           = useState('');
-  const [runState, setRunState] = useState(null); // null | 'queued' | 'done'
-  const [result, setResult]     = useState(null);
-  const pollRef                 = useRef(null);
-  const startedAtRef            = useRef(null);
+  const [expanded, setExpanded] = useState(false);
   const [params, setParams]     = useState(() => getInitialTaskParams(task.id));
-  const resultFacts = result ? getTaskExecutionFactLines(result.payload) : [];
 
-  const isPaid    = task.tier === 2;
-  const isBlocked = !tasksEnabled;
+  const isPaid      = task.tier === 2;
+  const isBlocked   = !tasksEnabled;
   const needsParams = isExecutionTask(task.id);
+  const activeRun   = isTaskRunActive(latestRun) ? latestRun : null;
+  const failedRun   = latestRun?.status === 'failed' ? latestRun : null;
+  const result      = activeRun
+    ? null
+    : buildTaskRunResult(task, latestRun) || latestResult || null;
+  const resultFacts = result ? getTaskExecutionFactLines(result.payload) : [];
+  const resultLinks = result ? getTaskExecutionLinks(result.payload) : [];
+  const resultMeta  = result ? getTaskResultStatusMeta(task, result.payload || {}) : null;
+  const summaryText = result ? getTaskPayloadSummary(task, result.payload || {}) : '';
+  const errorMessage = err || (!activeRun && failedRun ? getTaskRunErrorMessage(failedRun.error || failedRun.stage_detail || failedRun.stage_label) : '');
 
   useEffect(() => {
     setParams(getInitialTaskParams(task.id));
   }, [task.id]);
 
-  // On mount: check if there's a recent result (last 3 min) for this task
-  useEffect(() => {
-    if (!agentId) return;
-    tasksApi.results(agentId, 20).then(data => {
-      const cutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString();
-      const found = (data.results || []).find(
-        r => r.task_id === task.id && r.created_at >= cutoff,
-      );
-      if (found) { setResult(found); setRunState('done'); }
-    }).catch(() => {});
-  }, [agentId, task.id]);
-
-  function stopPoll() {
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-  }
-
   async function handleRun() {
-    if (!agentId || isBlocked) return;
+    if (!agentId || isBlocked || activeRun) return;
     if (needsParams && !expanded) {
       setExpanded(true);
       return;
@@ -915,45 +1239,40 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
       return;
     }
 
-    setBusy(true); setErr(''); setResult(null); setRunState('queued');
-    startedAtRef.current = new Date().toISOString();
+    setBusy(true);
+    setErr('');
+
     try {
-      const response = await tasksApi.runTask(agentId, task.id, needsParams ? buildTaskParams(task.id, params) : undefined);
-      if (response?.inline) {
-        setResult(buildInlineTaskResult(task, response));
-        setRunState('done');
-        onRefresh?.();
+      const response = await tasksApi.runTask(
+        agentId,
+        task.id,
+        needsParams ? buildTaskParams(task.id, params) : undefined,
+      );
+
+      if (response?.run) {
+        onRunQueued?.(response.run);
+        setExpanded(true);
         return;
       }
-      let attempts = 0;
-      pollRef.current = setInterval(async () => {
-        attempts++;
-        try {
-          const data = await tasksApi.results(agentId, 20);
-          const found = (data.results || []).find(
-            r => r.task_id === task.id && r.created_at >= startedAtRef.current,
-          );
-          if (found) {
-            setResult(found);
-            setRunState('done');
-            stopPoll();
-            onRefresh?.();
-          }
-        } catch { /* ignore poll errors */ }
-        if (attempts >= 20) { stopPoll(); setRunState(null); }
-      }, 3000);
+
+      if (response?.inline) {
+        onRunQueued?.({
+          ...response.run,
+          status: 'completed',
+          result_payload: response.result || null,
+          completed_at: new Date().toISOString(),
+        });
+      }
     } catch (e) {
+      if (e?.data?.run) {
+        onRunQueued?.(e.data.run);
+        setExpanded(true);
+      }
       setErr(getTaskRunErrorMessage(e.message));
-      setRunState(null);
     } finally {
       setBusy(false);
     }
   }
-
-  useEffect(() => () => stopPoll(), []);
-
-  const [expanded, setExpanded] = useState(false);
-  const resultMeta = result ? getTaskResultStatusMeta(task, result.payload || {}) : null;
 
   return (
     <div className={`border rounded-xl overflow-hidden transition-colors ${expanded ? 'border-slate-300' : 'border-slate-200'}`}>
@@ -980,7 +1299,7 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
 
         <button
           onClick={handleRun}
-          disabled={busy || !agentId || runState === 'queued' || isBlocked}
+          disabled={busy || !agentId || Boolean(activeRun) || isBlocked}
           className={`shrink-0 flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition
             ${isBlocked
               ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
@@ -989,9 +1308,11 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
                 : 'bg-[#66D121] text-white hover:bg-[#55b81c] disabled:opacity-60'
             }`}
         >
-          {runState === 'queued'
-            ? <><Spinner size={11} /> Running…</>
-            : runState === 'done'
+          {busy
+            ? <><Spinner size={11} /> Starting…</>
+            : activeRun
+              ? <><Spinner size={11} /> In Progress</>
+              : result
               ? resultMeta?.buttonLabel === 'Simulated'
                 ? <><AlertTriangle size={11} /> Simulated</>
                 : resultMeta?.buttonLabel === 'Skipped'
@@ -1154,71 +1475,51 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
               })()}
 
               {task.id === 'EXEC_CCTP_BRIDGE' && (
-                <div className="grid gap-2 sm:grid-cols-3">
-                  <label className="block">
-                    <span className="block text-[11px] font-medium text-slate-500 mb-1">From Chain</span>
-                    <select
-                      value={params.fromChain}
-                      onChange={e => setParams(current => ({ ...current, fromChain: e.target.value }))}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
-                    >
-                      {CCTP_CHAIN_OPTIONS.map(chain => (
-                        <option key={chain} value={chain}>{chain}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span className="block text-[11px] font-medium text-slate-500 mb-1">To Chain</span>
-                    <select
-                      value={params.toChain}
-                      onChange={e => setParams(current => ({ ...current, toChain: e.target.value }))}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
-                    >
-                      {CCTP_CHAIN_OPTIONS.map(chain => (
-                        <option key={chain} value={chain}>{chain}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Amount (USDC)</span>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.000001"
-                      value={params.amountUsdc}
-                      onChange={e => setParams(current => ({ ...current, amountUsdc: e.target.value }))}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
-                      placeholder="1.00"
-                    />
-                  </label>
-                </div>
-              )}
-
-              {task.id === 'EXEC_YIELD_MOVE' && (
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <label className="block">
-                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Action</span>
-                    <select
-                      value={params.action}
-                      onChange={e => setParams(current => ({ ...current, action: e.target.value }))}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
-                    >
-                      <option value="supply">Supply</option>
-                      <option value="withdraw">Withdraw</option>
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Amount (USDC)</span>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.000001"
-                      value={params.amount}
-                      onChange={e => setParams(current => ({ ...current, amount: e.target.value }))}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
-                      placeholder="1.00"
-                    />
-                  </label>
+                <div className="space-y-2">
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    <label className="block">
+                      <span className="block text-[11px] font-medium text-slate-500 mb-1">From Chain</span>
+                      <select
+                        value={params.fromChain}
+                        onChange={e => setParams(current => ({ ...current, fromChain: e.target.value }))}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                      >
+                        {CCTP_CHAIN_OPTIONS.map(chain => (
+                          <option key={chain} value={chain}>{chain}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="block text-[11px] font-medium text-slate-500 mb-1">To Chain</span>
+                      <select
+                        value={params.toChain}
+                        onChange={e => setParams(current => ({ ...current, toChain: e.target.value }))}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                      >
+                        {CCTP_CHAIN_OPTIONS.map(chain => (
+                          <option key={chain} value={chain}>{chain}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="block text-[11px] font-medium text-slate-500 mb-1">Amount (USDC)</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.000001"
+                        value={params.amountUsdc}
+                        onChange={e => setParams(current => ({ ...current, amountUsdc: e.target.value }))}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                        placeholder="1.00"
+                      />
+                    </label>
+                  </div>
+                  <p className="text-[11px] text-slate-500">
+                    This card stays locked while the bridge runs. If you leave this screen and come back later, the latest backend stage is restored here automatically and the button stays disabled until the bridge finishes or fails.
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    Arbitrum Sepolia is usually the slowest destination and can take up to 10 minutes during the attestation and mint leg.
+                  </p>
                 </div>
               )}
 
@@ -1283,14 +1584,50 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
               </p>
             </div>
           )}
+          {task.id === 'EXEC_SEPOLIA_GAS_FANOUT' && (
+            <div className="space-y-1">
+              <p className="text-[11px] text-slate-500">
+                This run waits for each destination ETH balance update before the card unlocks. If you leave this screen and return later, the latest backend stage is restored and the button remains disabled until all three destinations finish.
+              </p>
+              <p className="text-[11px] text-slate-500">
+                Arbitrum Sepolia is usually the slowest leg and can take up to 10 minutes to reflect the bridged gas.
+              </p>
+            </div>
+          )}
           <p className="text-[11px] text-slate-400 font-mono">{task.id}</p>
           {isPaid && (
             <p className="text-xs text-amber-700/80 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-1.5">
-              This task executes a real on-chain transaction via your agent wallet.
-              A <strong>{Number(task.fee_usdc).toFixed(2)} USDC</strong> platform fee is deposited
-              into ArcRevenuePool on execution.
+              Fee rail: <strong>x402 / Circle Gateway</strong>{' -> '}<strong>agentic task economy</strong>{' -> '}shared Arc revenue pool.
+              The execution tx and fee settlement tx appear below after confirmation.
             </p>
           )}
+        </div>
+      )}
+
+      {/* Active run panel */}
+      {activeRun && (
+        <div className="px-4 pb-3 border-t border-slate-100 pt-2.5 bg-blue-50/70">
+          <div className="flex items-start gap-2">
+            {activeRun.status === 'queued' ? (
+              <Clock size={13} className="text-blue-600 shrink-0 mt-0.5" />
+            ) : (
+              <Spinner size={13} className="text-blue-600 shrink-0 mt-0.5" />
+            )}
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-semibold text-blue-800">{activeRun.stage_label || (activeRun.status === 'queued' ? 'Queued' : 'Running')}</p>
+              {activeRun.stage_detail && (
+                <p className="text-xs mt-0.5 text-blue-700">{activeRun.stage_detail}</p>
+              )}
+              {['EXEC_CCTP_BRIDGE', 'EXEC_SEPOLIA_GAS_FANOUT'].includes(task.id) && (
+                <p className="text-[11px] text-blue-700/90 mt-1">
+                  Bridge tasks can remain active for several minutes. If you leave this screen and return, this card stays locked, reloads the latest backend stage, and prevents a duplicate run until the destination leg finishes.
+                </p>
+              )}
+              <p className="text-[11px] text-slate-500 mt-1">
+                Started {formatTimestamp(activeRun.created_at)} · Last update {formatTimestamp(activeRun.updated_at || activeRun.created_at)}
+              </p>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1307,8 +1644,8 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
             )}
             <div className="min-w-0 flex-1">
               <p className={`text-xs font-semibold ${resultMeta?.titleClasses || 'text-green-800'}`}>{resultMeta?.label || 'Task completed'}</p>
-              {result.payload?.summary && (
-                <p className={`text-xs mt-0.5 ${resultMeta?.detailClasses || 'text-slate-600'}`}>{result.payload.summary}</p>
+              {summaryText && (
+                <p className={`text-xs mt-0.5 ${resultMeta?.detailClasses || 'text-slate-600'}`}>{summaryText}</p>
               )}
               {resultFacts.length > 0 && (
                 <div className="mt-1 space-y-0.5">
@@ -1317,6 +1654,7 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
                   ))}
                 </div>
               )}
+              <TaskExecutionLinks links={resultLinks} />
               {result.payload?.dryRun && isPaid && (
                 <p className="text-[11px] text-amber-700 mt-1">
                   No on-chain transaction was sent. Check dry-run mode, relayer funding and pool configuration before treating this as a live execution.
@@ -1331,9 +1669,9 @@ function TaskCard({ task, agentId, tasksEnabled, onRefresh }) {
       )}
 
       {/* Error */}
-      {err && (
+      {errorMessage && !activeRun && (
         <div className="px-4 pb-2">
-          <Alert type="error" className="py-1 text-xs">{err}</Alert>
+          <Alert type="error" className="py-1 text-xs">{errorMessage}</Alert>
         </div>
       )}
     </div>
@@ -1345,7 +1683,9 @@ function ResultRow({ result }) {
   const [expanded, setExpanded] = useState(false);
   const ts = new Date(result.created_at).toLocaleTimeString();
   const factLines = getTaskExecutionFactLines(result.payload);
-  const expandedText = [result.payload?.summary, ...factLines].filter(Boolean).join('\n');
+  const executionLinks = getTaskExecutionLinks(result.payload);
+  const summaryText = getTaskPayloadSummary({ id: result.task_id, title: result.title }, result.payload || {});
+  const hasRenderableContent = Boolean(summaryText) || factLines.length > 0 || executionLinks.length > 0;
 
   return (
     <div className="border border-slate-200 rounded-xl overflow-hidden">
@@ -1361,11 +1701,21 @@ function ResultRow({ result }) {
           : <ChevronDown size={12} className="text-slate-400" />}
       </button>
       {expanded && (
-        <pre className="px-4 pb-3 pt-1 text-xs text-slate-500 overflow-x-auto border-t border-slate-100 max-h-40 whitespace-pre-wrap">
-          {expandedText
-            ? expandedText
-            : JSON.stringify(result.payload, null, 2)}
-        </pre>
+        <div className="border-t border-slate-100 px-4 pb-3 pt-2 text-xs text-slate-500">
+          {hasRenderableContent ? (
+            <div className="space-y-1.5">
+              {summaryText && (
+                <p className="whitespace-pre-wrap text-slate-600">{summaryText}</p>
+              )}
+              {factLines.map(line => (
+                <p key={line}>{line}</p>
+              ))}
+              <TaskExecutionLinks links={executionLinks} />
+            </div>
+          ) : (
+            <pre className="overflow-x-auto whitespace-pre-wrap">{JSON.stringify(result.payload, null, 2)}</pre>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1376,6 +1726,7 @@ export default function TasksTab() {
   const { agent, setAgent } = useAgent();
 
   const [catalog, setCatalog]         = useState([]);
+  const [taskRuns, setTaskRuns]       = useState([]);
   const [results, setResults]         = useState([]);
   const [poolBal, setPoolBal]         = useState(null);
   const [agentStatus, setAgentStatus] = useState(null);
@@ -1434,7 +1785,7 @@ export default function TasksTab() {
   const load = useCallback(async () => {
     setLoading(true); setError('');
     try {
-      const [catRes, poolRes, statusRes, reputationRes] = await Promise.all([
+      const [catRes, poolRes, statusRes, reputationRes, resultsRes, runsRes] = await Promise.all([
         tasksApi.catalog(),
         tasksApi.poolBalance(),
         agent?.id
@@ -1443,9 +1794,17 @@ export default function TasksTab() {
         agent?.id
           ? agentsApi.reputation(agent.id, 8).then(data => ({ data })).catch(err => ({ error: err.message }))
           : Promise.resolve(null),
+        agent?.id
+          ? tasksApi.results(agent.id, 20).catch(() => ({ results: [] }))
+          : Promise.resolve({ results: [] }),
+        agent?.id
+          ? tasksApi.runs(agent.id, 'recent', 20).catch(() => ({ runs: [] }))
+          : Promise.resolve({ runs: [] }),
       ]);
       setCatalog(catRes.tasks || []);
       setPoolBal(poolRes);
+      setResults(resultsRes.results || []);
+      setTaskRuns(runsRes.runs || []);
       if (statusRes?.data) {
         setAgentStatus(statusRes.data);
       } else if (agent?.id) {
@@ -1456,10 +1815,6 @@ export default function TasksTab() {
       } else if (agent?.id) {
         setReputationOverview(null);
       }
-      if (agent?.id) {
-        const resRes = await tasksApi.results(agent.id, 20);
-        setResults(resRes.results || []);
-      }
     } catch (e) {
       setError(e.message);
     } finally {
@@ -1468,6 +1823,40 @@ export default function TasksTab() {
   }, [agent?.id]);
 
   useEffect(() => { load(); }, [load]);
+
+  const hasActiveTaskRun = taskRuns.some(isTaskRunActive);
+
+  useEffect(() => {
+    if (!agent?.id || !hasActiveTaskRun) return undefined;
+
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const runRes = await tasksApi.runs(agent.id, 'recent', 20);
+        if (cancelled) return;
+
+        let shouldReload = false;
+        setTaskRuns((current) => {
+          const nextRuns = runRes.runs || [];
+          const prevActiveIds = new Set(current.filter(isTaskRunActive).map(run => run.id));
+          const nextActiveIds = new Set(nextRuns.filter(isTaskRunActive).map(run => run.id));
+          shouldReload = Array.from(prevActiveIds).some(id => !nextActiveIds.has(id));
+          return nextRuns;
+        });
+
+        if (shouldReload) {
+          await load();
+        }
+      } catch {
+        // Keep the current UI state; the next poll tick can recover.
+      }
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [agent?.id, hasActiveTaskRun, load]);
 
   async function handleEnableToggle(newVal) {
     if (!agent?.id) return;
@@ -1552,6 +1941,20 @@ export default function TasksTab() {
 
   const freeTasks  = catalog.filter(t => t.tier === 1);
   const paidTasks  = catalog.filter(t => t.tier === 2);
+  const latestTaskRunById = new Map();
+  for (const run of taskRuns) {
+    if (!latestTaskRunById.has(run.task_id)) {
+      latestTaskRunById.set(run.task_id, run);
+    }
+  }
+
+  const latestTaskResultById = new Map();
+  for (const result of results) {
+    if (!latestTaskResultById.has(result.task_id)) {
+      latestTaskResultById.set(result.task_id, result);
+    }
+  }
+
   const shownTasks = activeGroup === 'free'
     ? freeTasks
     : activeGroup === 'paid'
@@ -1769,7 +2172,12 @@ export default function TasksTab() {
           task={task}
           agentId={agent?.id}
           tasksEnabled={tasksEnabled}
-          onRefresh={load}
+          latestRun={latestTaskRunById.get(task.id) || null}
+          latestResult={latestTaskResultById.get(task.id) || null}
+          onRunQueued={(run) => {
+            if (!run) return;
+            setTaskRuns(current => [run, ...current.filter(item => item.id !== run.id)]);
+          }}
         />
       ))}
     </div>
@@ -1891,12 +2299,6 @@ export default function TasksTab() {
         <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-500 flex items-center gap-2">
           <Clock size={12} className="shrink-0" />
           Full catalog — this agent can run up to 5 free task runs total per day. Oracle product status and payment flow now live under the dedicated Oracle tab.
-        </div>
-      )}
-      {activeGroup === 'paid' && (
-        <div className="rounded-xl border border-amber-100 bg-amber-50/60 px-3.5 py-2.5 text-xs text-amber-700 flex items-center gap-2">
-          <Coins size={12} className="shrink-0" />
-          Paid tasks execute real on-chain transactions via your agent wallet. CCTP Bridge is <strong>free</strong>. Other paid tasks incur a 0.10 USDC platform fee per run.
         </div>
       )}
       {activeGroup === 'automation' && (

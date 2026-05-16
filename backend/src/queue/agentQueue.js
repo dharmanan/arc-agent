@@ -23,6 +23,7 @@ const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationSe
 const taskEconomyService = require('../services/agenticEconomy/taskEconomyService');
 const agenticTaskExecutionService = require('../services/agenticEconomy/agenticTaskExecutionService');
 const { getDailyLimitBypass, isDailyLimitBypassed } = require('../services/dailyLimitBypass');
+const taskRunService = require('../services/taskRunService');
 
 const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
 const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
@@ -147,11 +148,66 @@ const queue = new Bull('agent-jobs', {
 });
 
 const REGISTERED_MANUAL_TASK_PROCESSORS = new Map();
+const REGISTERED_PAID_TASK_PROCESSORS = new Set();
+const PAID_TASK_ACTIVITY_SUPPORTED_IDS = new Set([
+  'EXEC_CURVE_SWAP',
+  'EXEC_CURVE_LIQUIDITY_ADD',
+  'EXEC_CURVE_LIQUIDITY_REMOVE',
+  'EXEC_CIRBTC_USDC_ZAP_IN',
+  'EXEC_CIRBTC_EURC_ZAP_IN',
+  'EXEC_CIRBTC_USDC_LP_REMOVE',
+  'EXEC_CIRBTC_EURC_LP_REMOVE',
+  'EXEC_CCTP_BRIDGE',
+  'EXEC_SEPOLIA_GAS_FANOUT',
+  'EXEC_ARB',
+  'EXEC_REBALANCE',
+]);
 const MANUAL_TASK_READY_TIMEOUT_MS = parseInt(process.env.MANUAL_TASK_READY_TIMEOUT_MS || '1200', 10);
 
 function registerTaskProcessor(name, concurrency, handler) {
-  REGISTERED_MANUAL_TASK_PROCESSORS.set(name, handler);
-  queue.process(name, concurrency, handler);
+  const wrappedHandler = async (job) => {
+    const taskRunId = job?.data?.taskRunId || null;
+
+    if (taskRunId) {
+      await taskRunService.markTaskRunRunning(taskRunId, {
+        stageKey: 'starting',
+        stageLabel: 'Starting',
+        stageDetail: 'Worker accepted the task request and is preparing execution.',
+      }).catch(() => {});
+    }
+
+    try {
+      const result = await handler(job);
+
+      if (taskRunId) {
+        if (result && result.ok === false) {
+          await taskRunService.failTaskRun(taskRunId, {
+            error: result.error || result.reason || 'task_run_failed',
+            stageDetail: result.errorSummary || result.error || null,
+            resultPayload: result.payload || null,
+          }).catch(() => {});
+        } else {
+          await taskRunService.completeTaskRun(taskRunId, {
+            resultPayload: result?.payload || result || {},
+            stageDetail: result?.payload?.summary || 'Task completed successfully.',
+          }).catch(() => {});
+        }
+      }
+
+      return result;
+    } catch (err) {
+      if (taskRunId) {
+        await taskRunService.failTaskRun(taskRunId, {
+          error: err.message,
+          stageDetail: err.message,
+        }).catch(() => {});
+      }
+      throw err;
+    }
+  };
+
+  REGISTERED_MANUAL_TASK_PROCESSORS.set(name, wrappedHandler);
+  queue.process(name, concurrency, wrappedHandler);
 }
 
 function _withTimeout(promise, timeoutMs, code) {
@@ -187,6 +243,178 @@ async function runTaskInline(taskName, data) {
     id: `inline-${taskName}-${Date.now()}`,
     data,
   });
+}
+
+async function queueManualTask(taskName, data) {
+  const handler = REGISTERED_MANUAL_TASK_PROCESSORS.get(taskName);
+  if (!handler) {
+    const error = new Error('manual_task_processor_missing');
+    error.code = 'manual_task_processor_missing';
+    throw error;
+  }
+
+  const manualJob = {
+    id: `manual-${taskName}-${data?.agentId || 'unknown'}-${Date.now()}`,
+    data,
+  };
+
+  setImmediate(() => {
+    Promise.resolve(handler(manualJob))
+      .then((result) => {
+        if (result && result.ok === false) {
+          console.warn(`[QUEUE] Job ${manualJob.id} finished with local failure:`, result.reason || result.error || 'task_run_failed');
+          return;
+        }
+
+        console.log(`[QUEUE] Job ${manualJob.id} completed`);
+      })
+      .catch((err) => {
+        console.error(`[QUEUE] Job ${manualJob.id} failed:`, err.message);
+      });
+  });
+
+  return {
+    id: manualJob.id,
+    mode: 'in_process_detached',
+  };
+}
+
+function _shortTxHash(txHash) {
+  if (!txHash || typeof txHash !== 'string' || txHash.length < 12) return null;
+  return `${txHash.slice(0, 6)}...${txHash.slice(-4)}`;
+}
+
+function _buildBridgeStageMeta(step, params = {}, data = {}) {
+  const fromChain = params.fromChain || 'the source chain';
+  const toChain = params.toChain || 'the destination chain';
+  const burnHash = _shortTxHash(data?.burnTxHash);
+  const approveHash = _shortTxHash(data?.approveTxHash);
+  const mintHash = _shortTxHash(data?.mintTxHash);
+  const attestationLagNote = toChain === 'Arbitrum Sepolia'
+    ? 'This attestation leg can take up to 10 minutes before Arbitrum Sepolia is ready to mint.'
+    : 'This attestation leg can take a few minutes before the destination mint is ready.';
+
+  switch (step) {
+    case 'approving':
+      return {
+        stageKey: 'bridge_approving',
+        stageLabel: 'Approving USDC',
+        stageDetail: `Submitting USDC approval on ${fromChain}.`,
+      };
+    case 'approved':
+      return {
+        stageKey: 'bridge_approved',
+        stageLabel: 'Approval Confirmed',
+        stageDetail: approveHash
+          ? `Approval confirmed on ${fromChain} (${approveHash}). Preparing the Circle burn.`
+          : `Approval confirmed on ${fromChain}. Preparing the Circle burn.`,
+      };
+    case 'burning':
+      return {
+        stageKey: 'bridge_burning',
+        stageLabel: 'Burning On Source',
+        stageDetail: `Submitting the Circle burn transaction on ${fromChain}.`,
+      };
+    case 'burned':
+      return {
+        stageKey: 'bridge_burned',
+        stageLabel: 'Burn Confirmed',
+        stageDetail: burnHash
+          ? `Burn confirmed on ${fromChain} (${burnHash}). Waiting for Circle attestation before minting on ${toChain}.`
+          : `Burn confirmed on ${fromChain}. Waiting for Circle attestation before minting on ${toChain}.`,
+      };
+    case 'attesting':
+      return {
+        stageKey: 'bridge_attesting',
+        stageLabel: 'Waiting For Attestation',
+        stageDetail: `${attestationLagNote} Keep this task locked until the mint step starts.`,
+      };
+    case 'attested':
+      return {
+        stageKey: 'bridge_attested',
+        stageLabel: 'Attestation Ready',
+        stageDetail: `Circle attestation is ready. Preparing the destination mint on ${toChain}.`,
+      };
+    case 'minting':
+      return {
+        stageKey: 'bridge_minting',
+        stageLabel: 'Minting On Destination',
+        stageDetail: `Submitting receiveMessage on ${toChain}.`,
+      };
+    case 'complete':
+      return {
+        stageKey: 'bridge_complete',
+        stageLabel: 'Bridge Completed',
+        stageDetail: mintHash
+          ? `Mint confirmed on ${toChain} (${mintHash}).`
+          : `Mint confirmed on ${toChain}.`,
+      };
+    default:
+      return {
+        stageKey: 'bridge_running',
+        stageLabel: 'Bridge Running',
+        stageDetail: `Bridge execution is in progress from ${fromChain} to ${toChain}.`,
+      };
+  }
+}
+
+function _buildGasFanoutStageMeta(step, data = {}) {
+  const toChain = data.toChain || 'destination chain';
+  const topUpHash = _shortTxHash(data?.topUpTxHash);
+
+  switch (step) {
+    case 'preparing':
+      return {
+        stageKey: 'fanout_preparing',
+        stageLabel: 'Preparing Fanout',
+        stageDetail: 'Preparing the Sepolia gas fanout to all configured destination testnets.',
+      };
+    case 'bridging':
+      return {
+        stageKey: 'fanout_bridging',
+        stageLabel: `Bridging To ${toChain}`,
+        stageDetail: `Submitting the source-chain bridge leg from Sepolia to ${toChain}.`,
+      };
+    case 'awaiting_arrival':
+      return {
+        stageKey: 'fanout_awaiting_arrival',
+        stageLabel: `Waiting For ${toChain}`,
+        stageDetail: toChain === 'Arbitrum Sepolia'
+          ? 'Source tx is confirmed. Arbitrum Sepolia credit can take up to 10 minutes before the destination ETH balance updates.'
+          : `Source tx is confirmed. Waiting for the destination ETH balance on ${toChain} to update.`,
+      };
+    case 'arrived':
+      return {
+        stageKey: 'fanout_arrived',
+        stageLabel: `${toChain} Funded`,
+        stageDetail: topUpHash
+          ? `Destination ETH balance updated for ${toChain}. Source bridge tx: ${topUpHash}.`
+          : `Destination ETH balance updated for ${toChain}.`,
+      };
+    case 'complete':
+      return {
+        stageKey: 'fanout_complete',
+        stageLabel: 'Gas Fanout Completed',
+        stageDetail: 'All destination testnets reported the expected ETH top-up.',
+      };
+    default:
+      return {
+        stageKey: 'fanout_running',
+        stageLabel: 'Gas Fanout Running',
+        stageDetail: 'Sepolia gas fanout is currently in progress.',
+      };
+  }
+}
+
+async function _reportTaskRunStage(taskRunId, stageMeta) {
+  if (!taskRunId || !stageMeta) return;
+
+  await taskRunService.updateTaskRunStage(taskRunId, {
+    status: 'running',
+    stageKey: stageMeta.stageKey,
+    stageLabel: stageMeta.stageLabel,
+    stageDetail: stageMeta.stageDetail,
+  }).catch(() => {});
 }
 
 // ── Engine selector — use LLM when key is available, fall back to rule engine ──
@@ -871,6 +1099,33 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       agentPrivateKey: privateKey,
     });
 
+    let economy = null;
+    try {
+      economy = await taskEconomyService.settleExecutionFee({
+        agent,
+        referenceId: txResult.txHash || `defi-loop-${agentId}-${Date.now()}`,
+        referenceType: 'automation',
+        feeUsdc: AUTOMATION_EXECUTION_FEE_USDC,
+        fromChain: 'Arc Testnet',
+        toChain: 'Arc Testnet',
+        mode: 'circle_gateway_automation_fee',
+        rail: 'agentic_automation_economy',
+      });
+    } catch (err) {
+      economy = {
+        mode: 'circle_gateway_automation_fee',
+        rail: 'agentic_automation_economy',
+        referenceType: 'automation',
+        referenceId: txResult.txHash || null,
+        feeUsdc: AUTOMATION_EXECUTION_FEE_USDC,
+        sourceChain: 'Arc Testnet',
+        destinationChain: 'Arc Testnet',
+        status: 'failed',
+        error: err.message,
+      };
+      console.warn('[AUTOMATION_ECONOMY] DEFI_LOOP fee settlement failed:', err.message);
+    }
+
     // Increment auto-tx counter
     await db.query(
       'UPDATE agents SET daily_auto_tx_count = daily_auto_tx_count + 1 WHERE id = $1',
@@ -895,12 +1150,19 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         walletReserveUsdc,
         availableToTradeUsdc,
         amountOut: txResult.amountOut,
+        economy,
       })],
     );
 
     console.log(`[QUEUE] DEFI_LOOP swap OK agent=${agentId} tx=${txResult.txHash}`);
     recordReputationEvent(agentId, EVENT_TYPES.DEFI_LOOP).catch(() => {});
-    return finishDefi('executed', { ok: true, action: 'swap_executed', txHash: txResult.txHash, amountOut: txResult.amountOut });
+    return finishDefi('executed', {
+      ok: true,
+      action: 'swap_executed',
+      txHash: txResult.txHash,
+      amountOut: txResult.amountOut,
+      economy,
+    });
 
   } catch (err) {
     const errorDetails = buildExecutionErrorDetails(err);
@@ -967,8 +1229,8 @@ const DAILY_FREE_TASK_CAP = parseInt(process.env.DAILY_FREE_TASK_CAP || '5', 10)
 const BUILTIN_DAILY_TASKS = [
   {
     id: 'DAILY_PRICE_REPORT',
-    title: 'FX Price Report',
-    description: 'EURC/USDC + BRLA/USDC live rates via Frankfurter',
+    title: 'FX Peg Proxy Report',
+    description: 'EURC/USDC + BRLA/USDC fiat peg proxies via Frankfurter',
   },
   {
     id: 'DAILY_POOL_HEALTH',
@@ -992,8 +1254,8 @@ const BUILTIN_DAILY_TASKS = [
   },
   {
     id: 'DAILY_FOREX_MATRIX',
-    title: 'FX Matrix',
-    description: 'EURC, BRLA, MXNB and JPYC snapshots against USDC',
+    title: 'FX Peg Proxy Matrix',
+    description: 'EURC, BRLA, MXNB and JPYC fiat peg proxies against USDC',
   },
   {
     id: 'DAILY_USDC_PEG_CHECK',
@@ -1019,6 +1281,10 @@ const BUILTIN_DAILY_TASKS = [
 const DAILY_TASK_TYPES = BUILTIN_DAILY_TASKS.map(task => task.id);
 
 const PAID_TASK_FEE_USDC = parseFloat(process.env.PAID_TASK_FEE_USDC || '0.10');
+const GAS_FANOUT_TASK_FEE_USDC = parseFloat(process.env.GAS_FANOUT_TASK_FEE_USDC || '0.20');
+const AUTOMATION_EXECUTION_FEE_USDC = parseFloat(
+  process.env.AUTOMATION_EXECUTION_FEE_USDC || String(PAID_TASK_FEE_USDC),
+);
 
 // ── TIER-2 PAID TASK CATALOG ───────────────────────────────────────────────────
 const BUILTIN_TIER2_TASKS = [
@@ -1074,16 +1340,16 @@ const BUILTIN_TIER2_TASKS = [
   {
     id:          'EXEC_CCTP_BRIDGE',
     title:       'CCTP Bridge',
-    description: 'Agent auto-bridges USDC cross-chain via Circle CCTP V2 (free, no platform fee)',
-    tier:        1,
-    fee_usdc:    0,
-  },
-  {
-    id:          'EXEC_YIELD_MOVE',
-    title:       'Yield Move',
-    description: 'Supply or withdraw USDC from Aave for yield optimization',
+    description: 'Bridge USDC from Arc Testnet to one selected EVM testnet via Circle CCTP V2',
     tier:        2,
     fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_SEPOLIA_GAS_FANOUT',
+    title:       'Sepolia Gas Fanout',
+    description: 'Bridge 0.01 ETH each from Sepolia to Optimism, Base and Arbitrum Sepolia in one run',
+    tier:        2,
+    fee_usdc:    GAS_FANOUT_TASK_FEE_USDC,
   },
   {
     id:          'EXEC_ARB',
@@ -1106,6 +1372,16 @@ const _ALL_SEEDED_TASKS = [
   ...BUILTIN_DAILY_TASKS.map(t => ({ ...t, tier: 1, fee_usdc: 0 })),
   ...BUILTIN_TIER2_TASKS,
 ];
+const EXECUTION_TASK_FEE_BY_ID = Object.fromEntries(
+  BUILTIN_TIER2_TASKS.map(task => [task.id, Number(task.fee_usdc) || 0]),
+);
+
+function getExecutionTaskFeeUsdc(taskId, fallbackFeeUsdc = PAID_TASK_FEE_USDC) {
+  const feeUsdc = EXECUTION_TASK_FEE_BY_ID[taskId];
+  return Number.isFinite(feeUsdc) && feeUsdc >= 0
+    ? feeUsdc
+    : fallbackFeeUsdc;
+}
 
 async function ensureTaskCatalogSeeded() {
   const placeholders = _ALL_SEEDED_TASKS
@@ -1130,6 +1406,12 @@ async function ensureTaskCatalogSeeded() {
          fee_usdc = EXCLUDED.fee_usdc,
          enabled = TRUE`,
     params,
+  );
+
+  await db.query(
+    `UPDATE task_catalog
+        SET enabled = FALSE
+      WHERE id = 'EXEC_YIELD_MOVE'`,
   );
 }
 
@@ -1232,46 +1514,246 @@ async function _freeExecGuard(agentId) {
   return { ok: true, agent };
 }
 
+function _toTaskTxAmount(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function _getCurveStableTaskToken(index) {
+  return Number(index) === 1 ? 'EURC' : 'USDC';
+}
+
+function _getPaidTaskActivityStatus(payload) {
+  if (payload?.dryRun) return 'dry_run';
+  if (payload?.skipped) return 'skipped';
+  return 'confirmed';
+}
+
+async function _insertTaskActivityRecord(agentId, record) {
+  await db.query(
+    `INSERT INTO transactions
+       (agent_id, type, from_chain, to_chain, token, amount_usdc, tx_hash, status, meta)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+    [
+      agentId,
+      record.type,
+      record.fromChain || null,
+      record.toChain || null,
+      record.token || 'USDC',
+      _toTaskTxAmount(record.amount),
+      record.txHash || null,
+      record.status || 'confirmed',
+      JSON.stringify(record.meta || {}),
+    ],
+  );
+}
+
+async function _recordPaidTaskActivity(agentId, taskId, payload, executionMeta) {
+  const status = _getPaidTaskActivityStatus(payload);
+
+  if (taskId === 'EXEC_CIRBTC_USDC_ZAP_IN' || taskId === 'EXEC_CIRBTC_EURC_ZAP_IN') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'direct_lp_add',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.stableToken || 'USDC',
+      amount: payload?.amountIn,
+      txHash: payload?.mintTxHash || payload?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_CIRBTC_USDC_LP_REMOVE' || taskId === 'EXEC_CIRBTC_EURC_LP_REMOVE') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'direct_lp_remove',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.stableToken || 'USDC',
+      amount: payload?.lpAmount || 0,
+      txHash: payload?.burnTxHash || payload?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_CURVE_SWAP') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'swap',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: executionMeta.fromToken || 'USDC',
+      amount: payload?.amountIn,
+      txHash: payload?.txHash || payload?.hash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_CURVE_LIQUIDITY_ADD') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'curve_lp_add',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.tokenIn || 'USDC',
+      amount: payload?.amountIn,
+      txHash: payload?.txHash || payload?.hash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_CURVE_LIQUIDITY_REMOVE') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'curve_lp_remove',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.tokenOut || 'USDC',
+      amount: payload?.amountOut || 0,
+      txHash: payload?.txHash || payload?.hash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_CCTP_BRIDGE') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'bridge',
+      fromChain: payload?.fromChain || 'Arc Testnet',
+      toChain: payload?.toChain || 'Arc Testnet',
+      token: 'USDC',
+      amount: payload?.amountUsdc,
+      txHash: payload?.burnTxHash || payload?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_SEPOLIA_GAS_FANOUT') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'gas_topup',
+      fromChain: payload?.fromChain || 'Sepolia',
+      toChain: Array.isArray(payload?.targets) && payload.targets.length === 1
+        ? payload.targets[0].toChain
+        : 'Multiple destinations',
+      token: 'ETH',
+      amount: 0,
+      txHash: payload?.targets?.[0]?.topUpTxHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_ARB') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'task_arb',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: executionMeta.fromToken || 'USDC',
+      amount: payload?.amountIn,
+      txHash: payload?.swapTxHash || payload?.swap?.txHash || payload?.swap?.hash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_REBALANCE') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'rebalance',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.fromToken || 'USDC',
+      amount: payload?.amountIn,
+      txHash: payload?.txHash || payload?.hash || null,
+      status,
+      meta: executionMeta,
+    });
+  }
+}
+
 // Write result + increment daily_paid_task_count + attach task economy fee metadata
-async function _savePaidTaskResult(agentId, taskId, payload, agent) {
+async function _savePaidTaskResult(agentId, taskId, payload, agent, options = {}) {
+  const feeUsdc = Number.isFinite(Number(options.feeUsdc))
+    ? Number(options.feeUsdc)
+    : getExecutionTaskFeeUsdc(taskId);
+  const fromChain = options.fromChain || taskEconomyService.getTaskEconomyConfigSummary().chain;
+  const toChain = options.toChain || taskEconomyService.getTaskEconomyConfigSummary().chain;
   let economy = null;
 
   try {
     economy = await taskEconomyService.settleTaskExecutionFee({
       agent,
       taskId,
-      feeUsdc: PAID_TASK_FEE_USDC,
+      feeUsdc,
+      fromChain,
+      toChain,
     });
   } catch (err) {
     economy = {
       mode: 'circle_gateway_task_fee',
       rail: 'agentic_task_economy',
       taskId,
-      feeUsdc: PAID_TASK_FEE_USDC,
+      feeUsdc,
+      sourceChain: fromChain,
+      destinationChain: toChain,
       status: 'failed',
       error: err.message,
     };
     console.warn(`[TASK_ECONOMY] ${taskId} fee settlement failed:`, err.message);
   }
 
-  await db.query(
-    `INSERT INTO agent_task_results (agent_id, task_id, payload) VALUES ($1, $2, $3::jsonb)`,
-    [agentId, taskId, JSON.stringify({ ...payload, economy })],
+  const resultPayload = { ...payload, economy };
+
+  const { rows: [storedResult] } = await db.query(
+    `INSERT INTO agent_task_results (agent_id, task_id, payload)
+     VALUES ($1, $2, $3::jsonb)
+     RETURNING id, created_at`,
+    [agentId, taskId, JSON.stringify(resultPayload)],
   );
 
   const executionMeta = {
     taskId,
+    taskResultId: storedResult?.id || null,
+    taskResultCreatedAt: storedResult?.created_at || null,
+    txHash: payload?.txHash || payload?.hash || payload?.swapTxHash || null,
+    fromToken: payload?.fromToken || _getCurveStableTaskToken(payload?.indexIn),
+    toToken: payload?.toToken || _getCurveStableTaskToken(payload?.indexOut),
     executionRail: payload?.executionRail || null,
     swapExecutionRail: payload?.swapExecutionRail || null,
     swapRouteStrategy: payload?.swapRouteStrategy || null,
     swapRouteReason: payload?.swapRouteReason || null,
+    poolAddress: payload?.poolAddress || null,
+    poolSource: payload?.poolSource || null,
+    indexIn: payload?.indexIn ?? null,
+    indexOut: payload?.indexOut ?? null,
+    minDy: payload?.minDy || payload?.swap?.minDy || null,
+    minLpAmount: payload?.minLpAmount || null,
+    minAmountOut: payload?.minAmountOut || null,
     stableToken: payload?.stableToken || null,
     volatileToken: payload?.volatileToken || null,
     amountIn: payload?.amountIn || null,
+    requestedAmountIn: payload?.requestedAmountIn || payload?.amountIn || null,
+    amountUsdc: payload?.amountUsdc || null,
+    amountEth: payload?.amountEth || null,
     swappedAmountIn: payload?.swappedAmountIn || null,
     remainingAmountIn: payload?.remainingAmountIn || null,
     amountOut: payload?.amountOut || null,
     lpAmount: payload?.lpAmount || null,
+    fromChain: payload?.fromChain || null,
+    toChain: payload?.toChain || null,
+    direction: payload?.direction || null,
+    bridgeType: payload?.bridgeType || null,
+    kind: payload?.kind || null,
+    targets: Array.isArray(payload?.targets) ? payload.targets : null,
+    signalOpportunity: payload?.signal?.opportunity || null,
     liquidityStableAmountUsed: payload?.liquidityStableAmountUsed || null,
     liquidityStableAmountRemaining: payload?.liquidityStableAmountRemaining || null,
     liquidityVolatileAmountUsed: payload?.liquidityVolatileAmountUsed || null,
@@ -1290,40 +1772,69 @@ async function _savePaidTaskResult(agentId, taskId, payload, agent) {
     economy,
   };
 
-  if (taskId === 'EXEC_CIRBTC_USDC_ZAP_IN' || taskId === 'EXEC_CIRBTC_EURC_ZAP_IN') {
-    await db.query(
-      `INSERT INTO transactions
-         (agent_id, type, from_chain, to_chain, token, amount_usdc, tx_hash, status, meta)
-       VALUES ($1, 'direct_lp_add', 'arc-testnet', 'arc-testnet', $2, $3, $4, 'confirmed', $5::jsonb)`,
-      [
-        agentId,
-        payload?.stableToken || 'USDC',
-        Number(payload?.amountIn || 0),
-        payload?.mintTxHash || payload?.txHash || null,
-        JSON.stringify(executionMeta),
-      ],
-    );
-  }
-
-  if (taskId === 'EXEC_CIRBTC_USDC_LP_REMOVE' || taskId === 'EXEC_CIRBTC_EURC_LP_REMOVE') {
-    await db.query(
-      `INSERT INTO transactions
-         (agent_id, type, from_chain, to_chain, token, amount_usdc, tx_hash, status, meta)
-       VALUES ($1, 'direct_lp_remove', 'arc-testnet', 'arc-testnet', $2, 0, $3, 'confirmed', $4::jsonb)`,
-      [
-        agentId,
-        payload?.stableToken || 'USDC',
-        payload?.burnTxHash || payload?.txHash || null,
-        JSON.stringify(executionMeta),
-      ],
-    );
-  }
+  await _recordPaidTaskActivity(agentId, taskId, payload, executionMeta);
 
   await db.query(
     `UPDATE agents SET daily_paid_task_count = daily_paid_task_count + 1 WHERE id = $1`,
     [agentId],
   );
   recordReputationEvent(agentId, EVENT_TYPES.DAILY_TASK).catch(() => {});
+
+  return resultPayload;
+}
+
+function registerPaidTaskProcessor(name, concurrency, executePaidTask, resolveEconomyOptions) {
+  REGISTERED_PAID_TASK_PROCESSORS.add(name);
+
+  registerTaskProcessor(name, concurrency, async (job) => {
+    const { agentId, params = {}, taskRunId = null } = job.data;
+    const guard = await _paidTaskGuard(agentId);
+    if (!guard.ok) return guard;
+    const { agent } = guard;
+
+    const context = {
+      job,
+      agentId,
+      agent,
+      params,
+      taskRunId,
+      dryRun: shouldUseDryRun(agent),
+    };
+
+    const result = await executePaidTask(context);
+    if (!result.ok) return result;
+
+    const economyOptions = typeof resolveEconomyOptions === 'function'
+      ? resolveEconomyOptions({ ...context, result }) || {}
+      : {};
+
+    const storedPayload = await _savePaidTaskResult(agentId, name, result.payload, agent, {
+      feeUsdc: getExecutionTaskFeeUsdc(name),
+      ...economyOptions,
+    });
+
+    return { ...result, payload: storedPayload };
+  });
+}
+
+function assertPaidTaskEconomyCoverage() {
+  const missing = BUILTIN_TIER2_TASKS
+    .map(task => task.id)
+    .filter(taskId => !REGISTERED_PAID_TASK_PROCESSORS.has(taskId));
+
+  if (missing.length > 0) {
+    throw new Error(`Missing paid task economy coverage for: ${missing.join(', ')}`);
+  }
+}
+
+function assertPaidTaskActivityCoverage() {
+  const missing = BUILTIN_TIER2_TASKS
+    .map(task => task.id)
+    .filter(taskId => !PAID_TASK_ACTIVITY_SUPPORTED_IDS.has(taskId));
+
+  if (missing.length > 0) {
+    throw new Error(`Missing paid task activity coverage for: ${missing.join(', ')}`);
+  }
 }
 
 // ── DAILY_PRICE_REPORT ────────────────────────────────────────────────────────
@@ -1340,9 +1851,9 @@ registerTaskProcessor('DAILY_PRICE_REPORT', 3, async (job) => {
     EURC_USDC: eurc.status === 'fulfilled' ? eurc.value : null,
     BRLA_USDC: brla.status === 'fulfilled' ? brla.value : null,
     summary:   [
-      eurc.status === 'fulfilled' ? `EURC/USDC ${eurc.value.rate}` : null,
-      brla.status === 'fulfilled' ? `BRLA/USDC ${brla.value.rate}` : null,
-    ].filter(Boolean).join(' · ') || 'FX snapshot captured for EURC and BRLA.',
+      eurc.status === 'fulfilled' ? `EURC/USDC peg proxy ${eurc.value.rate}` : null,
+      brla.status === 'fulfilled' ? `BRLA/USDC peg proxy ${brla.value.rate}` : null,
+    ].filter(Boolean).join(' · ') || 'Fiat peg proxy snapshot captured for EURC and BRLA.',
     fetchedAt:  new Date().toISOString(),
   };
   await _saveTaskResult(agentId, 'DAILY_PRICE_REPORT', payload);
@@ -1462,8 +1973,8 @@ registerTaskProcessor('DAILY_FOREX_MATRIX', 3, async (job) => {
   const payload = {
     rates,
     summary: strongest
-      ? `Tracked ${pairs.length} fiat-backed pairs. Highest quote: ${strongest[0]} ${strongest[1].rate}.`
-      : 'Tracked fiat-backed stablecoin pairs for the daily matrix.',
+      ? `Tracked ${pairs.length} fiat peg proxies. Highest proxy: ${strongest[0]} ${strongest[1].rate}.`
+      : 'Tracked fiat peg proxies for the daily matrix.',
     fetchedAt: new Date().toISOString(),
   };
   await _saveTaskResult(agentId, 'DAILY_FOREX_MATRIX', payload);
@@ -1584,148 +2095,98 @@ registerTaskProcessor('DAILY_ACTIVITY_RECAP', 3, async (job) => {
 // Each processor: guard → execute DeFi op → save result + fee deposit (fire-and-forget)
 
 // ── EXEC_CURVE_SWAP ───────────────────────────────────────────────────────────
-registerTaskProcessor('EXEC_CURVE_SWAP', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeCurveSwapTask({
+registerPaidTaskProcessor('EXEC_CURVE_SWAP', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeCurveSwapTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
+    dryRun,
     defaultCurvePool: _getUsdcEurcCurvePool(),
-  });
-  if (!result.ok) return result;
+  })
+));
 
-  await _savePaidTaskResult(agentId, 'EXEC_CURVE_SWAP', result.payload, agent);
-  return result;
-});
-
-registerTaskProcessor('EXEC_CURVE_LIQUIDITY_ADD', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeCurveLiquidityAddTask({
+registerPaidTaskProcessor('EXEC_CURVE_LIQUIDITY_ADD', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeCurveLiquidityAddTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
-  });
-  if (!result.ok) return result;
+    dryRun,
+  })
+));
 
-  await _savePaidTaskResult(agentId, 'EXEC_CURVE_LIQUIDITY_ADD', result.payload, agent);
-  return result;
-});
-
-registerTaskProcessor('EXEC_CURVE_LIQUIDITY_REMOVE', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeCurveLiquidityRemoveTask({
+registerPaidTaskProcessor('EXEC_CURVE_LIQUIDITY_REMOVE', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeCurveLiquidityRemoveTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
-  });
-  if (!result.ok) return result;
+    dryRun,
+  })
+));
 
-  await _savePaidTaskResult(agentId, 'EXEC_CURVE_LIQUIDITY_REMOVE', result.payload, agent);
-  return result;
-});
-
-registerTaskProcessor('EXEC_CIRBTC_USDC_ZAP_IN', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeDirectPairZapInTask({
+registerPaidTaskProcessor('EXEC_CIRBTC_USDC_ZAP_IN', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeDirectPairZapInTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
+    dryRun,
     stableToken: 'USDC',
-  });
-  if (!result.ok) return result;
+  })
+));
 
-  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_USDC_ZAP_IN', result.payload, agent);
-  return result;
-});
-
-registerTaskProcessor('EXEC_CIRBTC_EURC_ZAP_IN', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeDirectPairZapInTask({
+registerPaidTaskProcessor('EXEC_CIRBTC_EURC_ZAP_IN', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeDirectPairZapInTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
+    dryRun,
     stableToken: 'EURC',
-  });
-  if (!result.ok) return result;
+  })
+));
 
-  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_EURC_ZAP_IN', result.payload, agent);
-  return result;
-});
-
-registerTaskProcessor('EXEC_CIRBTC_USDC_LP_REMOVE', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeDirectPairRemoveLiquidityTask({
+registerPaidTaskProcessor('EXEC_CIRBTC_USDC_LP_REMOVE', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeDirectPairRemoveLiquidityTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
+    dryRun,
     stableToken: 'USDC',
-  });
-  if (!result.ok) return result;
+  })
+));
 
-  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_USDC_LP_REMOVE', result.payload, agent);
-  return result;
-});
-
-registerTaskProcessor('EXEC_CIRBTC_EURC_LP_REMOVE', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeDirectPairRemoveLiquidityTask({
+registerPaidTaskProcessor('EXEC_CIRBTC_EURC_LP_REMOVE', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeDirectPairRemoveLiquidityTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
+    dryRun,
     stableToken: 'EURC',
-  });
-  if (!result.ok) return result;
-
-  await _savePaidTaskResult(agentId, 'EXEC_CIRBTC_EURC_LP_REMOVE', result.payload, agent);
-  return result;
-});
+  })
+));
 
 // ── EXEC_CCTP_BRIDGE ──────────────────────────────────────────────────────────
-// Free (Tier-1) — no platform fee charged.
-registerTaskProcessor('EXEC_CCTP_BRIDGE', 1, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _freeExecGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeBridgeTask({
+// Paid (Tier-2) — fee settles back into the shared Arc revenue pool.
+registerPaidTaskProcessor('EXEC_CCTP_BRIDGE', 1, async ({ agent, params, dryRun, taskRunId }) => (
+  agenticTaskExecutionService.executeBridgeTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
-    onStep: (step) => console.log(`[EXEC_CCTP_BRIDGE] agent=${agentId} step=${step}`),
-  });
-  if (!result.ok) return result;
+    dryRun,
+    onStep: async (step, data) => {
+      await _reportTaskRunStage(taskRunId, _buildBridgeStageMeta(step, params, data));
+    },
+  })
+), ({ result, params }) => ({
+    fromChain: result.payload?.fromChain || params.fromChain || 'Arc Testnet',
+    toChain: 'Arc Testnet',
+}));
 
-  await _saveResultOnly(agentId, 'EXEC_CCTP_BRIDGE', result.payload);
-  return result;
+// ── EXEC_SEPOLIA_GAS_FANOUT ──────────────────────────────────────────────────
+registerPaidTaskProcessor('EXEC_SEPOLIA_GAS_FANOUT', 1, async ({ agent, dryRun, taskRunId }) => (
+  agenticTaskExecutionService.executeSepoliaGasFanoutTask({
+    agent,
+    dryRun,
+    onStep: async (step, data) => {
+      await _reportTaskRunStage(taskRunId, _buildGasFanoutStageMeta(step, data));
+    },
+  })
+), () => {
+  const taskEconomyChain = taskEconomyService.getTaskEconomyConfigSummary().chain;
+  return {
+    fromChain: taskEconomyChain,
+    toChain: taskEconomyChain,
+  };
 });
 
 // ── EXEC_YIELD_MOVE ───────────────────────────────────────────────────────────
@@ -1742,47 +2203,32 @@ registerTaskProcessor('EXEC_YIELD_MOVE', 2, async (job) => {
   });
   if (!result.ok) return result;
 
-  await _savePaidTaskResult(agentId, 'EXEC_YIELD_MOVE', result.payload, agent);
-  return result;
+  const storedPayload = await _savePaidTaskResult(agentId, 'EXEC_YIELD_MOVE', result.payload, agent);
+  return { ...result, payload: storedPayload };
 });
 
 // ── EXEC_ARB ──────────────────────────────────────────────────────────────────
-registerTaskProcessor('EXEC_ARB', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeArbTask({
+registerPaidTaskProcessor('EXEC_ARB', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeArbTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
+    dryRun,
     pricingPool: _getEurcUsdcCurvePool(),
     swapPool: _getUsdcEurcCurvePool(),
-  });
-  if (!result.ok) return result;
-
-  await _savePaidTaskResult(agentId, 'EXEC_ARB', result.payload, agent);
-  return result;
-});
+  })
+));
 
 // ── EXEC_REBALANCE ────────────────────────────────────────────────────────────
-registerTaskProcessor('EXEC_REBALANCE', 2, async (job) => {
-  const { agentId, params = {} } = job.data;
-  const guard = await _paidTaskGuard(agentId);
-  if (!guard.ok) return guard;
-  const { agent } = guard;
-
-  const result = await agenticTaskExecutionService.executeRebalanceTask({
+registerPaidTaskProcessor('EXEC_REBALANCE', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeRebalanceTask({
     agent,
     params,
-    dryRun: shouldUseDryRun(agent),
-  });
-  if (!result.ok) return result;
+    dryRun,
+  })
+));
 
-  await _savePaidTaskResult(agentId, 'EXEC_REBALANCE', result.payload, agent);
-  return result;
-});
+assertPaidTaskEconomyCoverage();
+assertPaidTaskActivityCoverage();
 
 async function scheduleDailyTasks() {
   await ensureTaskCatalogSeeded();
@@ -1800,4 +2246,5 @@ module.exports.scheduleOracleLoop = scheduleOracleLoop;
 module.exports.scheduleDefiLoop   = scheduleDefiLoop;
 module.exports.scheduleDailyTasks = scheduleDailyTasks;
 module.exports.canQueueManualTasks = canQueueManualTasks;
+module.exports.queueManualTask = queueManualTask;
 module.exports.runTaskInline = runTaskInline;
