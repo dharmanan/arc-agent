@@ -1,36 +1,40 @@
 {
-  "generatedAt": "2026-05-14T23:59:00.256Z",
+  "generatedAt": "2026-05-16T02:39:23.548Z",
   "status": "ok",
   "database": {
-    "dbBytes": 9854976,
-    "dbHuman": "9.40 MB"
+    "dbBytes": 10477568,
+    "dbHuman": "9.99 MB"
   },
   "chainEvents": {
-    "bytes": 131072,
-    "human": "128.00 KB",
-    "rows": 225,
+    "bytes": 155648,
+    "human": "152.00 KB",
+    "rows": 14,
     "pendingRows": 0,
-    "processedRows": 225,
+    "processedRows": 14,
     "pendingRowsOlderThan24h": 0,
     "pendingRowsOlderThan48h": 0,
     "oldestPendingAt": null,
     "newestPendingAt": null
   },
+  "transactions": {
+    "bytes": 401408,
+    "human": "392.00 KB",
+    "rows": 219
+  },
+  "taskResults": {
+    "bytes": 172032,
+    "human": "168.00 KB",
+    "rows": 83
+  },
   "dailyBreakdown": [
     {
-      "day": "2026-05-14",
-      "rows": 1,
-      "bytes": 336,
-      "human": "336 B"
+      "day": "2026-05-16",
+      "rows": 2,
+      "bytes": 672,
+      "human": "672 B"
     },
     {
-      "day": "2026-05-12",
-      "rows": 212,
-      "bytes": 71232,
-      "human": "69.56 KB"
-    },
-    {
-      "day": "2026-05-11",
+      "day": "2026-05-15",
       "rows": 12,
       "bytes": 4032,
       "human": "3.94 KB"

@@ -86,6 +86,10 @@ function buildMarkdown(report) {
     `- chain_events rows: ${report.chainEvents.rows}`,
     `- chain_events pending rows: ${report.chainEvents.pendingRows}`,
     `- chain_events processed rows: ${report.chainEvents.processedRows}`,
+    `- transactions size: ${report.transactions.bytes} bytes (${report.transactions.human})`,
+    `- transactions rows: ${report.transactions.rows}`,
+    `- agent_task_results size: ${report.taskResults.bytes} bytes (${report.taskResults.human})`,
+    `- agent_task_results rows: ${report.taskResults.rows}`,
     `- Pending older than 24h: ${report.chainEvents.pendingRowsOlderThan24h}`,
     `- Pending older than 48h: ${report.chainEvents.pendingRowsOlderThan48h}`,
   ];
@@ -145,7 +149,11 @@ async function main() {
       `SELECT
          pg_database_size(current_database())::bigint AS db_bytes,
          pg_total_relation_size('chain_events')::bigint AS chain_events_bytes,
+         pg_total_relation_size('transactions')::bigint AS transactions_bytes,
+         pg_total_relation_size('agent_task_results')::bigint AS task_results_bytes,
          COUNT(*)::bigint AS chain_event_rows,
+         (SELECT COUNT(*)::bigint FROM transactions) AS transaction_rows,
+         (SELECT COUNT(*)::bigint FROM agent_task_results) AS task_result_rows,
          COUNT(*) FILTER (WHERE processed = FALSE)::bigint AS pending_rows,
          COUNT(*) FILTER (WHERE processed = TRUE)::bigint AS processed_rows,
          COUNT(*) FILTER (WHERE processed = FALSE AND created_at < NOW() - INTERVAL '24 hours')::bigint AS pending_rows_older_than_24h,
@@ -194,6 +202,16 @@ async function main() {
         pendingRowsOlderThan48h: Number(summary.pending_rows_older_than_48h),
         oldestPendingAt: toIsoString(summary.oldest_pending_at),
         newestPendingAt: toIsoString(summary.newest_pending_at),
+      },
+      transactions: {
+        bytes: Number(summary.transactions_bytes),
+        human: formatBytes(summary.transactions_bytes),
+        rows: Number(summary.transaction_rows),
+      },
+      taskResults: {
+        bytes: Number(summary.task_results_bytes),
+        human: formatBytes(summary.task_results_bytes),
+        rows: Number(summary.task_result_rows),
       },
       dailyBreakdown: dailyRows.map((row) => ({
         day: toIsoString(row.day)?.slice(0, 10) || String(row.day),
