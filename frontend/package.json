@@ -17,7 +17,7 @@
     "@splinetool/runtime": "^1.12.94",
     "@tanstack/react-query": "^5.100.10",
     "@zxing/browser": "^0.2.0",
-    "@zxing/library": "^0.22.0",
+    "@zxing/library": "^0.23.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "ethers": "^6.16.0",
