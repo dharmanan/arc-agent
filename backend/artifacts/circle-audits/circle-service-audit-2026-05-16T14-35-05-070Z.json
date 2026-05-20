@@ -1,0 +1,5082 @@
+{
+  "generatedAt": "2026-05-16T14:35:05.092Z",
+  "catalogUrl": "https://agents.circle.com/api/v1/internal/x402/services",
+  "filters": {
+    "category": null,
+    "service": null,
+    "limit": 3,
+    "concurrency": 4,
+    "timeoutMs": 10000
+  },
+  "summary": {
+    "totalServices": 3,
+    "totalEndpointsProbed": 76,
+    "byClassification": {
+      "mainnet_or_non_arc_only": 3
+    },
+    "byCategory": {
+      "Infrastructure": 1,
+      "Financial Analysis": 2
+    },
+    "arcTestnetServices": [],
+    "otherTestnetServices": [],
+    "mainnetOnlyServices": [
+      {
+        "id": "agentmail",
+        "name": "AgentMail",
+        "slug": "agentmail",
+        "category": "Infrastructure",
+        "supportsCircleGateway": false,
+        "partyType": "1P",
+        "endpointCount": 43,
+        "networks": [
+          "eip155:8453",
+          "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+          "eip155:43114",
+          "eip155:196"
+        ],
+        "networkLabels": [
+          "eip155:8453",
+          "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+          "eip155:43114",
+          "eip155:196"
+        ],
+        "schemes": [
+          "exact"
+        ],
+        "gatewayKinds": [
+          "USD Coin"
+        ],
+        "endpointProbes": [
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/domains",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/domains",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/domains",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/domains",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "PATCH",
+            "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/domains/{domain_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/domains/{domain_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D/verify",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/domains/{domain_id}/verify",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id}/verify)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D/zone-file",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/domains/{domain_id}/zone-file",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id}/zone-file)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/drafts",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/drafts",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/drafts)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/drafts/%7Bdraft_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/drafts/{draft_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/drafts/{draft_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/drafts/%7Bdraft_id%7D/attachments/%7Battachment_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/drafts/{draft_id}/attachments/{attachment_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/drafts/{draft_id}/attachments/{attachment_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/inboxes",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/inboxes",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/inboxes)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/inboxes",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/inboxes",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/inboxes)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/lists/%7Bdirection%7D/%7Btype%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/lists/{direction}/{type}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/lists/{direction}/{type})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/lists/%7Bdirection%7D/%7Btype%7D/%7Bentry%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/lists/{direction}/{type}/{entry}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/lists/{direction}/{type}/{entry})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/metrics",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/metrics",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/metrics)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/organizations",
+            "status": 404,
+            "ok": false,
+            "paymentHeaderName": null,
+            "paymentRequired": {
+              "x402Version": null,
+              "resource": null,
+              "acceptsCount": 0,
+              "networks": [],
+              "schemes": [],
+              "gatewayKinds": []
+            },
+            "responseSnippet": "{\"error\":\"Endpoint not found\",\"message\":\"This endpoint is not registered for this service. Only registered endpoints can be called.\"}",
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/pods",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "PATCH",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D/verify",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/verify",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/verify)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D/zone-file",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/zone-file",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/zone-file)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/drafts",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/drafts",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/drafts)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/drafts/%7Bdraft_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/drafts/%7Bdraft_id%7D/attachments/%7Battachment_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id}/attachments/{attachment_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id}/attachments/{attachment_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/inboxes",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/inboxes",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/inboxes)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/inboxes",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/inboxes",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/inboxes)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/lists/%7Bdirection%7D/%7Btype%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/lists/%7Bdirection%7D/%7Btype%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/lists/%7Bdirection%7D/%7Btype%7D/%7Bentry%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}/{entry}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}/{entry})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/metrics",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/metrics",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/metrics)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/threads",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/threads",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/threads)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/threads/%7Bthread_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/threads/%7Bthread_id%7D/attachments/%7Battachment_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id}/attachments/{attachment_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id}/attachments/{attachment_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/threads",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/threads",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/threads)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/threads/%7Bthread_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/threads/{thread_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/threads/{thread_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/threads/%7Bthread_id%7D/attachments/%7Battachment_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/threads/{thread_id}/attachments/{attachment_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/threads/{thread_id}/attachments/{attachment_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.api.agentmail.to/v0/webhooks",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/webhooks",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.api.agentmail.to/v0/webhooks",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/webhooks",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks)",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "DELETE",
+            "url": "https://x402.api.agentmail.to/v0/webhooks/%7Bwebhook_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/webhooks/{webhook_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks/{webhook_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "PATCH",
+            "url": "https://x402.api.agentmail.to/v0/webhooks/%7Bwebhook_id%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://api.paysponge.com/v0/webhooks/{webhook_id}",
+                "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks/{webhook_id})",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 4,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "eip155:43114",
+                "eip155:196"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          }
+        ],
+        "classification": "mainnet_or_non_arc_only"
+      },
+      {
+        "id": "aisa",
+        "name": "AIsa API",
+        "slug": "aisa",
+        "category": "Financial Analysis",
+        "supportsCircleGateway": true,
+        "partyType": "1P",
+        "endpointCount": 24,
+        "networks": [
+          "eip155:1",
+          "eip155:8453",
+          "eip155:43114",
+          "eip155:42161",
+          "eip155:10",
+          "eip155:137",
+          "eip155:130",
+          "eip155:146",
+          "eip155:480",
+          "eip155:1329",
+          "eip155:999"
+        ],
+        "networkLabels": [
+          "eip155:1",
+          "eip155:8453",
+          "eip155:43114",
+          "eip155:42161",
+          "eip155:10",
+          "eip155:137",
+          "eip155:130",
+          "eip155:146",
+          "eip155:480",
+          "eip155:1329",
+          "eip155:999"
+        ],
+        "schemes": [
+          "exact"
+        ],
+        "gatewayKinds": [
+          "GatewayWalletBatched"
+        ],
+        "endpointProbes": [
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/analyst-estimates",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/analyst-estimates",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/company/facts",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/company/facts",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/earnings",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/earnings",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/earnings/press-releases",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/earnings/press-releases",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/filings",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/filings",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/filings/items",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/filings/items",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/financial-metrics",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financial-metrics",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/financial-metrics/snapshot",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financial-metrics/snapshot",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/financials",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financials",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/financials/balance-sheets",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financials/balance-sheets",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/financials/cash-flow-statements",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financials/cash-flow-statements",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/financials/income-statements",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financials/income-statements",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://api.aisa.one/apis/v2/financial/financials/search/line-items",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financials/search/line-items",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://api.aisa.one/apis/v2/financial/financials/search/screener",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financials/search/screener",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/financials/segmented-revenues",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/financials/segmented-revenues",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/insider-trades",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/insider-trades",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/institutional-ownership",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/institutional-ownership",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/macro/interest-rates",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/macro/interest-rates",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/macro/interest-rates/snapshot",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/macro/interest-rates/snapshot",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/news",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/news",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/prices",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/prices",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/financial/prices/snapshot",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/financial/prices/snapshot",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/matching-markets/sports",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/matching-markets/sports",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.aisa.one/apis/v2/matching-markets/sports/%7Bsport%7D",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "/apis/v2/matching-markets/sports/%7Bsport%7D",
+                "description": "Paid resource",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 11,
+              "networks": [
+                "eip155:1",
+                "eip155:8453",
+                "eip155:43114",
+                "eip155:42161",
+                "eip155:10",
+                "eip155:137",
+                "eip155:130",
+                "eip155:146",
+                "eip155:480",
+                "eip155:1329",
+                "eip155:999"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          }
+        ],
+        "classification": "mainnet_or_non_arc_only"
+      },
+      {
+        "id": "alchemy",
+        "name": "Alchemy",
+        "slug": "alchemy",
+        "category": "Financial Analysis",
+        "supportsCircleGateway": true,
+        "partyType": "1P",
+        "endpointCount": 9,
+        "networks": [
+          "eip155:8453",
+          "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+        ],
+        "networkLabels": [
+          "eip155:8453",
+          "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+        ],
+        "schemes": [
+          "exact"
+        ],
+        "gatewayKinds": [
+          "USD Coin",
+          "GatewayWalletBatched"
+        ],
+        "endpointProbes": [
+          {
+            "method": "GET",
+            "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getContractMetadata",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getContractMetadata",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTMetadata",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTMetadata",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTsForOwner",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTsForOwner",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.alchemy.com/%7BchainNetwork%7D/v2",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/%7BchainNetwork%7D/v2",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.alchemy.com/data/v1/assets/nfts/by-address",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/data/v1/assets/nfts/by-address",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.alchemy.com/data/v1/assets/tokens/by-address",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/data/v1/assets/tokens/by-address",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.alchemy.com/prices/v1/tokens/by-address",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/prices/v1/tokens/by-address",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://x402.alchemy.com/prices/v1/tokens/by-symbol",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/prices/v1/tokens/by-symbol",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          },
+          {
+            "method": "POST",
+            "url": "https://x402.alchemy.com/prices/v1/tokens/historical",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": "PAYMENT-REQUIRED",
+            "paymentRequired": {
+              "x402Version": 2,
+              "resource": {
+                "url": "https://x402.alchemy.com/prices/v1/tokens/historical",
+                "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+                "mimeType": "application/json"
+              },
+              "acceptsCount": 3,
+              "networks": [
+                "eip155:8453",
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin",
+                "GatewayWalletBatched"
+              ]
+            },
+            "responseSnippet": null,
+            "error": null
+          }
+        ],
+        "classification": "mainnet_or_non_arc_only"
+      }
+    ]
+  },
+  "services": [
+    {
+      "id": "agentmail",
+      "name": "AgentMail",
+      "slug": "agentmail",
+      "category": "Infrastructure",
+      "supportsCircleGateway": false,
+      "partyType": "1P",
+      "endpointCount": 43,
+      "networks": [
+        "eip155:8453",
+        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        "eip155:43114",
+        "eip155:196"
+      ],
+      "networkLabels": [
+        "eip155:8453",
+        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        "eip155:43114",
+        "eip155:196"
+      ],
+      "schemes": [
+        "exact"
+      ],
+      "gatewayKinds": [
+        "USD Coin"
+      ],
+      "endpointProbes": [
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/domains",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/domains",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/domains",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/domains",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "PATCH",
+          "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/domains/{domain_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/domains/{domain_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D/verify",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/domains/{domain_id}/verify",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id}/verify)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/domains/%7Bdomain_id%7D/zone-file",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/domains/{domain_id}/zone-file",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/domains/{domain_id}/zone-file)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/drafts",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/drafts",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/drafts)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/drafts/%7Bdraft_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/drafts/{draft_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/drafts/{draft_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/drafts/%7Bdraft_id%7D/attachments/%7Battachment_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/drafts/{draft_id}/attachments/{attachment_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/drafts/{draft_id}/attachments/{attachment_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/inboxes",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/inboxes",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/inboxes)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/inboxes",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/inboxes",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/inboxes)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/lists/%7Bdirection%7D/%7Btype%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/lists/{direction}/{type}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/lists/{direction}/{type})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/lists/%7Bdirection%7D/%7Btype%7D/%7Bentry%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/lists/{direction}/{type}/{entry}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/lists/{direction}/{type}/{entry})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/metrics",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/metrics",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/metrics)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/organizations",
+          "status": 404,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"error\":\"Endpoint not found\",\"message\":\"This endpoint is not registered for this service. Only registered endpoints can be called.\"}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/pods",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "PATCH",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D/verify",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/verify",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/verify)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/domains/%7Bdomain_id%7D/zone-file",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/zone-file",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/domains/{domain_id}/zone-file)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/drafts",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/drafts",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/drafts)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/drafts/%7Bdraft_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/drafts/%7Bdraft_id%7D/attachments/%7Battachment_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id}/attachments/{attachment_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/drafts/{draft_id}/attachments/{attachment_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/inboxes",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/inboxes",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/inboxes)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/inboxes",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/inboxes",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/inboxes)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/lists/%7Bdirection%7D/%7Btype%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/lists/%7Bdirection%7D/%7Btype%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/lists/%7Bdirection%7D/%7Btype%7D/%7Bentry%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}/{entry}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/lists/{direction}/{type}/{entry})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/metrics",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/metrics",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/metrics)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/threads",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/threads",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/threads)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/threads/%7Bthread_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/pods/%7Bpod_id%7D/threads/%7Bthread_id%7D/attachments/%7Battachment_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id}/attachments/{attachment_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/pods/{pod_id}/threads/{thread_id}/attachments/{attachment_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/threads",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/threads",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/threads)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/threads/%7Bthread_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/threads/{thread_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/threads/{thread_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/threads/%7Bthread_id%7D/attachments/%7Battachment_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/threads/{thread_id}/attachments/{attachment_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/threads/{thread_id}/attachments/{attachment_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.api.agentmail.to/v0/webhooks",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/webhooks",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.api.agentmail.to/v0/webhooks",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/webhooks",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks)",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "DELETE",
+          "url": "https://x402.api.agentmail.to/v0/webhooks/%7Bwebhook_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/webhooks/{webhook_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks/{webhook_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "PATCH",
+          "url": "https://x402.api.agentmail.to/v0/webhooks/%7Bwebhook_id%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://api.paysponge.com/v0/webhooks/{webhook_id}",
+              "description": "Service: AgentMail API (https://api.paysponge.com/v0/webhooks/{webhook_id})",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 4,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "eip155:43114",
+              "eip155:196"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        }
+      ],
+      "classification": "mainnet_or_non_arc_only"
+    },
+    {
+      "id": "aisa",
+      "name": "AIsa API",
+      "slug": "aisa",
+      "category": "Financial Analysis",
+      "supportsCircleGateway": true,
+      "partyType": "1P",
+      "endpointCount": 24,
+      "networks": [
+        "eip155:1",
+        "eip155:8453",
+        "eip155:43114",
+        "eip155:42161",
+        "eip155:10",
+        "eip155:137",
+        "eip155:130",
+        "eip155:146",
+        "eip155:480",
+        "eip155:1329",
+        "eip155:999"
+      ],
+      "networkLabels": [
+        "eip155:1",
+        "eip155:8453",
+        "eip155:43114",
+        "eip155:42161",
+        "eip155:10",
+        "eip155:137",
+        "eip155:130",
+        "eip155:146",
+        "eip155:480",
+        "eip155:1329",
+        "eip155:999"
+      ],
+      "schemes": [
+        "exact"
+      ],
+      "gatewayKinds": [
+        "GatewayWalletBatched"
+      ],
+      "endpointProbes": [
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/analyst-estimates",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/analyst-estimates",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/company/facts",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/company/facts",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/earnings",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/earnings",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/earnings/press-releases",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/earnings/press-releases",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/filings",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/filings",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/filings/items",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/filings/items",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/financial-metrics",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financial-metrics",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/financial-metrics/snapshot",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financial-metrics/snapshot",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/financials",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financials",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/financials/balance-sheets",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financials/balance-sheets",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/financials/cash-flow-statements",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financials/cash-flow-statements",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/financials/income-statements",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financials/income-statements",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://api.aisa.one/apis/v2/financial/financials/search/line-items",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financials/search/line-items",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://api.aisa.one/apis/v2/financial/financials/search/screener",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financials/search/screener",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/financials/segmented-revenues",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/financials/segmented-revenues",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/insider-trades",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/insider-trades",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/institutional-ownership",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/institutional-ownership",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/macro/interest-rates",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/macro/interest-rates",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/macro/interest-rates/snapshot",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/macro/interest-rates/snapshot",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/news",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/news",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/prices",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/prices",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/financial/prices/snapshot",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/financial/prices/snapshot",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/matching-markets/sports",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/matching-markets/sports",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.aisa.one/apis/v2/matching-markets/sports/%7Bsport%7D",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "/apis/v2/matching-markets/sports/%7Bsport%7D",
+              "description": "Paid resource",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 11,
+            "networks": [
+              "eip155:1",
+              "eip155:8453",
+              "eip155:43114",
+              "eip155:42161",
+              "eip155:10",
+              "eip155:137",
+              "eip155:130",
+              "eip155:146",
+              "eip155:480",
+              "eip155:1329",
+              "eip155:999"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        }
+      ],
+      "classification": "mainnet_or_non_arc_only"
+    },
+    {
+      "id": "alchemy",
+      "name": "Alchemy",
+      "slug": "alchemy",
+      "category": "Financial Analysis",
+      "supportsCircleGateway": true,
+      "partyType": "1P",
+      "endpointCount": 9,
+      "networks": [
+        "eip155:8453",
+        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+      ],
+      "networkLabels": [
+        "eip155:8453",
+        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+      ],
+      "schemes": [
+        "exact"
+      ],
+      "gatewayKinds": [
+        "USD Coin",
+        "GatewayWalletBatched"
+      ],
+      "endpointProbes": [
+        {
+          "method": "GET",
+          "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getContractMetadata",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getContractMetadata",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTMetadata",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTMetadata",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTsForOwner",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/%7BchainNetwork%7D/nft/v3/getNFTsForOwner",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.alchemy.com/%7BchainNetwork%7D/v2",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/%7BchainNetwork%7D/v2",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.alchemy.com/data/v1/assets/nfts/by-address",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/data/v1/assets/nfts/by-address",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.alchemy.com/data/v1/assets/tokens/by-address",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/data/v1/assets/tokens/by-address",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.alchemy.com/prices/v1/tokens/by-address",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/prices/v1/tokens/by-address",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://x402.alchemy.com/prices/v1/tokens/by-symbol",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/prices/v1/tokens/by-symbol",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://x402.alchemy.com/prices/v1/tokens/historical",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": "PAYMENT-REQUIRED",
+          "paymentRequired": {
+            "x402Version": 2,
+            "resource": {
+              "url": "https://x402.alchemy.com/prices/v1/tokens/historical",
+              "description": "Pay $0.001 per request — no account required. See https://www.alchemy.com/docs/reference/compute-unit-costs",
+              "mimeType": "application/json"
+            },
+            "acceptsCount": 3,
+            "networks": [
+              "eip155:8453",
+              "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin",
+              "GatewayWalletBatched"
+            ]
+          },
+          "responseSnippet": null,
+          "error": null
+        }
+      ],
+      "classification": "mainnet_or_non_arc_only"
+    }
+  ]
+}

@@ -12,6 +12,8 @@ const ORACLE_PRICES = {
   'reserve-state': '0.003',
   'protocol-tvl':  '0.002',
   'pool-compare':  '0.003',
+  'event-odds-compare': '0.005',
+  'prediction-market-check': '0.005',
   'yield-rank':    '0.002',
   'arb-signal':    '0.005',
   'arb-scan-multi': '0.006',

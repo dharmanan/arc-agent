@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS agents (
   oracle_last_status         VARCHAR(30) NOT NULL DEFAULT 'idle',
   defi_loop_last_run_at      TIMESTAMPTZ,
   defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle',
+  defi_loop_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
   reputation_last_run_at     TIMESTAMPTZ,
   reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle',
 
@@ -127,6 +128,7 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_tasks_enabled        BOOLEAN N
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_enabled    BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_enabled             BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_enabled          BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_enabled          BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_enabled         BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Faza 2.0: daily operation counters (reset at 00:00 UTC via daily_limit_reset_at)
@@ -142,6 +144,7 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_last_run_at         TIMESTAMP
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_last_status         VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_run_at      TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_run_at     TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle';
 
@@ -315,6 +318,36 @@ CREATE TRIGGER trg_task_runs_updated_at
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 12.2 CIRCLE PAID SNAPSHOTS (preview drafts + unlocked saved info results)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS circle_paid_snapshots (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id           UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  item_id            TEXT NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'preview_ready',
+  params             JSONB NOT NULL DEFAULT '{}'::jsonb,
+  preview_payload    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  full_payload       JSONB NOT NULL DEFAULT '{}'::jsonb,
+  pricing            JSONB NOT NULL DEFAULT '{}'::jsonb,
+  economy            JSONB NOT NULL DEFAULT '{}'::jsonb,
+  preview_expires_at TIMESTAMPTZ,
+  unlocked_at        TIMESTAMPTZ,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_circle_paid_snapshots_agent_created
+  ON circle_paid_snapshots(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_circle_paid_snapshots_item_created
+  ON circle_paid_snapshots(item_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_circle_paid_snapshots_status_expiry
+  ON circle_paid_snapshots(status, preview_expires_at);
+
+DROP TRIGGER IF EXISTS trg_circle_paid_snapshots_updated_at ON circle_paid_snapshots;
+CREATE TRIGGER trg_circle_paid_snapshots_updated_at
+  BEFORE UPDATE ON circle_paid_snapshots
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- 13. ORACLE PAYMENTS (x402 nanopayment audit log — one row per verified tx)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS oracle_payments (
@@ -374,17 +407,20 @@ CREATE TABLE IF NOT EXISTS agent_jobs (
   tx_hash_create    VARCHAR(100),
   tx_hash_deliver   VARCHAR(100),
   tx_hash_settle    VARCHAR(100),
+  review_deadline_at TIMESTAMPTZ,
   economy           JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE agent_jobs ALTER COLUMN status SET DEFAULT 'funded';
 ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS economy JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS review_deadline_at TIMESTAMPTZ;
 UPDATE agent_jobs
 SET status = 'funded', updated_at = NOW()
 WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_jobs_agent  ON agent_jobs(agent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON agent_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_review_deadline ON agent_jobs(review_deadline_at);
 
 DROP TRIGGER IF EXISTS trg_jobs_updated_at ON agent_jobs;
 CREATE TRIGGER trg_jobs_updated_at
@@ -417,3 +453,133 @@ CREATE INDEX IF NOT EXISTS idx_agentic_payment_events_reference
   ON agentic_payment_events(reference_type, reference_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agentic_payment_events_rail
   ON agentic_payment_events(rail, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 17. LP REWARD PROGRAMS (claimable incentive emissions, separate from LP fees)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS lp_reward_programs (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pool_key            TEXT NOT NULL,
+  reward_token        TEXT NOT NULL,
+  reward_source_type  TEXT NOT NULL,
+  emission_mode       TEXT NOT NULL,
+  emission_rate       NUMERIC(20,8),
+  start_at            TIMESTAMPTZ,
+  end_at              TIMESTAMPTZ,
+  status              TEXT NOT NULL DEFAULT 'draft',
+  metadata            JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT lp_reward_programs_source_type_check CHECK (
+    reward_source_type IN ('treasury', 'partner', 'protocol_revenue')
+  ),
+  CONSTRAINT lp_reward_programs_emission_mode_check CHECK (
+    emission_mode IN ('fixed_rate', 'epoch_budget')
+  ),
+  CONSTRAINT lp_reward_programs_status_check CHECK (
+    status IN ('draft', 'scheduled', 'live', 'paused', 'ended')
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_lp_reward_programs_pool_status
+  ON lp_reward_programs(pool_key, status, start_at DESC);
+CREATE INDEX IF NOT EXISTS idx_lp_reward_programs_reward_token
+  ON lp_reward_programs(reward_token, status, start_at DESC);
+
+DROP TRIGGER IF EXISTS trg_lp_reward_programs_updated_at ON lp_reward_programs;
+CREATE TRIGGER trg_lp_reward_programs_updated_at
+  BEFORE UPDATE ON lp_reward_programs
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 18. LP REWARD EPOCH SNAPSHOTS (source-of-truth epochs for accrual accounting)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS lp_reward_epoch_snapshots (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  program_id          UUID NOT NULL REFERENCES lp_reward_programs(id) ON DELETE CASCADE,
+  epoch_start         TIMESTAMPTZ NOT NULL,
+  epoch_end           TIMESTAMPTZ NOT NULL,
+  pool_lp_supply      NUMERIC(30,12),
+  eligible_lp_supply  NUMERIC(30,12),
+  reward_budget       NUMERIC(30,12),
+  source_block_number BIGINT,
+  status              TEXT NOT NULL DEFAULT 'pending',
+  snapshot_payload    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT lp_reward_epoch_snapshots_status_check CHECK (
+    status IN ('pending', 'finalized', 'cancelled')
+  ),
+  CONSTRAINT lp_reward_epoch_snapshots_epoch_order_check CHECK (epoch_end > epoch_start),
+  CONSTRAINT lp_reward_epoch_snapshots_unique_epoch UNIQUE (program_id, epoch_start, epoch_end)
+);
+CREATE INDEX IF NOT EXISTS idx_lp_reward_epoch_snapshots_program_epoch
+  ON lp_reward_epoch_snapshots(program_id, epoch_start DESC, epoch_end DESC);
+CREATE INDEX IF NOT EXISTS idx_lp_reward_epoch_snapshots_status
+  ON lp_reward_epoch_snapshots(status, epoch_end DESC);
+
+DROP TRIGGER IF EXISTS trg_lp_reward_epoch_snapshots_updated_at ON lp_reward_epoch_snapshots;
+CREATE TRIGGER trg_lp_reward_epoch_snapshots_updated_at
+  BEFORE UPDATE ON lp_reward_epoch_snapshots
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 19. AGENT LP REWARD ACCRUALS (per-agent earned / claimed / unclaimed ledger)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_lp_reward_accruals (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id            UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  program_id          UUID NOT NULL REFERENCES lp_reward_programs(id) ON DELETE CASCADE,
+  snapshot_id         UUID NOT NULL REFERENCES lp_reward_epoch_snapshots(id) ON DELETE CASCADE,
+  avg_lp_balance      NUMERIC(30,12),
+  share_bps           INTEGER,
+  reward_earned       NUMERIC(30,12) NOT NULL DEFAULT 0,
+  reward_claimed      NUMERIC(30,12) NOT NULL DEFAULT 0,
+  reward_unclaimed    NUMERIC(30,12) NOT NULL DEFAULT 0,
+  status              TEXT NOT NULL DEFAULT 'accrued',
+  last_compound_at    TIMESTAMPTZ,
+  metadata            JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT agent_lp_reward_accruals_status_check CHECK (
+    status IN ('accrued', 'partially_claimed', 'claimed', 'compounded', 'cancelled')
+  ),
+  CONSTRAINT agent_lp_reward_accruals_share_bps_check CHECK (
+    share_bps IS NULL OR (share_bps >= 0 AND share_bps <= 10000)
+  ),
+  CONSTRAINT agent_lp_reward_accruals_unique_agent_snapshot UNIQUE (agent_id, snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_accruals_agent_created
+  ON agent_lp_reward_accruals(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_accruals_program_status
+  ON agent_lp_reward_accruals(program_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_accruals_snapshot
+  ON agent_lp_reward_accruals(snapshot_id);
+
+DROP TRIGGER IF EXISTS trg_agent_lp_reward_accruals_updated_at ON agent_lp_reward_accruals;
+CREATE TRIGGER trg_agent_lp_reward_accruals_updated_at
+  BEFORE UPDATE ON agent_lp_reward_accruals
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20. AGENT LP REWARD CLAIMS (claim / compound execution ledger)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_lp_reward_claims (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id            UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  program_id          UUID NOT NULL REFERENCES lp_reward_programs(id) ON DELETE CASCADE,
+  accrual_id          UUID NOT NULL REFERENCES agent_lp_reward_accruals(id) ON DELETE CASCADE,
+  claim_mode          TEXT NOT NULL,
+  amount              NUMERIC(30,12) NOT NULL,
+  tx_hash             TEXT,
+  metadata            JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT agent_lp_reward_claims_mode_check CHECK (
+    claim_mode IN ('claim', 'compound')
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_claims_agent_created
+  ON agent_lp_reward_claims(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_claims_program_created
+  ON agent_lp_reward_claims(program_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_claims_accrual_created
+  ON agent_lp_reward_claims(accrual_id, created_at DESC);

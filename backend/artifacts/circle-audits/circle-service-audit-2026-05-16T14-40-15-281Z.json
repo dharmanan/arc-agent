@@ -1,0 +1,259 @@
+{
+  "generatedAt": "2026-05-16T14:40:15.282Z",
+  "catalogUrl": "https://agents.circle.com/api/v1/internal/x402/services",
+  "filters": {
+    "category": null,
+    "service": "gloria",
+    "limit": null,
+    "concurrency": 4,
+    "timeoutMs": 10000
+  },
+  "summary": {
+    "totalServices": 1,
+    "totalEndpointsProbed": 4,
+    "byClassification": {
+      "mainnet_or_non_arc_only": 1
+    },
+    "byCategory": {
+      "Financial Analysis": 1
+    },
+    "arcTestnetServices": [],
+    "otherTestnetServices": [],
+    "mainnetOnlyServices": [
+      {
+        "id": "gloria",
+        "name": "Gloria AI",
+        "slug": "gloria",
+        "category": "Financial Analysis",
+        "supportsCircleGateway": false,
+        "partyType": "1P",
+        "endpointCount": 4,
+        "networks": [
+          "eip155:8453"
+        ],
+        "networkLabels": [
+          "eip155:8453"
+        ],
+        "schemes": [
+          "exact"
+        ],
+        "gatewayKinds": [
+          "USD Coin"
+        ],
+        "endpointProbes": [
+          {
+            "method": "GET",
+            "url": "https://api.itsgloria.ai/news",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": null,
+            "paymentRequired": {
+              "x402Version": 1,
+              "resource": null,
+              "acceptsCount": 1,
+              "networks": [
+                "eip155:8453"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"30000\",\"resource\":\"https://api.itsgloria.ai/news\",\"description\":\"Get the latest news about a covered news topic, delivering the most recent 10 headlines.\",\"m",
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.itsgloria.ai/news-by-keyword",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": null,
+            "paymentRequired": {
+              "x402Version": 1,
+              "resource": null,
+              "acceptsCount": 1,
+              "networks": [
+                "eip155:8453"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"50000\",\"resource\":\"https://api.itsgloria.ai/news-by-keyword\",\"description\":\"Get the news about a topic by keyword, delivering the most recent 20 headlines.\",",
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.itsgloria.ai/news-ticker-summary",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": null,
+            "paymentRequired": {
+              "x402Version": 1,
+              "resource": null,
+              "acceptsCount": 1,
+              "networks": [
+                "eip155:8453"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"31000\",\"resource\":\"https://api.itsgloria.ai/news-ticker-summary\",\"description\":\"Get a 24-hour news summary for a specific token/ticker, combining internal ne",
+            "error": null
+          },
+          {
+            "method": "GET",
+            "url": "https://api.itsgloria.ai/recaps",
+            "status": 402,
+            "ok": false,
+            "paymentHeaderName": null,
+            "paymentRequired": {
+              "x402Version": 1,
+              "resource": null,
+              "acceptsCount": 1,
+              "networks": [
+                "eip155:8453"
+              ],
+              "schemes": [
+                "exact"
+              ],
+              "gatewayKinds": [
+                "USD Coin"
+              ]
+            },
+            "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"100000\",\"resource\":\"https://api.itsgloria.ai/recaps\",\"description\":\"Get a recap of the news or summary of a covered news topic over the past 12-24 hours.\",\"m",
+            "error": null
+          }
+        ],
+        "classification": "mainnet_or_non_arc_only"
+      }
+    ]
+  },
+  "services": [
+    {
+      "id": "gloria",
+      "name": "Gloria AI",
+      "slug": "gloria",
+      "category": "Financial Analysis",
+      "supportsCircleGateway": false,
+      "partyType": "1P",
+      "endpointCount": 4,
+      "networks": [
+        "eip155:8453"
+      ],
+      "networkLabels": [
+        "eip155:8453"
+      ],
+      "schemes": [
+        "exact"
+      ],
+      "gatewayKinds": [
+        "USD Coin"
+      ],
+      "endpointProbes": [
+        {
+          "method": "GET",
+          "url": "https://api.itsgloria.ai/news",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": 1,
+            "resource": null,
+            "acceptsCount": 1,
+            "networks": [
+              "eip155:8453"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"30000\",\"resource\":\"https://api.itsgloria.ai/news\",\"description\":\"Get the latest news about a covered news topic, delivering the most recent 10 headlines.\",\"m",
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.itsgloria.ai/news-by-keyword",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": 1,
+            "resource": null,
+            "acceptsCount": 1,
+            "networks": [
+              "eip155:8453"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"50000\",\"resource\":\"https://api.itsgloria.ai/news-by-keyword\",\"description\":\"Get the news about a topic by keyword, delivering the most recent 20 headlines.\",",
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.itsgloria.ai/news-ticker-summary",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": 1,
+            "resource": null,
+            "acceptsCount": 1,
+            "networks": [
+              "eip155:8453"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"31000\",\"resource\":\"https://api.itsgloria.ai/news-ticker-summary\",\"description\":\"Get a 24-hour news summary for a specific token/ticker, combining internal ne",
+          "error": null
+        },
+        {
+          "method": "GET",
+          "url": "https://api.itsgloria.ai/recaps",
+          "status": 402,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": 1,
+            "resource": null,
+            "acceptsCount": 1,
+            "networks": [
+              "eip155:8453"
+            ],
+            "schemes": [
+              "exact"
+            ],
+            "gatewayKinds": [
+              "USD Coin"
+            ]
+          },
+          "responseSnippet": "{\"x402Version\":1,\"error\":\"X-PAYMENT header is required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"base\",\"maxAmountRequired\":\"100000\",\"resource\":\"https://api.itsgloria.ai/recaps\",\"description\":\"Get a recap of the news or summary of a covered news topic over the past 12-24 hours.\",\"m",
+          "error": null
+        }
+      ],
+      "classification": "mainnet_or_non_arc_only"
+    }
+  ]
+}

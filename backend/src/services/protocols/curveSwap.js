@@ -20,8 +20,10 @@ const CURVE_EXCHANGE_ABI = [
   'function calc_token_amount(uint256[] amounts, bool is_deposit) view returns (uint256)',
   'function add_liquidity(uint256[] amounts, uint256 min_mint_amount) returns (uint256)',
   'function calc_withdraw_one_coin(uint256 token_amount, int128 i) view returns (uint256)',
+  'function remove_liquidity(uint256 amount, uint256[] min_amounts) returns (uint256[])',
   'function remove_liquidity_one_coin(uint256 token_amount, int128 i, uint256 min_amount) returns (uint256)',
   'function balanceOf(address account) view returns (uint256)',
+  'function totalSupply() view returns (uint256)',
   // Coin addresses at each index
   'function coins(uint256 i) view returns (address)',
 ];
@@ -29,6 +31,7 @@ const CURVE_EXCHANGE_ABI = [
 const ERC20_APPROVE_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
   'function allowance(address owner, address spender) view returns (uint256)',
+  'function balanceOf(address owner) view returns (uint256)',
 ];
 
 function getArcRpcUrl() {
@@ -43,6 +46,16 @@ function buildCurveDepositAmounts(indexIn, amountRaw) {
   return Number(indexIn) === 0
     ? [amountRaw, 0n]
     : [0n, amountRaw];
+}
+
+async function approveIfNeeded(tokenAddress, signer, spender, amountRaw) {
+  const token = new ethers.Contract(tokenAddress, ERC20_APPROVE_ABI, signer);
+  const allowance = await token.allowance(signer.address, spender);
+  if (allowance < amountRaw) {
+    const approveTx = await token.approve(spender, amountRaw);
+    await approveTx.wait(1);
+  }
+  return token;
 }
 
 /**
@@ -149,12 +162,7 @@ async function executeCurveAddLiquidity({
   const lpOutRaw = await pool.calc_token_amount(depositAmounts, true).catch(() => null);
   const minMintAmount = lpOutRaw ? applySlippageFloor(lpOutRaw, slippagePct) : 0n;
 
-  const token = new ethers.Contract(tokenInAddress, ERC20_APPROVE_ABI, signer);
-  const allowance = await token.allowance(signer.address, poolAddress);
-  if (allowance < amountRaw) {
-    const approveTx = await token.approve(poolAddress, amountRaw);
-    await approveTx.wait(1);
-  }
+  await approveIfNeeded(tokenInAddress, signer, poolAddress, amountRaw);
 
   const tx = await pool.add_liquidity(depositAmounts, minMintAmount);
   const receipt = await tx.wait(1);
@@ -163,6 +171,46 @@ async function executeCurveAddLiquidity({
     txHash: receipt.hash,
     lpAmount: lpOutRaw ? ethers.formatUnits(lpOutRaw, lpDecimals) : null,
     minLpAmount: lpOutRaw ? ethers.formatUnits(minMintAmount, lpDecimals) : null,
+  };
+}
+
+async function executeCurveAddLiquidityBalanced({
+  poolAddress,
+  token0Address,
+  token1Address,
+  amount0,
+  amount1,
+  slippagePct = 0.5,
+  agentPrivateKey,
+  decimals0 = 6,
+  decimals1 = 6,
+  lpDecimals = 18,
+}) {
+  const rpcUrl = getArcRpcUrl();
+  if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
+
+  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const signer = new ethers.Wallet(agentPrivateKey, provider);
+  const amount0Raw = ethers.parseUnits(String(amount0), decimals0);
+  const amount1Raw = ethers.parseUnits(String(amount1), decimals1);
+  const depositAmounts = [amount0Raw, amount1Raw];
+  const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
+
+  const lpOutRaw = await pool.calc_token_amount(depositAmounts, true).catch(() => null);
+  const minMintAmount = lpOutRaw ? applySlippageFloor(lpOutRaw, slippagePct) : 0n;
+
+  await approveIfNeeded(token0Address, signer, poolAddress, amount0Raw);
+  await approveIfNeeded(token1Address, signer, poolAddress, amount1Raw);
+
+  const tx = await pool.add_liquidity(depositAmounts, minMintAmount);
+  const receipt = await tx.wait(1);
+
+  return {
+    txHash: receipt.hash,
+    lpAmount: lpOutRaw ? ethers.formatUnits(lpOutRaw, lpDecimals) : null,
+    minLpAmount: lpOutRaw ? ethers.formatUnits(minMintAmount, lpDecimals) : null,
+    amount0In: ethers.formatUnits(amount0Raw, decimals0),
+    amount1In: ethers.formatUnits(amount1Raw, decimals1),
   };
 }
 
@@ -196,9 +244,67 @@ async function executeCurveRemoveLiquidityOneCoin({
   };
 }
 
+async function executeCurveRemoveLiquidity({
+  poolAddress,
+  lpAmount,
+  slippagePct = 0.5,
+  agentPrivateKey,
+  token0Address,
+  token1Address,
+  decimals0 = 6,
+  decimals1 = 6,
+  lpDecimals = 18,
+}) {
+  const rpcUrl = getArcRpcUrl();
+  if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
+
+  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const signer = new ethers.Wallet(agentPrivateKey, provider);
+  const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
+  const lpAmountRaw = ethers.parseUnits(String(lpAmount), lpDecimals);
+  const resolvedToken0Address = token0Address || await pool.coins(0);
+  const resolvedToken1Address = token1Address || await pool.coins(1);
+  const token0 = new ethers.Contract(resolvedToken0Address, ERC20_APPROVE_ABI, signer);
+  const token1 = new ethers.Contract(resolvedToken1Address, ERC20_APPROVE_ABI, signer);
+
+  const [poolToken0BalanceRaw, poolToken1BalanceRaw, totalSupplyRaw, token0BalanceBeforeRaw, token1BalanceBeforeRaw] = await Promise.all([
+    token0.balanceOf(poolAddress),
+    token1.balanceOf(poolAddress),
+    pool.totalSupply(),
+    token0.balanceOf(signer.address),
+    token1.balanceOf(signer.address),
+  ]);
+
+  const expectedAmount0Raw = totalSupplyRaw > 0n ? (poolToken0BalanceRaw * lpAmountRaw) / totalSupplyRaw : 0n;
+  const expectedAmount1Raw = totalSupplyRaw > 0n ? (poolToken1BalanceRaw * lpAmountRaw) / totalSupplyRaw : 0n;
+  const minAmounts = [
+    applySlippageFloor(expectedAmount0Raw, slippagePct),
+    applySlippageFloor(expectedAmount1Raw, slippagePct),
+  ];
+
+  const tx = await pool.remove_liquidity(lpAmountRaw, minAmounts);
+  const receipt = await tx.wait(1);
+
+  const [token0BalanceAfterRaw, token1BalanceAfterRaw] = await Promise.all([
+    token0.balanceOf(signer.address),
+    token1.balanceOf(signer.address),
+  ]);
+
+  return {
+    txHash: receipt.hash,
+    token0Amount: ethers.formatUnits(token0BalanceAfterRaw - token0BalanceBeforeRaw, decimals0),
+    token1Amount: ethers.formatUnits(token1BalanceAfterRaw - token1BalanceBeforeRaw, decimals1),
+    minToken0Amount: ethers.formatUnits(minAmounts[0], decimals0),
+    minToken1Amount: ethers.formatUnits(minAmounts[1], decimals1),
+    lpAmount: ethers.formatUnits(lpAmountRaw, lpDecimals),
+  };
+}
+
 module.exports = {
   getCurveQuote,
   executeCurveSwap,
   executeCurveAddLiquidity,
+  executeCurveAddLiquidityBalanced,
+  executeCurveRemoveLiquidity,
   executeCurveRemoveLiquidityOneCoin,
 };

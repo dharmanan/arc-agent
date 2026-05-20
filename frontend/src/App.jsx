@@ -7,11 +7,12 @@ import DashboardTab from './components/DashboardTab.jsx';
 import AgentTab from './components/AgentTab.jsx';
 import BridgeTab from './components/BridgeTab.jsx';
 import SwapTab from './components/SwapTab.jsx';
-import SecurityTab from './components/SecurityTab.jsx';
 import JobsTab from './components/JobsTab.jsx';
 import TasksTab from './components/TasksTab.jsx';
+import DeFiTab from './components/DeFiTab.jsx';
 import OracleTab from './components/OracleTab.jsx';
-import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Briefcase, Zap, ChevronDown, Brain } from 'lucide-react';
+import LandingPage from './components/LandingPage.jsx';
+import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Briefcase, Zap, ChevronDown, Brain, Droplets } from 'lucide-react';
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
@@ -20,6 +21,7 @@ const TABS = [
   { id: 'agent',     label: 'Agent',     Icon: Bot             },
   { id: 'jobs',      label: 'Jobs',      Icon: Briefcase       },
   { id: 'tasks',     label: 'Tasks',     Icon: Zap             },
+  { id: 'defi',      label: 'DeFi',      Icon: Droplets        },
   { id: 'oracle',    label: 'Oracle',    Icon: Brain           },
 ];
 
@@ -65,20 +67,24 @@ function NetworkSwitcher() {
   );
 }
 
-function Header({ activeTab, setTab }) {
+function Header({ activeTab, setTab, onOpenLanding }) {
   const { isConnected } = useAccount();
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/80 backdrop-blur-md">
       <div className="mx-auto flex max-w-6xl items-center gap-4 px-4 py-3 sm:px-6 lg:px-8">
         {/* Logo */}
-        <div className="mr-2 flex items-center gap-2.5">
+        <button
+          type="button"
+          onClick={onOpenLanding}
+          className="mr-2 flex items-center gap-2.5 rounded-xl px-1 py-1 transition hover:bg-slate-100"
+        >
           <img
             src="/arc-logo-icon.png"
             alt=""
             className="h-11 w-auto object-contain"
           />
           <span className="font-extrabold tracking-tight text-slate-900">Arc Machina</span>
-        </div>
+        </button>
 
         {/* Tab navigation */}
         <nav className="hidden md:flex items-center gap-1 flex-1">
@@ -132,13 +138,23 @@ function Header({ activeTab, setTab }) {
 
 function AppContent() {
   const [tab, setTab] = useState('dashboard');
+  const [showLanding, setShowLanding] = useState(true);
 
-  const navigate = (t) => setTab(t);
-  const back     = ()  => setTab('dashboard');
+  const openApp = (nextTab = 'dashboard') => {
+    setTab(nextTab);
+    setShowLanding(false);
+  };
+
+  const navigate = (nextTab) => openApp(nextTab);
+  const back = () => setTab('dashboard');
+
+  if (showLanding) {
+    return <LandingPage onEnterApp={openApp} />;
+  }
 
   return (
     <div className="min-h-screen">
-      <Header activeTab={tab} setTab={setTab} />
+      <Header activeTab={tab} setTab={setTab} onOpenLanding={() => setShowLanding(true)} />
       <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
         {tab === 'dashboard' && <DashboardTab onNavigate={navigate} />}
         {tab === 'bridge' && <BridgeTab onBack={back} />}
@@ -146,8 +162,8 @@ function AppContent() {
         {tab === 'agent' && <AgentTab />}
         {tab === 'jobs' && <JobsTab />}
         {tab === 'tasks' && <TasksTab />}
+        {tab === 'defi' && <DeFiTab />}
         {tab === 'oracle' && <OracleTab />}
-        {tab === 'security' && <SecurityTab onBack={back} />}
       </main>
     </div>
   );

@@ -56,6 +56,7 @@ export default function AgentTab() {
     marketAnalysisEnabled: false,
     oracleEnabled:         false,
     defiLoopEnabled:       false,
+    cirbtcLpEnabled:       false,
     reputationEnabled:     false,
   });
   const [savingSettings, setSavingSettings] = useState(false);
@@ -202,6 +203,7 @@ export default function AgentTab() {
       payload.marketAnalysisEnabled = features.marketAnalysisEnabled;
       payload.oracleEnabled         = features.oracleEnabled;
       payload.defiLoopEnabled       = features.defiLoopEnabled;
+      payload.cirbtcLpEnabled       = features.cirbtcLpEnabled;
       payload.reputationEnabled     = features.reputationEnabled;
       const updated = await agentApi.update(agent.id, payload);
       setAgent({ ...agent, ...updated });
@@ -564,15 +566,15 @@ export default function AgentTab() {
           <div className="rounded-xl border border-slate-100 bg-slate-50 p-4 text-sm text-slate-600">
             <p className="font-medium text-slate-800 mb-1 flex items-center gap-2">
               Basic Mode (default)
-              <Badge variant="green" className="text-xs">Rule engine active</Badge>
+              <Badge variant="green" className="text-xs">Built-in rules</Badge>
             </p>
-            <p>Agent runs with built-in rules: respects daily limit, auto-approves trades under the threshold, executes bridge/swap when you trigger them manually.</p>
-            <p className="mt-2 text-xs text-slate-500">No LLM key needed for Free Daily Tasks — the rule engine handles everything automatically.</p>
+            <p>Agent follows built-in limits and only trades when you trigger actions manually.</p>
+            <p className="mt-2 text-xs text-slate-500">No LLM key is needed for Free Daily Tasks.</p>
           </div>
         ) : (
           <div className="space-y-4">
             <div className="rounded-xl border border-arc-green/20 bg-arc-greenBg p-3 text-xs text-slate-600">
-              Smart Mode uses an LLM to autonomously scan opportunities, decide trade timing, and execute within your set limits — no manual trigger needed.
+              Smart Mode can use an LLM to scan for opportunities and act within your limits.
             </div>
             <Select
               label="LLM Model"
@@ -599,19 +601,19 @@ export default function AgentTab() {
             />
             <div className="rounded-xl border border-slate-100 bg-slate-50 p-3 text-xs text-slate-600 space-y-1">
               <p>
-                <span className="font-semibold text-slate-800">Selected model:</span> {llmModel} ({getProviderLabel(llmModel)})
+                <span className="font-semibold text-slate-800">Model:</span> {llmModel} ({getProviderLabel(llmModel)})
               </p>
               <p>
-                <span className="font-semibold text-slate-800">Current key behavior:</span>{' '}
+                <span className="font-semibold text-slate-800">Key status:</span>{' '}
                 {llmApiKey.trim()
-                  ? 'The typed key above will be tested now and will replace the stored key only if you click Save Settings.'
+                  ? 'The key above will be tested now and saved only if you click Save Settings.'
                   : agent?.hasLlmKey
-                    ? 'No new key entered. Save Settings will keep the currently stored key.'
-                    : 'No key is stored yet. Smart Mode will fall back to Rule Engine until you save a valid key.'}
+                    ? 'No new key entered. Save Settings will keep the current key.'
+                    : 'No key is stored yet. Smart Mode will keep using built-in rules until you save one.'}
               </p>
             </div>
             {agent?.hasLlmKey && (
-              <p className="text-xs text-arc-green">✓ API key is stored (encrypted at rest with AES-256-GCM)</p>
+              <p className="text-xs text-arc-green">API key is stored securely.</p>
             )}
             {/* Groq onboarding card */}
             {(llmModel === 'llama-3.3-70b-versatile' || llmModel === 'llama-3.1-8b-instant') && (
@@ -653,7 +655,7 @@ export default function AgentTab() {
         <div className="mt-4 flex items-center gap-4">
           {smartMode && (
             <Button variant="outline" onClick={handleTestLlm} loading={testingLlm}>
-              <FlaskConical size={14} /> Test API
+              <FlaskConical size={14} /> Test connection
             </Button>
           )}
           <Button onClick={handleSaveSettings} loading={savingSettings}>Save Settings</Button>
@@ -670,7 +672,7 @@ export default function AgentTab() {
         )}
         {smartMode && (
           <p className="mt-2 text-xs text-slate-500">
-            Test API sends a live uncached provider request and verifies a one-time challenge in the response. This confirms the selected key and model can complete a real request now. It does not, by itself, guarantee that autonomous jobs will run later unless Smart Mode, feature toggles, relevant strategy permissions, balance, and trigger conditions are also satisfied.
+            This checks whether the selected key and model can complete a live request right now. A successful test does not guarantee that automatic jobs will run later.
           </p>
         )}
       </Card>
@@ -680,10 +682,13 @@ export default function AgentTab() {
         <div className="mb-4">
           <h3 className="font-bold text-slate-900">Strategy Preferences</h3>
           <p className="mt-1 text-xs text-slate-500">
-            These flags now act as a second layer on top of Tasks → Automation. They do not replace the automation toggles, but some of them do block specific background behaviors.
+            These switches work with Tasks -&gt; Automation and help decide which automatic actions are allowed.
           </p>
           <p className="mt-1 text-xs text-slate-500">
-            Today, <strong>DeFi Protocol Scanner</strong> gates Market Analysis, and <strong>Arbitrage</strong> gates oracle-strategy eligibility plus DeFi Loop Execution. The remaining checkboxes are still saved strategy preferences for future modules.
+            Today, <strong>DeFi Protocol Scanner</strong> affects Market Analysis, and <strong>Arbitrage</strong> affects oracle checks plus DeFi Loop.
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            Stable pool actions are the next likely automatic expansion. cirBTC actions stay manual for now.
           </p>
         </div>
         <div className="space-y-3">

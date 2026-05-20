@@ -1,0 +1,76 @@
+
+> arc-agent-backend@1.0.0 smoke:paid-readiness
+> node scripts/paidReadinessSmoke.js
+
+◇ injected env (51) from ../.env // tip: ⌘ custom filepath { path: '/custom/path/.env' }
+{
+  "smokeWalletAddress": "0xEf222293BfDb77bBe80a5AdE15718c13F6a59709",
+  "paidTasks": {
+    "revenuePool": {
+      "address": "0x7E84fFFAA5f0524CD55b13B6AEC7eE0785c07e5e",
+      "source": "env",
+      "balanceUsdc": 1.24,
+      "error": null
+    },
+    "readinessOverall": "needs_attention",
+    "coreTasks": [
+      {
+        "taskId": "EXEC_CCTP_BRIDGE",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_CURVE_SWAP",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_CURVE_LIQUIDITY_ADD",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_CURVE_LIQUIDITY_REMOVE",
+        "ok": true,
+        "status": "guarded",
+        "reason": "insufficient_lp_position"
+      },
+      {
+        "taskId": "EXEC_ARB",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_REBALANCE",
+        "ok": true,
+        "status": "guarded",
+        "reason": "lp_position_exit_required"
+      }
+    ]
+  },
+  "oracle": {
+    "endpoint": "prediction-market-check",
+    "amountUsdc": "0.005",
+    "deposited": false,
+    "paymentResponse": {
+      "success": true,
+      "payer": "0xef222293bfdb77bbe80a5ade15718c13f6a59709",
+      "transaction": "dd01bdfb-598d-4a6e-b08a-049d9d9bc243",
+      "network": "eip155:5042002"
+    },
+    "revenueBefore": {
+      "totalUsdc": 0.065,
+      "requestCount": 27
+    },
+    "revenueAfter": {
+      "totalUsdc": 0.07,
+      "requestCount": 28
+    },
+    "requestCountDelta": 1,
+    "totalUsdcDelta": 0.0050000000000000044
+  }
+}

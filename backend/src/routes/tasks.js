@@ -13,6 +13,24 @@ const queue           = require('../queue/agentQueue');
 const { ethers }      = require('ethers');
 const { isDailyLimitBypassed } = require('../services/dailyLimitBypass');
 const taskRunService = require('../services/taskRunService');
+const { getAgentWithKey } = require('../services/agentService');
+const {
+  buildCirclePaidHandoff,
+  getCirclePaidCatalog,
+  getCirclePaidItemById,
+} = require('../services/circlePaidCatalogService');
+const {
+  getEventOddsCompare,
+  getPredictionMarketPulse,
+} = require('../services/predictionMarketService');
+const {
+  buildCirclePaidPricingSnapshot,
+  buildPredictionMarketPreviewPayload,
+  createCirclePaidPreviewSnapshot,
+  getCirclePaidSnapshotForAgent,
+  listCirclePaidSnapshots,
+  unlockCirclePaidSnapshot,
+} = require('../services/circlePaidSnapshotService');
 
 // ── Minimal ABI for ArcRevenuePool.getPoolBalance() ──────────────────────────
 const _POOL_VIEW_ABI = ['function getPoolBalance() external view returns (uint256)'];
@@ -46,6 +64,13 @@ const DIRECT_PAIR_ZAP_LIMITS = {
   EXEC_CIRBTC_USDC_ZAP_IN: 20,
   EXEC_CIRBTC_EURC_ZAP_IN: 16,
 };
+const MANUAL_DEFI_CURVE_POOLS = new Set(['USDC-EURC', 'EURC-USDC']);
+const MANUAL_DEFI_DIRECT_PAIR_STABLE_BY_POOL = {
+  'USDC-CIRBTC': 'USDC',
+  'CIRBTC-USDC': 'USDC',
+  'EURC-CIRBTC': 'EURC',
+  'CIRBTC-EURC': 'EURC',
+};
 const CCTP_CHAIN_NAMES = new Set([
   'Arc Testnet',
   'Sepolia',
@@ -54,6 +79,8 @@ const CCTP_CHAIN_NAMES = new Set([
   'Arbitrum Sepolia',
 ]);
 const REBALANCE_TOKENS = new Set(['USDC', 'EURC']);
+const PREDICTION_MARKET_CHECK_ITEM_ID = 'ARC_PREDICTION_MARKET_CHECK';
+const EVENT_ODDS_COMPARE_ITEM_ID = 'ARC_EVENT_ODDS_COMPARE';
 
 function _isPositiveNumber(value) {
   const parsed = Number(value);
@@ -62,6 +89,203 @@ function _isPositiveNumber(value) {
 
 function _isBinaryIndex(value) {
   return Number(value) === 0 || Number(value) === 1;
+}
+
+function _normalizeManualDefiParams(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function _resolveCurveSwapRoute(params) {
+  const fromToken = String(params.fromToken || '').toUpperCase();
+  const toToken = String(params.toToken || '').toUpperCase();
+
+  if (fromToken === 'USDC' && toToken === 'EURC') {
+    return { indexIn: 0, indexOut: 1, fromToken, toToken };
+  }
+
+  if (fromToken === 'EURC' && toToken === 'USDC') {
+    return { indexIn: 1, indexOut: 0, fromToken, toToken };
+  }
+
+  return null;
+}
+
+function _resolveManualDefiExecution(body) {
+  const poolKey = String(body?.poolKey || body?.pool || '').trim().toUpperCase();
+  const venue = String(body?.venue || '').trim().toLowerCase();
+  const action = String(body?.action || '').trim().toLowerCase();
+  const params = _normalizeManualDefiParams(body?.params);
+
+  if (!poolKey) return { error: 'manual_defi_pool_required' };
+  if (!action) return { error: 'manual_defi_action_required' };
+
+  if (MANUAL_DEFI_CURVE_POOLS.has(poolKey)) {
+    if (venue && venue !== 'curve') return { error: 'manual_defi_curve_venue_invalid' };
+
+    if (action === 'swap') {
+      const route = _resolveCurveSwapRoute(params);
+      if (!route) return { error: 'curve_swap_direction_required' };
+      if (!_isPositiveNumber(params.amountIn)) return { error: 'curve_swap_amount_required' };
+
+      return {
+        taskId: 'EXEC_MANUAL_CURVE_SWAP',
+        poolKey,
+        action,
+        params: {
+          amountIn: Number(params.amountIn),
+          indexIn: route.indexIn,
+          indexOut: route.indexOut,
+        },
+      };
+    }
+
+    if (action === 'add_single') {
+      const tokenIn = String(params.tokenIn || '').toUpperCase();
+      if (!CURVE_POOL_TOKENS.has(tokenIn)) return { error: 'curve_liquidity_add_token_required' };
+      if (!_isPositiveNumber(params.amountIn)) return { error: 'curve_liquidity_add_amount_required' };
+
+      return {
+        taskId: 'EXEC_MANUAL_CURVE_LIQUIDITY_ADD_SINGLE',
+        poolKey,
+        action,
+        params: {
+          tokenIn,
+          amountIn: Number(params.amountIn),
+        },
+      };
+    }
+
+    if (action === 'add_dual') {
+      if (!_isPositiveNumber(params.amountUsdc) || !_isPositiveNumber(params.amountEurc)) {
+        return { error: 'curve_liquidity_add_dual_amounts_required' };
+      }
+
+      return {
+        taskId: 'EXEC_MANUAL_CURVE_LIQUIDITY_ADD_DUAL',
+        poolKey,
+        action,
+        params: {
+          amountUsdc: Number(params.amountUsdc),
+          amountEurc: Number(params.amountEurc),
+        },
+      };
+    }
+
+    if (action === 'remove_single') {
+      const tokenOut = String(params.tokenOut || '').toUpperCase();
+      if (!CURVE_POOL_TOKENS.has(tokenOut)) return { error: 'curve_liquidity_remove_token_required' };
+      if (!_isPositiveNumber(params.lpAmount)) return { error: 'curve_liquidity_remove_amount_required' };
+
+      return {
+        taskId: 'EXEC_MANUAL_CURVE_LIQUIDITY_REMOVE_SINGLE',
+        poolKey,
+        action,
+        params: {
+          tokenOut,
+          lpAmount: Number(params.lpAmount),
+        },
+      };
+    }
+
+    if (action === 'remove_dual') {
+      if (!_isPositiveNumber(params.lpAmount)) return { error: 'curve_liquidity_remove_amount_required' };
+
+      return {
+        taskId: 'EXEC_MANUAL_CURVE_LIQUIDITY_REMOVE_DUAL',
+        poolKey,
+        action,
+        params: {
+          lpAmount: Number(params.lpAmount),
+        },
+      };
+    }
+
+    return { error: 'manual_defi_curve_action_invalid' };
+  }
+
+  const stableToken = MANUAL_DEFI_DIRECT_PAIR_STABLE_BY_POOL[poolKey];
+  if (!stableToken) {
+    return { error: 'manual_defi_pool_unsupported' };
+  }
+
+  if (venue && venue !== 'uniswap_v2_like') {
+    return { error: 'manual_defi_direct_pair_venue_invalid' };
+  }
+
+  if (action === 'swap') {
+    return { error: 'manual_defi_direct_pair_swap_disabled_use_swap_tab' };
+  }
+
+  if (action === 'add_single') {
+    const inputToken = String(params.inputToken || stableToken).toUpperCase();
+    if (!new Set([stableToken, 'CIRBTC']).has(inputToken)) return { error: 'direct_pair_input_token_invalid' };
+    if (!_isPositiveNumber(params.amountIn)) return { error: 'pair_zap_amount_required' };
+
+    return {
+      taskId: 'EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_ADD',
+      poolKey,
+      action,
+      params: {
+        stableToken,
+        mode: 'single',
+        inputToken,
+        amountIn: Number(params.amountIn),
+      },
+    };
+  }
+
+  if (action === 'add_dual') {
+    if (!_isPositiveNumber(params.amountStable) || !_isPositiveNumber(params.amountCirbtc)) {
+      return { error: 'direct_pair_dual_amounts_required' };
+    }
+
+    return {
+      taskId: 'EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_ADD',
+      poolKey,
+      action,
+      params: {
+        stableToken,
+        mode: 'dual',
+        amountStable: Number(params.amountStable),
+        amountCirbtc: Number(params.amountCirbtc),
+      },
+    };
+  }
+
+  if (action === 'remove_single') {
+    const targetToken = String(params.targetToken || stableToken).toUpperCase();
+    if (!new Set([stableToken, 'CIRBTC']).has(targetToken)) return { error: 'direct_pair_input_token_invalid' };
+    if (!_isPositiveNumber(params.withdrawPct) || Number(params.withdrawPct) > 100) return { error: 'pair_exit_pct_invalid' };
+
+    return {
+      taskId: 'EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_REMOVE_SINGLE',
+      poolKey,
+      action,
+      params: {
+        stableToken,
+        targetToken,
+        withdrawPct: Number(params.withdrawPct),
+      },
+    };
+  }
+
+  if (action === 'remove_dual' || action === 'exit') {
+    if (!_isPositiveNumber(params.withdrawPct) || Number(params.withdrawPct) > 100) return { error: 'pair_exit_pct_invalid' };
+
+    return {
+      taskId: 'EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_REMOVE_DUAL',
+      poolKey,
+      action,
+      params: {
+        stableToken,
+        withdrawPct: Number(params.withdrawPct),
+      },
+    };
+  }
+
+  return { error: 'manual_defi_direct_pair_action_invalid' };
 }
 
 function _validateExecutionParams(taskId, params) {
@@ -159,6 +383,188 @@ function _getInlineTaskFailureStatus(reason) {
   }
 }
 
+function _normalizeCirclePaidParams(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function _normalizeCirclePaidPreviewId(value) {
+  return String(value || '').trim();
+}
+
+async function _getCirclePaidLiveResult(itemId, params = {}) {
+  switch (itemId) {
+    case PREDICTION_MARKET_CHECK_ITEM_ID:
+      return getPredictionMarketPulse({
+        topic: params.topic,
+        limit: params.limit,
+      });
+    case EVENT_ODDS_COMPARE_ITEM_ID:
+      return getEventOddsCompare({
+        primaryTopic: params.primaryTopic || params.topic,
+        secondaryTopic: params.secondaryTopic,
+        limit: params.limit,
+      });
+    default:
+      return null;
+  }
+}
+
+async function _getCirclePaidContext(agentId, userId, itemId) {
+  const agent = await getAgentWithKey(agentId, userId);
+  if (!agent) return { error: 'agent_not_found', status: 404 };
+
+  const item = getCirclePaidItemById(itemId);
+  if (!item) return { error: 'circle_paid_item_not_found', status: 404 };
+
+  const linkedTaskIds = Array.isArray(item.linkedTaskIds) ? item.linkedTaskIds : [];
+  const { rows: paidTasks } = linkedTaskIds.length
+    ? await db.query(
+      `SELECT id, title, description, fee_usdc
+         FROM task_catalog
+        WHERE id = ANY($1::text[])
+          AND enabled = TRUE`,
+      [linkedTaskIds],
+    )
+    : { rows: [] };
+
+  return {
+    agent,
+    item,
+    paidTasks,
+    handoff: buildCirclePaidHandoff(item, paidTasks),
+  };
+}
+
+function _findRecommendedCirclePaidTask(handoff, liveResult) {
+  const recommendedTasks = Array.isArray(handoff?.recommendedTasks) ? handoff.recommendedTasks : [];
+  return recommendedTasks.find(task => task.taskId === liveResult?.recommendedTaskId) || null;
+}
+
+function _buildCirclePaidPreviewResponse({ item, snapshot, liveResult, handoff, legacyAlias = false }) {
+  return {
+    previewId: snapshot.id,
+    itemId: item.id,
+    title: item.title,
+    status: 'preview_ready',
+    providerCallReady: true,
+    chargeReady: true,
+    preview: snapshot.preview_payload,
+    pricing: snapshot.pricing,
+    unlock: {
+      expiresAt: snapshot.preview_expires_at,
+    },
+    note: liveResult.isFallback
+      ? 'This preview is using a fallback snapshot because the provider did not respond cleanly. Unlock still never auto-runs the next Arc action.'
+      : 'This preview is free. Unlock pays for the full result and saved snapshot only; any suggested Arc action still requires a separate explicit run in the Paid lane.',
+    nextAction: {
+      requiresExplicitConfirmation: true,
+      hint: 'Unlock never auto-executes the recommended Arc action. The user must open the Paid lane and run that task separately.',
+    },
+    handoff: {
+      whyItMatters: handoff?.whyItMatters || item.whyItMatters,
+      whatYouGet: handoff?.whatYouGet || item.whatYouGet,
+    },
+    compatibility: legacyAlias
+      ? { alias: 'circle-paid/run', mode: 'preview' }
+      : null,
+  };
+}
+
+function _buildCirclePaidUnlockResponse({ item, snapshot, handoff }) {
+  const liveResult = snapshot.full_payload || {};
+  const recommendedTask = _findRecommendedCirclePaidTask(handoff, liveResult);
+
+  return {
+    snapshotId: snapshot.id,
+    itemId: item.id,
+    title: item.title,
+    status: 'unlocked',
+    chargeReady: true,
+    liveResult,
+    economy: snapshot.economy || {},
+    recommendedTask,
+    note: 'Unlock paid for the information result and saved snapshot only. Any suggested Arc action still requires a separate explicit task run.',
+    nextAction: {
+      requiresExplicitConfirmation: true,
+      taskId: recommendedTask?.taskId || null,
+      hint: recommendedTask
+        ? `Open the Paid lane and run ${recommendedTask.title} separately if you want to act on this result.`
+        : 'Unlock does not auto-run any task. Review the Paid lane separately before executing anything on-chain.',
+    },
+    savedSnapshot: {
+      createdAt: snapshot.created_at,
+      unlockedAt: snapshot.unlocked_at,
+    },
+  };
+}
+
+function _serializeCirclePaidSnapshot(snapshot) {
+  const item = getCirclePaidItemById(snapshot.item_id);
+  const handoff = item ? buildCirclePaidHandoff(item) : null;
+  const liveResult = snapshot.full_payload || {};
+  const recommendedTask = _findRecommendedCirclePaidTask(handoff, liveResult);
+
+  return {
+    snapshotId: snapshot.id,
+    itemId: snapshot.item_id,
+    title: item?.title || snapshot.item_id,
+    status: snapshot.status,
+    preview: snapshot.preview_payload,
+    pricing: snapshot.pricing,
+    createdAt: snapshot.created_at,
+    updatedAt: snapshot.updated_at,
+    previewExpiresAt: snapshot.preview_expires_at,
+    unlockedAt: snapshot.unlocked_at,
+    fullResultAvailable: snapshot.status === 'unlocked',
+    recommendedTask,
+    economy: snapshot.status === 'unlocked' ? snapshot.economy : null,
+  };
+}
+
+async function _handleCirclePaidPreview(req, res, next, { legacyAlias = false } = {}) {
+  try {
+    const agentId = req.params.id;
+    const itemId = String(req.body?.itemId || '').trim().toUpperCase();
+    const params = _normalizeCirclePaidParams(req.body?.params);
+
+    if (!itemId) return res.status(400).json({ error: 'circle_paid_item_required' });
+
+    const context = await _getCirclePaidContext(agentId, req.user.userId, itemId);
+    if (context.error) return res.status(context.status).json({ error: context.error });
+
+    const { item, handoff } = context;
+    if (item.status !== 'live') {
+      return res.json(handoff);
+    }
+
+    const liveResult = await _getCirclePaidLiveResult(item.id, params);
+    if (!liveResult) {
+      return res.json(handoff);
+    }
+
+    const snapshot = await createCirclePaidPreviewSnapshot({
+      agentId: context.agent.id,
+      itemId: item.id,
+      params,
+      previewPayload: buildPredictionMarketPreviewPayload(liveResult),
+      fullPayload: liveResult,
+      pricing: buildCirclePaidPricingSnapshot(item),
+    });
+
+    return res.json(_buildCirclePaidPreviewResponse({
+      item,
+      snapshot,
+      liveResult,
+      handoff,
+      legacyAlias,
+    }));
+  } catch (err) {
+    return next(err);
+  }
+}
+
 // ── GET /api/agents/:id/tasks/runs ───────────────────────────────────────────
 // Returns recent task runs or only active ones for UI recovery and progress.
 router.get('/agents/:id/tasks/runs', requireAuth, async (req, res, next) => {
@@ -205,6 +611,119 @@ router.get('/catalog', async (_req, res, next) => {
        ORDER BY tier ASC, id ASC`,
     );
     res.json({ tasks: rows });
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/tasks/circle-paid/catalog ───────────────────────────────────────
+// Circle Paid catalog with live cards plus preview cards, ordered by Arc Testnet action priority.
+router.get('/circle-paid/catalog', async (_req, res, next) => {
+  try {
+    res.json(getCirclePaidCatalog());
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/tasks/agents/:id/circle-paid/preview ───────────────────────────
+// Free preview for a Circle Paid card. Today only Prediction Market Check creates a live preview snapshot.
+router.post('/agents/:id/circle-paid/preview', requireAuth, async (req, res, next) => {
+  return _handleCirclePaidPreview(req, res, next);
+});
+
+// ── POST /api/tasks/agents/:id/circle-paid/run ───────────────────────────────
+// Legacy alias kept during rollout. Behaves like the new preview endpoint.
+router.post('/agents/:id/circle-paid/run', requireAuth, async (req, res, next) => {
+  return _handleCirclePaidPreview(req, res, next, { legacyAlias: true });
+});
+
+// ── POST /api/tasks/agents/:id/circle-paid/unlock ────────────────────────────
+// Paid unlock for a previously created preview. Unlock never auto-runs the next Arc action.
+router.post('/agents/:id/circle-paid/unlock', requireAuth, async (req, res, next) => {
+  try {
+    const agentId = req.params.id;
+    const previewId = _normalizeCirclePaidPreviewId(req.body?.previewId);
+
+    if (!previewId) return res.status(400).json({ error: 'preview_id_required' });
+
+    const agent = await getAgentWithKey(agentId, req.user.userId);
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const previewSnapshot = await getCirclePaidSnapshotForAgent(agent.id, previewId);
+    if (!previewSnapshot) return res.status(404).json({ error: 'preview_not_found' });
+
+    const item = getCirclePaidItemById(previewSnapshot.item_id);
+    if (!item) return res.status(404).json({ error: 'circle_paid_item_not_found' });
+
+    const context = await _getCirclePaidContext(agentId, req.user.userId, item.id);
+    if (context.error) return res.status(context.status).json({ error: context.error });
+
+    try {
+      const unlockedSnapshot = await unlockCirclePaidSnapshot({
+        agent,
+        snapshot: previewSnapshot,
+      });
+
+      return res.json(_buildCirclePaidUnlockResponse({
+        item,
+        snapshot: unlockedSnapshot,
+        handoff: context.handoff,
+      }));
+    } catch (error) {
+      if (error?.code) {
+        return res.status(error.status || 400).json({
+          error: error.code,
+          details: error.details || {},
+        });
+      }
+
+      throw error;
+    }
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/tasks/agents/:id/circle-paid/snapshots ──────────────────────────
+// Lists saved Circle Paid snapshots. Defaults to unlocked snapshots only.
+router.get('/agents/:id/circle-paid/snapshots', requireAuth, async (req, res, next) => {
+  try {
+    const agent = await getAgentWithKey(req.params.id, req.user.userId);
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const snapshots = await listCirclePaidSnapshots(agent.id, {
+      itemId: req.query.itemId,
+      status: req.query.status,
+      limit: req.query.limit,
+    });
+
+    return res.json({ snapshots: snapshots.map(_serializeCirclePaidSnapshot) });
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/tasks/agents/:id/circle-paid/snapshots/:snapshotId ──────────────
+// Returns one snapshot. Preview snapshots expose preview only; unlocked ones expose the full result.
+router.get('/agents/:id/circle-paid/snapshots/:snapshotId', requireAuth, async (req, res, next) => {
+  try {
+    const agent = await getAgentWithKey(req.params.id, req.user.userId);
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const snapshot = await getCirclePaidSnapshotForAgent(agent.id, req.params.snapshotId);
+    if (!snapshot) return res.status(404).json({ error: 'snapshot_not_found' });
+
+    const item = getCirclePaidItemById(snapshot.item_id);
+    const handoff = item ? buildCirclePaidHandoff(item) : null;
+
+    return res.json({
+      snapshot: {
+        ..._serializeCirclePaidSnapshot(snapshot),
+        fullResult: snapshot.status === 'unlocked' ? snapshot.full_payload : null,
+        note: snapshot.status === 'unlocked'
+          ? 'This saved snapshot exposes the unlocked full result only. Running any suggested Arc action still requires a separate explicit task run.'
+          : 'This is still a preview draft. Unlock is required before the full result becomes a saved snapshot.',
+        nextAction: {
+          requiresExplicitConfirmation: true,
+          recommendedTaskId: snapshot.status === 'unlocked'
+            ? _findRecommendedCirclePaidTask(handoff, snapshot.full_payload || {})?.taskId || null
+            : null,
+        },
+      },
+    });
   } catch (err) { next(err); }
 });
 
@@ -338,6 +857,71 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
       taskId,
       tier:    task.tier,
       feeUsdc: task.tier === 2 ? Number(task.fee_usdc) : 0,
+      run,
+    });
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/tasks/agents/:id/defi/manual/execute ──────────────────────────
+// Queues a manual DeFi pool action without depending on the Tasks switch or the public paid task catalog.
+router.post('/agents/:id/defi/manual/execute', requireAuth, async (req, res, next) => {
+  try {
+    const agentId = req.params.id;
+    const resolution = _resolveManualDefiExecution(req.body || {});
+    if (resolution.error) {
+      return res.status(400).json({ error: resolution.error });
+    }
+
+    const { rows: [agent] } = await db.query(
+      `SELECT id FROM agents WHERE id = $1 AND user_id = $2`,
+      [agentId, req.user.userId],
+    );
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const { rows: [task] } = await db.query(
+      `SELECT id, tier, fee_usdc FROM task_catalog WHERE id = $1`,
+      [resolution.taskId],
+    );
+    if (!task) return res.status(404).json({ error: 'manual_defi_task_not_found' });
+
+    const existingRun = await taskRunService.findActiveTaskRun(agentId, resolution.taskId);
+    if (existingRun) {
+      return res.status(409).json({
+        error: 'task_already_running',
+        run: existingRun,
+      });
+    }
+
+    const run = await taskRunService.createTaskRun({
+      agentId,
+      taskId: resolution.taskId,
+      params: resolution.params,
+      stageKey: 'queued',
+      stageLabel: 'Queued',
+      stageDetail: 'Manual DeFi action accepted and waiting for worker pickup.',
+    });
+
+    try {
+      await queue.queueManualTask(resolution.taskId, { agentId, params: resolution.params, taskRunId: run.id });
+    } catch (err) {
+      await taskRunService.failTaskRun(run.id, {
+        error: err.code || err.message || 'manual_task_queue_unavailable',
+        stageKey: 'queue_unavailable',
+        stageLabel: 'Queue Unavailable',
+        stageDetail: 'The manual DeFi worker was not ready to accept this action.',
+      });
+
+      return res.status(_getInlineTaskFailureStatus(err.code || err.message)).json({
+        error: err.code || err.message || 'manual_task_queue_unavailable',
+      });
+    }
+
+    return res.status(202).json({
+      queued: true,
+      inline: false,
+      poolKey: resolution.poolKey,
+      action: resolution.action,
+      feeUsdc: Number(task.fee_usdc) || 0,
       run,
     });
   } catch (err) { next(err); }

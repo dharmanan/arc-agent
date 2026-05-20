@@ -28,6 +28,7 @@ const EVENT_TYPES = {
   DEFI_LOOP:      'DEFI_LOOP_COMPLETED',
   ORACLE_QUERY:   'ORACLE_QUERY_COMPLETED',
   DAILY_TASK:     'DAILY_TASK_COMPLETED',
+  JOB_REVIEW_TIMEOUT: 'JOB_REVIEW_TIMEOUT',
 };
 
 // Score deltas per event type
@@ -37,6 +38,7 @@ const SCORE_DELTAS = {
   [EVENT_TYPES.DEFI_LOOP]:     1,
   [EVENT_TYPES.ORACLE_QUERY]:  1,
   [EVENT_TYPES.DAILY_TASK]:    1,
+  [EVENT_TYPES.JOB_REVIEW_TIMEOUT]: -2,
 };
 
 async function setReputationState(agentId, status) {

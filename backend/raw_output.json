@@ -1,0 +1,360 @@
+◇ injected env (51) from ../.env // tip: ◈ encrypted .env [www.dotenvx.com]
+{
+  "agentId": null,
+  "walletAddress": "0xEf222293BfDb77bBe80a5AdE15718c13F6a59709",
+  "mode": "full",
+  "balances": {
+    "arcUsdc": 33.95735,
+    "arcEurc": 646.224444,
+    "arcCirbtc": 0.00015865,
+    "curveLp": 0.731656719650479,
+    "usdcCirbtcLp": 1.201778e-12,
+    "eurcCirbtcLp": 1.237212e-12
+  },
+  "env": {
+    "aavePoolConfigured": false,
+    "curveUsdcEurcPool": "0x2D84D79C852f6842AbE0304b70bBaA1506AdD457",
+    "curveEurcUsdcPool": "0x2D84D79C852f6842AbE0304b70bBaA1506AdD457",
+    "usdcCirbtcPair": "0x10D4115Da1880C4b4D424F69f3a9DBd7a2B8ffd0",
+    "eurcCirbtcPair": "0x6f29F477D950821683dbE249DbB5D87d48183535"
+  },
+  "revenuePool": {
+    "address": "0x7E84fFFAA5f0524CD55b13B6AEC7eE0785c07e5e",
+    "source": "env",
+    "balanceUsdc": 1.24,
+    "error": null
+  },
+  "readiness": {
+    "overall": "needs_attention",
+    "readyCount": 10,
+    "blockedCount": 2,
+    "tasks": [
+      {
+        "taskId": "EXEC_CURVE_SWAP",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass:1 USDC",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_CURVE_LIQUIDITY_ADD",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass:1 USDC",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_CURVE_LIQUIDITY_REMOVE",
+        "status": "blocked",
+        "blocker": "insufficient_lp_position",
+        "fundsGate": "pass_lp:0.731657",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_CIRBTC_USDC_ZAP_IN",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass:20 USDC",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_CIRBTC_EURC_ZAP_IN",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass:16 EURC",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_CIRBTC_USDC_LP_REMOVE",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass_lp:0",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_CIRBTC_EURC_LP_REMOVE",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass_lp:0",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_CCTP_BRIDGE",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass:1 USDC",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_SEPOLIA_GAS_FANOUT",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "requires_sepolia_eth",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_YIELD_MOVE",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass:1 USDC",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_ARB",
+        "status": "ready",
+        "blocker": null,
+        "fundsGate": "pass:1 USDC",
+        "recentStatus": null,
+        "recentStage": null
+      },
+      {
+        "taskId": "EXEC_REBALANCE",
+        "status": "blocked",
+        "blocker": "lp_position_exit_required",
+        "fundsGate": "pass:1 USDC",
+        "recentStatus": null,
+        "recentStage": null
+      }
+    ]
+  },
+  "checks": [
+    {
+      "taskId": "EXEC_CURVE_SWAP",
+      "recent": null,
+      "fundsGate": "pass:1 USDC",
+      "preflight": {
+        "label": "curve_swap",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "quoteAmountOut": "0.948987"
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_CURVE_LIQUIDITY_ADD",
+      "recent": null,
+      "fundsGate": "pass:1 USDC",
+      "preflight": {
+        "label": "curve_liquidity_add",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "poolAddress": "0x2D84D79C852f6842AbE0304b70bBaA1506AdD457",
+          "positionBefore": {
+            "poolKey": "USDC-EURC",
+            "poolAddress": "0x2D84D79C852f6842AbE0304b70bBaA1506AdD457",
+            "lpBalance": "0.73165671965047898",
+            "sharePct": 0,
+            "underlying": [
+              {
+                "symbol": "USDC",
+                "amount": "0.824732",
+                "decimals": 6
+              },
+              {
+                "symbol": "EURC",
+                "amount": "0.046588",
+                "decimals": 6
+              }
+            ]
+          }
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_CURVE_LIQUIDITY_REMOVE",
+      "recent": null,
+      "fundsGate": "pass_lp:0.731657",
+      "preflight": {
+        "label": "curve_liquidity_remove",
+        "ok": false,
+        "result": {
+          "ok": false,
+          "reason": "insufficient_lp_position",
+          "error": "available_lp_balance:0.73165671965047898"
+        },
+        "reason": "insufficient_lp_position"
+      }
+    },
+    {
+      "taskId": "EXEC_CIRBTC_USDC_ZAP_IN",
+      "recent": null,
+      "fundsGate": "pass:20 USDC",
+      "preflight": {
+        "label": "cirbtc_usdc_zap_in",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "pairAddress": "0x10D4115Da1880C4b4D424F69f3a9DBd7a2B8ffd0",
+          "pairSeeded": true,
+          "swapRouteStrategy": "swap_kit_primary_with_v2_fallback"
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_CIRBTC_EURC_ZAP_IN",
+      "recent": null,
+      "fundsGate": "pass:16 EURC",
+      "preflight": {
+        "label": "cirbtc_eurc_zap_in",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "pairAddress": "0x6f29F477D950821683dbE249DbB5D87d48183535",
+          "pairSeeded": true,
+          "swapRouteStrategy": "swap_kit_primary_with_v2_fallback"
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_CIRBTC_USDC_LP_REMOVE",
+      "recent": null,
+      "fundsGate": "pass_lp:0",
+      "preflight": {
+        "label": "cirbtc_usdc_lp_remove",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "pairAddress": "0x10D4115Da1880C4b4D424F69f3a9DBd7a2B8ffd0"
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_CIRBTC_EURC_LP_REMOVE",
+      "recent": null,
+      "fundsGate": "pass_lp:0",
+      "preflight": {
+        "label": "cirbtc_eurc_lp_remove",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "pairAddress": "0x6f29F477D950821683dbE249DbB5D87d48183535"
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_CCTP_BRIDGE",
+      "recent": null,
+      "fundsGate": "pass:1 USDC",
+      "preflight": {
+        "label": "cctp_bridge",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "payload": {
+            "dryRun": true,
+            "fromChain": "Arc Testnet",
+            "toChain": "Base Sepolia",
+            "amountUsdc": "1",
+            "executedAt": "2026-05-18T19:46:13.683Z"
+          }
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_SEPOLIA_GAS_FANOUT",
+      "recent": null,
+      "fundsGate": "requires_sepolia_eth",
+      "preflight": {
+        "label": "sepolia_gas_fanout",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "payload": {
+            "dryRun": true,
+            "fromChain": "Sepolia",
+            "amountEth": "0.01",
+            "targets": [
+              {
+                "toChain": "Optimism Sepolia",
+                "amountEth": "0.01"
+              },
+              {
+                "toChain": "Base Sepolia",
+                "amountEth": "0.01"
+              },
+              {
+                "toChain": "Arbitrum Sepolia",
+                "amountEth": "0.01"
+              }
+            ],
+            "summary": "Simulation only. Would bridge 0.01 ETH from Sepolia to Optimism Sepolia, Base Sepolia, Arbitrum Sepolia.",
+            "executedAt": "2026-05-18T19:46:13.684Z"
+          }
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_YIELD_MOVE",
+      "recent": null,
+      "fundsGate": "pass:1 USDC",
+      "preflight": {
+        "label": "yield_move",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "aavePoolConfigured": false
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_ARB",
+      "recent": null,
+      "fundsGate": "pass:1 USDC",
+      "preflight": {
+        "label": "arb",
+        "ok": true,
+        "result": {
+          "ok": true,
+          "reason": null,
+          "summary": "Simulation only. Would evaluate the latest arbitrage signal for a 1 USDC Curve entry leg. This task does not claim realized profit because it does not execute the bridge or exit leg.",
+          "confidence": "HIGH"
+        },
+        "reason": null
+      }
+    },
+    {
+      "taskId": "EXEC_REBALANCE",
+      "recent": null,
+      "fundsGate": "pass:1 USDC",
+      "preflight": {
+        "label": "rebalance",
+        "ok": false,
+        "result": {
+          "ok": false,
+          "reason": "lp_position_exit_required",
+          "error": null
+        },
+        "reason": "lp_position_exit_required"
+      }
+    }
+  ]
+}

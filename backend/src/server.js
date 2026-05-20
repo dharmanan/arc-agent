@@ -15,10 +15,13 @@ const bridgeRoutes       = require('./routes/bridge');
 const oracleRoutes       = require('./routes/oracle');
 const tasksRoutes        = require('./routes/tasks');
 const jobsRoutes         = require('./routes/jobs');
+const publicJobsRoutes   = require('./routes/publicJobs');
 const agentQueue         = require('./queue/agentQueue');
 const { globalRateLimit }  = require('./middleware/rateLimit');
 const { startIndexer }     = require('./services/indexerService');
 const { startChainEventRetention } = require('./services/chainEventRetentionService');
+const { startJobRetention } = require('./services/jobRetentionService');
+const { startLpRewardEpochSnapshotWriter } = require('./services/lpRewardProgramService');
 const bridgeActivityService = require('./services/bridgeActivityService');
 const agentWalletService    = require('./services/agentWalletService');
 const agentService          = require('./services/agentService');
@@ -77,6 +80,7 @@ app.use('/api/transactions', transactionRoutes);
 app.use('/api/bridge',       bridgeRoutes);
 app.use('/api/oracle',       oracleRoutes);
 app.use('/api/tasks',        tasksRoutes);
+app.use('/api/jobs',         publicJobsRoutes);
 // tasks.js also handles /api/tasks/agents/:id/tasks/* routes (mounted at /api/tasks)
 app.use('/api/agents/:id/jobs', jobsRoutes);
 // jobs.js handles /api/agents/:id/jobs/* routes (ERC-8183 AgenticCommerce)
@@ -188,6 +192,8 @@ async function bootstrap() {
   }
 
   startChainEventRetention();
+  startJobRetention();
+  startLpRewardEpochSnapshotWriter();
 
   // Start blockchain event indexer (non-blocking)
   startIndexer().catch(err => console.error('[INDEXER] startup error', err));

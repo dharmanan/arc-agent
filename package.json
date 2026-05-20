@@ -5,11 +5,15 @@
   "private": true,
   "scripts": {
     "audit": "npm audit",
+    "smoke:prod": "node scripts/prodSmoke.js",
     "frontend:dev": "cd frontend && npm run dev",
     "frontend:build": "cd frontend && npm run build",
     "backend:dev": "cd backend && npm run dev",
     "backend:start": "cd backend && npm start",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down"
+  },
+  "dependencies": {
+    "vercel": "^54.1.0"
   }
 }

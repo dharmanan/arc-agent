@@ -1,0 +1,116 @@
+
+> arc-agent-backend@1.0.0 smoke:readiness
+> npm run smoke:route && npm run smoke:paid-readiness
+
+
+> arc-agent-backend@1.0.0 smoke:route
+> npm test -- src/routes/__tests__/routeSmoke.test.js
+
+
+> arc-agent-backend@1.0.0 test
+> npx -y jest@30.4.2 --runInBand src/routes/__tests__/routeSmoke.test.js
+
+PASS src/routes/__tests__/routeSmoke.test.js
+  tasks route smoke
+    ✓ rejects protected task results without auth (274 ms)
+    ✓ returns the public task catalog (75 ms)
+    ✓ returns protected task results with a valid token (73 ms)
+    ✓ rejects paid rebalance runs with missing required params (126 ms)
+  jobs route smoke
+    ✓ creates a funded job for an authenticated agent (149 ms)
+    ✓ moves a job from funded to delivered to completed (57 ms)
+    ✓ cancels a funded job before delivery (53 ms)
+    ✓ rejects delivered work through a separate reject route (76 ms)
+    ✓ requires reject instead of cancel for delivered jobs (93 ms)
+    ✓ creates a manual-application job without a fixed provider (76 ms)
+    ✓ assigns a provider to an open applicant job (109 ms)
+  public jobs route smoke
+    ✓ returns active jobs on the public board without auth (80 ms)
+    ✓ records a public provider delivery with a wallet signature (153 ms)
+    ✓ records a public manual application with a wallet signature (108 ms)
+    ✓ records a provider dispute during manual client review (110 ms)
+    ✓ returns 410 for an expired delivered job detail (88 ms)
+  oracle public payment guard smoke
+    ✓ returns a payment challenge for the public pool-state route (89 ms)
+
+Test Suites: 1 passed, 1 total
+Tests:       17 passed, 17 total
+Snapshots:   0 total
+Time:        2.24 s
+Ran all test suites matching src/routes/__tests__/routeSmoke.test.js.
+
+> arc-agent-backend@1.0.0 smoke:paid-readiness
+> node scripts/paidReadinessSmoke.js
+
+◇ injected env (51) from ../.env // tip: ◈ secrets for agents [www.dotenvx.com]
+{
+  "smokeWalletAddress": "0xEf222293BfDb77bBe80a5AdE15718c13F6a59709",
+  "paidTasks": {
+    "revenuePool": {
+      "address": "0x7E84fFFAA5f0524CD55b13B6AEC7eE0785c07e5e",
+      "source": "env",
+      "balanceUsdc": 1.24,
+      "error": null
+    },
+    "readinessOverall": "needs_attention",
+    "coreTasks": [
+      {
+        "taskId": "EXEC_CCTP_BRIDGE",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_CURVE_SWAP",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_CURVE_LIQUIDITY_ADD",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_CURVE_LIQUIDITY_REMOVE",
+        "ok": true,
+        "status": "guarded",
+        "reason": "insufficient_lp_position"
+      },
+      {
+        "taskId": "EXEC_ARB",
+        "ok": true,
+        "status": "ready",
+        "reason": null
+      },
+      {
+        "taskId": "EXEC_REBALANCE",
+        "ok": true,
+        "status": "guarded",
+        "reason": "lp_position_exit_required"
+      }
+    ]
+  },
+  "oracle": {
+    "endpoint": "prediction-market-check",
+    "amountUsdc": "0.005",
+    "deposited": false,
+    "paymentResponse": {
+      "success": true,
+      "payer": "0xef222293bfdb77bbe80a5ade15718c13f6a59709",
+      "transaction": "1eb75cba-9a69-4797-ab75-f6d0868bff24",
+      "network": "eip155:5042002"
+    },
+    "revenueBefore": {
+      "totalUsdc": 0.075,
+      "requestCount": 29
+    },
+    "revenueAfter": {
+      "totalUsdc": 0.08,
+      "requestCount": 30
+    },
+    "requestCountDelta": 1,
+    "totalUsdcDelta": 0.0050000000000000044
+  }
+}

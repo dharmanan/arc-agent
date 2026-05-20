@@ -13,6 +13,7 @@ const SUPPORTED_ENDPOINTS = new Set([
   'reserve-state',
   'protocol-tvl',
   'pool-compare',
+  'prediction-market-check',
   'yield-rank',
   'arb-signal',
   'arb-scan-multi',
@@ -31,6 +32,8 @@ function printUsage() {
     '  ORACLE_PUBLIC_ASSETS=USDC,EURC,USDT',
     '  ORACLE_PUBLIC_PROTOCOLS=aave,morpho,maple',
     '  ORACLE_PUBLIC_TARGETS=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC',
+    '  ORACLE_PUBLIC_TOPIC=crypto',
+    '  ORACLE_PUBLIC_LIMIT=4',
     '  ORACLE_BUYER_PRIVATE_KEY=0x...',
     '  ORACLE_BUYER_CHAIN=arcTestnet',
     '  ORACLE_BUYER_RPC_URL=https://rpc.testnet.arc.network',
@@ -101,6 +104,11 @@ function buildOracleUrl() {
 
   if (endpoint === 'pool-compare') {
     url.searchParams.set('targets', process.env.ORACLE_PUBLIC_TARGETS || 'curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC');
+  }
+
+  if (endpoint === 'prediction-market-check') {
+    url.searchParams.set('topic', process.env.ORACLE_PUBLIC_TOPIC || 'crypto');
+    url.searchParams.set('limit', process.env.ORACLE_PUBLIC_LIMIT || '4');
   }
 
   if (endpoint === 'arb-signal') {

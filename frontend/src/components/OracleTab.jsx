@@ -26,44 +26,39 @@ function getOracleWarnings(oracleOverview) {
   if (!oracleOverview?.config) return warnings;
 
   if (!oracleOverview.config.payToConfigured) {
-    warnings.push('ORACLE_PAY_ADDRESS is missing. Public x402 requests cannot complete payment verification.');
+    warnings.push('Public payment address is missing. Buyers cannot complete paid verification yet.');
   }
   if (!oracleOverview.config.pools?.usdcEurcConfigured) {
-    warnings.push('CURVE_USDC_EURC_POOL is missing. Curve pool state and arbitrage routes still fall back to mock data.');
+    warnings.push('The Curve USDC/EURC pool is not connected. Pool state and arbitrage reads may fall back to sample data.');
   }
   if (!oracleOverview.config.pools?.wusdcUsdcConfigured) {
-    warnings.push('CURVE_WUSDC_USDC_POOL is missing. WUSDC/USDC oracle reads are unavailable.');
+    warnings.push('WUSDC/USDC oracle reads are unavailable.');
   }
   if (!oracleOverview.config.pools?.eurcWusdcConfigured) {
-    warnings.push('Verified EURC/WUSDC oracle reads are unavailable.');
+    warnings.push('EURC/WUSDC oracle reads are unavailable.');
   }
 
   const seller = oracleOverview?.gateway?.seller;
   const facilitatorError = seller?.facilitator?.supportedCache?.lastError;
   if (seller?.authRequired && !seller?.authConfigured) {
-    warnings.push(`Circle Gateway auth mode is ${seller.authMode}, but the current auth headers are not fully configured.`);
+    warnings.push(`Circle Gateway auth is incomplete for mode ${seller.authMode}.`);
   }
   if (facilitatorError?.message) {
     warnings.push(`Circle Gateway facilitator error: ${facilitatorError.message}`);
   }
 
-  const fallbackCount = Object.values(oracleOverview?.observability?.fallbackCounts || {})
-    .reduce((total, value) => total + Number(value || 0), 0);
   const settlementFailures = Number(oracleOverview?.observability?.signalCounts?.settlement_failure || 0);
   const serverErrors = Number(oracleOverview?.observability?.signalCounts?.server_error || 0);
   const alertDeliveryFailures = Number(oracleOverview?.observability?.alerting?.failedCount || 0);
 
-  if (fallbackCount > 0) {
-    warnings.push(`Oracle fallback events observed since boot: ${fallbackCount}. Check the Data Quality & Observability section.`);
-  }
   if (settlementFailures > 0) {
-    warnings.push(`Oracle settlement failures observed since boot: ${settlementFailures}.`);
+    warnings.push(`Settlement failures observed: ${settlementFailures}.`);
   }
   if (serverErrors > 0) {
-    warnings.push(`Oracle public 5xx responses observed since boot: ${serverErrors}.`);
+    warnings.push(`Public server errors observed: ${serverErrors}.`);
   }
   if (alertDeliveryFailures > 0) {
-    warnings.push(`Oracle alert backend failures observed since boot: ${alertDeliveryFailures}.`);
+    warnings.push(`Alert delivery failures observed: ${alertDeliveryFailures}.`);
   }
 
   return warnings;
@@ -91,17 +86,17 @@ const PAYMENT_FLOW_STEPS = [
 const ORACLE_EXPLANATION_CARDS = [
   {
     title: 'What this tab is for',
-    description: 'This is the control surface for the paid oracle service, not just a task helper. It shows whether the product can actually sell data to external callers.',
+    description: 'Use this page to see whether the oracle can sell data to outside buyers right now.',
     Icon: Brain,
   },
   {
     title: 'Why it matters',
-    description: 'If the oracle is healthy, agents can monetize information directly: stablecoin FX, pool state, yield ranking and arbitrage signals become paid services.',
+    description: 'If the oracle is healthy, agents can earn from stablecoin FX, pool state, yield ranking, and arbitrage signals.',
     Icon: CircleDollarSign,
   },
   {
     title: 'What to inspect here',
-    description: 'Use this page to check payment readiness, endpoint availability, request revenue, current warning state and the address that receives oracle payments.',
+    description: 'Check payment readiness, endpoint availability, revenue, warnings, and the address that receives oracle payments.',
     Icon: ShieldCheck,
   },
 ];
@@ -122,6 +117,102 @@ const EXTERNAL_DEX_QUERY_VENUES = {
   arcFx: 'arcfx',
   aaveLike: 'aave_like',
 };
+const CURVE_DEPENDENT_ENDPOINTS = new Set([
+  'stablecoin-fx',
+  'pool-state',
+  'pool-compare',
+  'arb-signal',
+  'arb-scan-multi',
+]);
+
+function getOracleEndpointBadges(endpointKey, { payToConfigured, curveConfigured }) {
+  const paymentBadge = payToConfigured
+    ? {
+        label: 'Payment gated',
+        tone: 'border-green-200 bg-green-50 text-green-700',
+      }
+    : {
+        label: 'Payment blocked',
+        tone: 'border-red-200 bg-red-50 text-red-700',
+      };
+
+  if (CURVE_DEPENDENT_ENDPOINTS.has(endpointKey)) {
+    return [
+      paymentBadge,
+      curveConfigured
+        ? {
+            label: 'Live route',
+            tone: 'border-blue-200 bg-blue-50 text-blue-700',
+          }
+        : {
+            label: 'Fallback risk',
+            tone: 'border-amber-200 bg-amber-50 text-amber-800',
+          },
+    ];
+  }
+
+  return [
+    paymentBadge,
+    {
+      label: 'Live read',
+      tone: 'border-blue-200 bg-blue-50 text-blue-700',
+    },
+  ];
+}
+
+function OracleTrustPanel({
+  payToConfigured,
+  publicChallengeCount,
+  curveConfigured,
+  gatewayFundingState,
+  operatorNote,
+}) {
+  return (
+    <Card>
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <ShieldCheck size={16} className="text-indigo-600" />
+          <h3 className="text-lg font-semibold text-slate-900">Buyer Readiness</h3>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div className={`rounded-xl border px-4 py-3 text-xs ${payToConfigured ? 'border-green-200 bg-green-50 text-green-700' : 'border-red-200 bg-red-50 text-red-700'}`}>
+            <p className="text-[11px] font-semibold uppercase tracking-wide">Payment Gate</p>
+            <p className="mt-1 text-sm font-semibold">{payToConfigured ? '402 flow is configured' : '402 flow is blocked'}</p>
+            <p className="mt-1 leading-5">
+              {payToConfigured
+                ? 'Public buyers should expect a 402 challenge first, then a paid retry with payment proof.'
+                : 'ORACLE_PAY_ADDRESS is missing, so public buyers cannot complete paid verification yet.'}
+            </p>
+          </div>
+
+          <div className={`rounded-xl border px-4 py-3 text-xs ${curveConfigured ? 'border-green-200 bg-green-50 text-green-700' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+            <p className="text-[11px] font-semibold uppercase tracking-wide">Data Source</p>
+            <p className="mt-1 text-sm font-semibold">{curveConfigured ? 'Verified live reads only' : 'Fallback risk'}</p>
+            <p className="mt-1 leading-5">
+              {curveConfigured
+                ? 'Current canonical reads are coming from configured live sources.'
+                : 'Some core pool reads may fall back until the main Curve pool is configured.'}
+            </p>
+          </div>
+
+          <div className={`rounded-xl border px-4 py-3 text-xs ${gatewayFundingState.tone}`}>
+            <p className="text-[11px] font-semibold uppercase tracking-wide">Buyer Funding</p>
+            <p className="mt-1 text-sm font-semibold">{gatewayFundingState.title}</p>
+            <p className="mt-1 leading-5">{gatewayFundingState.body}</p>
+          </div>
+
+          <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-800">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-500">Watch now</p>
+            <p className="mt-1 text-sm font-semibold text-blue-900">Current focus</p>
+            <p className="mt-1 leading-5">{operatorNote}</p>
+            <p className="mt-2 text-[11px] text-blue-700">402 challenges seen: {publicChallengeCount.toLocaleString()}</p>
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
 
 export default function OracleTab() {
   const { agent } = useAgent();
@@ -222,7 +313,8 @@ export default function OracleTab() {
   const signalCounts = oracleObservability?.signalCounts || {};
   const fallbackCounts = oracleObservability?.fallbackCounts || {};
   const totalFallbacks = Object.values(fallbackCounts).reduce((total, value) => total + Number(value || 0), 0);
-  const recentFallbacks = (oracleObservability?.recentFallbacks || []).slice(0, 3);
+  const recentFallbackEntries = oracleObservability?.recentFallbacks || [];
+  const recentFallbacks = recentFallbackEntries.slice(0, 3);
   const recentAlertDeliveries = (oracleAlerting?.recentDeliveries || []).slice(0, 3);
   const configuredAlertSinks = (oracleAlerting?.sinks || []).slice(0, 3);
   const walletAvailableForManualFund = Number(gatewayBalance?.wallet?.availableUsdc || 0);
@@ -234,12 +326,41 @@ export default function OracleTab() {
     : hasWarnings
       ? 'border-amber-200 bg-amber-50 text-amber-700'
       : 'border-green-200 bg-green-50 text-green-700';
+  const payToConfigured = Boolean(oracleOverview?.config?.payToConfigured);
+  const publicChallengeCount = Number(signalCounts.payment_challenge || 0);
+  const gatewayFundingState = !agent?.id
+    ? {
+        tone: 'border-slate-200 bg-slate-50 text-slate-600',
+        title: 'No agent selected',
+        body: 'Connect or reconnect an agent to inspect wallet USDC and Gateway available balance for buyer-side payments.',
+      }
+    : gatewayBalance?.funded
+      ? {
+          tone: 'border-green-200 bg-green-50 text-green-700',
+          title: 'Gateway balance is warm',
+          body: 'This agent can pay public x402 routes without an extra deposit step right now.',
+        }
+      : canManualFundGateway
+        ? {
+            tone: 'border-amber-200 bg-amber-50 text-amber-800',
+            title: 'Will fund on demand',
+            body: 'The wallet has enough USDC, so the buyer helper can deposit into Gateway during the first paid request or you can pre-fund it manually below.',
+          }
+        : {
+            tone: 'border-red-200 bg-red-50 text-red-700',
+            title: 'Buyer wallet needs funds',
+            body: `The selected agent needs at least ${MANUAL_GATEWAY_FUND_USDC} USDC in the wallet before manual Gateway funding can run.`,
+          };
+  const operatorNote = gatewayBalance?.funded
+    ? 'Buyers can use the normal 402 -> pay -> retry flow. Keep an eye on fallback warnings and settlement failures.'
+    : 'If this agent will buy oracle data, keep wallet USDC and ARC gas ready.';
+  const curveConfigured = Boolean(oracleOverview?.config?.pools?.usdcEurcConfigured);
 
   return (
     <div className="space-y-6">
       <SectionHeader
         title="Oracle"
-        subtitle="Dedicated control surface for the paid oracle product, external payment flow and revenue readiness."
+        subtitle="Paid oracle status, buyer flow, and revenue readiness."
       />
 
       <Card className="space-y-5 border-blue-100 bg-[radial-gradient(circle_at_top_left,rgba(219,234,254,0.95),rgba(255,255,255,1),rgba(240,253,250,0.9))]">
@@ -256,7 +377,7 @@ export default function OracleTab() {
               </span>
             </div>
             <p className="mt-2 text-sm text-slate-600">
-              Oracle belongs here as its own product surface. This page explains what the oracle sells, how payment-gated access works, and whether the current deployment is actually ready to serve paid external traffic.
+              See what the oracle sells, how payment works, and whether this deployment is ready for paid buyer traffic.
             </p>
           </div>
 
@@ -292,11 +413,21 @@ export default function OracleTab() {
         </Alert>
       )}
 
+      {!oracleError && (
+        <OracleTrustPanel
+          payToConfigured={payToConfigured}
+          publicChallengeCount={publicChallengeCount}
+          curveConfigured={curveConfigured}
+          gatewayFundingState={gatewayFundingState}
+          operatorNote={operatorNote}
+        />
+      )}
+
       <Card className="space-y-4">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex items-center gap-2">
             <Cable size={16} className="text-teal-600" />
-            <h3 className="text-lg font-semibold text-slate-900">External Buyer Onboarding</h3>
+            <h3 className="text-lg font-semibold text-slate-900">Buyer Guide</h3>
           </div>
 
           <div className="grid gap-2 sm:grid-cols-3 xl:min-w-[640px] xl:flex-1 xl:pl-6">
@@ -328,19 +459,18 @@ export default function OracleTab() {
         <div className="space-y-3">
           <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600 space-y-2">
             <p>
-              This is the human-facing onboarding surface for external buyers and developers.
-              The public buyer guide can be opened directly in the browser.
+              This guide explains the paid oracle flow for both people and apps.
+              Open it in the browser for a quick walkthrough.
             </p>
             <p>
-              Download is optional. Agents and integrators do not need to download anything just to understand the payment flow.
-              The download buttons are only for developers who want ready-to-run reference files.
+              Downloads are optional. Use them only if you want ready-to-run example files.
             </p>
           </div>
 
           <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-800">
             <strong>Who this is for:</strong>
             {' '}
-            the guide URL is for people and for external agent developers. The same URL is also returned in the production `402` response body so a programmatic buyer can discover it automatically.
+            the guide works for both human buyers and automated buyers. The same link is also returned in the live 402 response so apps can discover it automatically.
           </div>
         </div>
       </Card>
@@ -385,6 +515,19 @@ export default function OracleTab() {
             <div className="grid gap-2 md:grid-cols-2">
               {(oracleOverview?.publicEndpoints || []).map(endpoint => (
                 <div key={endpoint.key} className="rounded-xl border border-slate-200 bg-white p-4">
+                  <div className="mb-3 flex flex-wrap gap-1.5">
+                    {getOracleEndpointBadges(endpoint.key, {
+                      payToConfigured,
+                      curveConfigured,
+                    }).map((badge) => (
+                      <span
+                        key={`${endpoint.key}-${badge.label}`}
+                        className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${badge.tone}`}
+                      >
+                        {badge.label}
+                      </span>
+                    ))}
+                  </div>
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <p className="text-sm font-semibold text-slate-800">{endpoint.title}</p>

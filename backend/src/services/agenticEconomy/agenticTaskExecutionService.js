@@ -6,6 +6,7 @@ const agentWalletService = require('../agentWalletService');
 const positionsService = require('../positionsService');
 const { decrypt } = require('../cryptoService');
 const { resolveDirectSwapFallbackPool } = require('../oracle/pools');
+const { evaluateStableAutomationPolicy } = require('../stableAutomationPolicy');
 
 const DEFAULT_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000';
 const DEFAULT_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
@@ -104,6 +105,45 @@ function _summarizePoolPosition(position) {
     lpBalance: position.lpToken?.balance || '0',
     sharePct: position.sharePct,
     underlying: position.underlying || [],
+  };
+}
+
+function _resolveDirectPairConfig(stableToken = 'USDC') {
+  const normalizedStableToken = String(stableToken || 'USDC').toUpperCase();
+  const config = DIRECT_PAIR_ZAP_LIMITS[normalizedStableToken];
+  const directPair = resolveDirectSwapFallbackPool(config?.pairKey || `${normalizedStableToken}-cirBTC`);
+
+  return {
+    normalizedStableToken,
+    config,
+    directPair,
+  };
+}
+
+function _findDirectPairToken(directPair, symbolOrAddress) {
+  const normalizedValue = String(symbolOrAddress || '').toLowerCase();
+  if (!directPair) return null;
+
+  const candidates = [directPair.baseToken, directPair.quoteToken].filter(Boolean);
+  return candidates.find((token) => (
+    String(token?.symbol || '').toLowerCase() === normalizedValue
+      || String(token?.address || '').toLowerCase() === normalizedValue
+  )) || null;
+}
+
+function _getOtherDirectPairToken(directPair, symbolOrAddress) {
+  const current = _findDirectPairToken(directPair, symbolOrAddress);
+  if (!current) return null;
+
+  return [directPair.baseToken, directPair.quoteToken].find(
+    token => String(token?.address || '').toLowerCase() !== String(current.address || '').toLowerCase(),
+  ) || null;
+}
+
+function _getDirectPairDecimalsMap(directPair) {
+  return {
+    [String(directPair?.baseToken?.address || '').toLowerCase()]: directPair?.baseToken?.decimals || 6,
+    [String(directPair?.quoteToken?.address || '').toLowerCase()]: directPair?.quoteToken?.decimals || 8,
   };
 }
 
@@ -213,6 +253,61 @@ async function executeCurveLiquidityAddTask({ agent, params = {}, dryRun = false
   };
 }
 
+async function executeCurveLiquidityAddBalancedTask({ agent, params = {}, dryRun = false }) {
+  const amountUsdc = String(params.amountUsdc ?? params.amount0 ?? '0');
+  const amountEurc = String(params.amountEurc ?? params.amount1 ?? '0');
+  const curvePool = _resolveStableCurvePoolForToken('USDC');
+
+  if (!(Number(amountUsdc) > 0) || !(Number(amountEurc) > 0)) {
+    return { ok: false, reason: 'curve_liquidity_add_dual_amounts_required' };
+  }
+
+  if (!curvePool?.address) {
+    return { ok: false, reason: 'curve_pool_not_configured' };
+  }
+
+  const positionGuard = await _readCurvePositionGuard(agent, curvePool);
+  if (!positionGuard.ok) return positionGuard;
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        dryRun: true,
+        amountUsdc,
+        amountEurc,
+        poolAddress: curvePool.address,
+        poolSource: curvePool.source || 'verified_default',
+        positionBefore: _summarizePoolPosition(positionGuard.position),
+      }),
+    };
+  }
+
+  const result = await protocols.executeCurveAddLiquidityBalanced({
+    poolAddress: curvePool.address,
+    token0Address: curvePool.baseToken.address,
+    token1Address: curvePool.quoteToken.address,
+    amount0: amountUsdc,
+    amount1: amountEurc,
+    agentPrivateKey: decrypt(agent.private_key_encrypted),
+    decimals0: curvePool.baseToken.decimals || 6,
+    decimals1: curvePool.quoteToken.decimals || 6,
+  });
+
+  return {
+    ok: true,
+    payload: _timestamped({
+      ...result,
+      amountUsdc,
+      amountEurc,
+      poolAddress: curvePool.address,
+      poolSource: curvePool.source || 'verified_default',
+      executionRail: 'curve_liquidity_add_dual',
+      summary: `Added dual-sided Curve liquidity with ${amountUsdc} USDC and ${amountEurc} EURC.`,
+    }),
+  };
+}
+
 async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = false }) {
   const tokenOut = params.tokenOut || 'USDC';
   const lpAmount = String(params.lpAmount ?? '1');
@@ -270,6 +365,70 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
       poolSource: curvePool.source || 'verified_default',
       executionRail: 'curve_liquidity_remove',
       summary: `Removed ${lpAmount} Curve LP into ${tokenOut}.`,
+    }),
+  };
+}
+
+async function executeCurveLiquidityRemoveBalancedTask({ agent, params = {}, dryRun = false }) {
+  const lpAmount = String(params.lpAmount ?? '0');
+  const curvePool = _resolveStableCurvePoolForToken('USDC');
+
+  if (!(Number(lpAmount) > 0)) {
+    return { ok: false, reason: 'curve_liquidity_remove_amount_required' };
+  }
+
+  if (!curvePool?.address) {
+    return { ok: false, reason: 'curve_pool_not_configured' };
+  }
+
+  const positionGuard = await _readCurvePositionGuard(agent, curvePool);
+  if (!positionGuard.ok) return positionGuard;
+
+  const currentLpBalance = Number(positionGuard.position?.lpToken?.balance || 0);
+  if (!positionGuard.position || currentLpBalance <= 0) {
+    return { ok: false, reason: 'lp_position_not_found' };
+  }
+  if (Number(lpAmount) > currentLpBalance) {
+    return {
+      ok: false,
+      reason: 'insufficient_lp_position',
+      error: `available_lp_balance:${positionGuard.position.lpToken.balance}`,
+    };
+  }
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        dryRun: true,
+        lpAmount,
+        poolAddress: curvePool.address,
+        poolSource: curvePool.source || 'verified_default',
+        positionBefore: _summarizePoolPosition(positionGuard.position),
+      }),
+    };
+  }
+
+  const result = await protocols.executeCurveRemoveLiquidity({
+    poolAddress: curvePool.address,
+    lpAmount,
+    agentPrivateKey: decrypt(agent.private_key_encrypted),
+    token0Address: curvePool.baseToken.address,
+    token1Address: curvePool.quoteToken.address,
+    decimals0: curvePool.baseToken.decimals || 6,
+    decimals1: curvePool.quoteToken.decimals || 6,
+  });
+
+  return {
+    ok: true,
+    payload: _timestamped({
+      ...result,
+      poolAddress: curvePool.address,
+      poolSource: curvePool.source || 'verified_default',
+      token0Symbol: curvePool.baseToken.symbol,
+      token1Symbol: curvePool.quoteToken.symbol,
+      executionRail: 'curve_liquidity_remove_dual',
+      summary: `Removed ${lpAmount} Curve LP into both pool tokens.`,
     }),
   };
 }
@@ -411,6 +570,211 @@ async function executeDirectPairZapInTask({ agent, params = {}, dryRun = false, 
   }
 }
 
+async function executeDirectPairAddLiquidityTask({ agent, params = {}, dryRun = false, stableToken = 'USDC' }) {
+  const { normalizedStableToken, config, directPair } = _resolveDirectPairConfig(stableToken);
+  const mode = String(params.mode || 'single').toLowerCase();
+  const stableCoin = _findDirectPairToken(directPair, normalizedStableToken);
+  const volatileCoin = _findDirectPairToken(directPair, 'cirBTC');
+
+  if (!config) {
+    return { ok: false, reason: 'swap_not_configured' };
+  }
+
+  if (!directPair?.address || !stableCoin || !volatileCoin) {
+    return { ok: false, reason: 'direct_pair_not_configured' };
+  }
+
+  if (mode === 'dual') {
+    const amountStable = String(params.amountStable ?? '0');
+    const amountCirbtc = String(params.amountCirbtc ?? '0');
+
+    if (!(Number(amountStable) > 0) || !(Number(amountCirbtc) > 0)) {
+      return { ok: false, reason: 'direct_pair_dual_amounts_required' };
+    }
+
+    if (dryRun) {
+      return {
+        ok: true,
+        payload: _timestamped({
+          dryRun: true,
+          mode,
+          stableToken: normalizedStableToken,
+          volatileToken: 'cirBTC',
+          amountStable,
+          amountCirbtc,
+          poolAddress: directPair.address,
+          poolSource: directPair.source || 'env',
+          executionRail: 'direct_pair_liquidity_add_dual',
+          summary: `Would add dual-sided liquidity with ${amountStable} ${normalizedStableToken} and ${amountCirbtc} cirBTC.`,
+        }),
+      };
+    }
+
+    const result = await protocols.executeConstantProductAddLiquidity({
+      pairAddress: directPair.address,
+      tokenAAddress: stableCoin.address,
+      tokenBAddress: volatileCoin.address,
+      maxAmountA: amountStable,
+      maxAmountB: amountCirbtc,
+      agentPrivateKey: decrypt(agent.private_key_encrypted),
+      decimalsA: stableCoin.decimals || 6,
+      decimalsB: volatileCoin.decimals || 8,
+    });
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...result,
+        mode,
+        stableToken: normalizedStableToken,
+        volatileToken: 'cirBTC',
+        amountStable,
+        amountCirbtc,
+        poolAddress: directPair.address,
+        poolSource: directPair.source || 'env',
+        executionRail: 'direct_pair_liquidity_add_dual',
+        summary: `Added dual-sided liquidity with ${amountStable} ${normalizedStableToken} and ${amountCirbtc} cirBTC on the direct pair.`,
+      }),
+    };
+  }
+
+  const inputToken = String(params.inputToken || normalizedStableToken).toUpperCase();
+  const amountIn = String(params.amountIn ?? '0');
+  const tokenIn = _findDirectPairToken(directPair, inputToken);
+  const tokenOut = _getOtherDirectPairToken(directPair, inputToken);
+
+  if (!(Number(amountIn) > 0)) {
+    return { ok: false, reason: 'pair_zap_amount_required' };
+  }
+
+  if (!tokenIn || !tokenOut) {
+    return { ok: false, reason: 'direct_pair_input_token_invalid' };
+  }
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        dryRun: true,
+        mode: 'single',
+        stableToken: normalizedStableToken,
+        volatileToken: 'cirBTC',
+        inputToken,
+        amountIn,
+        poolAddress: directPair.address,
+        poolSource: directPair.source || 'env',
+        executionRail: 'direct_pair_zap_in',
+        summary: `Would zap ${amountIn} ${inputToken} into the ${normalizedStableToken}/cirBTC direct pair using an auto-derived split.`,
+      }),
+    };
+  }
+
+  try {
+    const result = await protocols.executeConstantProductZapIn({
+      pairAddress: directPair.address,
+      tokenInAddress: tokenIn.address,
+      tokenOutAddress: tokenOut.address,
+      totalAmountIn: amountIn,
+      agentPrivateKey: decrypt(agent.private_key_encrypted),
+      decimalsIn: tokenIn.decimals || 6,
+      decimalsOut: tokenOut.decimals || 8,
+      feePct: directPair.feePct || 0.3,
+    });
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...result,
+        mode: 'single',
+        stableToken: normalizedStableToken,
+        volatileToken: 'cirBTC',
+        inputToken,
+        amountIn,
+        poolAddress: directPair.address,
+        poolSource: directPair.source || 'env',
+        executionRail: 'direct_pair_zap_in',
+        summary: `Added one-sided liquidity from ${amountIn} ${inputToken} into the ${normalizedStableToken}/cirBTC direct pair.`,
+      }),
+    };
+  } catch (error) {
+    if (/seeded before zap-in|pair reserves are inconsistent|liquidity addition down to zero/i.test(error.message || '')) {
+      return { ok: false, reason: 'direct_pair_seed_required', error: error.message };
+    }
+
+    return { ok: false, reason: 'swap_error', error: error.message };
+  }
+}
+
+async function executeDirectPairSwapTask({ agent, params = {}, dryRun = false, stableToken = 'USDC' }) {
+  const { normalizedStableToken, config, directPair } = _resolveDirectPairConfig(stableToken);
+  const fromToken = String(params.fromToken || normalizedStableToken).toUpperCase();
+  const toToken = String(params.toToken || (fromToken === normalizedStableToken ? 'CIRBTC' : normalizedStableToken)).toUpperCase();
+  const amountIn = String(params.amountIn ?? '0');
+  const tokenIn = _findDirectPairToken(directPair, fromToken);
+  const tokenOut = _findDirectPairToken(directPair, toToken);
+
+  if (!config) {
+    return { ok: false, reason: 'swap_not_configured' };
+  }
+
+  if (!(Number(amountIn) > 0)) {
+    return { ok: false, reason: 'pair_swap_amount_required' };
+  }
+
+  if (!directPair?.address || !tokenIn || !tokenOut || String(tokenIn.address).toLowerCase() === String(tokenOut.address).toLowerCase()) {
+    return { ok: false, reason: 'direct_pair_swap_route_invalid' };
+  }
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        dryRun: true,
+        stableToken: normalizedStableToken,
+        volatileToken: 'cirBTC',
+        fromToken,
+        toToken,
+        amountIn,
+        poolAddress: directPair.address,
+        poolSource: directPair.source || 'env',
+        executionRail: 'direct_pair_swap',
+        summary: `Would swap ${amountIn} ${fromToken} into ${toToken} on the direct pair.`,
+      }),
+    };
+  }
+
+  try {
+    const result = await protocols.executeConstantProductSwap({
+      pairAddress: directPair.address,
+      tokenInAddress: tokenIn.address,
+      tokenOutAddress: tokenOut.address,
+      amountIn,
+      agentPrivateKey: decrypt(agent.private_key_encrypted),
+      decimalsIn: tokenIn.decimals || 6,
+      decimalsOut: tokenOut.decimals || 8,
+      feePct: directPair.feePct || 0.3,
+    });
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...result,
+        stableToken: normalizedStableToken,
+        volatileToken: 'cirBTC',
+        fromToken,
+        toToken,
+        amountIn,
+        poolAddress: directPair.address,
+        poolSource: directPair.source || 'env',
+        executionRail: 'direct_pair_swap',
+        summary: `Swapped ${amountIn} ${fromToken} into ${toToken} on the direct pair.`,
+      }),
+    };
+  } catch (error) {
+    return { ok: false, reason: 'swap_error', error: error.message };
+  }
+}
+
 async function executeDirectPairRemoveLiquidityTask({ agent, params = {}, dryRun = false, stableToken = 'USDC' }) {
   const normalizedStableToken = String(stableToken || 'USDC').toUpperCase();
   const config = DIRECT_PAIR_ZAP_LIMITS[normalizedStableToken];
@@ -475,6 +839,104 @@ async function executeDirectPairRemoveLiquidityTask({ agent, params = {}, dryRun
         poolSource: directPair.source || 'env',
         executionRail: 'uniswap_v2_lp_remove',
         summary: `LP exit completed: burned ${result.lpAmount} LP (${withdrawPct}% of the current position) and returned ${result.token0Amount} ${token0Symbol} plus ${result.token1Amount} ${token1Symbol} to the agent wallet.`,
+      }),
+    };
+  } catch (error) {
+    if (/LP position not found/i.test(error.message || '')) {
+      return { ok: false, reason: 'direct_pair_lp_not_found', error: error.message };
+    }
+
+    return { ok: false, reason: 'swap_error', error: error.message };
+  }
+}
+
+async function executeDirectPairRemoveLiquiditySingleTask({ agent, params = {}, dryRun = false, stableToken = 'USDC' }) {
+  const { normalizedStableToken, config, directPair } = _resolveDirectPairConfig(stableToken);
+  const withdrawPct = Number(params.withdrawPct ?? 100);
+  const targetToken = String(params.targetToken || normalizedStableToken).toUpperCase();
+  const targetCoin = _findDirectPairToken(directPair, targetToken);
+  const otherCoin = _getOtherDirectPairToken(directPair, targetToken);
+
+  if (!config) {
+    return { ok: false, reason: 'swap_not_configured' };
+  }
+
+  if (!Number.isFinite(withdrawPct) || withdrawPct <= 0 || withdrawPct > 100) {
+    return { ok: false, reason: 'pair_exit_pct_invalid' };
+  }
+
+  if (!directPair?.address || !targetCoin || !otherCoin) {
+    return { ok: false, reason: 'direct_pair_not_configured' };
+  }
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        dryRun: true,
+        stableToken: normalizedStableToken,
+        volatileToken: 'cirBTC',
+        withdrawPct,
+        targetToken,
+        poolAddress: directPair.address,
+        poolSource: directPair.source || 'env',
+        executionRail: 'direct_pair_lp_remove_single',
+        summary: `Would burn ${withdrawPct}% of the LP position, then convert the opposite leg into ${targetToken}.`,
+      }),
+    };
+  }
+
+  try {
+    const burnResult = await protocols.executeConstantProductRemoveLiquidity({
+      pairAddress: directPair.address,
+      withdrawPct,
+      agentPrivateKey: decrypt(agent.private_key_encrypted),
+      tokenDecimals: _getDirectPairDecimalsMap(directPair),
+    });
+
+    const token0Coin = _findDirectPairToken(directPair, burnResult.token0Address);
+    const token1Coin = _findDirectPairToken(directPair, burnResult.token1Address);
+    const token0Amount = Number(burnResult.token0Amount || 0);
+    const token1Amount = Number(burnResult.token1Amount || 0);
+    const existingTargetAmount = String(targetCoin.address).toLowerCase() === String(burnResult.token0Address || '').toLowerCase()
+      ? token0Amount
+      : token1Amount;
+    const swapAmount = String(otherCoin.address).toLowerCase() === String(burnResult.token0Address || '').toLowerCase()
+      ? burnResult.token0Amount
+      : burnResult.token1Amount;
+
+    let swapResult = null;
+    if (Number(swapAmount) > 0) {
+      swapResult = await protocols.executeConstantProductSwap({
+        pairAddress: directPair.address,
+        tokenInAddress: otherCoin.address,
+        tokenOutAddress: targetCoin.address,
+        amountIn: swapAmount,
+        agentPrivateKey: decrypt(agent.private_key_encrypted),
+        decimalsIn: otherCoin.decimals || 6,
+        decimalsOut: targetCoin.decimals || 8,
+        feePct: directPair.feePct || 0.3,
+      });
+    }
+
+    const totalTargetAmount = Number(existingTargetAmount || 0) + Number(swapResult?.amountOut || 0);
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...burnResult,
+        stableToken: normalizedStableToken,
+        volatileToken: 'cirBTC',
+        targetToken,
+        targetTokenAmount: String(totalTargetAmount),
+        token0Symbol: token0Coin?.symbol || burnResult.token0Address,
+        token1Symbol: token1Coin?.symbol || burnResult.token1Address,
+        swapTxHash: swapResult?.txHash || null,
+        swapAmountOut: swapResult?.amountOut || null,
+        poolAddress: directPair.address,
+        poolSource: directPair.source || 'env',
+        executionRail: 'direct_pair_lp_remove_single',
+        summary: `Exited ${withdrawPct}% of the direct pair and consolidated into ${targetToken}.`,
       }),
     };
   } catch (error) {
@@ -695,12 +1157,16 @@ async function executeArbTask({ agent, params = {}, dryRun = false, pricingPool,
     expectedProfitUsdc,
     netProfitUsdc,
   });
-
-  if (dryRun) {
-    payload.dryRun = true;
-    payload.summary = `Simulation only. Would evaluate the latest arbitrage signal for a ${requestedSizeLabel} Curve entry leg. This task does not claim realized profit because it does not execute the bridge or exit leg.`;
-    return { ok: true, payload };
-  }
+  const stablePolicy = evaluateStableAutomationPolicy({
+    agent,
+    forexRate,
+    poolState,
+    signal,
+    pricingPool: pricingTarget,
+    swapPool: swapTarget,
+    requestedAmountUsdc: inputAmountNumeric,
+  });
+  payload.stablePolicy = stablePolicy;
 
   if (!poolAddress) {
     payload.skipped = true;
@@ -723,6 +1189,24 @@ async function executeArbTask({ agent, params = {}, dryRun = false, pricingPool,
   if (!opportunity.found || confidence === 'LOW') {
     payload.skipped = true;
     payload.summary = `No on-chain trade was sent. The latest full-route oracle model is not profitable for the requested ${requestedSizeLabel} Curve entry leg.`;
+    return { ok: true, payload };
+  }
+
+  if (stablePolicy.metrics?.sizeClamped) {
+    payload.skipped = true;
+    payload.summary = `No on-chain trade was sent. The requested ${requestedSizeLabel} exceeds the current stable-lane safety cap of ${stablePolicy.metrics.effectiveMaxTradeUsdc} USDC for this route.`;
+    return { ok: true, payload };
+  }
+
+  if (stablePolicy.verdict?.execute !== true) {
+    payload.skipped = true;
+    payload.summary = `No on-chain trade was sent. ${stablePolicy.verdict?.reason || 'Stable automation policy v1 blocked this Curve entry leg.'}`;
+    return { ok: true, payload };
+  }
+
+  if (dryRun) {
+    payload.dryRun = true;
+    payload.summary = `Simulation only. The requested ${requestedSizeLabel} Curve entry leg clears the current stable-lane policy checks, but this task does not execute the bridge or exit leg.`;
     return { ok: true, payload };
   }
 
@@ -833,9 +1317,14 @@ async function executeRebalanceTask({ agent, params = {}, dryRun = false }) {
 module.exports = {
   executeArbTask,
   executeBridgeTask,
+  executeCurveLiquidityAddBalancedTask,
+  executeDirectPairSwapTask,
   executeDirectPairRemoveLiquidityTask,
+  executeDirectPairRemoveLiquiditySingleTask,
+  executeDirectPairAddLiquidityTask,
   executeDirectPairZapInTask,
   executeCurveLiquidityAddTask,
+  executeCurveLiquidityRemoveBalancedTask,
   executeCurveLiquidityRemoveTask,
   executeCurveSwapTask,
   executeRebalanceTask,

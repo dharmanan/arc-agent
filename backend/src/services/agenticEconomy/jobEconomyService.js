@@ -2,6 +2,7 @@
 
 const gatewayBuyerService = require('./gatewayBuyer');
 const { logJobEconomy } = require('./logger');
+const { buildJobReviewPolicy } = require('../jobRetentionService');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 const JOB_ECONOMY_CHAIN = process.env.JOB_ECONOMY_CHAIN || 'Arc Testnet';
@@ -174,6 +175,11 @@ function buildPayoutState({ jobStatus, txHashSettle = null, jobIdOnchain = null 
         ...base,
         status: jobIdOnchain ? 'confirmed' : 'recorded',
       };
+    case 'rejected':
+      return {
+        ...base,
+        status: 'rejected',
+      };
     case 'cancelled':
       return {
         ...base,
@@ -194,12 +200,24 @@ function buildPayoutState({ jobStatus, txHashSettle = null, jobIdOnchain = null 
 
 function buildJobEconomy({ economy = null, job }) {
   const existing = economy && typeof economy === 'object' ? economy : {};
+  const applications = Array.isArray(existing.applications)
+    ? existing.applications
+        .filter((entry) => entry && typeof entry === 'object')
+        .map((entry) => ({
+          applicantAddress: entry.applicantAddress || null,
+          note: entry.note || '',
+          createdAt: entry.createdAt || null,
+        }))
+    : [];
 
   return {
     mode: 'job_escrow_with_gateway_fee',
     rail: 'agentic_job_economy',
     lifecycle: 'agentic_commerce_escrow',
     createFee: existing.createFee || null,
+    applicationsOpen: existing.applicationsOpen === true,
+    applications,
+    reviewPolicy: buildJobReviewPolicy(existing.reviewPolicy),
     payout: buildPayoutState({
       jobStatus: job?.status,
       txHashSettle: job?.tx_hash_settle,

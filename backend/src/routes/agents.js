@@ -15,6 +15,7 @@ const agentService  = require('../services/agentService');
 const llmService    = require('../services/llmService');
 const reputationService = require('../services/reputationService');
 const positionsService = require('../services/positionsService');
+const lpRewardService = require('../services/lpRewardService');
 const agentQueue = require('../queue/agentQueue');
 const { encrypt }   = require('../services/cryptoService');
 
@@ -83,6 +84,7 @@ const updateSchema = z.object({
   marketAnalysisEnabled: z.boolean().optional(),
   oracleEnabled:         z.boolean().optional(),
   defiLoopEnabled:       z.boolean().optional(),
+  cirbtcLpEnabled:       z.boolean().optional(),
   reputationEnabled:     z.boolean().optional(),
 }).strict();
 
@@ -117,7 +119,7 @@ router.put('/:id', async (req, res, next) => {
         jobId: `oracle-manual-${agent.id}-${Date.now()}`,
       }));
     }
-    if (data.defiLoopEnabled === true) {
+    if (data.defiLoopEnabled === true || data.cirbtcLpEnabled === true) {
       kickoffJobs.push(agentQueue.add('DEFI_LOOP', {
         agentId: agent.id,
       }, {
@@ -204,6 +206,20 @@ router.get('/:id/positions', async (req, res, next) => {
     const positions = await positionsService.getAgentPositions(req.params.id, req.user.userId);
     if (!positions) return res.status(404).json({ error: 'Agent not found' });
     res.json(positions);
+  } catch (err) { next(err); }
+});
+
+// ── Claimable reward overview ────────────────────────────────────────────────
+router.get('/:id/rewards', async (req, res, next) => {
+  try {
+    const rewards = await lpRewardService.getAgentRewardOverview(req.params.id, req.user.userId, {
+      programLimit: req.query.programLimit,
+      accrualLimit: req.query.accrualLimit,
+      claimLimit: req.query.claimLimit,
+      snapshotLimit: req.query.snapshotLimit,
+    });
+    if (!rewards) return res.status(404).json({ error: 'Agent not found' });
+    res.json(rewards);
   } catch (err) { next(err); }
 });
 

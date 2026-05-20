@@ -76,6 +76,15 @@ export const agents = {
   updatePermissions: (id, perms) => put(`/agents/${id}/permissions`, perms),
   status:            (id)        => get(`/agents/${id}/status`),
   positions:         (id)        => get(`/agents/${id}/positions`),
+  rewards:           (id, options = {}) => {
+    const params = new URLSearchParams();
+    if (options.programLimit) params.set('programLimit', String(options.programLimit));
+    if (options.accrualLimit) params.set('accrualLimit', String(options.accrualLimit));
+    if (options.claimLimit) params.set('claimLimit', String(options.claimLimit));
+    if (options.snapshotLimit) params.set('snapshotLimit', String(options.snapshotLimit));
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return get(`/agents/${id}/rewards${suffix}`);
+  },
   reputation:        (id, limit) => get(`/agents/${id}/reputation${limit ? `?limit=${limit}` : ''}`),
   delete:            (id)        => del(`/agents/${id}`),
   retryIdentity:     (id)        => post(`/agents/${id}/register-identity`),
@@ -120,6 +129,19 @@ export const bridge = {
 export const tasks = {
   featured:    ()                        => get('/tasks/featured'),
   catalog:     ()                        => get('/tasks/catalog'),
+  circlePaidCatalog: ()                  => get('/tasks/circle-paid/catalog'),
+  circlePaidPreview: (agentId, itemId, params) => post(`/tasks/agents/${agentId}/circle-paid/preview`, { itemId, params }),
+  circlePaidRun: (agentId, itemId, params) => post(`/tasks/agents/${agentId}/circle-paid/run`, { itemId, params }),
+  circlePaidUnlock: (agentId, previewId) => post(`/tasks/agents/${agentId}/circle-paid/unlock`, { previewId }),
+  circlePaidSnapshots: (agentId, options = {}) => {
+    const params = new URLSearchParams();
+    if (options.itemId) params.set('itemId', options.itemId);
+    if (options.status) params.set('status', options.status);
+    if (options.limit) params.set('limit', String(options.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return get(`/tasks/agents/${agentId}/circle-paid/snapshots${suffix}`);
+  },
+  circlePaidSnapshot: (agentId, snapshotId) => get(`/tasks/agents/${agentId}/circle-paid/snapshots/${snapshotId}`),
   poolBalance: ()                        => get(`/tasks/pool-balance?ts=${Date.now()}`),
   runTask:     (agentId, taskId, params) => post(`/tasks/agents/${agentId}/tasks/run`, { taskId, params }),
   runs:        (agentId, status = 'recent', limit) => get(`/tasks/agents/${agentId}/tasks/runs?status=${encodeURIComponent(status)}${limit ? `&limit=${limit}` : ''}`),
@@ -129,6 +151,13 @@ export const tasks = {
 // ── Oracle ───────────────────────────────────────────────────────────────────
 export const oracle = {
   status: () => get('/oracle/status'),
+  poolState: (pool, venue) => {
+    const params = new URLSearchParams();
+    if (pool) params.set('pool', pool);
+    if (venue) params.set('venue', venue);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return get(`/oracle/pool-state${suffix}`);
+  },
   gatewayBalance: (agentId, chainName) => {
     const params = new URLSearchParams({ agentId });
     if (chainName) params.set('chainName', chainName);
@@ -138,13 +167,31 @@ export const oracle = {
   testAlert: (body = {}) => post('/oracle/debug/test-alert', body),
 };
 
+// ── Manual DeFi ─────────────────────────────────────────────────────────────
+export const defi = {
+  manualExecute: (agentId, body) => post(`/tasks/agents/${agentId}/defi/manual/execute`, body),
+};
+
 // ── Jobs (ERC-8183 AgenticCommerce) ───────────────────────────────────────────
 export const jobs = {
-  list:     (agentId, status)      => get(`/agents/${agentId}/jobs${status ? `?status=${status}` : ''}`),
-  get:      (agentId, jobId)       => get(`/agents/${agentId}/jobs/${jobId}`),
-  create:   (agentId, data)        => post(`/agents/${agentId}/jobs`, data),
-  deliver:  (agentId, jobId, hash) => put(`/agents/${agentId}/jobs/${jobId}/deliver`, { deliverableHash: hash }),
-  complete: (agentId, jobId)       => put(`/agents/${agentId}/jobs/${jobId}/complete`, {}),
-  cancel:   (agentId, jobId)       => put(`/agents/${agentId}/jobs/${jobId}/cancel`, {}),
+  board:    (options = {})         => {
+    const params = new URLSearchParams();
+    if (options.includeFinalized) params.set('includeFinalized', 'true');
+    if (options.limit) params.set('limit', String(options.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return get(`/jobs/public/board${suffix}`);
+  },
+  publicGet: (jobId)               => get(`/jobs/public/${jobId}`),
+  publicApply: (jobId, body)       => post(`/jobs/public/${jobId}/apply`, body),
+  publicDispute: (jobId, body)     => post(`/jobs/public/${jobId}/dispute`, body),
+  publicDeliver: (jobId, body)     => post(`/jobs/public/${jobId}/deliver`, body),
+  list:      (agentId, status)     => get(`/agents/${agentId}/jobs${status ? `?status=${status}` : ''}`),
+  get:       (agentId, jobId)      => get(`/agents/${agentId}/jobs/${jobId}`),
+  create:    (agentId, data)       => post(`/agents/${agentId}/jobs`, data),
+  assignProvider: (agentId, jobId, providerAddress) => put(`/agents/${agentId}/jobs/${jobId}/assign-provider`, { providerAddress }),
+  deliver:   (agentId, jobId, hash) => put(`/agents/${agentId}/jobs/${jobId}/deliver`, { deliverableHash: hash }),
+  complete:  (agentId, jobId)      => put(`/agents/${agentId}/jobs/${jobId}/complete`, {}),
+  reject:    (agentId, jobId)      => put(`/agents/${agentId}/jobs/${jobId}/reject`, {}),
+  cancel:    (agentId, jobId)      => put(`/agents/${agentId}/jobs/${jobId}/cancel`, {}),
 };
 

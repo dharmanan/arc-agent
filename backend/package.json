@@ -12,7 +12,11 @@
     "dev": "nodemon src/server.js",
     "db:init": "node src/db/migrate.js",
     "db:snapshot": "node scripts/dbSnapshot.js",
-    "test": "jest --runInBand",
+    "test": "npx -y jest@30.4.2 --runInBand",
+    "smoke:route": "npm test -- src/routes/__tests__/routeSmoke.test.js",
+    "smoke:paid-readiness": "node scripts/paidReadinessSmoke.js",
+    "smoke:readiness": "npm run smoke:route && npm run smoke:paid-readiness",
+    "jobs:smoke:e2e": "node scripts/jobsE2ESmoke.js",
     "oracle:buyer:example": "node examples/oraclePublicBuyerExample.js",
     "oracle:buyer:preview": "node examples/oraclePublicBuyerExample.js --preview"
   },
@@ -22,10 +26,10 @@
     "@circle-fin/swap-kit": "^1.2.0",
     "@circle-fin/x402-batching": "^3.0.4",
     "@coral-xyz/anchor": "^0.32.1",
+    "@simplewebauthn/server": "^11.0.0",
     "@x402/core": "^2.12.0",
     "@x402/evm": "^2.12.0",
     "@x402/express": "^2.12.0",
-    "@simplewebauthn/server": "^11.0.0",
     "axios": "^1.16.0",
     "bcryptjs": "^3.0.3",
     "bull": "^4.16.3",
@@ -49,6 +53,7 @@
   "devDependencies": {
     "jest": "^30.4.2",
     "nodemon": "^3.1.7",
-    "solc": "^0.8.24"
+    "solc": "^0.8.24",
+    "supertest": "^7.2.2"
   }
 }

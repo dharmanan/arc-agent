@@ -1,0 +1,229 @@
+{
+  "generatedAt": "2026-05-16T14:39:45.020Z",
+  "catalogUrl": "https://agents.circle.com/api/v1/internal/x402/services",
+  "filters": {
+    "category": null,
+    "service": "goldsky-edge-rpc",
+    "limit": null,
+    "concurrency": 4,
+    "timeoutMs": 10000
+  },
+  "summary": {
+    "totalServices": 1,
+    "totalEndpointsProbed": 11,
+    "byClassification": {
+      "unknown": 1
+    },
+    "byCategory": {
+      "Financial Analysis": 1
+    },
+    "arcTestnetServices": [],
+    "otherTestnetServices": [],
+    "mainnetOnlyServices": []
+  },
+  "services": [
+    {
+      "id": "goldsky-edge-rpc",
+      "name": "Goldsky",
+      "slug": "goldsky-edge-rpc",
+      "category": "Financial Analysis",
+      "supportsCircleGateway": true,
+      "partyType": "1P",
+      "endpointCount": 11,
+      "networks": [],
+      "networkLabels": [],
+      "schemes": [],
+      "gatewayKinds": [],
+      "endpointProbes": [
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/1",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/10",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/1301",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"unauthorized\",\"code\":-32016}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/1329",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/137",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/146",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/42161",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/43114",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/480",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/8453",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        },
+        {
+          "method": "POST",
+          "url": "https://edge.goldsky.com/standard/evm/998",
+          "status": 401,
+          "ok": false,
+          "paymentHeaderName": null,
+          "paymentRequired": {
+            "x402Version": null,
+            "resource": null,
+            "acceptsCount": 0,
+            "networks": [],
+            "schemes": [],
+            "gatewayKinds": []
+          },
+          "responseSnippet": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"unauthorized\"}}",
+          "error": null
+        }
+      ],
+      "classification": "unknown"
+    }
+  ]
+}

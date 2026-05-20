@@ -17,6 +17,7 @@ const oracle          = require('../services/oracle');
 const agentService    = require('../services/agentService');
 const db              = require('../db');
 const { ORACLE_PRICES } = require('../services/oracle/pricing');
+const { getPredictionMarketPulse } = require('../services/predictionMarketService');
 const {
   createGatewayRouteConfig,
   createGatewaySellerMiddleware,
@@ -137,6 +138,18 @@ const ORACLE_PUBLIC_ENDPOINTS = [
     supportedPools: ['USDC-EURC', 'EURC-WUSDC', 'QTM-WUSDC', 'MUSDC-MEURC'],
     exampleQueries: [
       '/api/oracle/public/pool-compare?targets=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC',
+    ],
+  },
+  {
+    key: 'prediction-market-check',
+    title: 'Prediction Market Check',
+    path: '/api/oracle/public/prediction-market-check',
+    priceUsdc: ORACLE_PRICES['prediction-market-check'],
+    description: 'Live Polymarket-based crypto market regime summary with liquidity, movement, and Arc action guidance.',
+    supportedTopics: ['crypto', 'bitcoin', 'ethereum'],
+    exampleQueries: [
+      '/api/oracle/public/prediction-market-check?topic=crypto',
+      '/api/oracle/public/prediction-market-check?topic=bitcoin&limit=5',
     ],
   },
   {
@@ -351,6 +364,10 @@ const PUBLIC_ORACLE_QUERY_RULES = Object.freeze({
   },
   'pool-compare': {
     targets: { maxLength: 180, pattern: /^[A-Za-z0-9:_,-]{3,180}$/ },
+  },
+  'prediction-market-check': {
+    topic: { maxLength: 48, pattern: /^[A-Za-z0-9 _-]{2,48}$/ },
+    limit: { maxLength: 1, pattern: /^[1-8]$/ },
   },
   'yield-rank': {
     asset: { maxLength: 12, pattern: /^[A-Za-z0-9]{2,12}$/ },
@@ -624,6 +641,17 @@ async function _buildPoolCompareResponse(targetsValue) {
         }
       : null,
     fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function _buildPredictionMarketCheckResponse(topic, limit) {
+  const pulse = await getPredictionMarketPulse({ topic, limit });
+
+  return {
+    sku: 'prediction-market-check',
+    chargeModel: 'x402_circle_gateway',
+    priceUsdc: ORACLE_PRICES['prediction-market-check'],
+    ...pulse,
   };
 }
 
@@ -1183,6 +1211,7 @@ const pegMonitorGateway = _createOracleGatewayMiddleware('/peg-monitor', 'peg-mo
 const reserveStateGateway = _createOracleGatewayMiddleware('/reserve-state', 'reserve-state');
 const protocolTvlGateway = _createOracleGatewayMiddleware('/protocol-tvl', 'protocol-tvl');
 const poolCompareGateway = _createOracleGatewayMiddleware('/pool-compare', 'pool-compare');
+const predictionMarketCheckGateway = _createOracleGatewayMiddleware('/prediction-market-check', 'prediction-market-check');
 const yieldRankGateway = _createOracleGatewayMiddleware('/yield-rank', 'yield-rank');
 const arbSignalGateway = _createOracleGatewayMiddleware('/arb-signal', 'arb-signal');
 const arbScanMultiGateway = _createOracleGatewayMiddleware('/arb-scan-multi', 'arb-scan-multi');
@@ -1462,6 +1491,13 @@ router.get('/pool-compare', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /api/oracle/prediction-market-check ─────────────────────────────────
+router.get('/prediction-market-check', requireAuth, async (req, res, next) => {
+  try {
+    res.json(await _buildPredictionMarketCheckResponse(req.query.topic, req.query.limit));
+  } catch (err) { next(err); }
+});
+
 // ── GET /api/oracle/yield-rank ────────────────────────────────────────────────
 // ?asset=USDC&minApy=1.0   (defaults)
 router.get('/yield-rank', requireAuth, async (req, res, next) => {
@@ -1603,6 +1639,13 @@ publicRouter.get('/protocol-tvl', _createPublicOracleQueryGuard('protocol-tvl'),
 publicRouter.get('/pool-compare', _createPublicOracleQueryGuard('pool-compare'), _createOraclePaymentAuditMiddleware('pool-compare'), poolCompareGateway, async (req, res, next) => {
   try {
     res.json(await _buildPoolCompareResponse(req.query.targets));
+  } catch (err) { next(err); }
+});
+
+// GET /api/oracle/public/prediction-market-check
+publicRouter.get('/prediction-market-check', _createPublicOracleQueryGuard('prediction-market-check'), _createOraclePaymentAuditMiddleware('prediction-market-check'), predictionMarketCheckGateway, async (req, res, next) => {
+  try {
+    res.json(await _buildPredictionMarketCheckResponse(req.query.topic, req.query.limit));
   } catch (err) { next(err); }
 });
 

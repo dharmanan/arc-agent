@@ -2,6 +2,7 @@
 
 const { ethers } = require('ethers');
 const db = require('../db');
+const oracle = require('./oracle');
 const { resolveCurvePool, resolveDirectSwapFallbackPool } = require('./oracle/pools');
 
 const CURVE_POSITION_ABI = [
@@ -26,6 +27,31 @@ const TRACKED_CURVE_POOLS = [
   'USDC-USYC',
 ];
 
+const POSITION_PRICE_SYMBOL_MAP = {
+  CIRBTC: 'BTC',
+  WUSDC: 'USDC',
+  USYC: 'USDC',
+};
+
+const POSITION_PRICE_FALLBACK_USD = {
+  USDC: 1,
+  WUSDC: 1,
+  USYC: 1,
+  EURC: 1.08,
+};
+
+const LP_DAILY_TURNOVER_BASELINES = {
+  curve: 0.22,
+  uniswap_v2_like: 0.06,
+  constant_product: 0.06,
+};
+
+const LP_MAX_APR_PCT = {
+  curve: 18,
+  uniswap_v2_like: 24,
+  constant_product: 24,
+};
+
 function getProvider() {
   const rpcUrl = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
   return new ethers.JsonRpcProvider(rpcUrl);
@@ -33,6 +59,162 @@ function getProvider() {
 
 function formatUnits(value, decimals) {
   return ethers.formatUnits(value, decimals);
+}
+
+function roundTo(value, digits = 2) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const scale = 10 ** digits;
+  return Math.round(numeric * scale) / scale;
+}
+
+function toPriceLookupSymbol(symbol) {
+  const normalized = String(symbol || '').trim().toUpperCase();
+  return POSITION_PRICE_SYMBOL_MAP[normalized] || normalized;
+}
+
+async function getTokenPriceLookup(symbols = []) {
+  const requestedSymbols = Array.from(new Set(
+    symbols
+      .map(toPriceLookupSymbol)
+      .filter(Boolean),
+  ));
+
+  if (!requestedSymbols.length) return {};
+
+  const prices = await oracle.getMultipleTokenPrices(requestedSymbols);
+  return prices && typeof prices === 'object' ? prices : {};
+}
+
+function getUsdPriceForSymbol(symbol, priceLookup = {}) {
+  const normalized = String(symbol || '').trim().toUpperCase();
+  const lookupKey = toPriceLookupSymbol(normalized);
+  const lookedUpPrice = Number(priceLookup?.[lookupKey]?.usdPrice);
+
+  if (Number.isFinite(lookedUpPrice) && lookedUpPrice > 0) {
+    return lookedUpPrice;
+  }
+
+  return POSITION_PRICE_FALLBACK_USD[normalized] ?? null;
+}
+
+function getPoolStateForPosition(position) {
+  if (position?.protocol === 'curve') {
+    const pool = resolveCurvePool(position.poolKey);
+    if (!pool?.address) return null;
+    return oracle.getCurvePoolState(pool);
+  }
+
+  const directPair = resolveDirectSwapFallbackPool(position?.poolKey);
+  if (!directPair?.address) return null;
+  return oracle.getConstantProductPoolState(directPair);
+}
+
+function getTurnoverDepthModifier(priceImpact10kPct) {
+  const numeric = Number(priceImpact10kPct);
+  if (!Number.isFinite(numeric)) return 1;
+  if (numeric <= 0.15) return 1.35;
+  if (numeric <= 0.5) return 1.15;
+  if (numeric <= 1.5) return 1;
+  if (numeric <= 3) return 0.75;
+  return 0.5;
+}
+
+function estimateYieldMetrics(position, poolState, totalValueUsd) {
+  const liquidityState = String(poolState?.liquidityState || position?.liquidityState || '').toLowerCase();
+  const feePct = Number(poolState?.fee ?? position?.feePct ?? 0);
+  const baselineTurnover = LP_DAILY_TURNOVER_BASELINES[position?.protocol] || LP_DAILY_TURNOVER_BASELINES.constant_product;
+
+  if (!Number.isFinite(totalValueUsd) || totalValueUsd <= 0 || !Number.isFinite(feePct) || feePct <= 0 || liquidityState === 'empty') {
+    return {
+      aprPct: 0,
+      apyPct: 0,
+      dailyUsd: 0,
+      weeklyUsd: 0,
+      source: 'live_pool_fee_depth_heuristic',
+      note: 'Approximate fee-only LP estimate is unavailable until the pool has live liquidity and a non-zero fee tier.',
+      includesPriceExposure: false,
+      turnoverRatio: 0,
+      poolFeePct: roundTo(feePct, 4) || 0,
+      priceImpact10kPct: roundTo(poolState?.priceImpact?.swap10k, 4),
+    };
+  }
+
+  const turnoverRatio = baselineTurnover * getTurnoverDepthModifier(poolState?.priceImpact?.swap10k);
+  const uncappedAprPct = feePct * turnoverRatio * 365;
+  const aprPctCeiling = LP_MAX_APR_PCT[position?.protocol] || LP_MAX_APR_PCT.constant_product;
+  const aprPct = Math.min(uncappedAprPct, aprPctCeiling);
+  const apyPct = ((1 + (aprPct / 100) / 365) ** 365 - 1) * 100;
+  const dailyUsd = totalValueUsd * (aprPct / 100) / 365;
+  const weeklyUsd = dailyUsd * 7;
+
+  return {
+    aprPct: roundTo(aprPct, 2) || 0,
+    apyPct: roundTo(apyPct, 2) || 0,
+    dailyUsd: roundTo(dailyUsd, 4) || 0,
+    weeklyUsd: roundTo(weeklyUsd, 4) || 0,
+    source: 'live_pool_fee_depth_heuristic',
+    note: 'Approximate fee-only LP estimate from the current pool fee tier and live depth proxy, with a protocol safety cap until a true volume feed is wired. This excludes token price movement, incentives and impermanent loss.',
+    includesPriceExposure: false,
+    turnoverRatio: roundTo(turnoverRatio * 100, 2) || 0,
+    poolFeePct: roundTo(feePct, 4) || 0,
+    priceImpact10kPct: roundTo(poolState?.priceImpact?.swap10k, 4),
+    isCapped: uncappedAprPct > aprPct,
+  };
+}
+
+async function enrichPosition(position, priceLookup) {
+  let poolState = null;
+  try {
+    poolState = await getPoolStateForPosition(position);
+  } catch {
+    poolState = null;
+  }
+
+  const valuedUnderlying = (position.underlying || []).map((asset) => {
+    const amount = Number(asset.amount || 0);
+    const usdPrice = getUsdPriceForSymbol(asset.symbol, priceLookup);
+    const usdValue = Number.isFinite(amount) && Number.isFinite(usdPrice)
+      ? amount * usdPrice
+      : null;
+
+    return {
+      ...asset,
+      usdPrice: Number.isFinite(usdPrice) ? roundTo(usdPrice, 6) : null,
+      usdValue: Number.isFinite(usdValue) ? roundTo(usdValue, 4) : null,
+    };
+  });
+
+  const totalValueUsd = valuedUnderlying.reduce((sum, asset) => (
+    sum + (Number.isFinite(asset.usdValue) ? Number(asset.usdValue) : 0)
+  ), 0);
+
+  const underlying = valuedUnderlying.map((asset) => ({
+    ...asset,
+    exposurePct: totalValueUsd > 0 && Number.isFinite(asset.usdValue)
+      ? roundTo((Number(asset.usdValue) / totalValueUsd) * 100, 2)
+      : null,
+  }));
+
+  return {
+    ...position,
+    underlying,
+    valuation: {
+      totalUsd: roundTo(totalValueUsd, 4) || 0,
+      source: 'token_spot_lookup',
+      note: 'Stable assets use spot/fallback prices; cirBTC is valued against BTC spot as a wrapped BTC proxy.',
+    },
+    analytics: {
+      impliedRate: roundTo(poolState?.impliedRate, 6),
+      inverseRate: roundTo(poolState?.inverseRate, 6),
+      priceImpact1kPct: roundTo(poolState?.priceImpact?.swap1k, 4),
+      priceImpact10kPct: roundTo(poolState?.priceImpact?.swap10k, 4),
+      priceImpact50kPct: roundTo(poolState?.priceImpact?.swap50k, 4),
+      poolFeePct: roundTo(poolState?.fee ?? position?.feePct, 4),
+      liquidityState: poolState?.liquidityState || position?.liquidityState || null,
+    },
+    yieldMetrics: estimateYieldMetrics(position, poolState, totalValueUsd),
+  };
 }
 
 function dedupeTrackedCurvePools(poolKeys = TRACKED_CURVE_POOLS) {
@@ -81,6 +263,18 @@ function getTrackedDirectPairPools() {
   return pairs;
 }
 
+function filterTrackedDirectPairPools(poolKeys = []) {
+  const normalizedKeys = Array.isArray(poolKeys)
+    ? poolKeys.map(key => String(key || '').trim().toUpperCase())
+    : [];
+
+  if (!normalizedKeys.length) {
+    return getTrackedDirectPairPools();
+  }
+
+  return getTrackedDirectPairPools().filter(pool => normalizedKeys.includes(String(pool.key || '').toUpperCase()));
+}
+
 async function getWalletPositions(walletAddress, { poolKeys } = {}) {
   if (!walletAddress) {
     return {
@@ -93,9 +287,7 @@ async function getWalletPositions(walletAddress, { poolKeys } = {}) {
 
   const provider = getProvider();
   const trackedPools = dedupeTrackedCurvePools(poolKeys);
-  const trackedDirectPairs = (!Array.isArray(poolKeys) || !poolKeys.length)
-    ? getTrackedDirectPairPools()
-    : [];
+  const trackedDirectPairs = filterTrackedDirectPairPools(poolKeys);
 
   const settled = await Promise.allSettled(
     trackedPools.map(pool => readCurvePosition(provider, walletAddress, pool)),
@@ -105,7 +297,7 @@ async function getWalletPositions(walletAddress, { poolKeys } = {}) {
     trackedDirectPairs.map(pool => readDirectPairPosition(provider, walletAddress, pool)),
   );
 
-  const positions = settled
+  const rawPositions = settled
     .filter(result => result.status === 'fulfilled' && result.value)
     .map(result => result.value)
     .concat(
@@ -113,6 +305,14 @@ async function getWalletPositions(walletAddress, { poolKeys } = {}) {
         .filter(result => result.status === 'fulfilled' && result.value)
         .map(result => result.value),
     );
+
+  const priceLookup = await getTokenPriceLookup(
+    rawPositions.flatMap(position => (position.underlying || []).map(asset => asset.symbol)),
+  ).catch(() => ({}));
+
+  const positions = await Promise.all(
+    rawPositions.map(position => enrichPosition(position, priceLookup).catch(() => position)),
+  );
 
   const warnings = settled
     .map((result, index) => {

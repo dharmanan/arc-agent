@@ -7,7 +7,8 @@
  * GET  /api/agents/:id/jobs/:jobId              — single job detail
  * PUT  /api/agents/:id/jobs/:jobId/deliver      — submit deliverable hash
  * PUT  /api/agents/:id/jobs/:jobId/complete     — mark completed (payout)
- * PUT  /api/agents/:id/jobs/:jobId/cancel       — cancel open job
+ * PUT  /api/agents/:id/jobs/:jobId/reject       — reject delivered work
+ * PUT  /api/agents/:id/jobs/:jobId/cancel       — cancel before delivery
  *
  * On-chain calls require AGENTIC_COMMERCE_ADDRESS env; if absent, DB-only mode
  * (jobs are tracked off-chain until the contract is deployed on Arc Testnet).
@@ -21,11 +22,13 @@ const { decrypt }     = require('../services/cryptoService');
 const gatewayAuditService = require('../services/agenticEconomy/gatewayAuditService');
 const jobEconomyService = require('../services/agenticEconomy/jobEconomyService');
 const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationService');
+const { buildJobReviewPolicy, JOB_REVIEW_TIMEOUT_HOURS } = require('../services/jobRetentionService');
 
 router.use(requireAuth);
 
 const AGENTIC_COMMERCE_ADDRESS = process.env.AGENTIC_COMMERCE_ADDRESS || null;
 const ARC_RPC_URL              = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
+const PROVIDER_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
 // Minimal ABI — only what we need
 const AGENTIC_COMMERCE_ABI = [
@@ -68,6 +71,15 @@ function _decorateJob(job) {
   };
 }
 
+function isReviewWindowExpired(job) {
+  if (!job || job.status !== 'delivered' || !job.review_deadline_at) return false;
+  return new Date(job.review_deadline_at).getTime() <= Date.now();
+}
+
+function isFinalizedJobStatus(status) {
+  return status === 'completed' || status === 'cancelled' || status === 'rejected';
+}
+
 // ── GET /api/agents/:id/jobs ──────────────────────────────────────────────────
 router.get('/', async (req, res, next) => {
   try {
@@ -80,9 +92,16 @@ router.get('/', async (req, res, next) => {
 
     const { rows } = await db.query(
       `SELECT id, job_id_onchain, client_address, provider_address, amount_usdc,
-              description, status, deliverable_hash, tx_hash_create, tx_hash_settle, economy, created_at, updated_at
+              description, status, deliverable_hash, tx_hash_create, tx_hash_settle,
+              review_deadline_at, economy, created_at, updated_at
        FROM agent_jobs
-       WHERE agent_id = $1 ${status ? 'AND status = $3' : ''}
+       WHERE agent_id = $1
+         AND NOT (
+           status = 'delivered'
+           AND review_deadline_at IS NOT NULL
+           AND review_deadline_at <= NOW()
+         )
+         ${status ? 'AND status = $3' : ''}
        ORDER BY created_at DESC
        LIMIT $2`,
       status ? [agentId, limit, status] : [agentId, limit],
@@ -92,6 +111,7 @@ router.get('/', async (req, res, next) => {
       jobs: rows.map(_decorateJob),
       onchainEnabled: !!AGENTIC_COMMERCE_ADDRESS,
       jobEconomy: jobEconomyService.getJobEconomyConfigSummary(),
+      jobReviewTimeoutHours: JOB_REVIEW_TIMEOUT_HOURS,
     });
   } catch (err) { next(err); }
 });
@@ -104,10 +124,16 @@ router.get('/:jobId', async (req, res, next) => {
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
 
     const { rows: [job] } = await db.query(
-      `SELECT * FROM agent_jobs WHERE id = $1 AND agent_id = $2`,
+      `SELECT *
+         FROM agent_jobs
+        WHERE id = $1
+          AND agent_id = $2`,
       [jobId, agentId],
     );
     if (!job) return res.status(404).json({ error: 'job_not_found' });
+    if (isReviewWindowExpired(job)) {
+      return res.status(410).json({ error: 'job_review_window_expired' });
+    }
 
     res.json(_decorateJob(job));
   } catch (err) { next(err); }
@@ -115,9 +141,16 @@ router.get('/:jobId', async (req, res, next) => {
 
 // ── POST /api/agents/:id/jobs ─────────────────────────────────────────────────
 const createJobSchema = z.object({
-  providerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'Invalid EVM address'),
+  providerAddress: z.preprocess(
+    (value) => {
+      const normalized = String(value || '').trim();
+      return normalized || undefined;
+    },
+    z.string().regex(PROVIDER_ADDRESS_PATTERN, 'Invalid EVM address').optional(),
+  ),
   amountUsdc:      z.number().positive().max(100_000),
   description:     z.string().min(1).max(500),
+  acceptingApplications: z.boolean().optional(),
 });
 
 router.post('/', async (req, res, next) => {
@@ -128,14 +161,19 @@ router.post('/', async (req, res, next) => {
 
     const parsed = createJobSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-    const { providerAddress, amountUsdc, description } = parsed.data;
+    const { amountUsdc, description } = parsed.data;
+    const providerAddress = parsed.data.providerAddress || null;
+    const acceptingApplications = Boolean(parsed.data.acceptingApplications) && !providerAddress;
+    if (!providerAddress && !acceptingApplications) {
+      return res.status(400).json({ error: 'provider_or_manual_applications_required' });
+    }
 
     let jobIdOnchain = null;
     let txHashCreate = null;
     const initialStatus = 'funded';
 
     // On-chain: only if contract deployed
-    if (AGENTIC_COMMERCE_ADDRESS && agent.private_key_encrypted) {
+    if (providerAddress && AGENTIC_COMMERCE_ADDRESS && agent.private_key_encrypted) {
       try {
         const privateKey      = decrypt(agent.private_key_encrypted);
         const { signer }      = await _getProviderAndSigner(privateKey);
@@ -184,7 +222,12 @@ router.post('/', async (req, res, next) => {
     }
 
     const economy = jobEconomyService.buildJobEconomy({
-      economy: { createFee },
+      economy: {
+        createFee,
+        applicationsOpen: acceptingApplications,
+        applications: [],
+        reviewPolicy: buildJobReviewPolicy(),
+      },
       job: {
         job_id_onchain: jobIdOnchain,
         status: initialStatus,
@@ -224,6 +267,58 @@ router.post('/', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── PUT /api/agents/:id/jobs/:jobId/assign-provider ──────────────────────────
+router.put('/:jobId/assign-provider', async (req, res, next) => {
+  try {
+    const { id: agentId, jobId } = req.params;
+    const agent = await _getAgentForUser(agentId, req.user.userId);
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const providerAddress = String(req.body?.providerAddress || '').trim();
+    if (!PROVIDER_ADDRESS_PATTERN.test(providerAddress)) {
+      return res.status(400).json({ error: 'Invalid EVM address' });
+    }
+
+    const { rows: [job] } = await db.query(
+      `SELECT * FROM agent_jobs WHERE id = $1 AND agent_id = $2`,
+      [jobId, agentId],
+    );
+    if (!job) return res.status(404).json({ error: 'job_not_found' });
+    if (isFinalizedJobStatus(job.status)) {
+      return res.status(409).json({ error: 'job_already_finalized', status: job.status });
+    }
+    if (job.provider_address) {
+      return res.status(409).json({ error: 'provider_already_assigned' });
+    }
+
+    const updatedEconomy = jobEconomyService.buildJobEconomy({
+      economy: {
+        ...(job.economy || {}),
+        applicationsOpen: false,
+      },
+      job: {
+        ...job,
+        provider_address: providerAddress,
+      },
+    });
+
+    const { rows: [updated] } = await db.query(
+      `UPDATE agent_jobs
+          SET provider_address = $1,
+              economy = $2::jsonb,
+              updated_at = NOW()
+        WHERE id = $3
+        RETURNING *`,
+      [providerAddress, JSON.stringify(updatedEconomy), jobId],
+    );
+
+    res.json({
+      job: _decorateJob(updated),
+      assignmentMode: updated.job_id_onchain ? 'provider_locked' : 'local_provider_locked',
+    });
+  } catch (err) { next(err); }
+});
+
 // ── PUT /api/agents/:id/jobs/:jobId/deliver ───────────────────────────────────
 router.put('/:jobId/deliver', async (req, res, next) => {
   try {
@@ -240,6 +335,7 @@ router.put('/:jobId/deliver', async (req, res, next) => {
     );
     if (!job)                    return res.status(404).json({ error: 'job_not_found' });
     if (job.status !== 'funded') return res.status(409).json({ error: 'job_not_funded', status: job.status });
+    if (!job.provider_address)   return res.status(409).json({ error: 'provider_not_assigned' });
 
     let txHashDeliver = null;
 
@@ -260,15 +356,38 @@ router.put('/:jobId/deliver', async (req, res, next) => {
       }
     }
 
+    const deliveredEconomy = jobEconomyService.buildJobEconomy({
+      economy: {
+        ...(job.economy || {}),
+        reviewPolicy: buildJobReviewPolicy({
+          ...(job.economy?.reviewPolicy || {}),
+          disputeState: 'none',
+          disputeReason: '',
+          disputeRaisedAt: null,
+          disputeRaisedBy: null,
+        }),
+      },
+      job: {
+        ...job,
+        status: 'delivered',
+        tx_hash_deliver: txHashDeliver,
+      },
+    });
+
     const { rows: [updated] } = await db.query(
       `UPDATE agent_jobs
-       SET status = 'delivered', deliverable_hash = $1, tx_hash_deliver = $2, updated_at = NOW()
-       WHERE id = $3
+       SET status = 'delivered',
+           deliverable_hash = $1,
+           tx_hash_deliver = $2,
+           review_deadline_at = NOW() + ($3::int * INTERVAL '1 hour'),
+           economy = $4::jsonb,
+           updated_at = NOW()
+       WHERE id = $5
        RETURNING *`,
-      [deliverableHash, txHashDeliver, jobId],
+      [deliverableHash, txHashDeliver, JOB_REVIEW_TIMEOUT_HOURS, JSON.stringify(deliveredEconomy), jobId],
     );
 
-    res.json(updated);
+    res.json(_decorateJob(updated));
   } catch (err) { next(err); }
 });
 
@@ -285,6 +404,7 @@ router.put('/:jobId/complete', async (req, res, next) => {
     );
     if (!job)                       return res.status(404).json({ error: 'job_not_found' });
     if (job.status !== 'delivered') return res.status(409).json({ error: 'job_not_delivered', status: job.status });
+    if (isReviewWindowExpired(job)) return res.status(410).json({ error: 'job_review_window_expired' });
 
     let txHashSettle = null;
 
@@ -313,7 +433,7 @@ router.put('/:jobId/complete', async (req, res, next) => {
 
     const { rows: [updated] } = await db.query(
       `UPDATE agent_jobs
-       SET status = 'completed', tx_hash_settle = $1, economy = $2::jsonb, updated_at = NOW()
+       SET status = 'completed', tx_hash_settle = $1, review_deadline_at = NULL, economy = $2::jsonb, updated_at = NOW()
        WHERE id = $3
        RETURNING *`,
       [txHashSettle, JSON.stringify(completedEconomy), jobId],
@@ -354,8 +474,12 @@ router.put('/:jobId/cancel', async (req, res, next) => {
       [jobId, agentId],
     );
     if (!job)                    return res.status(404).json({ error: 'job_not_found' });
-    if (job.status === 'completed' || job.status === 'cancelled') {
+    if (isReviewWindowExpired(job)) return res.status(410).json({ error: 'job_review_window_expired' });
+    if (isFinalizedJobStatus(job.status)) {
       return res.status(409).json({ error: 'job_already_finalized', status: job.status });
+    }
+    if (job.status === 'delivered') {
+      return res.status(409).json({ error: 'job_requires_reject', status: job.status });
     }
 
     if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.private_key_encrypted) {
@@ -370,12 +494,77 @@ router.put('/:jobId/cancel', async (req, res, next) => {
       }
     }
 
+    const cancelledEconomy = jobEconomyService.buildJobEconomy({
+      economy: job.economy,
+      job: {
+        ...job,
+        status: 'cancelled',
+        review_deadline_at: null,
+      },
+    });
+
     const { rows: [updated] } = await db.query(
-      `UPDATE agent_jobs SET status = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING *`,
-      [jobId],
+      `UPDATE agent_jobs
+          SET status = 'cancelled', review_deadline_at = NULL, economy = $1::jsonb, updated_at = NOW()
+        WHERE id = $2
+        RETURNING *`,
+      [JSON.stringify(cancelledEconomy), jobId],
     );
 
-    res.json(updated);
+    res.json(_decorateJob(updated));
+  } catch (err) { next(err); }
+});
+
+// ── PUT /api/agents/:id/jobs/:jobId/reject ───────────────────────────────────
+router.put('/:jobId/reject', async (req, res, next) => {
+  try {
+    const { id: agentId, jobId } = req.params;
+    const agent = await _getAgentForUser(agentId, req.user.userId);
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const { rows: [job] } = await db.query(
+      `SELECT * FROM agent_jobs WHERE id = $1 AND agent_id = $2`,
+      [jobId, agentId],
+    );
+    if (!job) return res.status(404).json({ error: 'job_not_found' });
+    if (isReviewWindowExpired(job)) return res.status(410).json({ error: 'job_review_window_expired' });
+    if (isFinalizedJobStatus(job.status)) {
+      return res.status(409).json({ error: 'job_already_finalized', status: job.status });
+    }
+    if (job.status !== 'delivered') {
+      return res.status(409).json({ error: 'job_not_delivered', status: job.status });
+    }
+
+    if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.private_key_encrypted) {
+      try {
+        const privateKey = decrypt(agent.private_key_encrypted);
+        const { signer } = await _getProviderAndSigner(privateKey);
+        const contract   = _getContract(signer);
+        const tx = await contract.cancel(BigInt(job.job_id_onchain));
+        await tx.wait(1);
+      } catch (err) {
+        console.error('[JOBS] on-chain reject error:', err.message);
+      }
+    }
+
+    const rejectedEconomy = jobEconomyService.buildJobEconomy({
+      economy: job.economy,
+      job: {
+        ...job,
+        status: 'rejected',
+        review_deadline_at: null,
+      },
+    });
+
+    const { rows: [updated] } = await db.query(
+      `UPDATE agent_jobs
+          SET status = 'rejected', review_deadline_at = NULL, economy = $1::jsonb, updated_at = NOW()
+        WHERE id = $2
+        RETURNING *`,
+      [JSON.stringify(rejectedEconomy), jobId],
+    );
+
+    res.json(_decorateJob(updated));
   } catch (err) { next(err); }
 });
 

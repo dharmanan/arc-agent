@@ -5,8 +5,14 @@ const { createArcOracleBuyer } = require('./arcOracleBuyerHelper');
 const SUPPORTED_ENDPOINTS = new Set([
   'stablecoin-fx',
   'pool-state',
+  'peg-monitor',
+  'reserve-state',
+  'protocol-tvl',
+  'pool-compare',
+  'prediction-market-check',
   'yield-rank',
   'arb-signal',
+  'arb-scan-multi',
 ]);
 
 function printUsage() {
@@ -19,6 +25,11 @@ function printUsage() {
     '  ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url',
     '  ORACLE_PUBLIC_ENDPOINT=pool-state',
     '  ORACLE_PUBLIC_POOL=USDC-EURC',
+    '  ORACLE_PUBLIC_ASSETS=USDC,EURC,USDT',
+    '  ORACLE_PUBLIC_PROTOCOLS=aave,morpho,maple',
+    '  ORACLE_PUBLIC_TARGETS=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC',
+    '  ORACLE_PUBLIC_TOPIC=crypto',
+    '  ORACLE_PUBLIC_LIMIT=4',
     '  ORACLE_BUYER_PRIVATE_KEY=0x...',
     '  ORACLE_BUYER_CHAIN=arcTestnet',
     '  ORACLE_BUYER_RPC_URL=https://rpc.testnet.arc.network',
@@ -75,8 +86,33 @@ function buildOracleUrl() {
     url.searchParams.set('asset', process.env.ORACLE_PUBLIC_ASSET || 'USDC');
   }
 
+  if (endpoint === 'peg-monitor') {
+    url.searchParams.set('assets', process.env.ORACLE_PUBLIC_ASSETS || 'USDC,EURC,USDT');
+  }
+
+  if (endpoint === 'reserve-state') {
+    url.searchParams.set('assets', process.env.ORACLE_PUBLIC_ASSETS || 'USDC,EURC,WUSDC');
+  }
+
+  if (endpoint === 'protocol-tvl') {
+    url.searchParams.set('protocols', process.env.ORACLE_PUBLIC_PROTOCOLS || 'aave,morpho,maple');
+  }
+
+  if (endpoint === 'pool-compare') {
+    url.searchParams.set('targets', process.env.ORACLE_PUBLIC_TARGETS || 'curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC');
+  }
+
+  if (endpoint === 'prediction-market-check') {
+    url.searchParams.set('topic', process.env.ORACLE_PUBLIC_TOPIC || 'crypto');
+    url.searchParams.set('limit', process.env.ORACLE_PUBLIC_LIMIT || '4');
+  }
+
   if (endpoint === 'arb-signal') {
     url.searchParams.set('strategy', process.env.ORACLE_PUBLIC_STRATEGY || 'stablecoin_fx');
+  }
+
+  if (endpoint === 'arb-scan-multi') {
+    url.searchParams.set('targets', process.env.ORACLE_PUBLIC_TARGETS || 'curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC');
   }
 
   return url.toString();

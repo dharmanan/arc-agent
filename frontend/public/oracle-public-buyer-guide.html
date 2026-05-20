@@ -333,6 +333,7 @@
           <li><code>/api/oracle/public/reserve-state?assets=USDC,EURC,WUSDC</code></li>
           <li><code>/api/oracle/public/protocol-tvl?protocols=aave,morpho,maple</code></li>
           <li><code>/api/oracle/public/pool-compare?targets=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC</code></li>
+          <li><code>/api/oracle/public/prediction-market-check?topic=crypto&amp;limit=4</code></li>
           <li><code>/api/oracle/public/yield-rank?asset=USDC</code></li>
           <li><code>/api/oracle/public/arb-signal?strategy=stablecoin_fx</code></li>
           <li><code>/api/oracle/public/arb-scan-multi?targets=curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC</code></li>
@@ -352,8 +353,11 @@
           <code>peg-monitor</code> returns spot stablecoin peg health with explicit fallback metadata,
           <code>reserve-state</code> returns Aave-style reserve APY state with fallback yield hints,
           <code>protocol-tvl</code> returns TVL and 24h change across the protocol watchlist,
-          and <code>pool-compare</code> compares multiple pool targets side by side across
-          <code>curve</code>, <code>uniswap_v2_like</code>, and <code>arcfx</code>. <code>arb-scan-multi</code>
+          <code>pool-compare</code> compares multiple pool targets side by side across
+          <code>curve</code>, <code>uniswap_v2_like</code>, and <code>arcfx</code>,
+          and <code>prediction-market-check</code> returns a live Polymarket-based crypto regime snapshot with
+          liquidity, movement, and Arc action guidance.
+          <code>arb-scan-multi</code>
           scans several stable lanes at once and returns the strongest profitable lane.
         </div>
 
@@ -428,6 +432,13 @@ node oraclePublicBuyerExample.js --preview</code></pre>
       ORACLE_PUBLIC_TARGETS=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC \
       node oraclePublicBuyerExample.js --preview</code></pre>
 
+        <p>Preview the prediction market SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=prediction-market-check \
+      ORACLE_PUBLIC_TOPIC=crypto \
+      ORACLE_PUBLIC_LIMIT=4 \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
         <p>Preview the multi-lane arbitrage scanner SKU:</p>
         <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
       ORACLE_PUBLIC_ENDPOINT=arb-scan-multi \
@@ -468,7 +479,7 @@ node oraclePublicBuyerExample.js</code></pre>
             </tr>
             <tr>
               <td><code>ORACLE_PUBLIC_ENDPOINT</code></td>
-              <td>One of <code>stablecoin-fx</code>, <code>pool-state</code>, <code>peg-monitor</code>, <code>reserve-state</code>, <code>protocol-tvl</code>, <code>pool-compare</code>, <code>yield-rank</code>, <code>arb-signal</code>, <code>arb-scan-multi</code>.</td>
+              <td>One of <code>stablecoin-fx</code>, <code>pool-state</code>, <code>peg-monitor</code>, <code>reserve-state</code>, <code>protocol-tvl</code>, <code>pool-compare</code>, <code>prediction-market-check</code>, <code>yield-rank</code>, <code>arb-signal</code>, <code>arb-scan-multi</code>.</td>
             </tr>
             <tr>
               <td><code>ORACLE_BUYER_CHAIN</code></td>
@@ -493,6 +504,14 @@ node oraclePublicBuyerExample.js</code></pre>
             <tr>
               <td><code>ORACLE_PUBLIC_TARGETS</code></td>
               <td>Comma-separated <code>venue:pool</code> list for <code>pool-compare</code> or <code>arb-scan-multi</code>.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_TOPIC</code></td>
+              <td>Topic string for <code>prediction-market-check</code>, for example <code>crypto</code> or <code>bitcoin</code>.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_LIMIT</code></td>
+              <td>Optional market sample size for <code>prediction-market-check</code>. Supported range is <code>1</code> to <code>8</code>.</td>
             </tr>
           </tbody>
         </table>

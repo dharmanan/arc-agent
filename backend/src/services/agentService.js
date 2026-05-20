@@ -278,6 +278,7 @@ async function updateAgent(agentId, userId, data) {
     marketAnalysisEnabled:   'market_analysis_enabled',
     oracleEnabled:           'oracle_enabled',
     defiLoopEnabled:         'defi_loop_enabled',
+    cirbtcLpEnabled:         'cirbtc_lp_enabled',
     reputationEnabled:       'reputation_enabled',
   };
 
@@ -335,11 +336,11 @@ async function getAgentStatus(agentId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
             a.llm_model, a.wallet_address, a.last_reset_day,
-            a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.reputation_enabled,
+          a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
             a.daily_market_analysis_count, a.daily_defi_loop_count, a.daily_auto_tx_count,
             a.market_analysis_last_run_at, a.market_analysis_last_status,
             a.oracle_last_run_at, a.oracle_last_status,
-            a.defi_loop_last_run_at, a.defi_loop_last_status,
+          a.defi_loop_last_run_at, a.defi_loop_last_status, a.defi_loop_last_decision,
             a.reputation_last_run_at, a.reputation_last_status
      FROM agents a
      WHERE a.id = $1 AND a.user_id = $2`,
@@ -360,6 +361,17 @@ async function getAgentStatus(agentId, userId) {
   }
 
   const dailyLimitBypass = getDailyLimitBypass(a);
+  const defiLoopLastDecision = a.defi_loop_last_decision
+    && typeof a.defi_loop_last_decision === 'object'
+    && Object.keys(a.defi_loop_last_decision).length > 0
+    ? a.defi_loop_last_decision
+    : null;
+  const stableLoopLastDecision = defiLoopLastDecision && defiLoopLastDecision.lane !== 'cirbtc_direct_pair_lp'
+    ? defiLoopLastDecision
+    : null;
+  const cirbtcLpLastDecision = defiLoopLastDecision?.lane === 'cirbtc_direct_pair_lp'
+    ? defiLoopLastDecision
+    : null;
 
   return {
     agentId:       a.id,
@@ -393,6 +405,17 @@ async function getAgentStatus(agentId, userId) {
         enabled: a.defi_loop_enabled ?? false,
         lastRunAt: a.defi_loop_last_run_at,
         lastStatus: a.defi_loop_last_status || 'idle',
+        lastDecision: stableLoopLastDecision,
+        todayCount: a.daily_defi_loop_count ?? 0,
+        dailyCap: 10,
+        autoTxToday: a.daily_auto_tx_count ?? 0,
+        bypassDailyCap: dailyLimitBypass.enabled,
+      },
+      cirbtcLp: {
+        enabled: a.cirbtc_lp_enabled ?? false,
+        lastRunAt: a.defi_loop_last_run_at,
+        lastStatus: a.defi_loop_last_status || 'idle',
+        lastDecision: cirbtcLpLastDecision,
         todayCount: a.daily_defi_loop_count ?? 0,
         dailyCap: 10,
         autoTxToday: a.daily_auto_tx_count ?? 0,
@@ -453,6 +476,7 @@ function formatAgent(row, perms) {
       marketAnalysisEnabled: row.market_analysis_enabled ?? false,
       oracleEnabled:         row.oracle_enabled          ?? false,
       defiLoopEnabled:       row.defi_loop_enabled       ?? false,
+      cirbtcLpEnabled:       row.cirbtc_lp_enabled       ?? false,
       reputationEnabled:     row.reputation_enabled      ?? false,
     },
     createdAt:    row.created_at,

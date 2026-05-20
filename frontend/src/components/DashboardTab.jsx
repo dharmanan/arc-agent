@@ -123,6 +123,380 @@ function formatLpAmount(amount) {
   return numeric.toFixed(3).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
 }
 
+function formatUsdAmount(amount) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '$0.00';
+  if (Math.abs(numeric) < 0.01) return '<$0.01';
+
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: numeric >= 100 ? 0 : 2,
+    maximumFractionDigits: numeric >= 100 ? 0 : 2,
+  }).format(numeric);
+}
+
+function formatRewardAmount(amount, token = 'USDC') {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) return `0 ${token}`;
+  if (numeric === 0) return `0 ${token}`;
+
+  const digits = Math.abs(numeric) >= 100 ? 0 : Math.abs(numeric) >= 1 ? 2 : 4;
+  return `${numeric.toFixed(digits).replace(/\.0+$|(?<=\.\d*?)0+$/g, '')} ${token}`;
+}
+
+function formatDateTime(value) {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '—';
+
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(parsed);
+}
+
+function formatPercentAmount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '0%';
+  if (Math.abs(numeric) < 0.01) return '<0.01%';
+  return `${numeric.toFixed(2).replace(/\.0+$|(?<=\.\d*?)0+$/g, '')}%`;
+}
+
+function formatStatusPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return `${numeric.toFixed(numeric >= 1 ? 2 : 3).replace(/\.0+$|(?<=\.\d*?)0+$/g, '')}%`;
+}
+
+function getPositionRiskStatus(position) {
+  const protocol = String(position?.protocol || position?.poolModel || '').toLowerCase();
+  const liquidityState = String(position?.analytics?.liquidityState || position?.liquidityState || '').toLowerCase();
+  const priceImpact10kPct = Number(position?.analytics?.priceImpact10kPct ?? position?.yieldMetrics?.priceImpact10kPct);
+
+  if (liquidityState === 'empty') {
+    return {
+      tone: 'red',
+      label: 'No depth',
+      detail: 'This pool needs live liquidity before fee estimates become meaningful.',
+    };
+  }
+
+  if (protocol === 'curve') {
+    if (Number.isFinite(priceImpact10kPct) && priceImpact10kPct > 1.5) {
+      return {
+        tone: 'amber',
+        label: 'Watch depth',
+        detail: 'Stable pool depth is weaker right now. Keep size smaller until conditions improve.',
+      };
+    }
+
+    return {
+      tone: 'green',
+      label: 'Stable',
+      detail: 'This is the lowest-volatility LP option on the page right now.',
+    };
+  }
+
+  if (Number.isFinite(priceImpact10kPct) && priceImpact10kPct > 3) {
+    return {
+      tone: 'red',
+      label: 'Thin',
+      detail: 'Low depth can move price quickly. Better for careful manual use only.',
+    };
+  }
+
+  return {
+    tone: 'amber',
+    label: 'Volatile',
+    detail: 'Price can move quickly here. Keep size small and watch pool depth before adding more.',
+  };
+}
+
+function getPositionStatusCards(position) {
+  const poolFeeLabel = formatStatusPercent(position?.yieldMetrics?.poolFeePct ?? position?.feePct);
+
+  return [
+    {
+      title: 'Reward Source',
+      tone: 'green',
+      label: 'Pool fees',
+      detail: poolFeeLabel
+        ? `${poolFeeLabel} pool fees stay inside the LP position. Extra reward campaigns are not active.`
+        : 'LP rewards come only from pool trading fees when this pool is actually used. Extra reward campaigns are not active.',
+    },
+    {
+      title: 'Claim Status',
+      tone: 'slate',
+      label: 'On exit',
+      detail: 'LP fees are not claimed separately. They are realized when you remove liquidity or close the position.',
+    },
+    {
+      title: 'Risk Status',
+      ...getPositionRiskStatus(position),
+    },
+  ];
+}
+
+function getRewardProgramStatus(program, summary) {
+  if (!program) {
+    return {
+      tone: 'slate',
+      label: 'No program',
+      detail: 'No reward program is configured for this agent yet.',
+    };
+  }
+
+  if (summary?.claimableRewardsEnabled) {
+    return {
+      tone: 'green',
+      label: 'Claimable',
+      detail: 'Funded reward emissions or unclaimed accruals are available.',
+    };
+  }
+
+  if (program.status === 'live') {
+    return {
+      tone: 'green',
+      label: 'Live',
+      detail: 'The reward program is active, but this agent has not accrued claimable balance yet.',
+    };
+  }
+
+  if (program.status === 'scheduled') {
+    return {
+      tone: 'amber',
+      label: 'Scheduled',
+      detail: 'The reward program is configured, but its funded live window has not started yet.',
+    };
+  }
+
+  return {
+    tone: 'slate',
+    label: 'Seeded paused',
+    detail: 'The reward ledger is wired, but funded emissions are still paused.',
+  };
+}
+
+function getRewardSnapshotStatus(snapshot) {
+  if (!snapshot) {
+    return {
+      tone: 'slate',
+      label: 'No snapshot',
+      detail: 'No epoch snapshot has been written yet.',
+    };
+  }
+
+  if (snapshot.status === 'finalized') {
+    return {
+      tone: 'green',
+      label: 'Finalized',
+      detail: 'This epoch snapshot is finalized and can feed accruals when the program is live.',
+    };
+  }
+
+  if (snapshot.status === 'cancelled') {
+    return {
+      tone: 'red',
+      label: 'Cancelled',
+      detail: 'This epoch is no longer eligible for new reward accruals.',
+    };
+  }
+
+  return {
+    tone: 'amber',
+    label: 'Pending',
+    detail: 'The snapshot is recorded for ledger visibility, but claimable emissions are not live yet.',
+  };
+}
+
+function humanizeAutomationStatus(status) {
+  const labels = {
+    idle: 'Idle',
+    running: 'Running',
+    success: 'Healthy',
+    executed: 'Executed',
+    dry_run: 'Dry Run',
+    policy_hold: 'Policy Hold',
+    insufficient_balance: 'Balance Hold',
+    permission_blocked: 'Permission Blocked',
+    cap_reached: 'Cap Reached',
+    fetch_error: 'Fetch Error',
+    position_guard_unavailable: 'Position Guard',
+    balance_check_failed: 'Balance Check',
+    execution_blocked: 'Execution Blocked',
+    execution_error: 'Execution Error',
+    dry_run_failed: 'Dry Run Failed',
+    pool_unconfigured: 'Pool Missing',
+    disabled: 'Disabled',
+    missing_agent: 'Missing Agent',
+    no_private_key: 'Missing Key',
+    error: 'Error',
+  };
+
+  return labels[status] || String(status || 'idle').replace(/_/g, ' ');
+}
+
+function humanizeAutomationAction(value, fallback = 'No action') {
+  if (!value) return fallback;
+  return String(value)
+    .split('_')
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function getStableAutomationStatus(defiLoopState, lastDecision) {
+  if (!defiLoopState?.enabled) {
+    return {
+      tone: 'slate',
+      label: 'Disabled',
+      detail: 'Stable automation is off for this agent. No autonomous LP or swap decision will run until it is enabled again.',
+    };
+  }
+
+  const status = String(defiLoopState?.lastStatus || 'idle');
+  const summary = lastDecision?.summary || lastDecision?.reason || null;
+
+  if (status === 'running') {
+    return {
+      tone: 'blue',
+      label: 'Running',
+      detail: 'Stable automation is evaluating the next verified USDC/EURC cycle right now.',
+    };
+  }
+
+  if (status === 'executed') {
+    return {
+      tone: 'green',
+      label: 'Executed',
+      detail: summary || 'The last stable automation cycle submitted an on-chain action.',
+    };
+  }
+
+  if (['success', 'dry_run'].includes(status)) {
+    return {
+      tone: status === 'success' ? 'green' : 'amber',
+      label: humanizeAutomationStatus(status),
+      detail: summary || 'The last stable automation cycle completed without a fatal error.',
+    };
+  }
+
+  if (['policy_hold', 'insufficient_balance', 'permission_blocked', 'cap_reached', 'disabled', 'no_private_key'].includes(status)) {
+    return {
+      tone: 'amber',
+      label: humanizeAutomationStatus(status),
+      detail: summary || 'The last stable automation cycle held instead of sending a transaction.',
+    };
+  }
+
+  if (['fetch_error', 'position_guard_unavailable', 'balance_check_failed', 'execution_blocked', 'execution_error', 'dry_run_failed', 'pool_unconfigured', 'missing_agent', 'error'].includes(status)) {
+    return {
+      tone: 'red',
+      label: humanizeAutomationStatus(status),
+      detail: summary || 'The last stable automation cycle hit an error before it could finish cleanly.',
+    };
+  }
+
+  return {
+    tone: 'slate',
+    label: humanizeAutomationStatus(status),
+    detail: summary || 'Stable automation is waiting for the next eligible cycle.',
+  };
+}
+
+function getCirbtcAutomationStatus(cirbtcLoopState, lastDecision) {
+  if (!cirbtcLoopState?.enabled) {
+    return {
+      tone: 'slate',
+      label: 'Disabled',
+      detail: 'cirBTC LP automation is off for this agent. No autonomous bootstrap, trim, or exit cycle will run until it is enabled again.',
+    };
+  }
+
+  const status = String(cirbtcLoopState?.lastStatus || 'idle');
+  const summary = lastDecision?.summary || lastDecision?.reason || null;
+
+  if (status === 'running') {
+    return {
+      tone: 'blue',
+      label: 'Running',
+      detail: 'cirBTC LP automation is evaluating the next verified direct-pair cycle right now.',
+    };
+  }
+
+  if (status === 'executed') {
+    return {
+      tone: 'green',
+      label: 'Executed',
+      detail: summary || 'The last cirBTC LP automation cycle submitted an on-chain action.',
+    };
+  }
+
+  if (['success', 'dry_run'].includes(status)) {
+    return {
+      tone: status === 'success' ? 'green' : 'amber',
+      label: humanizeAutomationStatus(status),
+      detail: summary || 'The last cirBTC LP automation cycle completed without a fatal error.',
+    };
+  }
+
+  if (['policy_hold', 'insufficient_balance', 'permission_blocked', 'cap_reached', 'disabled', 'no_private_key'].includes(status)) {
+    return {
+      tone: 'amber',
+      label: humanizeAutomationStatus(status),
+      detail: summary || 'The last cirBTC LP automation cycle held instead of sending a transaction.',
+    };
+  }
+
+  if (['fetch_error', 'position_guard_unavailable', 'balance_check_failed', 'execution_blocked', 'execution_error', 'dry_run_failed', 'pool_unconfigured', 'missing_agent', 'error'].includes(status)) {
+    return {
+      tone: 'red',
+      label: humanizeAutomationStatus(status),
+      detail: summary || 'The last cirBTC LP automation cycle hit an error before it could finish cleanly.',
+    };
+  }
+
+  return {
+    tone: 'slate',
+    label: humanizeAutomationStatus(status),
+    detail: summary || 'cirBTC LP automation is waiting for the next eligible cycle.',
+  };
+}
+
+function formatAutomationDecisionSize(decision) {
+  if (!decision) return '—';
+
+  if (decision.operationType === 'remove_liquidity') {
+    const lpAmount = Number(decision.suggestedLpExitAmount);
+    const notionalUsd = Number(decision.suggestedLpExitValueUsd);
+    if (Number.isFinite(lpAmount) && lpAmount > 0) {
+      const lpLabel = `${formatLpAmount(lpAmount)} LP`;
+      return Number.isFinite(notionalUsd) && notionalUsd > 0
+        ? `${lpLabel} · ${formatUsdAmount(notionalUsd)}`
+        : lpLabel;
+    }
+    return '—';
+  }
+
+  const actionAmount = Number(decision?.actionParams?.amountIn ?? decision?.suggestedAmountUsdc);
+  if (!Number.isFinite(actionAmount) || actionAmount <= 0) return '—';
+
+  return formatRewardAmount(actionAmount, decision?.actionAssetSymbol || 'USDC');
+}
+
+function getStatusBadgeClasses(tone) {
+  if (tone === 'blue') return 'border-sky-200 bg-sky-50 text-sky-700';
+  if (tone === 'green') return 'border-emerald-200 bg-emerald-50 text-emerald-700';
+  if (tone === 'amber') return 'border-amber-200 bg-amber-50 text-amber-700';
+  if (tone === 'red') return 'border-rose-200 bg-rose-50 text-rose-700';
+  return 'border-slate-200 bg-slate-100 text-slate-700';
+}
+
 function formatPositionVenue(position) {
   const chain = position?.chain || 'Arc Testnet';
   const protocol = String(position?.protocol || '').toLowerCase();
@@ -163,12 +537,24 @@ function getOracleSignalKey(meta) {
   ].join(':');
 }
 
+function isOracleFollowUpTxType(type) {
+  return [
+    'defi_loop_swap',
+    'defi_loop_dry',
+    'curve_lp_add',
+    'curve_lp_remove',
+    'rebalance',
+    'direct_lp_add',
+    'direct_lp_remove',
+  ].includes(type);
+}
+
 function getOracleSignalFollowUp(tx, allTxs) {
   const signalKey = getOracleSignalKey(getTxMeta(tx));
   if (!signalKey) return null;
 
   return allTxs.find(candidate => {
-    if (!['defi_loop_swap', 'defi_loop_dry'].includes(candidate?.type)) return false;
+    if (!isOracleFollowUpTxType(candidate?.type)) return false;
     return getOracleSignalKey(getTxMeta(candidate)) === signalKey;
   }) || null;
 }
@@ -425,23 +811,35 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
 
   if (isCurveLpRemove) {
     const tokenOut = meta.tokenOut || tx.token || 'USDC';
+    const isDualCurveExit = meta.executionRail === 'curve_liquidity_remove_dual'
+      || (!meta.tokenOut && (meta.token0Symbol || meta.token1Symbol));
     const burnLabel = meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP burned` : null;
     const returnedLabel = formatTokenAmount(meta.amountOut, tokenOut);
+    const returnedBothTokens = [
+      meta.token0Symbol && meta.token0Amount ? formatTokenAmount(meta.token0Amount, meta.token0Symbol) : null,
+      meta.token1Symbol && meta.token1Amount ? formatTokenAmount(meta.token1Amount, meta.token1Symbol) : null,
+    ].filter(Boolean);
+    const summarizedError = summarizeActivityError(meta.error);
     const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
     const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
 
     return {
       title: 'curve liquidity remove',
-      routeLabel: `Arc Testnet · Curve stable pool -> ${tokenOut}`,
+      routeLabel: isDualCurveExit
+        ? 'Arc Testnet · Curve stable pool -> both pool tokens'
+        : `Arc Testnet · Curve stable pool -> ${tokenOut}`,
       amountLabel: burnLabel,
       phase: tx.status === 'dry_run'
         ? 'Simulation only. No on-chain liquidity removal was submitted.'
         : tx.status === 'skipped'
           ? (meta.summary || 'No on-chain liquidity removal was submitted.')
+          : tx.status === 'failed'
+            ? (meta.summary || (summarizedError ? `Failed before confirmation: ${summarizedError}` : 'Curve liquidity removal failed before confirmation.'))
           : [
               burnLabel,
-              returnedLabel ? `Returned ${returnedLabel}` : null,
-              meta.minAmountOut ? `Minimum protected output ${formatTokenAmount(meta.minAmountOut, tokenOut)}` : null,
+              isDualCurveExit && returnedBothTokens.length > 0 ? `Returned ${returnedBothTokens.join(' + ')}` : null,
+              !isDualCurveExit && returnedLabel ? `Returned ${returnedLabel}` : null,
+              !isDualCurveExit && meta.minAmountOut ? `Minimum protected output ${formatTokenAmount(meta.minAmountOut, tokenOut)}` : null,
             ].filter(Boolean).join('. '),
       links: txUrl
         ? [{
@@ -625,6 +1023,9 @@ export default function DashboardTab({ onNavigate }) {
   const [loadingPositions, setLoadingPositions] = useState(false);
   const [positionsError, setPositionsError] = useState('');
   const [positionWarnings, setPositionWarnings] = useState([]);
+  const [rewardOverview, setRewardOverview] = useState(null);
+  const [loadingRewards, setLoadingRewards] = useState(false);
+  const [rewardsError, setRewardsError] = useState('');
   const [txs, setTxs]             = useState([]);
   const [loadingTxs, setLoadingTxs] = useState(false);
   const [txError, setTxError]     = useState('');
@@ -636,6 +1037,33 @@ export default function DashboardTab({ onNavigate }) {
 
   const arcPortfolio = portfolio.find(entry => entry.chainName === 'Arc Testnet');
   const sepoliaPortfolio = portfolio.find(entry => entry.chainName === 'Sepolia');
+  const primaryRewardProgram = rewardOverview?.programs?.[0] || null;
+  const latestRewardSnapshot = rewardOverview?.snapshots?.[0] || null;
+  const rewardProgramStatus = getRewardProgramStatus(primaryRewardProgram, rewardOverview?.summary);
+  const rewardSnapshotStatus = getRewardSnapshotStatus(latestRewardSnapshot);
+  const defiLoopState = agentStatus?.automation?.defiLoop || null;
+  const lastStableDecision = defiLoopState?.lastDecision || null;
+  const stableAutomationStatus = getStableAutomationStatus(defiLoopState, lastStableDecision);
+  const stableAutomationDecisionSize = formatAutomationDecisionSize(lastStableDecision);
+  const stableAutomationBandLabel = Number(lastStableDecision?.targetLpMinUsd) > 0 && Number(lastStableDecision?.targetLpMaxUsd) > 0
+    ? `${formatUsdAmount(lastStableDecision.targetLpMinUsd)} - ${formatUsdAmount(lastStableDecision.targetLpMaxUsd)}`
+    : '—';
+  const stableAutomationLastSeenAt = lastStableDecision?.recordedAt || defiLoopState?.lastRunAt || null;
+  const stableAutomationPositionValue = Number.isFinite(Number(lastStableDecision?.positionValueUsd))
+    ? formatUsdAmount(lastStableDecision?.positionValueUsd)
+    : '—';
+  const cirbtcStatusMissingFromBackend = Boolean(agentStatus?.automation && !agentStatus?.automation?.cirbtcLp);
+  const cirbtcLoopState = agentStatus?.automation?.cirbtcLp || null;
+  const lastCirbtcDecision = cirbtcLoopState?.lastDecision || null;
+  const cirbtcAutomationStatus = getCirbtcAutomationStatus(cirbtcLoopState, lastCirbtcDecision);
+  const cirbtcAutomationDecisionSize = formatAutomationDecisionSize(lastCirbtcDecision);
+  const cirbtcAutomationBandLabel = Number(lastCirbtcDecision?.targetLpMinUsd) > 0 && Number(lastCirbtcDecision?.targetLpMaxUsd) > 0
+    ? `${formatUsdAmount(lastCirbtcDecision.targetLpMinUsd)} - ${formatUsdAmount(lastCirbtcDecision.targetLpMaxUsd)}`
+    : '—';
+  const cirbtcAutomationLastSeenAt = lastCirbtcDecision?.recordedAt || cirbtcLoopState?.lastRunAt || null;
+  const cirbtcAutomationPositionValue = Number.isFinite(Number(lastCirbtcDecision?.positionValueUsd))
+    ? formatUsdAmount(lastCirbtcDecision?.positionValueUsd)
+    : '—';
 
   function getGasLabel(entry) {
     const symbol = entry?.nativeSymbol || 'ETH';
@@ -697,6 +1125,29 @@ export default function DashboardTab({ onNavigate }) {
     }
   }, [agent?.id, isAuthenticated]);
 
+  const loadRewards = useCallback(async ({ silent = false } = {}) => {
+    if (!agent?.id || !isAuthenticated) {
+      setRewardOverview(null);
+      return;
+    }
+
+    if (!silent) setLoadingRewards(true);
+    setRewardsError('');
+    try {
+      const data = await agents.rewards(agent.id, {
+        programLimit: 3,
+        snapshotLimit: 3,
+        accrualLimit: 3,
+        claimLimit: 3,
+      });
+      setRewardOverview(data || null);
+    } catch (e) {
+      setRewardsError(e.message || 'Failed to load LP rewards ledger');
+    } finally {
+      if (!silent) setLoadingRewards(false);
+    }
+  }, [agent?.id, isAuthenticated]);
+
   const loadTransactions = useCallback(async ({ silent = false } = {}) => {
     if (!agent?.id || !isAuthenticated) {
       setTxs([]);
@@ -738,6 +1189,10 @@ export default function DashboardTab({ onNavigate }) {
   }, [loadPositions]);
 
   useEffect(() => {
+    loadRewards();
+  }, [loadRewards]);
+
+  useEffect(() => {
     if (!agentWalletAddress) return;
 
     const intervalId = setInterval(() => {
@@ -756,6 +1211,16 @@ export default function DashboardTab({ onNavigate }) {
 
     return () => clearInterval(intervalId);
   }, [agent?.id, isAuthenticated, loadPositions]);
+
+  useEffect(() => {
+    if (!agent?.id || !isAuthenticated) return undefined;
+
+    const intervalId = setInterval(() => {
+      loadRewards({ silent: true });
+    }, 30_000);
+
+    return () => clearInterval(intervalId);
+  }, [agent?.id, isAuthenticated, loadRewards]);
 
   useEffect(() => {
     loadTransactions();
@@ -957,6 +1422,246 @@ export default function DashboardTab({ onNavigate }) {
       <Card>
         <div className="mb-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
+            <Repeat2 size={16} className="text-slate-400" />
+            <div>
+              <h3 className="font-semibold text-slate-800">Stable Automation State</h3>
+              <p className="text-xs text-slate-500">The verified USDC/EURC lane can hold, swap, add liquidity, trim, or exit based on the current stable policy.</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            className="px-3 py-2 text-xs"
+            onClick={() => loadAgentStatus()}
+          >
+            <RefreshCw size={13} /> Refresh
+          </Button>
+        </div>
+
+        {!defiLoopState ? (
+          <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+            Stable automation state is not available for this agent yet.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid gap-2 md:grid-cols-4">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Loop Status</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(stableAutomationStatus.tone)}`}>
+                    {stableAutomationStatus.label}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{formatDateTime(stableAutomationLastSeenAt)}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{stableAutomationStatus.detail}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Last Decision</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {lastStableDecision
+                    ? humanizeAutomationAction(lastStableDecision.operationType, lastStableDecision.execute === false ? 'Hold' : 'No action')
+                    : 'No decision yet'}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  {stableAutomationDecisionSize !== '—'
+                    ? stableAutomationDecisionSize
+                    : 'No sized action was selected in the latest cycle.'}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Target LP Band</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{stableAutomationBandLabel}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">Current LP value {stableAutomationPositionValue}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Today</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {Number(defiLoopState?.todayCount || 0)}/{Number(defiLoopState?.dailyCap || 10)} checks
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  {Number(defiLoopState?.autoTxToday || 0)} real auto tx sent{defiLoopState?.bypassDailyCap ? ' · daily cap bypass active' : ''}
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">
+                    {lastStableDecision
+                      ? humanizeAutomationAction(lastStableDecision.operationType, lastStableDecision.execute === false ? 'Hold' : 'No action')
+                      : 'Awaiting first stable automation cycle'}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">Last update {formatDateTime(stableAutomationLastSeenAt)}</p>
+                </div>
+                {lastStableDecision?.lpAction && (
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(lastStableDecision.lpAction === 'full_exit' ? 'red' : lastStableDecision.lpAction === 'trim_to_target' ? 'amber' : 'green')}`}>
+                    {humanizeAutomationAction(lastStableDecision.lpAction)}
+                  </span>
+                )}
+              </div>
+
+              <p className="mt-3 text-sm leading-6 text-slate-700">
+                {lastStableDecision?.summary || stableAutomationStatus.detail}
+              </p>
+
+              <div className="mt-3 grid gap-2 md:grid-cols-3">
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Blocked By</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {lastStableDecision?.blockedBy ? humanizeAutomationAction(lastStableDecision.blockedBy) : 'None'}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">Hold reason appears here when the policy refuses execution.</p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Wallet Inventory</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {formatRewardAmount(lastStableDecision?.availableUsdcBalance || 0, 'USDC')}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    {formatRewardAmount(lastStableDecision?.availableEurcBalance || 0, 'EURC')} · reserve {formatRewardAmount(lastStableDecision?.walletReserveUsdc || 0, 'USDC')}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Execution Rail</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {lastStableDecision?.executionSource ? humanizeAutomationAction(lastStableDecision.executionSource) : '—'}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    {lastStableDecision?.txHash
+                      ? `Latest tx ${lastStableDecision.txHash.slice(0, 10)}…`
+                      : 'No transaction hash recorded for the latest cycle.'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Repeat2 size={16} className="text-slate-400" />
+            <div>
+              <h3 className="font-semibold text-slate-800">cirBTC Automation State</h3>
+              <p className="text-xs text-slate-500">The verified direct-pair cirBTC lane can bootstrap, trim, or exit based on the current LP policy.</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            className="px-3 py-2 text-xs"
+            onClick={() => loadAgentStatus()}
+          >
+            <RefreshCw size={13} /> Refresh
+          </Button>
+        </div>
+
+        {!cirbtcLoopState ? (
+          <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+            {cirbtcStatusMissingFromBackend
+              ? 'cirBTC automation status is not available from the current backend yet. The frontend toggle is newer than the live status payload.'
+              : 'cirBTC automation state is not available for this agent yet.'}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid gap-2 md:grid-cols-4">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Loop Status</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(cirbtcAutomationStatus.tone)}`}>
+                    {cirbtcAutomationStatus.label}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{formatDateTime(cirbtcAutomationLastSeenAt)}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{cirbtcAutomationStatus.detail}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Last Decision</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {lastCirbtcDecision
+                    ? humanizeAutomationAction(lastCirbtcDecision.operationType, lastCirbtcDecision.execute === false ? 'Hold' : 'No action')
+                    : 'No decision yet'}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  {cirbtcAutomationDecisionSize !== '—'
+                    ? cirbtcAutomationDecisionSize
+                    : 'No sized action was selected in the latest cycle.'}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Target LP Band</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{cirbtcAutomationBandLabel}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">Current LP value {cirbtcAutomationPositionValue}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Today</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {Number(cirbtcLoopState?.todayCount || 0)}/{Number(cirbtcLoopState?.dailyCap || 10)} checks
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  {Number(cirbtcLoopState?.autoTxToday || 0)} real auto tx sent{cirbtcLoopState?.bypassDailyCap ? ' · daily cap bypass active' : ''}
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">
+                    {lastCirbtcDecision
+                      ? humanizeAutomationAction(lastCirbtcDecision.operationType, lastCirbtcDecision.execute === false ? 'Hold' : 'No action')
+                      : 'Awaiting first cirBTC automation cycle'}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">Last update {formatDateTime(cirbtcAutomationLastSeenAt)}</p>
+                </div>
+                {lastCirbtcDecision?.lpAction && (
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(lastCirbtcDecision.lpAction === 'full_exit' ? 'red' : lastCirbtcDecision.lpAction === 'trim_to_target' ? 'amber' : 'green')}`}>
+                    {humanizeAutomationAction(lastCirbtcDecision.lpAction)}
+                  </span>
+                )}
+              </div>
+
+              <p className="mt-3 text-sm leading-6 text-slate-700">
+                {lastCirbtcDecision?.summary || cirbtcAutomationStatus.detail}
+              </p>
+
+              <div className="mt-3 grid gap-2 md:grid-cols-3">
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Blocked By</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {lastCirbtcDecision?.blockedBy ? humanizeAutomationAction(lastCirbtcDecision.blockedBy) : 'None'}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">Hold reason appears here when the policy refuses execution.</p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Pair Context</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {lastCirbtcDecision?.poolKey ? String(lastCirbtcDecision.poolKey).replace(/_/g, ' / ') : 'No pool selected'}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    Funding asset {lastCirbtcDecision?.selectedStableToken || 'USDC'} · withdraw {lastCirbtcDecision?.withdrawPct ? `${lastCirbtcDecision.withdrawPct}%` : '—'}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Execution Rail</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {lastCirbtcDecision?.executionSource ? humanizeAutomationAction(lastCirbtcDecision.executionSource) : '—'}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    {lastCirbtcDecision?.txHash
+                      ? `Latest tx ${lastCirbtcDecision.txHash.slice(0, 10)}…`
+                      : 'No transaction hash recorded for the latest cycle.'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
             <Activity size={16} className="text-slate-400" />
             <div>
               <h3 className="font-semibold text-slate-800">Agent Positions</h3>
@@ -1022,19 +1727,244 @@ export default function DashboardTab({ onNavigate }) {
                   </div>
                 </div>
 
+                <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Position Value</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(position.valuation?.totalUsd)}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">Approximate USD spot valuation</p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Est. Fee APR</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">{formatPercentAmount(position.yieldMetrics?.aprPct)}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Trading fees only, not claimable rewards
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Est. Fee APY</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">{formatPercentAmount(position.yieldMetrics?.apyPct)}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">Compounded run-rate estimate</p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Yield Run-Rate</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(position.yieldMetrics?.dailyUsd)}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Weekly {formatUsdAmount(position.yieldMetrics?.weeklyUsd)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                  {getPositionStatusCards(position).map((card) => (
+                    <div key={`${position.poolAddress}-${card.title}`} className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{card.title}</p>
+                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(card.tone)}`}>
+                          {card.label}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-[11px] leading-5 text-slate-500">{card.detail}</p>
+                    </div>
+                  ))}
+                </div>
+
                 <div className="mt-4 rounded-xl border border-slate-200 bg-white px-3 py-3">
                   <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Underlying Assets</p>
                   <div className="mt-2 space-y-1.5 text-sm text-slate-600">
                     {position.underlying.map(asset => (
-                      <div key={`${position.poolAddress}-${asset.symbol}`} className="flex items-center justify-between gap-3">
-                        <span>{asset.symbol}</span>
-                        <span className="font-semibold text-slate-900">{formatPositionAmount(asset.amount || 0)}</span>
+                      <div key={`${position.poolAddress}-${asset.symbol}`} className="flex items-start justify-between gap-3">
+                        <div>
+                          <span>{asset.symbol}</span>
+                          <p className="mt-0.5 text-[11px] text-slate-500">
+                            {formatUsdAmount(asset.usdValue)} · {formatPercentAmount(asset.exposurePct)} exposure
+                          </p>
+                        </div>
+                        <div className="text-right">
+                          <span className="font-semibold text-slate-900">{formatPositionAmount(asset.amount || 0)}</span>
+                          <p className="mt-0.5 text-[11px] text-slate-500">
+                            Spot {formatUsdAmount(asset.usdPrice)}
+                          </p>
+                        </div>
                       </div>
                     ))}
                   </div>
                 </div>
+
+                {position.yieldMetrics?.note && (
+                  <p className="mt-3 text-[11px] leading-5 text-slate-500">
+                    {position.yieldMetrics.note}
+                    {position.yieldMetrics?.isCapped ? ' Safety cap applied to keep the estimate in a realistic range.' : ''}
+                  </p>
+                )}
               </div>
             ))}
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Zap size={16} className="text-slate-400" />
+            <div>
+              <h3 className="font-semibold text-slate-800">LP Rewards Ledger</h3>
+              <p className="text-xs text-slate-500">Claimable rewards stay separate from fee-only LP yield and can appear here before accruals go live.</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            className="px-3 py-2 text-xs"
+            onClick={() => loadRewards()}
+            loading={loadingRewards}
+          >
+            <RefreshCw size={13} /> Refresh
+          </Button>
+        </div>
+
+        {rewardsError && <Alert type="error">{rewardsError}</Alert>}
+
+        {loadingRewards ? (
+          <div className="flex justify-center py-8"><Spinner /></div>
+        ) : !rewardOverview ? (
+          <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+            No LP rewards ledger is available for this agent yet.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid gap-2 md:grid-cols-3">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Program Status</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(rewardProgramStatus.tone)}`}>
+                    {rewardProgramStatus.label}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {primaryRewardProgram?.metadata?.displayName || primaryRewardProgram?.poolKey || 'No configured program'}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{rewardProgramStatus.detail}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Claimable Balance</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {formatRewardAmount(rewardOverview.summary?.totalUnclaimed, primaryRewardProgram?.rewardToken || 'USDC')}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  {rewardOverview.summary?.claimableRewardsEnabled
+                    ? 'Unclaimed reward balance is available separately from LP fee APR.'
+                    : 'No funded claimable reward balance has accrued yet.'}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Latest Snapshot</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(rewardSnapshotStatus.tone)}`}>
+                    {rewardSnapshotStatus.label}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {formatDateTime(rewardOverview.summary?.latestSnapshotAt)}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{rewardSnapshotStatus.detail}</p>
+              </div>
+            </div>
+
+            {primaryRewardProgram && (
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_minmax(0,0.75fr)]">
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">{primaryRewardProgram.poolKey}</p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {String(primaryRewardProgram.rewardSourceType || 'program').replace(/_/g, ' ')} · {primaryRewardProgram.rewardToken}
+                      </p>
+                    </div>
+                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(rewardProgramStatus.tone)}`}>
+                      {primaryRewardProgram.status}
+                    </span>
+                  </div>
+
+                  <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Epoch Budget</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">
+                        {formatRewardAmount(primaryRewardProgram.latestRewardBudget, primaryRewardProgram.rewardToken)}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">Current configured reward budget</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Snapshots</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">{primaryRewardProgram.snapshotCount}</p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {primaryRewardProgram.latestSnapshotStatus
+                          ? `Latest ${primaryRewardProgram.latestSnapshotStatus}`
+                          : 'No epoch snapshot yet'}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Earned</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">
+                        {formatRewardAmount(primaryRewardProgram.totalEarned, primaryRewardProgram.rewardToken)}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">Agent accruals recorded so far</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Unclaimed</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">
+                        {formatRewardAmount(primaryRewardProgram.totalUnclaimed, primaryRewardProgram.rewardToken)}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">Still separate from LP fee APR shown above</p>
+                    </div>
+                  </div>
+
+                  <p className="mt-3 text-[11px] leading-5 text-slate-500">
+                    {primaryRewardProgram.metadata?.fundingNote || rewardOverview.summary?.note}
+                  </p>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">Recent Epoch Snapshots</p>
+                      <p className="mt-1 text-xs text-slate-500">Latest ledger writes for reward accounting.</p>
+                    </div>
+                    <span className="text-xs font-medium text-slate-400">{rewardOverview.snapshots?.length || 0} rows</span>
+                  </div>
+
+                  {rewardOverview.snapshots?.length ? (
+                    <div className="mt-3 space-y-2">
+                      {rewardOverview.snapshots.map((snapshot) => {
+                        const snapshotStatus = getRewardSnapshotStatus(snapshot);
+                        return (
+                          <div key={snapshot.id} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-slate-900">{formatDateTime(snapshot.epochEnd)}</p>
+                                <p className="mt-1 text-[11px] text-slate-500">
+                                  {snapshot.poolKey} · Budget {formatRewardAmount(snapshot.rewardBudget, snapshot.rewardToken)}
+                                </p>
+                              </div>
+                              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(snapshotStatus.tone)}`}>
+                                {snapshotStatus.label}
+                              </span>
+                            </div>
+                            <p className="mt-2 text-[11px] leading-5 text-slate-500">{snapshotStatus.detail}</p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="mt-3 rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                      No snapshot rows are available yet.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {latestRewardSnapshot?.snapshotPayload?.note && (
+              <p className="text-[11px] leading-5 text-slate-500">{latestRewardSnapshot.snapshotPayload.note}</p>
+            )}
           </div>
         )}
       </Card>
