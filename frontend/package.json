@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@circle-fin/adapter-viem-v2": "^1.10.0",
+    "@circle-fin/adapter-viem-v2": "^1.11.1",
     "@circle-fin/bridge-kit": "^1.10.0",
     "@radix-ui/react-slot": "^1.2.4",
     "@rainbow-me/rainbowkit": "^2.1.3",
