@@ -123,6 +123,90 @@ const DIRECT_PAIR_MANUAL_ACTIONS = [
   },
 ];
 
+const LENDING_WATCH_ASSETS = ['USDC', 'EURC'];
+const LENDING_MANUAL_ACTIONS = [
+  {
+    id: 'supply',
+    label: 'Supply',
+    title: 'Supply collateral',
+    description: 'Supply USDC or EURC into the Arc-native lending lane from the agent wallet.',
+    ctaLabel: 'Supply',
+    icon: PlusCircle,
+  },
+  {
+    id: 'withdraw',
+    label: 'Withdraw',
+    title: 'Withdraw supplied asset',
+    description: 'Withdraw an already supplied stable asset back into the agent wallet.',
+    ctaLabel: 'Withdraw',
+    icon: MinusCircle,
+  },
+  {
+    id: 'borrow',
+    label: 'Borrow',
+    title: 'Borrow stable asset',
+    description: 'Borrow against the current supplied collateral, if the visible risk buffer allows it.',
+    ctaLabel: 'Borrow',
+    icon: Coins,
+  },
+  {
+    id: 'repay',
+    label: 'Repay',
+    title: 'Repay debt',
+    description: 'Repay an existing stable debt position from the agent wallet.',
+    ctaLabel: 'Repay',
+    icon: RefreshCw,
+  },
+];
+
+function createEmptyLendingSnapshot() {
+  return {
+    assets: [...LENDING_WATCH_ASSETS],
+    reserves: [],
+    summary: null,
+    isFallback: true,
+    fetchedAt: null,
+  };
+}
+
+function createEmptyLendingSurface() {
+  return {
+    execution: {
+      source: 'arc_native_scaffold',
+      contractAddress: null,
+      buildState: 'scaffold_only',
+      globalPaused: false,
+      ready: false,
+      live: false,
+      notes: [],
+      actions: LENDING_MANUAL_ACTIONS.map(action => action.id),
+    },
+    prices: {
+      fetchedAt: null,
+      assets: [],
+    },
+    account: {
+      liquidity: null,
+      positions: [],
+    },
+    assets: [],
+    risk: {
+      totalSuppliedUsd: 0,
+      totalBorrowUsd: 0,
+      collateralSuppliedUsd: 0,
+      collateralCapacityUsd: 0,
+      liquidationCapacityUsd: 0,
+      availableBorrowUsd: 0,
+      ltvPct: 0,
+      healthFactor: null,
+      band: 'idle',
+      label: 'No debt',
+      detail: 'No active lending debt is visible yet.',
+    },
+    actionGuards: {},
+  };
+}
+
 function formatPositionAmount(amount) {
   const numeric = Number(amount);
   if (!Number.isFinite(numeric)) return '—';
@@ -182,6 +266,397 @@ function formatStatusPercent(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return null;
   return `${numeric.toFixed(numeric >= 1 ? 2 : 3).replace(/\.0+$|(?<=\.\d*?)0+$/g, '')}%`;
+}
+
+function formatTimestamp(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
+}
+
+function formatLendingRate(value, { hideZero = false } = {}) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  if (hideZero && numeric <= 0) return '—';
+  return formatPercentAmount(numeric);
+}
+
+function getLendingSourceStatus(reserve) {
+  if (reserve?.source === 'aave_onchain' && reserve?.isFallback !== true) {
+    return { tone: 'green', label: 'On-chain live' };
+  }
+  if (reserve?.isFallback) {
+    return { tone: 'amber', label: 'Fallback watch' };
+  }
+  return { tone: 'slate', label: 'Waiting' };
+}
+
+function formatLendingFallbackReason(reason) {
+  if (reason === 'aave_pool_not_configured') {
+    return 'No live external reserve is configured yet, so this asset stays in watchlist mode while the first lending lane is being built.';
+  }
+  if (reason === 'reserve_not_available') {
+    return 'A reserve target exists, but it did not return live on-chain state. The lending build should not trust it as an execution source yet.';
+  }
+  if (reason === 'onchain_fetch_failed') {
+    return 'On-chain reserve reads failed, so this card is showing fallback watch data while the lending lane remains under construction.';
+  }
+  if (!reason) {
+    return 'This asset is currently part of the lending watchlist while the first Arc lending lane is being designed.';
+  }
+  return String(reason).replace(/_/g, ' ');
+}
+
+function formatAddressShort(value) {
+  if (!value || typeof value !== 'string') return 'Not configured';
+  if (value.length <= 12) return value;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function formatHealthFactor(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '—';
+  if (numeric > 999) return '>999';
+  return numeric.toFixed(numeric >= 10 ? 2 : 3).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+}
+
+function getLendingRiskTone(band) {
+  if (band === 'healthy') return 'green';
+  if (band === 'warning') return 'amber';
+  if (band === 'critical') return 'red';
+  return 'slate';
+}
+
+function getLendingExecutionCard(surface) {
+  const execution = surface?.execution || {};
+  if (execution.globalPaused) {
+    return {
+      tone: 'red',
+      label: 'Paused',
+      detail: 'The Arc-native lending lane is globally paused.',
+    };
+  }
+
+  if (execution.ready) {
+    return {
+      tone: 'green',
+      label: 'Live write path',
+      detail: `Manual lending writes can use ${execution.source || 'the configured lending adapter'} from this screen.`,
+    };
+  }
+
+  if (execution.contractAddress && execution.buildState === 'scaffold_only') {
+    return {
+      tone: 'amber',
+      label: 'Scaffold contract',
+      detail: 'The contract address exists, but the contract still reports scaffold-only build state, so writes stay guarded.',
+    };
+  }
+
+  return {
+    tone: 'amber',
+    label: 'Build in progress',
+    detail: 'The Arc-native lending route is wired, but a live lending contract is not configured yet.',
+  };
+}
+
+function getLendingPriceCard(surface) {
+  const priceAssets = Array.isArray(surface?.prices?.assets) ? surface.prices.assets : [];
+  const fallbackAssets = priceAssets.filter(asset => asset?.isFallback);
+
+  if (priceAssets.length === 0) {
+    return {
+      tone: 'slate',
+      label: 'Waiting',
+      detail: 'Dedicated lending price inputs have not loaded yet.',
+    };
+  }
+
+  if (fallbackAssets.length > 0) {
+    return {
+      tone: 'amber',
+      label: 'Fallback active',
+      detail: `${fallbackAssets.map(asset => asset.symbol).join(', ')} is using a fallback price input right now.`,
+    };
+  }
+
+  return {
+    tone: 'green',
+    label: 'Dedicated source',
+    detail: 'The lending risk layer is using a dedicated stable-price snapshot for this lane.',
+  };
+}
+
+function getLendingActionGuard(surface, assetSymbol, actionId) {
+  return surface?.actionGuards?.[assetSymbol]?.[actionId] || {
+    execute: false,
+    detail: 'Guard state is unavailable right now.',
+  };
+}
+
+function getDefaultLendingManualParams(surface) {
+  const assetOptions = Array.isArray(surface?.assets) && surface.assets.length > 0
+    ? surface.assets.map(asset => asset.symbol)
+    : LENDING_WATCH_ASSETS;
+
+  return {
+    asset: assetOptions[0] || 'USDC',
+    amount: '',
+  };
+}
+
+function getLendingManualActionError(params) {
+  if (!params.asset) return 'Choose the asset used for this lending action.';
+  if (!(Number(params.amount) > 0)) return 'Enter a positive amount for this lending action.';
+  return '';
+}
+
+function LendingManualFields({ assetOptions, params, setParams }) {
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      <label>
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Asset</span>
+        <select
+          value={params.asset}
+          onChange={(event) => setParams(current => ({ ...current, asset: event.target.value }))}
+          className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#66D121]/40"
+        >
+          {assetOptions.map(option => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </label>
+      <label>
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Amount</span>
+        <input
+          type="number"
+          min="0"
+          step="0.0001"
+          value={params.amount}
+          onChange={(event) => setParams(current => ({ ...current, amount: event.target.value }))}
+          className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#66D121]/40"
+        />
+      </label>
+    </div>
+  );
+}
+
+function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
+  const actions = LENDING_MANUAL_ACTIONS;
+  const assetOptions = useMemo(() => {
+    const assets = Array.isArray(lendingSurface?.assets) ? lendingSurface.assets.map(asset => asset.symbol) : [];
+    return assets.length > 0 ? assets : LENDING_WATCH_ASSETS;
+  }, [lendingSurface]);
+  const [activeActionId, setActiveActionId] = useState(actions[0]?.id || 'supply');
+  const activeAction = actions.find(action => action.id === activeActionId) || actions[0] || null;
+  const ActionIcon = activeAction?.icon || PlusCircle;
+  const [params, setParams] = useState(() => getDefaultLendingManualParams(lendingSurface));
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setParams((current) => {
+      const nextAsset = assetOptions.includes(current.asset) ? current.asset : (assetOptions[0] || 'USDC');
+      return { ...current, asset: nextAsset };
+    });
+  }, [assetOptions]);
+
+  useEffect(() => {
+    setParams(getDefaultLendingManualParams(lendingSurface));
+    setMessage('');
+    setError('');
+  }, [lendingSurface?.execution?.contractAddress, lendingSurface?.execution?.buildState]);
+
+  const activeGuard = getLendingActionGuard(lendingSurface, params.asset, activeAction?.id);
+
+  async function handleSubmit() {
+    if (!agentId || !activeAction) return;
+
+    const paramError = getLendingManualActionError(params);
+    if (paramError) {
+      setError(paramError);
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    setMessage('');
+
+    try {
+      const response = await defiApi.manualExecute(agentId, {
+        lane: 'lending',
+        action: activeAction.id,
+        asset: params.asset,
+        params: {
+          asset: params.asset,
+          amount: Number(params.amount),
+        },
+      });
+      const feeLabel = Number(response?.feeUsdc) > 0
+        ? `${Number(response.feeUsdc).toFixed(2)} USDC fee applied.`
+        : 'Fee applied on submit.';
+
+      if (response?.run) {
+        setMessage(`Queued. ${feeLabel}`);
+        onRunQueued?.(response.run);
+        return;
+      }
+
+      setMessage('Submitted.');
+    } catch (runError) {
+      setError(runError?.data?.detail || runError.message || 'Failed to run the manual lending action.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!activeAction) {
+    return null;
+  }
+
+  return (
+    <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <div className="flex flex-wrap gap-2">
+          {actions.map((action) => {
+            const TabIcon = action.icon || PlusCircle;
+            const isActive = action.id === activeAction.id;
+            return (
+              <button
+                key={action.id}
+                type="button"
+                onClick={() => setActiveActionId(action.id)}
+                className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-2 text-sm font-semibold transition ${
+                  isActive
+                    ? 'border-[#66D121]/40 bg-arc-greenBg text-arc-green shadow-sm'
+                    : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:text-slate-800'
+                }`}
+              >
+                <TabIcon size={14} /> {action.label}
+              </button>
+            );
+          })}
+        </div>
+        <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700">
+          Arc fee on submit
+        </span>
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-4">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <ActionIcon size={16} className="text-slate-400" />
+              <p className="text-base font-semibold text-slate-900">{activeAction.title}</p>
+            </div>
+            <p className="mt-1 text-sm text-slate-500">{activeAction.description}</p>
+          </div>
+          <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${getStatusBadgeClasses(activeGuard.execute ? 'green' : 'amber')}`}>
+            {activeGuard.execute ? 'Guard passed' : 'Guard blocked'}
+          </span>
+        </div>
+
+        <div className="mt-4 space-y-2">
+          <LendingManualFields assetOptions={assetOptions} params={params} setParams={setParams} />
+        </div>
+
+        <p className="mt-3 text-xs leading-5 text-slate-500">{activeGuard.detail}</p>
+
+        {error && <p className="mt-3 text-xs text-red-500">{error}</p>}
+        {message && <p className="mt-3 text-xs text-green-600">{message}</p>}
+
+        <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-xs text-slate-500">
+            Every click here queues a hidden lending task. The worker re-checks the same guard before any on-chain call.
+          </p>
+          <button
+            type="button"
+            onClick={handleSubmit}
+            disabled={busy || !agentId || activeGuard.execute !== true}
+            className={`inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition ${
+              busy || !agentId || activeGuard.execute !== true
+                ? 'cursor-not-allowed bg-slate-200 text-slate-400'
+                : 'bg-amber-500 text-white hover:bg-amber-600'
+            }`}
+          >
+            {busy ? <Spinner size={13} /> : <ActionIcon size={15} />}
+            {busy ? 'Submitting...' : activeAction.ctaLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LendingAssetSnapshot({ lendingSurface }) {
+  const assets = Array.isArray(lendingSurface?.assets) ? lendingSurface.assets : [];
+
+  if (assets.length === 0) {
+    return (
+      <div className="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm text-slate-500">
+        No native lending asset snapshot is available yet.
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-2">
+      {assets.map((asset) => (
+        <div key={asset.symbol} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-lg font-semibold text-slate-900">{asset.symbol}</p>
+              <p className="mt-1 text-xs text-slate-500">
+                Price {formatUsdAmount(asset.price.priceUsd)} · {asset.price.isFallback ? 'Fallback price' : 'Dedicated price source'}
+              </p>
+            </div>
+            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(asset.reserve.paused ? 'red' : asset.reserve.supported ? 'green' : 'amber')}`}>
+              {asset.reserve.paused ? 'Paused' : asset.reserve.supported ? 'Configured' : 'Not configured'}
+            </span>
+          </div>
+
+          <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Wallet</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{formatPositionAmount(asset.wallet.amount)}</p>
+              <p className="mt-1 text-[11px] text-slate-500">{formatUsdAmount(asset.wallet.amountUsd)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Supplied</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{formatPositionAmount(asset.position.suppliedAmount)}</p>
+              <p className="mt-1 text-[11px] text-slate-500">{formatUsdAmount(asset.position.suppliedUsd)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Borrowed</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{formatPositionAmount(asset.position.borrowAmount)}</p>
+              <p className="mt-1 text-[11px] text-slate-500">{formatUsdAmount(asset.position.borrowUsd)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Collateral</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{asset.position.useAsCollateral ? 'Enabled' : 'Off'}</p>
+              <p className="mt-1 text-[11px] text-slate-500">CF {formatPercentAmount(asset.reserve.collateralFactorBps / 100)} · LT {formatPercentAmount(asset.reserve.liquidationThresholdBps / 100)}</p>
+            </div>
+          </div>
+
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            {LENDING_MANUAL_ACTIONS.map((action) => {
+              const guard = getLendingActionGuard(lendingSurface, asset.symbol, action.id);
+              return (
+                <div key={`${asset.symbol}:${action.id}`} className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{action.label}</p>
+                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(guard.execute ? 'green' : 'amber')}`}>
+                      {guard.execute ? 'Ready' : 'Blocked'}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-[11px] leading-5 text-slate-500">{guard.detail}</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function getRiskStatus(position) {
@@ -998,7 +1473,45 @@ function PoolPositionSnapshot({ position }) {
   );
 }
 
-function LendingPlaceholder() {
+function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface, lendingSurfaceError, agentId, onRunQueued }) {
+  const reserves = Array.isArray(lendingSnapshot?.reserves) ? lendingSnapshot.reserves : [];
+  const hasLiveMarket = reserves.some(reserve => reserve?.source === 'aave_onchain' && reserve?.isFallback !== true);
+  const hasFallbackData = reserves.some(reserve => reserve?.isFallback);
+  const summary = lendingSnapshot?.summary || null;
+  const executionCard = getLendingExecutionCard(lendingSurface);
+  const priceCard = getLendingPriceCard(lendingSurface);
+  const risk = lendingSurface?.risk || createEmptyLendingSurface().risk;
+  const reserveCards = reserves.length > 0
+    ? reserves
+    : LENDING_WATCH_ASSETS.map(asset => ({
+        asset,
+        market: 'aave_v3',
+        source: null,
+        isFallback: true,
+        fallbackReason: 'aave_pool_not_configured',
+      }));
+
+  const statusCards = [
+    {
+      title: 'Execution Status',
+      tone: executionCard.tone,
+      label: executionCard.label,
+      detail: executionCard.detail,
+    },
+    {
+      title: 'Account Risk',
+      tone: getLendingRiskTone(risk.band),
+      label: risk.label,
+      detail: `${risk.detail} Health factor ${formatHealthFactor(risk.healthFactor)} · LTV ${formatPercentAmount(risk.ltvPct)} · Available borrow ${formatUsdAmount(risk.availableBorrowUsd)}.`,
+    },
+    {
+      title: 'Price Guard',
+      tone: priceCard.tone,
+      label: priceCard.label,
+      detail: priceCard.detail,
+    },
+  ];
+
   return (
     <div className="space-y-4">
       <Card>
@@ -1006,27 +1519,152 @@ function LendingPlaceholder() {
           <ShieldCheck size={18} className="text-slate-400 shrink-0 mt-1" />
           <div>
             <h3 className="text-lg font-semibold text-slate-900">Lending</h3>
-            <p className="mt-1 text-sm text-slate-500">Manual lending is not live yet. This page will open with simple borrow and repay controls first.</p>
+            <p className="mt-1 text-sm text-slate-500">This lane now shows the Arc-native lending adapter state, visible account risk, and guarded manual actions for the first stable lending scope.</p>
           </div>
         </div>
 
+        {lendingError && <Alert type="error">{lendingError}</Alert>}
+        {lendingSurfaceError && <Alert type="error">{lendingSurfaceError}</Alert>}
+
         <div className="mt-4 grid gap-3 lg:grid-cols-3">
-          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Status</p>
-            <p className="mt-1 text-sm font-semibold text-slate-900">Coming next</p>
-            <p className="mt-1 text-xs leading-5 text-slate-500">Lending is planned, but it is not available for live use yet.</p>
-          </div>
-          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Assets first</p>
-            <p className="mt-1 text-sm font-semibold text-slate-900">USDC and EURC</p>
-            <p className="mt-1 text-xs leading-5 text-slate-500">The first lending version will focus on the two stable assets shown across the rest of DeFi.</p>
-          </div>
-          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Planned actions</p>
-            <p className="mt-1 text-sm font-semibold text-slate-900">Supply, withdraw, borrow, repay</p>
-            <p className="mt-1 text-xs leading-5 text-slate-500">The goal is a simple manual lending flow before any automation is added.</p>
-          </div>
+          {statusCards.map(card => (
+            <div key={card.title} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{card.title}</p>
+                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(card.tone)}`}>
+                  {card.label}
+                </span>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-slate-500">{card.detail}</p>
+            </div>
+          ))}
         </div>
+
+        <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <div className="flex items-center gap-2">
+                <Wallet size={14} className="text-slate-400" />
+                <p className="text-sm font-semibold text-slate-800">Execution source</p>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-slate-500">
+                Source {lendingSurface?.execution?.source || 'arc_native_scaffold'} · Build state {lendingSurface?.execution?.buildState || 'scaffold_only'} · Contract {formatAddressShort(lendingSurface?.execution?.contractAddress)}
+              </p>
+            </div>
+            <p className="text-xs text-slate-400">Updated {formatTimestamp(lendingSurface?.prices?.fetchedAt || lendingSnapshot?.fetchedAt)}</p>
+          </div>
+
+          {Array.isArray(lendingSurface?.execution?.notes) && lendingSurface.execution.notes.length > 0 && (
+            <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-3 text-xs text-slate-500">
+              {lendingSurface.execution.notes[0]}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-4 space-y-3">
+          <div className="flex items-center gap-2">
+            <Wallet size={14} className="text-slate-400" />
+            <p className="text-sm font-semibold text-slate-800">Manual lending controls</p>
+          </div>
+          <LendingManualControls agentId={agentId} lendingSurface={lendingSurface} onRunQueued={onRunQueued} />
+        </div>
+      </Card>
+
+      <Card>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-start gap-3">
+            <Activity size={18} className="text-slate-400 shrink-0 mt-1" />
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">Account and Guard Snapshot</h3>
+              <p className="mt-1 text-sm text-slate-500">Wallet balances, supplied amounts, borrowed amounts, and per-asset manual guard status for the v1 stable lending scope.</p>
+            </div>
+          </div>
+          <p className="text-xs text-slate-400">Supplied {formatUsdAmount(risk.totalSuppliedUsd)} · Borrowed {formatUsdAmount(risk.totalBorrowUsd)}</p>
+        </div>
+
+        <div className="mt-4 space-y-4">
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Total Supplied</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(risk.totalSuppliedUsd)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Total Borrowed</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(risk.totalBorrowUsd)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Available Borrow</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(risk.availableBorrowUsd)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Health Factor</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{formatHealthFactor(risk.healthFactor)}</p>
+            </div>
+          </div>
+
+          <LendingAssetSnapshot lendingSurface={lendingSurface} />
+        </div>
+      </Card>
+
+      <Card>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-start gap-3">
+            <BarChart3 size={18} className="text-slate-400 shrink-0 mt-1" />
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">Reserve Watchlist</h3>
+              <p className="mt-1 text-sm text-slate-500">Watch the first stable assets for supply APY, borrow APY, utilization, and fallback state before live execution opens.</p>
+            </div>
+          </div>
+          <p className="text-xs text-slate-400">Updated {formatTimestamp(lendingSnapshot?.fetchedAt)}</p>
+        </div>
+
+        {hasFallbackData && (
+          <Alert type="warning">Reserve data is still acting as a market watchlist. Lending execution stays disabled while the first Arc lending lane, reserve model, and risk guard are being implemented.</Alert>
+        )}
+
+        {loading && reserves.length === 0 ? (
+          <div className="flex justify-center py-10"><Spinner /></div>
+        ) : (
+          <div className="mt-4 grid gap-4 xl:grid-cols-2">
+            {reserveCards.map(reserve => {
+              const sourceStatus = getLendingSourceStatus(reserve);
+              return (
+                <div key={reserve.asset} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-lg font-semibold text-slate-900">{reserve.asset}</p>
+                      <p className="mt-1 text-xs text-slate-500">{String(reserve.market || 'aave_v3').replace(/_/g, ' ')}</p>
+                    </div>
+                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(sourceStatus.tone)}`}>
+                      {sourceStatus.label}
+                    </span>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Supply APY</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">{formatLendingRate(reserve.supplyApy)}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Borrow APY</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">{formatLendingRate(reserve.borrowApy, { hideZero: true })}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Utilization</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">{formatLendingRate(reserve.utilization, { hideZero: true })}</p>
+                    </div>
+                  </div>
+
+                  <p className="mt-3 text-xs leading-5 text-slate-500">
+                    {reserve.isFallback
+                      ? formatLendingFallbackReason(reserve.fallbackReason)
+                      : 'Live on-chain reserve data is available for this asset.'}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </Card>
     </div>
   );
@@ -1039,6 +1677,10 @@ export default function DeFiTab() {
   const [error, setError] = useState('');
   const [poolSnapshots, setPoolSnapshots] = useState({});
   const [positionSnapshot, setPositionSnapshot] = useState({ positions: [], warnings: [] });
+  const [lendingSnapshot, setLendingSnapshot] = useState(() => createEmptyLendingSnapshot());
+  const [lendingSurface, setLendingSurface] = useState(() => createEmptyLendingSurface());
+  const [lendingError, setLendingError] = useState('');
+  const [lendingSurfaceError, setLendingSurfaceError] = useState('');
 
   const load = useCallback(async () => {
     if (!agent?.id) return;
@@ -1047,8 +1689,14 @@ export default function DeFiTab() {
     setError('');
 
     try {
-      const [positionsRes, ...snapshotResults] = await Promise.all([
+      const [positionsRes, lendingRes, lendingSurfaceRes, ...snapshotResults] = await Promise.all([
         agentsApi.positions(agent.id).catch(() => ({ positions: [], warnings: [] })),
+        oracleApi.reserveState(LENDING_WATCH_ASSETS)
+          .then(data => ({ data }))
+          .catch(loadError => ({ error: loadError.message || 'Reserve watch data is unavailable right now.' })),
+        agentsApi.lending(agent.id)
+          .then(data => ({ data }))
+          .catch(loadError => ({ error: loadError.message || 'Native lending surface is unavailable right now.' })),
         ...DEFI_POOL_CONFIG.map(pool => (
           oracleApi.poolState(pool.key, pool.venue)
             .then(data => ({ key: pool.key, data }))
@@ -1060,6 +1708,10 @@ export default function DeFiTab() {
         positions: positionsRes?.positions || [],
         warnings: positionsRes?.warnings || [],
       });
+      setLendingSnapshot(lendingRes?.data || createEmptyLendingSnapshot());
+      setLendingError(lendingRes?.error || '');
+      setLendingSurface(lendingSurfaceRes?.data || createEmptyLendingSurface());
+      setLendingSurfaceError(lendingSurfaceRes?.error || '');
       setPoolSnapshots(Object.fromEntries(snapshotResults.map(result => [result.key, result])));
     } catch (loadError) {
       setError(loadError.message || 'Failed to load the DeFi surface.');
@@ -1147,7 +1799,19 @@ export default function DeFiTab() {
       {error && <Alert type="error">{error}</Alert>}
 
       {activeSection === 'lending' ? (
-        <LendingPlaceholder />
+        <LendingSection
+          loading={loading}
+          lendingSnapshot={lendingSnapshot}
+          lendingError={lendingError}
+          lendingSurface={lendingSurface}
+          lendingSurfaceError={lendingSurfaceError}
+          agentId={agent?.id}
+          onRunQueued={() => {
+            window.setTimeout(() => {
+              load();
+            }, 1500);
+          }}
+        />
       ) : loading ? (
         <div className="flex justify-center py-10"><Spinner /></div>
       ) : (

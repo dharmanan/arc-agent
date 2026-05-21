@@ -285,6 +285,12 @@ const PAID_TASK_ACTIVITY_SUPPORTED_IDS = new Set([
   'EXEC_CIRBTC_EURC_LP_REMOVE',
   'EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_REMOVE_SINGLE',
   'EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_REMOVE_DUAL',
+  'EXEC_MANUAL_LENDING_SUPPLY',
+  'EXEC_MANUAL_LENDING_WITHDRAW',
+  'EXEC_MANUAL_LENDING_BORROW',
+  'EXEC_MANUAL_LENDING_REPAY',
+  'EXEC_MANUAL_LENDING_DELEVERAGE',
+  'EXEC_MANUAL_LENDING_LIQUIDATE',
   'EXEC_CCTP_BRIDGE',
   'EXEC_SEPOLIA_GAS_FANOUT',
   'EXEC_ARB',
@@ -2140,6 +2146,54 @@ const BUILTIN_TIER2_TASKS = [
     enabled:     false,
   },
   {
+    id:          'EXEC_MANUAL_LENDING_SUPPLY',
+    title:       'Manual Lending Supply',
+    description: 'Hidden manual DeFi primitive for Arc lending supply actions',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
+    id:          'EXEC_MANUAL_LENDING_WITHDRAW',
+    title:       'Manual Lending Withdraw',
+    description: 'Hidden manual DeFi primitive for Arc lending withdraw actions',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
+    id:          'EXEC_MANUAL_LENDING_BORROW',
+    title:       'Manual Lending Borrow',
+    description: 'Hidden manual DeFi primitive for Arc lending borrow actions',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
+    id:          'EXEC_MANUAL_LENDING_REPAY',
+    title:       'Manual Lending Repay',
+    description: 'Hidden manual DeFi primitive for Arc lending repay actions',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
+    id:          'EXEC_MANUAL_LENDING_DELEVERAGE',
+    title:       'Manual Lending Deleverage',
+    description: 'Hidden manual DeFi primitive for deterministic emergency lending deleverage',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
+    id:          'EXEC_MANUAL_LENDING_LIQUIDATE',
+    title:       'Manual Lending Liquidate',
+    description: 'Hidden manual DeFi primitive for Arc lending liquidation actions',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
     id:          'EXEC_CCTP_BRIDGE',
     title:       'CCTP Bridge',
     description: 'Bridge USDC from Arc Testnet to one selected EVM testnet via Circle CCTP V2',
@@ -2387,6 +2441,52 @@ async function _recordPaidTaskActivity(agentId, taskId, payload, executionMeta) 
       token: payload?.targetToken || payload?.stableToken || 'USDC',
       amount: payload?.lpAmount || payload?.targetTokenAmount || 0,
       txHash: payload?.swapTxHash || payload?.burnTxHash || payload?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_MANUAL_LENDING_SUPPLY' || taskId === 'EXEC_MANUAL_LENDING_WITHDRAW' || taskId === 'EXEC_MANUAL_LENDING_BORROW' || taskId === 'EXEC_MANUAL_LENDING_REPAY') {
+    await _insertTaskActivityRecord(agentId, {
+      type: `lending_${String(payload?.action || '').toLowerCase() || 'action'}`,
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.asset || 'USDC',
+      amount: payload?.amount || 0,
+      txHash: payload?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_MANUAL_LENDING_DELEVERAGE') {
+    const firstStep = Array.isArray(payload?.stepsExecuted) && payload.stepsExecuted.length > 0
+      ? payload.stepsExecuted[0]
+      : (Array.isArray(payload?.plannedSteps) && payload.plannedSteps.length > 0 ? payload.plannedSteps[0] : null);
+
+    await _insertTaskActivityRecord(agentId, {
+      type: 'lending_deleverage',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: firstStep?.asset || 'USDC',
+      amount: payload?.repayUsdPlanned || firstStep?.usdAmount || 0,
+      txHash: firstStep?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_MANUAL_LENDING_LIQUIDATE') {
+    await _insertTaskActivityRecord(agentId, {
+      type: 'lending_liquidation',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.debtAsset || 'USDC',
+      amount: payload?.amount || 0,
+      txHash: payload?.txHash || null,
       status,
       meta: executionMeta,
     });
@@ -3059,6 +3159,53 @@ registerPaidTaskProcessor('EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_REMOVE_DUAL', 2, as
     params,
     dryRun,
     stableToken: params.stableToken || 'USDC',
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_SUPPLY', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingSupplyTask({
+    agent,
+    params,
+    dryRun,
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_WITHDRAW', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingWithdrawTask({
+    agent,
+    params,
+    dryRun,
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_BORROW', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingBorrowTask({
+    agent,
+    params,
+    dryRun,
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_REPAY', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingRepayTask({
+    agent,
+    params,
+    dryRun,
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_DELEVERAGE', 2, async ({ agent, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingEmergencyDeleverageTask({
+    agent,
+    dryRun,
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_LIQUIDATE', 2, async ({ agent, params, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingLiquidationTask({
+    agent,
+    params,
+    dryRun,
   })
 ), MANUAL_DEFI_PAID_TASK_OPTIONS);
 

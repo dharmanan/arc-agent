@@ -16,6 +16,7 @@ const llmService    = require('../services/llmService');
 const reputationService = require('../services/reputationService');
 const positionsService = require('../services/positionsService');
 const lpRewardService = require('../services/lpRewardService');
+const nativeLendingRiskService = require('../services/nativeLendingRiskService');
 const agentQueue = require('../queue/agentQueue');
 const { encrypt }   = require('../services/cryptoService');
 
@@ -206,6 +207,15 @@ router.get('/:id/positions', async (req, res, next) => {
     const positions = await positionsService.getAgentPositions(req.params.id, req.user.userId);
     if (!positions) return res.status(404).json({ error: 'Agent not found' });
     res.json(positions);
+  } catch (err) { next(err); }
+});
+
+// ── Native lending surface ───────────────────────────────────────────────────
+router.get('/:id/lending', async (req, res, next) => {
+  try {
+    const surface = await nativeLendingRiskService.getAgentLendingSurface(req.params.id, req.user.userId);
+    if (!surface) return res.status(404).json({ error: 'Agent not found' });
+    res.json(surface);
   } catch (err) { next(err); }
 });
 

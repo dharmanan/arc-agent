@@ -75,6 +75,7 @@ export const agents = {
   testLlm:           (id, data)  => post(`/agents/${id}/test-llm`, data),
   updatePermissions: (id, perms) => put(`/agents/${id}/permissions`, perms),
   status:            (id)        => get(`/agents/${id}/status`),
+  lending:           (id)        => get(`/agents/${id}/lending`),
   positions:         (id)        => get(`/agents/${id}/positions`),
   rewards:           (id, options = {}) => {
     const params = new URLSearchParams();
@@ -157,6 +158,15 @@ export const oracle = {
     if (venue) params.set('venue', venue);
     const suffix = params.toString() ? `?${params.toString()}` : '';
     return get(`/oracle/pool-state${suffix}`);
+  },
+  reserveState: (assets) => {
+    const params = new URLSearchParams();
+    const normalizedAssets = Array.isArray(assets)
+      ? assets.filter(Boolean).join(',')
+      : String(assets || '').trim();
+    if (normalizedAssets) params.set('assets', normalizedAssets);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return get(`/oracle/reserve-state${suffix}`);
   },
   gatewayBalance: (agentId, chainName) => {
     const params = new URLSearchParams({ agentId });

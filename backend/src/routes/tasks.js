@@ -13,6 +13,7 @@ const queue           = require('../queue/agentQueue');
 const { ethers }      = require('ethers');
 const { isDailyLimitBypassed } = require('../services/dailyLimitBypass');
 const taskRunService = require('../services/taskRunService');
+const nativeLendingRiskService = require('../services/nativeLendingRiskService');
 const { getAgentWithKey } = require('../services/agentService');
 const {
   buildCirclePaidHandoff,
@@ -71,6 +72,15 @@ const MANUAL_DEFI_DIRECT_PAIR_STABLE_BY_POOL = {
   'EURC-CIRBTC': 'EURC',
   'CIRBTC-EURC': 'EURC',
 };
+const MANUAL_LENDING_ACTION_TASK_IDS = {
+  supply: 'EXEC_MANUAL_LENDING_SUPPLY',
+  withdraw: 'EXEC_MANUAL_LENDING_WITHDRAW',
+  borrow: 'EXEC_MANUAL_LENDING_BORROW',
+  repay: 'EXEC_MANUAL_LENDING_REPAY',
+  deleverage: 'EXEC_MANUAL_LENDING_DELEVERAGE',
+  liquidate: 'EXEC_MANUAL_LENDING_LIQUIDATE',
+};
+const MANUAL_LENDING_ASSETS = new Set(['USDC', 'EURC']);
 const CCTP_CHAIN_NAMES = new Set([
   'Arc Testnet',
   'Sepolia',
@@ -112,11 +122,76 @@ function _resolveCurveSwapRoute(params) {
   return null;
 }
 
+function _resolveManualLendingExecution(body, params) {
+  const action = String(body?.action || '').trim().toLowerCase();
+  const asset = String(body?.asset || params?.asset || params?.symbol || '').trim().toUpperCase();
+  const amount = params?.amount ?? body?.amount;
+
+  if (!action) return { error: 'manual_lending_action_required' };
+  if (!MANUAL_LENDING_ACTION_TASK_IDS[action]) return { error: 'manual_lending_action_invalid' };
+
+  if (action === 'deleverage') {
+    return {
+      lane: 'lending',
+      taskId: MANUAL_LENDING_ACTION_TASK_IDS[action],
+      action,
+      params: {
+        action,
+      },
+    };
+  }
+
+  if (action === 'liquidate') {
+    const borrower = String(params?.borrower || params?.borrowerAddress || body?.borrower || '').trim();
+    const debtAsset = String(params?.debtAsset || asset || '').trim().toUpperCase();
+    const collateralAsset = String(params?.collateralAsset || body?.collateralAsset || '').trim().toUpperCase();
+
+    if (!borrower) return { error: 'lending_liquidation_borrower_required' };
+    if (!MANUAL_LENDING_ASSETS.has(debtAsset)) return { error: 'manual_lending_asset_invalid' };
+    if (!MANUAL_LENDING_ASSETS.has(collateralAsset)) return { error: 'lending_liquidation_collateral_asset_invalid' };
+    if (!_isPositiveNumber(amount)) return { error: 'lending_liquidation_amount_required' };
+
+    return {
+      lane: 'lending',
+      taskId: MANUAL_LENDING_ACTION_TASK_IDS[action],
+      action,
+      asset: debtAsset,
+      params: {
+        action,
+        borrower,
+        debtAsset,
+        collateralAsset,
+        amount: Number(amount),
+      },
+    };
+  }
+
+  if (!MANUAL_LENDING_ASSETS.has(asset)) return { error: 'manual_lending_asset_invalid' };
+  if (!_isPositiveNumber(amount)) return { error: 'lending_amount_required' };
+
+  return {
+    lane: 'lending',
+    taskId: MANUAL_LENDING_ACTION_TASK_IDS[action],
+    action,
+    asset,
+    params: {
+      action,
+      asset,
+      amount: Number(amount),
+    },
+  };
+}
+
 function _resolveManualDefiExecution(body) {
+  const lane = String(body?.lane || body?.surface || body?.section || '').trim().toLowerCase();
   const poolKey = String(body?.poolKey || body?.pool || '').trim().toUpperCase();
   const venue = String(body?.venue || '').trim().toLowerCase();
   const action = String(body?.action || '').trim().toLowerCase();
   const params = _normalizeManualDefiParams(body?.params);
+
+  if (lane === 'lending') {
+    return _resolveManualLendingExecution(body, params);
+  }
 
   if (!poolKey) return { error: 'manual_defi_pool_required' };
   if (!action) return { error: 'manual_defi_action_required' };
@@ -362,6 +437,9 @@ function _getInlineTaskFailureStatus(reason) {
       return 502;
     case 'position_guard_unavailable':
     case 'manual_task_queue_unavailable':
+    case 'lending_contract_not_configured':
+    case 'lending_contract_scaffold_only':
+    case 'lending_globally_paused':
       return 503;
     case 'swap_not_configured':
     case 'direct_pair_not_configured':
@@ -371,6 +449,27 @@ function _getInlineTaskFailureStatus(reason) {
     case 'lp_position_exit_required':
     case 'direct_pair_lp_not_found':
     case 'direct_pair_seed_required':
+    case 'lending_reserve_not_supported':
+    case 'lending_reserve_paused':
+    case 'lending_reserve_borrow_disabled':
+    case 'lending_wallet_balance_empty':
+    case 'lending_wallet_balance_too_low':
+    case 'lending_supply_position_required':
+    case 'lending_borrow_position_required':
+    case 'lending_supply_cap_reached':
+    case 'lending_borrow_cap_reached':
+    case 'lending_borrow_capacity_unavailable':
+    case 'lending_borrow_capacity_exceeded':
+    case 'lending_withdraw_amount_exceeds_supply':
+    case 'lending_repay_amount_exceeds_debt':
+    case 'lending_deleverage_not_required':
+    case 'lending_deleverage_wallet_funds_required':
+    case 'lending_liquidation_self_target_invalid':
+    case 'lending_liquidation_target_healthy':
+    case 'lending_liquidation_target_debt_missing':
+    case 'lending_liquidation_target_collateral_missing':
+    case 'lending_liquidation_amount_too_high':
+    case 'lending_liquidation_health_unknown':
     case 'task_already_running':
       return 409;
     case 'curve_pool_not_configured':
@@ -378,6 +477,13 @@ function _getInlineTaskFailureStatus(reason) {
     case 'bridge_params_required':
     case 'wallet_not_configured':
     case 'no_private_key':
+    case 'manual_lending_action_required':
+    case 'manual_lending_action_invalid':
+    case 'manual_lending_asset_invalid':
+    case 'lending_amount_required':
+    case 'lending_liquidation_borrower_required':
+    case 'lending_liquidation_collateral_asset_invalid':
+    case 'lending_liquidation_amount_required':
     default:
       return 400;
   }
@@ -873,10 +979,44 @@ router.post('/agents/:id/defi/manual/execute', requireAuth, async (req, res, nex
     }
 
     const { rows: [agent] } = await db.query(
-      `SELECT id FROM agents WHERE id = $1 AND user_id = $2`,
+      `SELECT id, wallet_address FROM agents WHERE id = $1 AND user_id = $2`,
       [agentId, req.user.userId],
     );
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    if (resolution.lane === 'lending') {
+      let validation;
+
+      if (resolution.action === 'deleverage') {
+        validation = await nativeLendingRiskService.guardAgentEmergencyDeleverage({ agent });
+      } else if (resolution.action === 'liquidate') {
+        validation = await nativeLendingRiskService.guardAgentLiquidationAction({
+          agent,
+          borrower: resolution.params.borrower,
+          debtAsset: resolution.params.debtAsset,
+          collateralAsset: resolution.params.collateralAsset,
+          amount: resolution.params.amount,
+        });
+      } else {
+        validation = await nativeLendingRiskService.guardAgentManualLendingAction({
+          agent,
+          action: resolution.action,
+          asset: resolution.asset,
+          amount: resolution.params.amount,
+        });
+      }
+
+      if (!validation.ok) {
+        return res.status(_getInlineTaskFailureStatus(validation.code)).json({
+          error: validation.code,
+          detail: validation.verdict?.detail || 'Manual lending action blocked by the current risk guard.',
+          risk: validation.surface?.risk || validation.borrowerSurface?.risk || null,
+          recovery: validation.surface?.recovery || null,
+          liquidation: validation.borrowerSurface?.liquidation || validation.surface?.liquidation || null,
+          actionGuard: validation.surface?.actionGuards?.[resolution.asset]?.[resolution.action] || null,
+        });
+      }
+    }
 
     const { rows: [task] } = await db.query(
       `SELECT id, tier, fee_usdc FROM task_catalog WHERE id = $1`,
@@ -919,8 +1059,11 @@ router.post('/agents/:id/defi/manual/execute', requireAuth, async (req, res, nex
     return res.status(202).json({
       queued: true,
       inline: false,
+      lane: resolution.lane || 'liquidity',
       poolKey: resolution.poolKey,
       action: resolution.action,
+      asset: resolution.asset || null,
+      borrower: resolution.params?.borrower || null,
       feeUsdc: Number(task.fee_usdc) || 0,
       run,
     });

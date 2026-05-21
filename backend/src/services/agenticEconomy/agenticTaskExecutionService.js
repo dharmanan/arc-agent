@@ -5,6 +5,7 @@ const protocols = require('../protocols');
 const agentWalletService = require('../agentWalletService');
 const positionsService = require('../positionsService');
 const { decrypt } = require('../cryptoService');
+const nativeLendingRiskService = require('../nativeLendingRiskService');
 const { resolveDirectSwapFallbackPool } = require('../oracle/pools');
 const { evaluateStableAutomationPolicy } = require('../stableAutomationPolicy');
 
@@ -1089,6 +1090,320 @@ async function executeYieldMoveTask({ agent, params = {}, dryRun = false }) {
   };
 }
 
+async function _executeNativeLendingTask({ agent, params = {}, dryRun = false, action }) {
+  const asset = String(params.asset || params.symbol || '').trim().toUpperCase();
+  const amount = String(params.amount ?? '0');
+
+  const validation = await nativeLendingRiskService.guardAgentManualLendingAction({
+    agent,
+    action,
+    asset,
+    amount,
+  });
+
+  if (!validation.ok) {
+    return {
+      ok: false,
+      reason: validation.code,
+      error: validation.verdict?.detail || 'Manual lending action blocked by the current risk guard.',
+    };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
+  }
+
+  const assetEntry = validation.asset;
+  const walletAddress = agent.wallet_address || agent.walletAddress;
+  const basePayload = {
+    action,
+    asset: assetEntry.symbol,
+    amount,
+    assetAddress: assetEntry.assetAddress,
+    executionRail: 'arc_native_lending',
+    executionSource: validation.surface.execution.source,
+    buildState: validation.surface.execution.buildState,
+    riskBand: validation.surface.risk.band,
+    healthFactor: validation.surface.risk.healthFactor,
+    availableBorrowUsd: validation.surface.risk.availableBorrowUsd,
+  };
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        dryRun: true,
+        summary: `Would ${action} ${amount} ${assetEntry.symbol} on the Arc-native lending lane.`,
+      }),
+    };
+  }
+
+  try {
+    const agentPrivateKey = decrypt(agent.private_key_encrypted);
+    let result;
+
+    if (action === 'supply') {
+      result = await protocols.executeNativeLendingSupply({
+        assetAddress: assetEntry.assetAddress,
+        amount,
+        agentPrivateKey,
+        onBehalfOf: walletAddress,
+        decimals: assetEntry.decimals,
+      });
+    } else if (action === 'withdraw') {
+      result = await protocols.executeNativeLendingWithdraw({
+        assetAddress: assetEntry.assetAddress,
+        amount,
+        agentPrivateKey,
+        to: walletAddress,
+        decimals: assetEntry.decimals,
+      });
+    } else if (action === 'borrow') {
+      result = await protocols.executeNativeLendingBorrow({
+        assetAddress: assetEntry.assetAddress,
+        amount,
+        agentPrivateKey,
+        to: walletAddress,
+        decimals: assetEntry.decimals,
+      });
+    } else {
+      result = await protocols.executeNativeLendingRepay({
+        assetAddress: assetEntry.assetAddress,
+        amount,
+        agentPrivateKey,
+        onBehalfOf: walletAddress,
+        decimals: assetEntry.decimals,
+      });
+    }
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...result,
+        ...basePayload,
+        summary: `${action[0].toUpperCase()}${action.slice(1)} ${amount} ${assetEntry.symbol} on the Arc-native lending lane.`,
+      }),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'native_lending_execution_error',
+      error: error.message,
+    };
+  }
+}
+
+async function executeNativeLendingSupplyTask({ agent, params = {}, dryRun = false }) {
+  return _executeNativeLendingTask({
+    agent,
+    params,
+    dryRun,
+    action: 'supply',
+  });
+}
+
+async function executeNativeLendingWithdrawTask({ agent, params = {}, dryRun = false }) {
+  return _executeNativeLendingTask({
+    agent,
+    params,
+    dryRun,
+    action: 'withdraw',
+  });
+}
+
+async function executeNativeLendingBorrowTask({ agent, params = {}, dryRun = false }) {
+  return _executeNativeLendingTask({
+    agent,
+    params,
+    dryRun,
+    action: 'borrow',
+  });
+}
+
+async function executeNativeLendingRepayTask({ agent, params = {}, dryRun = false }) {
+  return _executeNativeLendingTask({
+    agent,
+    params,
+    dryRun,
+    action: 'repay',
+  });
+}
+
+async function executeNativeLendingEmergencyDeleverageTask({ agent, dryRun = false }) {
+  const validation = await nativeLendingRiskService.guardAgentEmergencyDeleverage({ agent });
+  if (!validation.ok) {
+    return {
+      ok: false,
+      reason: validation.code,
+      error: validation.verdict?.detail || 'Emergency deleverage is not available right now.',
+    };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
+  }
+
+  const basePayload = {
+    action: 'deleverage',
+    executionRail: 'arc_native_lending',
+    executionSource: validation.surface.execution.source,
+    buildState: validation.surface.execution.buildState,
+    currentHealthFactor: validation.verdict.currentHealthFactor,
+    targetHealthFactor: validation.verdict.targetHealthFactor,
+    projectedHealthFactor: validation.verdict.projectedHealthFactor,
+    repayUsdNeeded: validation.verdict.repayUsdNeeded,
+    repayUsdPlanned: validation.verdict.repayUsdPlanned,
+    repayUsdShortfall: validation.verdict.repayUsdShortfall,
+    recoveryStatus: validation.verdict.status,
+    plannedSteps: validation.verdict.steps,
+  };
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        dryRun: true,
+        summary: 'Would run the deterministic emergency deleverage plan for the current lending account.',
+      }),
+    };
+  }
+
+  const agentPrivateKey = decrypt(agent.private_key_encrypted);
+  const walletAddress = agent.wallet_address || agent.walletAddress;
+  const assetMap = new Map((validation.surface.assets || []).map((assetEntry) => [assetEntry.symbol, assetEntry]));
+  const executedSteps = [];
+
+  try {
+    for (const step of validation.verdict.steps || []) {
+      const assetEntry = assetMap.get(step.asset);
+      if (!assetEntry) {
+        throw new Error(`Missing lending asset snapshot for ${step.asset}`);
+      }
+
+      const result = await protocols.executeNativeLendingRepay({
+        assetAddress: assetEntry.assetAddress,
+        amount: step.amount,
+        agentPrivateKey,
+        onBehalfOf: walletAddress,
+        decimals: assetEntry.decimals,
+      });
+
+      executedSteps.push({
+        ...step,
+        txHash: result.txHash || null,
+      });
+    }
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        stepsExecuted: executedSteps,
+        summary: 'Executed the deterministic emergency deleverage plan for the current lending account.',
+      }),
+    };
+  } catch (error) {
+    if (executedSteps.length > 0) {
+      return {
+        ok: true,
+        payload: _timestamped({
+          ...basePayload,
+          stepsExecuted: executedSteps,
+          partialFailure: {
+            error: error.message,
+          },
+          summary: 'Emergency deleverage started, but not all planned repay steps completed.',
+        }),
+      };
+    }
+
+    return {
+      ok: false,
+      reason: 'native_lending_deleverage_error',
+      error: error.message,
+    };
+  }
+}
+
+async function executeNativeLendingLiquidationTask({ agent, params = {}, dryRun = false }) {
+  const borrower = String(params.borrower || params.borrowerAddress || '').trim();
+  const debtAsset = String(params.debtAsset || params.asset || '').trim().toUpperCase();
+  const collateralAsset = String(params.collateralAsset || '').trim().toUpperCase();
+  const amount = String(params.amount ?? '0');
+
+  const validation = await nativeLendingRiskService.guardAgentLiquidationAction({
+    agent,
+    borrower,
+    debtAsset,
+    collateralAsset,
+    amount,
+  });
+
+  if (!validation.ok) {
+    return {
+      ok: false,
+      reason: validation.code,
+      error: validation.verdict?.detail || 'Liquidation is not available right now.',
+    };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
+  }
+
+  const basePayload = {
+    action: 'liquidate',
+    borrower,
+    debtAsset,
+    collateralAsset,
+    amount,
+    executionRail: 'arc_native_lending',
+    executionSource: validation.liquidatorSurface.execution.source,
+    buildState: validation.liquidatorSurface.execution.buildState,
+    borrowerHealthFactor: validation.borrowerSurface.risk.healthFactor,
+  };
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        dryRun: true,
+        summary: `Would liquidate ${amount} ${debtAsset} of debt from ${borrower}.`,
+      }),
+    };
+  }
+
+  try {
+    const agentPrivateKey = decrypt(agent.private_key_encrypted);
+    const result = await protocols.executeNativeLendingLiquidation({
+      borrower,
+      debtAssetAddress: validation.verdict.borrowerDebtEntry.assetAddress,
+      collateralAssetAddress: validation.verdict.borrowerCollateralEntry.assetAddress,
+      amount,
+      agentPrivateKey,
+      debtAssetDecimals: validation.verdict.borrowerDebtEntry.decimals,
+    });
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        ...result,
+        summary: `Liquidated ${amount} ${debtAsset} of debt from ${borrower}.`,
+      }),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'native_lending_liquidation_error',
+      error: error.message,
+    };
+  }
+}
+
 async function executeArbTask({ agent, params = {}, dryRun = false, pricingPool, swapPool }) {
   const poolAddress = params.poolAddress || swapPool?.address || process.env.CURVE_USDC_EURC_POOL || null;
   const amountIn = String(params.amountIn ?? '1');
@@ -1327,6 +1642,12 @@ module.exports = {
   executeCurveLiquidityRemoveBalancedTask,
   executeCurveLiquidityRemoveTask,
   executeCurveSwapTask,
+  executeNativeLendingEmergencyDeleverageTask,
+  executeNativeLendingBorrowTask,
+  executeNativeLendingLiquidationTask,
+  executeNativeLendingRepayTask,
+  executeNativeLendingSupplyTask,
+  executeNativeLendingWithdrawTask,
   executeRebalanceTask,
   executeSepoliaGasFanoutTask,
   executeYieldMoveTask,
