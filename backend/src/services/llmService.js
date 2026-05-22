@@ -16,6 +16,10 @@ const redis      = require('./redisClient');
 const { decrypt } = require('./cryptoService');
 
 const CACHE_TTL = parseInt(process.env.LLM_CACHE_TTL || '300', 10); // seconds
+const CHAT_MAX_TOKENS = (() => {
+  const parsed = Number.parseInt(process.env.LLM_CHAT_MAX_TOKENS || '256', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 256;
+})();
 
 // Testnet-approved models — cost-effective tier only
 // Each entry: [modelId, provider]
@@ -83,7 +87,7 @@ async function callLlm({ model, apiKey, systemPrompt, userPrompt, agentId }) {
   if (model.startsWith('claude')) {
     const msg = await client.messages.create({
       model,
-      max_tokens: 1024,
+      max_tokens: CHAT_MAX_TOKENS,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }],
     });
@@ -91,7 +95,7 @@ async function callLlm({ model, apiKey, systemPrompt, userPrompt, agentId }) {
   } else {
     const resp = await client.chat.completions.create({
       model,
-      max_tokens: 1024,
+      max_tokens: CHAT_MAX_TOKENS,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: userPrompt   },

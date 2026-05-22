@@ -30,6 +30,17 @@ const db                   = require('./db');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+function isEnvEnabled(name, defaultValue = true) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+
+  return !['0', 'false', 'no', 'off'].includes(String(raw).trim().toLowerCase());
+}
+
+const BACKGROUND_JOBS_ENABLED = isEnvEnabled('BACKGROUND_JOBS_ENABLED', true);
+const HEALTHCHECK_DB_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_DB_PROBE_ENABLED', true);
+const HEALTHCHECK_REDIS_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_REDIS_PROBE_ENABLED', true);
+
 // Trust proxy headers (needed for rate limiter behind Codespace/nginx proxy)
 app.set('trust proxy', 1);
 
@@ -87,31 +98,50 @@ app.use('/api/agents/:id/jobs', jobsRoutes);
 
 // ── Root info ─────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
-  res.json({ name: 'Arc Machina API', version: '1.0.0', status: 'running', docs: '/health' });
+  res.json({
+    name: 'Arc Machina API',
+    version: '1.0.0',
+    status: 'running',
+    readiness: '/readyz',
+    diagnostics: '/health',
+  });
+});
+
+app.get('/readyz', (_req, res) => {
+  res.json({ status: 'ok', ts: new Date().toISOString() });
 });
 
 // ── Health probe ──────────────────────────────────────────────────────────────
 app.get('/health', async (_req, res) => {
-  const health = { status: 'ok', db: 'ok', redis: 'ok', ts: new Date().toISOString() };
+  const health = {
+    status: 'ok',
+    db: HEALTHCHECK_DB_PROBE_ENABLED ? 'ok' : 'skipped',
+    redis: HEALTHCHECK_REDIS_PROBE_ENABLED ? 'ok' : 'skipped',
+    ts: new Date().toISOString(),
+  };
   let httpStatus = 200;
 
-  try {
-    await db.query('SELECT 1');
-  } catch (err) {
-    health.db = 'error';
-    health.dbError = err.message;
-    health.status = 'degraded';
-    httpStatus = 503;
+  if (HEALTHCHECK_DB_PROBE_ENABLED) {
+    try {
+      await db.query('SELECT 1');
+    } catch (err) {
+      health.db = 'error';
+      health.dbError = err.message;
+      health.status = 'degraded';
+      httpStatus = 503;
+    }
   }
 
-  try {
-    const redisClient = await ensureRedisReady();
-    await redisClient.ping();
-  } catch (err) {
-    health.redis = 'error';
-    health.redisError = err.message;
-    health.status = 'degraded';
-    httpStatus = 503;
+  if (HEALTHCHECK_REDIS_PROBE_ENABLED) {
+    try {
+      const redisClient = await ensureRedisReady();
+      await redisClient.ping();
+    } catch (err) {
+      health.redis = 'error';
+      health.redisError = err.message;
+      health.status = 'degraded';
+      httpStatus = 503;
+    }
   }
 
   res.status(httpStatus).json(health);
@@ -191,31 +221,35 @@ async function bootstrap() {
     console.error('[REDIS] startup warning:', err.message);
   }
 
-  startChainEventRetention();
-  startJobRetention();
-  startLpRewardEpochSnapshotWriter();
+  if (BACKGROUND_JOBS_ENABLED) {
+    startChainEventRetention();
+    startJobRetention();
+    startLpRewardEpochSnapshotWriter();
 
-  // Start blockchain event indexer (non-blocking)
-  startIndexer().catch(err => console.error('[INDEXER] startup error', err));
+    // Start blockchain event indexer (non-blocking)
+    startIndexer().catch(err => console.error('[INDEXER] startup error', err));
 
-  // Inject cctpMint + agentFetch into bridge activity poller (circular dep'i kır)
-  bridgeActivityService.setMintInjection(
-    agentWalletService.cctpMint,
-    (agentId) => agentService.getAgentWithKeyById(agentId),
-  );
-  bridgeActivityService.startPoller();
+    // Inject cctpMint + agentFetch into bridge activity poller (circular dep'i kır)
+    bridgeActivityService.setMintInjection(
+      agentWalletService.cctpMint,
+      (agentId) => agentService.getAgentWithKeyById(agentId),
+    );
+    bridgeActivityService.startPoller();
 
-  // Start oracle query loop (only runs for agents with oracle_enabled = TRUE)
-  agentQueue.scheduleOracleLoop().catch(err => console.error('[ORACLE_LOOP] startup error', err));
+    // Start oracle query loop (only runs for agents with oracle_enabled = TRUE)
+    agentQueue.scheduleOracleLoop().catch(err => console.error('[ORACLE_LOOP] startup error', err));
 
-  // Start market analysis loop (only runs for agents with market_analysis_enabled = TRUE)
-  agentQueue.scheduleMarketAnalysisLoop().catch(err => console.error('[MARKET_ANALYSIS_LOOP] startup error', err));
+    // Start market analysis loop (only runs for agents with market_analysis_enabled = TRUE)
+    agentQueue.scheduleMarketAnalysisLoop().catch(err => console.error('[MARKET_ANALYSIS_LOOP] startup error', err));
 
-  // Start DeFi loop (only runs for agents with defi_loop_enabled = TRUE)
-  agentQueue.scheduleDefiLoop().catch(err => console.error('[DEFI_LOOP] startup error', err));
+    // Start DeFi loop (only runs for agents with defi_loop_enabled = TRUE)
+    agentQueue.scheduleDefiLoop().catch(err => console.error('[DEFI_LOOP] startup error', err));
 
-  // Start daily free task scheduler (only for agents with daily_tasks_enabled = TRUE)
-  agentQueue.scheduleDailyTasks().catch(err => console.error('[DAILY_TASKS] startup error', err));
+    // Start daily free task scheduler (only for agents with daily_tasks_enabled = TRUE)
+    agentQueue.scheduleDailyTasks().catch(err => console.error('[DAILY_TASKS] startup error', err));
+  } else {
+    console.log('[BOOT] Background jobs disabled via BACKGROUND_JOBS_ENABLED=false');
+  }
 
   app.listen(PORT, () =>
     console.log(`[SERVER] Arc Machina backend running on port ${PORT} (${process.env.NODE_ENV})`),

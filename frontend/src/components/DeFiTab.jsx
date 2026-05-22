@@ -158,7 +158,25 @@ const LENDING_MANUAL_ACTIONS = [
     ctaLabel: 'Repay',
     icon: RefreshCw,
   },
+  {
+    id: 'deleverage',
+    label: 'Deleverage',
+    title: 'Run emergency deleverage',
+    description: 'Follow the deterministic recovery plan that repays visible debt with the same-asset wallet balance.',
+    ctaLabel: 'Run deleverage',
+    icon: ShieldCheck,
+  },
+  {
+    id: 'liquidate',
+    label: 'Liquidate',
+    title: 'Liquidate another account',
+    description: 'Repay a target borrower debt position and seize the configured collateral when the target is below threshold.',
+    ctaLabel: 'Liquidate',
+    icon: Activity,
+  },
 ];
+
+const LENDING_ASSET_ACTION_IDS = new Set(['supply', 'withdraw', 'borrow', 'repay']);
 
 function createEmptyLendingSnapshot() {
   return {
@@ -388,31 +406,163 @@ function getLendingPriceCard(surface) {
   };
 }
 
+function getLendingExecutionGuard(surface, detailWhenReady) {
+  if (surface?.execution?.globalPaused) {
+    return {
+      execute: false,
+      detail: 'The Arc-native lending lane is globally paused right now.',
+    };
+  }
+
+  if (!surface?.execution?.contractAddress) {
+    return {
+      execute: false,
+      detail: 'The Arc lending contract address is not configured yet.',
+    };
+  }
+
+  if (surface?.execution?.buildState === 'scaffold_only') {
+    return {
+      execute: false,
+      detail: 'The Arc lending contract still reports scaffold-only build state, so live writes stay blocked.',
+    };
+  }
+
+  return {
+    execute: true,
+    detail: detailWhenReady,
+  };
+}
+
 function getLendingActionGuard(surface, assetSymbol, actionId) {
+  if (actionId === 'deleverage') {
+    const recovery = surface?.recovery;
+    return {
+      execute: recovery?.execute === true,
+      detail: recovery?.detail || 'Emergency deleverage state is unavailable right now.',
+    };
+  }
+
+  if (actionId === 'liquidate') {
+    return getLendingExecutionGuard(
+      surface,
+      'Liquidation needs a borrower address, debt asset, collateral asset, and repay amount. The worker re-checks the target health before any on-chain call.',
+    );
+  }
+
   return surface?.actionGuards?.[assetSymbol]?.[actionId] || {
     execute: false,
     detail: 'Guard state is unavailable right now.',
   };
 }
 
-function getDefaultLendingManualParams(surface) {
+function getDefaultLendingManualParams(surface, actionId = 'supply') {
   const assetOptions = Array.isArray(surface?.assets) && surface.assets.length > 0
     ? surface.assets.map(asset => asset.symbol)
     : LENDING_WATCH_ASSETS;
 
+  const primaryAsset = assetOptions[0] || 'USDC';
+  const secondaryAsset = assetOptions.find(asset => asset !== primaryAsset) || primaryAsset;
+
+  if (actionId === 'deleverage') {
+    return {
+      asset: primaryAsset,
+      amount: '',
+      borrower: '',
+      collateralAsset: secondaryAsset,
+    };
+  }
+
+  if (actionId === 'liquidate') {
+    return {
+      asset: primaryAsset,
+      amount: '',
+      borrower: '',
+      collateralAsset: secondaryAsset,
+    };
+  }
+
   return {
-    asset: assetOptions[0] || 'USDC',
+    asset: primaryAsset,
     amount: '',
+    borrower: '',
+    collateralAsset: secondaryAsset,
   };
 }
 
-function getLendingManualActionError(params) {
+function getLendingManualActionError(actionId, params) {
+  if (actionId === 'deleverage') return '';
+
+  if (actionId === 'liquidate') {
+    if (!params.borrower) return 'Enter the borrower wallet address to liquidate.';
+    if (!params.asset) return 'Choose the debt asset used for this liquidation.';
+    if (!params.collateralAsset) return 'Choose the collateral asset to seize.';
+    if (!(Number(params.amount) > 0)) return 'Enter a positive repay amount for this liquidation.';
+    return '';
+  }
+
   if (!params.asset) return 'Choose the asset used for this lending action.';
   if (!(Number(params.amount) > 0)) return 'Enter a positive amount for this lending action.';
   return '';
 }
 
-function LendingManualFields({ assetOptions, params, setParams }) {
+function LendingManualFields({ actionId, assetOptions, params, setParams }) {
+  if (actionId === 'deleverage') {
+    return (
+      <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600">
+        This action follows the visible deterministic recovery plan. No extra amount input is needed.
+      </div>
+    );
+  }
+
+  if (actionId === 'liquidate') {
+    return (
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="sm:col-span-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Borrower</span>
+          <input
+            type="text"
+            value={params.borrower}
+            onChange={(event) => setParams(current => ({ ...current, borrower: event.target.value }))}
+            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#66D121]/40"
+            placeholder="0x..."
+          />
+        </label>
+        <label>
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Debt Asset</span>
+          <select
+            value={params.asset}
+            onChange={(event) => setParams(current => ({ ...current, asset: event.target.value }))}
+            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#66D121]/40"
+          >
+            {assetOptions.map(option => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+        <label>
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Collateral Asset</span>
+          <select
+            value={params.collateralAsset}
+            onChange={(event) => setParams(current => ({ ...current, collateralAsset: event.target.value }))}
+            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#66D121]/40"
+          >
+            {assetOptions.map(option => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+        <label className="sm:col-span-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Repay Amount</span>
+          <input
+            type="number"
+            min="0"
+            step="0.0001"
+            value={params.amount}
+            onChange={(event) => setParams(current => ({ ...current, amount: event.target.value }))}
+            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#66D121]/40"
+          />
+        </label>
+      </div>
+    );
+  }
+
   return (
     <div className="grid gap-2 sm:grid-cols-2">
       <label>
@@ -449,30 +599,78 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
   const [activeActionId, setActiveActionId] = useState(actions[0]?.id || 'supply');
   const activeAction = actions.find(action => action.id === activeActionId) || actions[0] || null;
   const ActionIcon = activeAction?.icon || PlusCircle;
-  const [params, setParams] = useState(() => getDefaultLendingManualParams(lendingSurface));
+  const [params, setParams] = useState(() => getDefaultLendingManualParams(lendingSurface, activeAction?.id));
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [trackedRun, setTrackedRun] = useState(null);
 
   useEffect(() => {
     setParams((current) => {
       const nextAsset = assetOptions.includes(current.asset) ? current.asset : (assetOptions[0] || 'USDC');
-      return { ...current, asset: nextAsset };
+      const nextCollateral = assetOptions.includes(current.collateralAsset)
+        ? current.collateralAsset
+        : (assetOptions.find(asset => asset !== nextAsset) || nextAsset);
+      return { ...current, asset: nextAsset, collateralAsset: nextCollateral };
     });
   }, [assetOptions]);
 
   useEffect(() => {
-    setParams(getDefaultLendingManualParams(lendingSurface));
+    setParams(getDefaultLendingManualParams(lendingSurface, activeAction?.id));
     setMessage('');
     setError('');
-  }, [lendingSurface?.execution?.contractAddress, lendingSurface?.execution?.buildState]);
+  }, [lendingSurface?.execution?.contractAddress, lendingSurface?.execution?.buildState, activeAction?.id]);
+
+  useEffect(() => {
+    if (!agentId || !trackedRun?.id || !isPoolManualRunActive(trackedRun)) {
+      return undefined;
+    }
+
+    let active = true;
+
+    async function syncTrackedRun() {
+      try {
+        const data = await tasksApi.runs(agentId, 'recent', 20);
+        if (!active) return;
+
+        const updatedRun = Array.isArray(data?.runs)
+          ? data.runs.find(item => item.id === trackedRun.id)
+          : null;
+
+        if (!updatedRun) return;
+
+        setTrackedRun(updatedRun);
+
+        if (!isPoolManualRunActive(updatedRun)) {
+          onRunQueued?.(updatedRun);
+          if (updatedRun.status === 'completed') {
+            setMessage(updatedRun.result_payload?.summary || 'Manual lending action completed.');
+            setError('');
+          } else if (updatedRun.status === 'failed') {
+            setError(updatedRun.error || updatedRun.stage_detail || 'The manual lending action failed.');
+          }
+        }
+      } catch (pollError) {
+        if (!active) return;
+        setError(current => current || pollError.message || 'Failed to refresh the manual lending action status.');
+      }
+    }
+
+    syncTrackedRun();
+    const intervalId = window.setInterval(syncTrackedRun, 2500);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [agentId, onRunQueued, trackedRun]);
 
   const activeGuard = getLendingActionGuard(lendingSurface, params.asset, activeAction?.id);
 
   async function handleSubmit() {
     if (!agentId || !activeAction) return;
 
-    const paramError = getLendingManualActionError(params);
+    const paramError = getLendingManualActionError(activeAction.id, params);
     if (paramError) {
       setError(paramError);
       return;
@@ -483,20 +681,47 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
     setMessage('');
 
     try {
-      const response = await defiApi.manualExecute(agentId, {
-        lane: 'lending',
-        action: activeAction.id,
-        asset: params.asset,
-        params: {
+      let request;
+
+      if (activeAction.id === 'deleverage') {
+        request = {
+          lane: 'lending',
+          action: 'deleverage',
+          params: {
+            action: 'deleverage',
+          },
+        };
+      } else if (activeAction.id === 'liquidate') {
+        request = {
+          lane: 'lending',
+          action: 'liquidate',
           asset: params.asset,
-          amount: Number(params.amount),
-        },
-      });
+          params: {
+            borrower: params.borrower,
+            debtAsset: params.asset,
+            collateralAsset: params.collateralAsset,
+            amount: Number(params.amount),
+          },
+        };
+      } else {
+        request = {
+          lane: 'lending',
+          action: activeAction.id,
+          asset: params.asset,
+          params: {
+            asset: params.asset,
+            amount: Number(params.amount),
+          },
+        };
+      }
+
+      const response = await defiApi.manualExecute(agentId, request);
       const feeLabel = Number(response?.feeUsdc) > 0
         ? `${Number(response.feeUsdc).toFixed(2)} USDC fee applied.`
         : 'Fee applied on submit.';
 
       if (response?.run) {
+        setTrackedRun(response.run);
         setMessage(`Queued. ${feeLabel}`);
         onRunQueued?.(response.run);
         return;
@@ -504,11 +729,18 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
 
       setMessage('Submitted.');
     } catch (runError) {
+      if (runError?.data?.run) {
+        setTrackedRun(runError.data.run);
+      }
       setError(runError?.data?.detail || runError.message || 'Failed to run the manual lending action.');
     } finally {
       setBusy(false);
     }
   }
+
+  const trackedRunStatus = trackedRun ? getPoolManualRunStatusMeta(trackedRun) : null;
+  const trackedRunSummary = trackedRun ? getPoolManualRunSummary(trackedRun, activeAction?.title || 'Manual lending action') : '';
+  const trackedRunLinks = trackedRun ? getPoolManualRunLinks(trackedRun) : [];
 
   if (!activeAction) {
     return null;
@@ -557,7 +789,7 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
         </div>
 
         <div className="mt-4 space-y-2">
-          <LendingManualFields assetOptions={assetOptions} params={params} setParams={setParams} />
+          <LendingManualFields actionId={activeAction.id} assetOptions={assetOptions} params={params} setParams={setParams} />
         </div>
 
         <p className="mt-3 text-xs leading-5 text-slate-500">{activeGuard.detail}</p>
@@ -583,6 +815,43 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
             {busy ? 'Submitting...' : activeAction.ctaLabel}
           </button>
         </div>
+
+        {trackedRun && (
+          <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Latest manual action</p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Started {formatTimestamp(trackedRun.created_at)} · Last update {formatTimestamp(trackedRun.updated_at || trackedRun.completed_at || trackedRun.created_at)}
+                </p>
+              </div>
+              {trackedRunStatus && (
+                <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${getStatusBadgeClasses(trackedRunStatus.tone)}`}>
+                  {trackedRunStatus.label}
+                </span>
+              )}
+            </div>
+
+            <p className="mt-3 text-sm leading-6 text-slate-700">{trackedRunSummary}</p>
+
+            {trackedRunLinks.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {trackedRunLinks.map(link => (
+                  <a
+                    key={`${link.label}-${link.txHash}`}
+                    href={link.url || '#'}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                  >
+                    <span>{link.label}</span>
+                    <span>{formatAddressShort(link.txHash)}</span>
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -639,7 +908,7 @@ function LendingAssetSnapshot({ lendingSurface }) {
           </div>
 
           <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-            {LENDING_MANUAL_ACTIONS.map((action) => {
+            {LENDING_MANUAL_ACTIONS.filter(action => LENDING_ASSET_ACTION_IDS.has(action.id)).map((action) => {
               const guard = getLendingActionGuard(lendingSurface, asset.symbol, action.id);
               return (
                 <div key={`${asset.symbol}:${action.id}`} className="rounded-lg border border-slate-200 bg-white px-3 py-3">

@@ -1,6 +1,10 @@
 'use strict';
 const { Pool } = require('pg');
 
+function isFalseLike(value) {
+  return ['0', 'false', 'no', 'off'].includes(String(value || '').trim().toLowerCase());
+}
+
 function sanitizeDatabaseUrl(connectionString) {
   if (!connectionString) return connectionString;
 
@@ -17,12 +21,22 @@ function sanitizeDatabaseUrl(connectionString) {
   }
 }
 
+function resolveSslConfig() {
+  if (process.env.NODE_ENV !== 'production') {
+    return false;
+  }
+
+  return {
+    rejectUnauthorized: !isFalseLike(process.env.DATABASE_SSL_REJECT_UNAUTHORIZED),
+  };
+}
+
 const pool = new Pool({
   connectionString: sanitizeDatabaseUrl(process.env.DATABASE_URL),
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
+  ssl: resolveSslConfig(),
 });
 
 pool.on('error', (err) => console.error('[DB] Unexpected pool error', err));
