@@ -42,6 +42,30 @@
   "overrides": {
     "axios": "^1.16.0",
     "esbuild": "^0.25.0",
+    "jayson": {
+      "uuid": "11.1.1"
+    },
+    "@metamask/eth-json-rpc-provider": {
+      "uuid": "11.1.1"
+    },
+    "@metamask/json-rpc-engine": {
+      "uuid": "11.1.1"
+    },
+    "@metamask/json-rpc-middleware-stream": {
+      "uuid": "11.1.1"
+    },
+    "@metamask/providers": {
+      "uuid": "11.1.1"
+    },
+    "@metamask/sdk": {
+      "uuid": "11.1.1"
+    },
+    "@metamask/sdk-communication-layer": {
+      "uuid": "11.1.1"
+    },
+    "@metamask/utils": {
+      "uuid": "11.1.1"
+    },
     "ws": "8.20.1"
   }
 }

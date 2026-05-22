@@ -558,6 +558,12 @@ Mimari kural (kritik, bozma): `Tasks > Paid` mevcut manual paid rayı olarak yer
   Doğrulama: Backend syntax check, editor error check ve Railway healthcheck temiz geçti. Uçtan uca auth'lu job akışı yerelde test edilemedi.
   Deploy hedefi: Railway deploy tamamlandı.
 
+- [x] UUID güvenlik uyarılarını backend ve frontend lockfile'larında kapat.
+  Kapsam: GitHub alert `#63` ve `#64` için `backend/package-lock.json` ve `frontend/package-lock.json` içindeki zafiyetli transitif `uuid <11.1.1` zincirlerini kırmadan güncelle.
+  Sonuç: Frontend'de `jayson` ve MetaMask connector zinciri, backend'de `bull` ve `jayson` altındaki `uuid` bağımlılıkları hedefli `overrides` ile `11.1.1` sürümüne taşındı; güvenli `rpc-websockets -> uuid@14` dalı korunarak her iki tarafta da audit sonucu `0 vulnerability` seviyesine indi.
+  Doğrulama: `cd frontend && npm install --package-lock-only && npm install && npm ls uuid --all && npm audit --json`, `cd backend && npm install --package-lock-only && npm install && npm ls uuid --all && npm audit --json`, Railway backend deploy `ba3554ff-0099-4e4e-afc5-08a36eeb7b2b` `SUCCESS`, `curl https://backend-production-597c.up.railway.app/health`, Vercel production deploy ve alias `https://arcmachina.vercel.app` temiz geçti.
+  Deploy hedefi: Railway backend deploy ve Vercel production deploy tamamlandı.
+
 ### P1 — Sonraki Ürün İşleri
 
 - [x] P0-X402 — Circle Gateway x402 agentic economy rayını izole kur.
