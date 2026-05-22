@@ -8,6 +8,7 @@
  */
 const { ethers } = require('ethers');
 const db         = require('../db');
+const oracle     = require('./oracle');
 const agentQueue = require('../queue/agentQueue');
 
 const ERC20_ABI = [
@@ -26,13 +27,29 @@ const STALE_PENDING_RESTORE_BATCH_SIZE = parseInt(process.env.CHAIN_EVENTS_STALE
 const STALE_PENDING_DELETE_BATCH_SIZE = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_DELETE_BATCH_SIZE || '10000', 10);
 const STALE_PENDING_DELETE_MAX_BATCHES = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_DELETE_MAX_BATCHES || '120', 10);
 
+const TOKEN_PRICE_SYMBOL_MAP = {
+  CIRBTC: 'BTC',
+};
+
+const TOKEN_PRICE_FALLBACK_USD = {
+  USDC: 1,
+  EURC: 1.08,
+};
+
 const WATCHED_CONTRACTS = {
   'Arc Testnet': {
-    usdc: process.env.USDC_ADDRESS_ARC,
+    tokens: [
+      { symbol: 'USDC', address: process.env.USDC_ADDRESS_ARC, decimals: 6 },
+      { symbol: 'EURC', address: process.env.EURC_ADDRESS_ARC, decimals: 6 },
+      { symbol: 'cirBTC', address: process.env.CIRBTC_ADDRESS_ARC, decimals: 8 },
+    ],
     rpcHttp: process.env.ARC_TESTNET_RPC,
   },
   'Sepolia': {
-    usdc: process.env.USDC_ADDRESS_SEPOLIA,
+    tokens: [
+      { symbol: 'USDC', address: process.env.USDC_ADDRESS_SEPOLIA, decimals: 6 },
+      { symbol: 'EURC', address: process.env.EURC_ADDRESS_SEPOLIA, decimals: 6 },
+    ],
     rpcHttp: process.env.SEPOLIA_RPC,
   },
 };
@@ -69,6 +86,42 @@ function withTimeout(promise, ms) {
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)),
   ]);
+}
+
+function normalizeWatchedTokenSymbol(symbol) {
+  const normalized = String(symbol || '').trim().toUpperCase();
+  if (!normalized) return 'USDC';
+  if (normalized === 'CIRBTC') return 'cirBTC';
+  return normalized;
+}
+
+function getPriceLookupSymbol(symbol) {
+  const normalized = String(symbol || '').trim().toUpperCase();
+  return TOKEN_PRICE_SYMBOL_MAP[normalized] || normalized;
+}
+
+function roundNumber(value, digits = 4) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const scale = 10 ** digits;
+  return Math.round(numeric * scale) / scale;
+}
+
+async function getTokenUsdPrice(symbol) {
+  const normalizedSymbol = normalizeWatchedTokenSymbol(symbol);
+  const lookupSymbol = getPriceLookupSymbol(normalizedSymbol);
+
+  try {
+    const prices = await oracle.getMultipleTokenPrices([lookupSymbol]);
+    const usdPrice = Number(prices?.[lookupSymbol]?.usdPrice);
+    if (Number.isFinite(usdPrice) && usdPrice > 0) {
+      return usdPrice;
+    }
+  } catch {
+    // Fall through to the static fallback below.
+  }
+
+  return TOKEN_PRICE_FALLBACK_USD[String(normalizedSymbol).toUpperCase()] ?? null;
 }
 
 async function loadWatchedAgents() {
@@ -113,15 +166,22 @@ async function lookupSenderAgentMeta(fromAddress) {
   };
 }
 
-async function ensureReceiveTransaction(agentId, chain, amountUsdc, from, to, txHash) {
+async function ensureReceiveTransaction(agentId, chain, transfer, from, to, txHash) {
+  const tokenSymbol = normalizeWatchedTokenSymbol(transfer?.tokenSymbol);
+  const amountUsd = roundNumber(transfer?.amountUsd, 6) ?? 0;
+  const tokenAmount = roundNumber(transfer?.tokenAmount, 10);
+  const usdPrice = roundNumber(transfer?.usdPrice, 8);
+  const tokenDecimals = Number(transfer?.decimals || 0) || null;
+
   const { rows: existing } = await db.query(
     `SELECT id
        FROM transactions
       WHERE agent_id = $1
         AND type = 'receive'
         AND tx_hash = $2
+        AND token = $3
       LIMIT 1`,
-    [agentId, txHash],
+    [agentId, txHash, tokenSymbol],
   );
   if (existing.length > 0) return false;
 
@@ -130,38 +190,78 @@ async function ensureReceiveTransaction(agentId, chain, amountUsdc, from, to, tx
   await db.query(
     `INSERT INTO transactions
        (agent_id, type, from_chain, to_chain, token, amount_usdc, from_address, to_address, tx_hash, status, meta)
-     VALUES ($1, 'receive', $2, $2, 'USDC', $3, $4, $5, $6, 'confirmed', $7)`,
-    [agentId, chain, amountUsdc, from, to, txHash, JSON.stringify(senderMeta)],
+     VALUES ($1, 'receive', $2, $2, $3, $4, $5, $6, $7, 'confirmed', $8)`,
+    [agentId, chain, tokenSymbol, amountUsd, from, to, txHash, JSON.stringify({
+      ...senderMeta,
+      tokenAmount,
+      usdValue: amountUsd,
+      usdPrice,
+      tokenDecimals,
+    })],
   );
 
   return true;
 }
 
 // ── Core handler for matched transfers only ───────────────────────────────────
-async function handleTransfer(chain, config, agents, from, to, amountUsdc, txHash, blockNumber) {
+async function handleTransfer(chain, tokenConfig, agents, from, to, tokenAmount, txHash, blockNumber) {
+  const tokenSymbol = normalizeWatchedTokenSymbol(tokenConfig?.symbol);
+
   // Deduplicate by tx_hash — skip if already recorded
   if (txHash) {
     const { rows: existing } = await db.query(
-      `SELECT id FROM chain_events WHERE tx_hash = $1 AND event_type = 'Transfer'`,
-      [txHash],
+      `SELECT id
+         FROM chain_events
+        WHERE tx_hash = $1
+          AND event_type = 'Transfer'
+          AND contract_address = $2
+        LIMIT 1`,
+      [txHash, tokenConfig.address],
     );
     if (existing.length > 0) return; // already processed
   }
 
+  const usdPrice = await getTokenUsdPrice(tokenSymbol);
+  const amountUsd = Number.isFinite(Number(tokenAmount)) && Number.isFinite(Number(usdPrice))
+    ? roundNumber(Number(tokenAmount) * Number(usdPrice), 6)
+    : 0;
+  const transfer = {
+    tokenSymbol,
+    tokenAmount: roundNumber(tokenAmount, 10),
+    amountUsd,
+    usdPrice: roundNumber(usdPrice, 8),
+    decimals: tokenConfig?.decimals || null,
+  };
+
   const { rows: [row] } = await db.query(
     `INSERT INTO chain_events (event_type, chain, contract_address, block_number, tx_hash, data)
      VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-    ['Transfer', chain, config.usdc,
+    ['Transfer', chain, tokenConfig.address,
      blockNumber, txHash,
-     JSON.stringify({ from, to, amountUsdc })],
+     JSON.stringify({
+       from,
+       to,
+       token: tokenSymbol,
+       tokenAmount: transfer.tokenAmount,
+       amountUsd: transfer.amountUsd,
+       usdPrice: transfer.usdPrice,
+       tokenDecimals: transfer.decimals,
+     })],
   );
 
   for (const agent of agents) {
-    await ensureReceiveTransaction(agent.id, chain, amountUsdc, from, to, txHash);
+    await ensureReceiveTransaction(agent.id, chain, transfer, from, to, txHash);
 
     if (agent.is_smart_mode) {
       agentQueue.add('INCOMING_TRANSFER', {
-        eventId: row.id, agentId: agent.id, chain, amountUsdc, from,
+        eventId: row.id,
+        agentId: agent.id,
+        chain,
+        amountUsdc: transfer.amountUsd,
+        token: tokenSymbol,
+        tokenAmount: transfer.tokenAmount,
+        usdPrice: transfer.usdPrice,
+        from,
         isSmartMode: agent.is_smart_mode,
         skipTransactionRecord: true,
       }).catch((err) => {
@@ -169,7 +269,7 @@ async function handleTransfer(chain, config, agents, from, to, amountUsdc, txHas
       });
     }
 
-    console.log(`[INDEXER] ${chain} → agent ${agent.id}: ${amountUsdc} USDC from ${from.slice(0, 10)}…`);
+    console.log(`[INDEXER] ${chain} → agent ${agent.id}: ${transfer.tokenAmount} ${tokenSymbol} from ${from.slice(0, 10)}…`);
   }
 
   await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [row.id]);
@@ -196,10 +296,12 @@ async function reconcilePendingEvents() {
   for (const row of rows) {
     const to = String(row.data?.to || '').toLowerCase();
     const from = row.data?.from;
-    const amountUsdc = Number(row.data?.amountUsdc || 0);
+    const tokenSymbol = normalizeWatchedTokenSymbol(row.data?.token);
+    const tokenAmount = Number(row.data?.tokenAmount || 0);
+    const amountUsd = Number(row.data?.amountUsd || 0);
     const agents = watchedAgents.get(to);
 
-    if (!agents?.length || !row.tx_hash || !from || amountUsdc <= 0) {
+    if (!agents?.length || !row.tx_hash || !from || tokenAmount <= 0) {
       await db.query('UPDATE chain_events SET processed = TRUE WHERE id = $1', [row.id]);
       discarded += 1;
       continue;
@@ -209,7 +311,13 @@ async function reconcilePendingEvents() {
       const inserted = await ensureReceiveTransaction(
         agent.id,
         row.chain,
-        amountUsdc,
+        {
+          tokenSymbol,
+          tokenAmount,
+          amountUsd,
+          usdPrice: row.data?.usdPrice,
+          decimals: row.data?.tokenDecimals,
+        },
         from,
         row.data.to,
         row.tx_hash,
@@ -267,14 +375,22 @@ async function reconcileStalePendingEvents() {
     for (const event of events.values()) {
       const from = event.data?.from;
       const to = event.data?.to;
-      const amountUsdc = Number(event.data?.amountUsdc || 0);
+      const tokenSymbol = normalizeWatchedTokenSymbol(event.data?.token);
+      const tokenAmount = Number(event.data?.tokenAmount || 0);
+      const amountUsd = Number(event.data?.amountUsd || 0);
 
-      if (event.txHash && from && to && amountUsdc > 0) {
+      if (event.txHash && from && to && tokenAmount > 0) {
         for (const agentId of event.agentIds) {
           const inserted = await ensureReceiveTransaction(
             agentId,
             event.chain,
-            amountUsdc,
+            {
+              tokenSymbol,
+              tokenAmount,
+              amountUsd,
+              usdPrice: event.data?.usdPrice,
+              decimals: event.data?.tokenDecimals,
+            },
             from,
             to,
             event.txHash,
@@ -330,6 +446,11 @@ async function reconcileStalePendingEvents() {
 
 async function getTransferLogs(provider, config, walletAddresses, fromBlock, toBlock) {
   const logs = [];
+  const watchedTokens = (config.tokens || []).filter(token => token?.address);
+
+  if (watchedTokens.length === 0) {
+    return logs;
+  }
 
   for (const blockRange of chunk(
     Array.from({ length: Math.ceil((toBlock - fromBlock + 1) / BLOCK_CHUNK_SIZE) }, (_, index) => ({
@@ -342,13 +463,15 @@ async function getTransferLogs(provider, config, walletAddresses, fromBlock, toB
 
     for (const walletChunk of chunk(walletAddresses, WALLET_CHUNK_SIZE)) {
       const topics = walletChunk.map((address) => ethers.zeroPadValue(address, 32));
-      const chunkLogs = await withTimeout(provider.getLogs({
-        address: config.usdc,
-        fromBlock: rangeStart,
-        toBlock: rangeEnd,
-        topics: [TRANSFER_TOPIC, null, topics],
-      }), 12_000);
-      logs.push(...chunkLogs);
+      for (const token of watchedTokens) {
+        const chunkLogs = await withTimeout(provider.getLogs({
+          address: token.address,
+          fromBlock: rangeStart,
+          toBlock: rangeEnd,
+          topics: [TRANSFER_TOPIC, null, topics],
+        }), 12_000);
+        logs.push(...chunkLogs.map(log => ({ log, token })));
+      }
     }
   }
 
@@ -356,7 +479,8 @@ async function getTransferLogs(provider, config, walletAddresses, fromBlock, toB
 }
 
 async function pollChain(chain, config) {
-  if (!config.rpcHttp || !config.usdc) return;
+  const watchedTokens = (config.tokens || []).filter(token => token?.address);
+  if (!config.rpcHttp || watchedTokens.length === 0) return;
 
   try {
     const watchedAgents = await loadWatchedAgents();
@@ -378,15 +502,16 @@ async function pollChain(chain, config) {
     const logs = await getTransferLogs(httpProvider, config, walletAddresses, fromBlock, latest);
     let matchedTransfers = 0;
 
-    for (const log of logs) {
+    for (const entry of logs) {
+      const { log, token } = entry;
       const parsed = TRANSFER_IFACE.parseLog(log);
       const from = parsed.args.from;
       const to = parsed.args.to;
       const agents = watchedAgents.get(to.toLowerCase());
       if (!agents?.length) continue;
 
-      const amountUsdc = parseFloat(ethers.formatUnits(parsed.args.value, 6));
-      await handleTransfer(chain, config, agents, from, to, amountUsdc, log.transactionHash, log.blockNumber);
+      const tokenAmount = parseFloat(ethers.formatUnits(parsed.args.value, token.decimals || 18));
+      await handleTransfer(chain, token, agents, from, to, tokenAmount, log.transactionHash, log.blockNumber);
       matchedTransfers += 1;
     }
 

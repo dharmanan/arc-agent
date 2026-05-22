@@ -58,7 +58,19 @@ async function ok(agentId, promptShape, obj) {
 // ─────────────────────────────────────────────────────────────────────────────
 // analyzeMarket
 // Same signature as llmService.analyzeMarket({ chain, token, agentId })
-// Returns: { opportunity: string, risk: "low"|"medium"|"high", action: string }
+// Returns: {
+//   opportunity: string,
+//   risk: "low"|"medium"|"high",
+//   action: string,
+//   signal: {
+//     lane: "stable_curve"|"observe",
+//     shouldReviewDefi: boolean,
+//     stableLpMinAllocationPct: number|null,
+//     stableLpTargetAllocationPct: number|null,
+//     stableLpMaxAllocationPct: number|null,
+//     confidence: "low"|"medium"|"high"
+//   }
+// }
 //
 // Rules:
 //   M1  Volatile token (cirBTC/ETH/WBTC)    → risk = "medium"
@@ -108,7 +120,26 @@ async function analyzeMarket({ chain, token, agentId } = {}) {
     action += ` (max ${MAX_TRADE_USDC} USDC per trade, ${DAILY_LIMIT_USDC} USDC daily limit)`;
   }
 
-  return ok(agentId, promptShape, { opportunity, risk, action });
+  const stableArcLane = c.includes('arc') && STABLE_TOKENS.has(t);
+  const signal = stableArcLane
+    ? {
+        lane: 'stable_curve',
+        shouldReviewDefi: true,
+        stableLpMinAllocationPct: 20,
+        stableLpTargetAllocationPct: 25,
+        stableLpMaxAllocationPct: 30,
+        confidence: risk === 'low' ? 'medium' : 'low',
+      }
+    : {
+        lane: 'observe',
+        shouldReviewDefi: false,
+        stableLpMinAllocationPct: null,
+        stableLpTargetAllocationPct: null,
+        stableLpMaxAllocationPct: null,
+        confidence: risk === 'high' ? 'low' : 'medium',
+      };
+
+  return ok(agentId, promptShape, { opportunity, risk, action, signal });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

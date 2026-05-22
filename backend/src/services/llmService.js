@@ -127,7 +127,19 @@ async function analyzeMarket({ chain, token, model, apiKey, agentId }) {
     apiKey,
     agentId,
     systemPrompt: `You are a DeFi market analysis engine for Arc Testnet.
-Respond with concise JSON only: { "opportunity": string, "risk": "low"|"medium"|"high", "action": string }`,
+Respond with concise JSON only: {
+  "opportunity": string,
+  "risk": "low"|"medium"|"high",
+  "action": string,
+  "signal": {
+    "lane": "stable_curve"|"observe",
+    "shouldReviewDefi": boolean,
+    "stableLpMinAllocationPct": number|null,
+    "stableLpTargetAllocationPct": number|null,
+    "stableLpMaxAllocationPct": number|null,
+    "confidence": "low"|"medium"|"high"
+  }
+}`,
     userPrompt: `Analyze current testnet conditions for ${token} on ${chain}. What should my agent do?`,
   });
 }

@@ -208,6 +208,9 @@ async function bootstrap() {
   // Start oracle query loop (only runs for agents with oracle_enabled = TRUE)
   agentQueue.scheduleOracleLoop().catch(err => console.error('[ORACLE_LOOP] startup error', err));
 
+  // Start market analysis loop (only runs for agents with market_analysis_enabled = TRUE)
+  agentQueue.scheduleMarketAnalysisLoop().catch(err => console.error('[MARKET_ANALYSIS_LOOP] startup error', err));
+
   // Start DeFi loop (only runs for agents with defi_loop_enabled = TRUE)
   agentQueue.scheduleDefiLoop().catch(err => console.error('[DEFI_LOOP] startup error', err));
 

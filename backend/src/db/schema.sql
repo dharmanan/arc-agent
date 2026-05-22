@@ -91,11 +91,16 @@ CREATE TABLE IF NOT EXISTS agents (
   last_reset_day            DATE           NOT NULL DEFAULT CURRENT_DATE,
   market_analysis_last_run_at TIMESTAMPTZ,
   market_analysis_last_status VARCHAR(30) NOT NULL DEFAULT 'idle',
+  market_analysis_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb,
+  stable_manual_cooldown_until TIMESTAMPTZ,
   oracle_last_run_at         TIMESTAMPTZ,
   oracle_last_status         VARCHAR(30) NOT NULL DEFAULT 'idle',
   defi_loop_last_run_at      TIMESTAMPTZ,
   defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle',
   defi_loop_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  cirbtc_lp_last_run_at      TIMESTAMPTZ,
+  cirbtc_lp_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle',
+  cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
   reputation_last_run_at     TIMESTAMPTZ,
   reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle',
 
@@ -140,11 +145,16 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_auto_tx_count         INTEGER 
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_limit_reset_at        TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_run_at TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_status VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS stable_manual_cooldown_until TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_last_run_at         TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_last_status         VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_run_at      TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_run_at      TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_run_at     TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle';
 

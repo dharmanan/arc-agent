@@ -54,12 +54,12 @@ export default function SwapTab({ onBack }) {
   const swapDisabledByDex = hasAmount && !quoting && !!quote && !quote.isDexQuote;
   const routeReason = quote?.routeReason || null;
   const userRouteReason = cirbtcNeedsSwapKit
-    ? 'cirBTC swaps need a live routed market on this deployment.'
+    ? 'cirBTC is not ready on this deployment right now.'
     : routeReason;
   const quoteWarning = swapDisabledByDex
-    ? (quote?.quoteError || userRouteReason || 'Live swap routing is unavailable right now.')
+    ? (quote?.quoteError || userRouteReason || 'This swap is unavailable right now.')
     : null;
-  const suggestLowerAmount = Boolean(quoteWarning && quoteWarning.includes('Try a lower amount.'));
+  const suggestLowerAmount = Boolean(quoteWarning && /try a smaller amount|stay at or below/i.test(quoteWarning));
 
   // ── Fetch quote on amount / direction change ──────────────────────────────
   const fetchQuote = useCallback(async (amount, from, to) => {
@@ -74,8 +74,8 @@ export default function SwapTab({ onBack }) {
         amountOut: stablePair ? parseFloat(amount) : null,
         isDexQuote: false,
         quoteError: stablePair
-          ? 'Live swap pricing is unavailable right now. Stable-to-stable quotes may show a placeholder.'
-          : 'Live swap pricing is unavailable right now.',
+          ? 'Live pricing is unavailable right now. Stable quotes may show a placeholder.'
+          : 'Live pricing is unavailable right now.',
       });
     } finally {
       setQuoting(false);
@@ -146,14 +146,14 @@ export default function SwapTab({ onBack }) {
   // ── Execute swap (agent auto-signs) ──────────────────────────────────────
   async function handleSwap() {
     if (!hasAmount) { setError('Enter a valid amount.'); return; }
-    if (quoting || !quote) { setError('Waiting for a live swap quote from Arc Testnet...'); return; }
-    if (!quote.isDexQuote) { setError(quote?.quoteError || userRouteReason || 'Live swap routing is unavailable right now.'); return; }
-    if (limitAwaitingQuote) { setError('Waiting for live cirBTC pricing to check your agent limit...'); return; }
-    if (exceedsMax) { setError(`Amount exceeds agent auto-approve limit (${maxTrade} USDC). Lower the amount or raise the limit in Agent Settings.`); return; }
+    if (quoting || !quote) { setError('Waiting for live pricing...'); return; }
+    if (!quote.isDexQuote) { setError(quote?.quoteError || userRouteReason || 'This swap is unavailable right now.'); return; }
+    if (limitAwaitingQuote) { setError('Waiting for live cirBTC pricing before checking your limit.'); return; }
+    if (exceedsMax) { setError(`This amount is above your auto limit (${maxTrade} USDC). Lower it or raise the limit in Agent Settings.`); return; }
 
     setError('');
     setLoading(true);
-    setStatus('Agent is executing swap autonomously…');
+    setStatus('Your agent is executing the swap...');
 
     try {
       const res = await txApi.swap({
@@ -164,10 +164,10 @@ export default function SwapTab({ onBack }) {
       });
 
       // Poll for confirmation
-      setStatus('Waiting for on-chain confirmation…');
+      setStatus('Waiting for on-chain confirmation...');
       const final = await txApi.poll(res.txId, tx => {
-        if (tx.status === 'executing') setStatus('Agent signing transaction…');
-        if (tx.status === 'pending')   setStatus('Broadcast — waiting for block…');
+        if (tx.status === 'executing') setStatus('Preparing the transaction...');
+        if (tx.status === 'pending')   setStatus('Sent to the network. Waiting for a block...');
       }, 90_000);
 
       setResult(final);
@@ -224,7 +224,7 @@ export default function SwapTab({ onBack }) {
               <ChevronLeft size={16}/> Back
             </button>
           )}
-          <SectionHeader title="Swap" subtitle="USDC / EURC / cirBTC on Arc Testnet — agentic." />
+          <SectionHeader title="Swap" subtitle="USDC / EURC / cirBTC on Arc Testnet." />
         </div>
         <Card>
           <div className="flex flex-col items-center gap-4 py-4 text-center">
@@ -233,7 +233,7 @@ export default function SwapTab({ onBack }) {
             </Badge>
             <Bot size={32} className="text-arc-green" />
             <h3 className="text-lg font-bold text-slate-900">
-              {isConfirmed ? 'Swap Executed by Agent!' : result.status === 'failed' ? 'Swap Failed' : 'Processing…'}
+              {isConfirmed ? 'Swap complete' : result.status === 'failed' ? 'Swap failed' : 'Processing...'}
             </h3>
             {amountOut && (
               <p className="text-sm text-slate-600">
@@ -264,7 +264,7 @@ export default function SwapTab({ onBack }) {
         )}
         <SectionHeader
           title="Swap"
-            subtitle="USDC / EURC / cirBTC on Arc Testnet — agent executes within your limits."
+          subtitle="USDC / EURC / cirBTC on Arc Testnet. Your agent handles the swap within your limit."
         />
       </div>
 
@@ -358,35 +358,30 @@ export default function SwapTab({ onBack }) {
                 {quoteWarning}
               </Alert>
             )}
-            {!quoteWarning && cirbtcPair && routeReason && (
-              <Alert type={quote?.isDexQuote ? 'info' : 'warning'}>
-                {userRouteReason}
-              </Alert>
-            )}
           </div>
 
-          {/* Agentic info panel */}
+          {/* Swap info panel */}
           <div className="rounded-xl border border-slate-100 bg-slate-50 p-3 space-y-1.5 text-xs text-slate-500">
             <div className="flex items-center gap-2">
               <Bot size={13} className="text-arc-green shrink-0"/>
               <span>
                 {isNano
-                  ? <><strong className="text-slate-700">Nano payment</strong> — agent executes automatically ({'<'}$0.01)</>
+                  ? <><strong className="text-slate-700">Tiny payment</strong> - your agent can send this automatically ({'<'}$0.01)</>
                   : cirbtcNeedsSwapKit
-                  ? 'cirBTC swaps need a live routed market on this deployment'
+                  ? 'cirBTC is not available here until a live market is ready.'
                   : limitAwaitingQuote
-                  ? 'Waiting for live cirBTC pricing to check your agent limit'
+                  ? 'Waiting for live cirBTC pricing before checking your limit.'
                   : isAgentic
-                  ? <><strong className="text-slate-700">Agentic</strong> — agent auto-executes (within {maxTrade} USDC-equivalent limit)</>
+                  ? <><strong className="text-slate-700">Auto-ready</strong> - this size is inside your {maxTrade} USDC limit.</>
                   : exceedsMax
-                  ? <span className="text-red-600">Exceeds auto-approve limit ({maxTrade} USDC) — raise limit in Agent Settings</span>
-                  : 'Enter an amount to see execution mode'}
+                  ? <span className="text-red-600">This is above your {maxTrade} USDC auto limit. Lower the size or raise the limit in Agent Settings.</span>
+                  : 'Enter an amount to preview the swap.'}
               </span>
             </div>
             {isAgentic && !exceedsMax && !limitAwaitingQuote && (
               <div className="flex items-center gap-2">
                 <Zap size={13} className="text-amber-500 shrink-0"/>
-                <span>No MetaMask pop-up needed — agent wallet signs autonomously</span>
+                <span>No wallet pop-up is needed while the amount stays inside your limit.</span>
               </div>
             )}
             <p>Agent: <span className="font-mono text-slate-700">{agent.walletAddress?.slice(0, 12)}…{agent.walletAddress?.slice(-4)}</span></p>
@@ -402,7 +397,7 @@ export default function SwapTab({ onBack }) {
             className="w-full"
           >
             {swapDisabledByDex
-              ? (cirbtcNeedsSwapKit ? 'Live route required' : suggestLowerAmount ? 'Try a lower amount' : 'Swap unavailable right now')
+              ? (cirbtcNeedsSwapKit ? 'Market not ready' : suggestLowerAmount ? 'Try a smaller size' : 'Swap unavailable right now')
               : isNano
               ? '⚡ Nano Swap'
               : <><Bot size={15}/> Agent Swap {amountIn || '0'} {fromToken} → {toToken}</>}

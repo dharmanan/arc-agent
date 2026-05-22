@@ -116,6 +116,8 @@ const CIRBTC_ARC = process.env.CIRBTC_ADDRESS_ARC || '0xf0C4a4CE82A5746AbAAd9425
 const ARC_SWAP_CHAIN = getChainByEnum(SwapChain.Arc_Testnet);
 const SWAP_KIT = new SwapKit();
 const SWAP_QUOTE_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
+const DEFAULT_CIRBTC_MAX_USDC_IN = 10;
+const DEFAULT_CIRBTC_MAX_EURC_IN = 8;
 
 // ── ABI'lar ───────────────────────────────────────────────────────────────────
 const ERC20_ABI = [
@@ -173,6 +175,49 @@ function isSwapConfigured() {
   return Boolean(getSwapKitKey());
 }
 
+function readPositiveNumberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getCirbtcInputLimit(fromToken) {
+  if (fromToken === 'EURC') {
+    return readPositiveNumberEnv('CIRBTC_SWAP_MAX_EURC_IN', DEFAULT_CIRBTC_MAX_EURC_IN);
+  }
+
+  return readPositiveNumberEnv('CIRBTC_SWAP_MAX_USDC_IN', DEFAULT_CIRBTC_MAX_USDC_IN);
+}
+
+function getCirbtcSwapSizeGuard({ fromToken, toToken, amountIn }) {
+  if (toToken !== 'cirBTC') {
+    return null;
+  }
+
+  const normalizedFromToken = String(fromToken || '').trim().toUpperCase();
+  if (!['USDC', 'EURC'].includes(normalizedFromToken)) {
+    return null;
+  }
+
+  const normalizedAmountIn = Number(amountIn);
+  if (!Number.isFinite(normalizedAmountIn) || normalizedAmountIn <= 0) {
+    return null;
+  }
+
+  const maxAmountIn = getCirbtcInputLimit(normalizedFromToken);
+  if (normalizedAmountIn <= maxAmountIn) {
+    return null;
+  }
+
+  return {
+    code: 'CIRBTC_SIZE_LIMIT',
+    fromToken: normalizedFromToken,
+    maxAmountIn,
+    userMessage: `This cirBTC market is thin right now. For reliable swaps, stay at or below ${maxAmountIn} ${normalizedFromToken}. Try a smaller amount.`,
+  };
+}
+
 function getDirectSwapFallbackPool(fromToken, toToken) {
   if (!fromToken || !toToken || fromToken === toToken) {
     return null;
@@ -191,10 +236,10 @@ function getDirectFallbackRouteReason(fallbackPool) {
   }
 
   if (fallbackPool.protocol === 'curve') {
-    return 'Verified direct Curve fallback is available for this stable pair on Arc Testnet.';
+    return 'This pair can still trade through the app\'s direct Arc stable pool if the main route is busy.';
   }
 
-  return 'A direct V2-style fallback pool is configured for this pair on Arc Testnet.';
+  return 'This pair can still trade through the app\'s direct Arc pool if the main route is busy.';
 }
 
 function getSwapRouteStrategy({ fromToken, toToken }) {
@@ -216,14 +261,14 @@ function getSwapRouteStrategy({ fromToken, toToken }) {
   if (isCirbtcPair(fromToken, toToken)) {
     return {
       routeStrategy: isSwapConfigured() ? 'swap_kit_only' : 'swap_kit_required',
-      routeReason: 'cirBTC pairs currently require a live Swap Kit route on Arc Testnet unless you configure a direct pair address via ARC_V2_CIRBTC_USDC_PAIR or ARC_V2_CIRBTC_EURC_PAIR.',
+      routeReason: 'cirBTC swaps only work when a live market is available on this deployment.',
       fallbackAvailable: false,
     };
   }
 
   return {
     routeStrategy: isSwapConfigured() ? 'swap_kit_only' : 'route_unavailable',
-    routeReason: 'No verified direct fallback route is configured for this pair on Arc Testnet.',
+    routeReason: 'This pair does not have a working swap route on this deployment right now.',
     fallbackAvailable: false,
   };
 }
@@ -277,7 +322,7 @@ async function getDirectSwapFallbackQuote({ fromToken, toToken, amountIn }) {
     console.warn('[AGENT-SWAP-QUOTE:FALLBACK]', error.message);
     return {
       amountOut: null,
-      quoteError: 'Direct fallback quote is unavailable right now.',
+      quoteError: 'A backup quote is unavailable right now. Try again in a moment.',
       ...strategy,
     };
   }
@@ -297,14 +342,26 @@ function createArcSwapAdapter(privateKey) {
 }
 
 function normalizeSwapQuoteError(error) {
-  const message = error?.message || 'Live quote is unavailable right now.';
+  const message = error?.userMessage || error?.message || 'Live quote is unavailable right now.';
+
+  if (error?.code === 'CIRBTC_SIZE_LIMIT') {
+    return message;
+  }
 
   if (message.includes('No route available')) {
-    return 'No live route is available for this amount right now. Try a lower amount.';
+    return 'This market is too thin for that size right now. Try a smaller amount.';
   }
 
   if (message.includes('Invalid API key format')) {
-    return 'Swap configuration is invalid on this deployment.';
+    return 'This deployment is missing a working live swap route.';
+  }
+
+  if (
+    /insufficient liquidity/i.test(message)
+    || /CALL_EXCEPTION/i.test(message)
+    || /transaction execution reverted/i.test(message)
+  ) {
+    return 'This market moved or ran out of depth before the swap could be sent. Try a smaller amount.';
   }
 
   return 'Live quote is unavailable right now.';
@@ -789,6 +846,15 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 // AGENTIC SWAP (USDC / EURC / cirBTC on Arc Testnet)
 // ─────────────────────────────────────────────────────────────────────────────
 async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5 }) {
+  const cirbtcSizeGuard = getCirbtcSwapSizeGuard({ fromToken, toToken, amountIn });
+  if (cirbtcSizeGuard) {
+    const error = new Error(cirbtcSizeGuard.userMessage);
+    error.code = cirbtcSizeGuard.code;
+    error.userMessage = cirbtcSizeGuard.userMessage;
+    error.recommendedMaxAmountIn = cirbtcSizeGuard.maxAmountIn;
+    throw error;
+  }
+
   if (!isSwapConfigured()) {
     const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
     if (!fallbackPool?.address) {
@@ -872,6 +938,19 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
 // ─────────────────────────────────────────────────────────────────────────────
 async function getSwapQuoteResult({ fromToken, toToken, amountIn }) {
   const strategy = getSwapRouteStrategy({ fromToken, toToken });
+  const cirbtcSizeGuard = getCirbtcSwapSizeGuard({ fromToken, toToken, amountIn });
+
+  if (cirbtcSizeGuard) {
+    return {
+      amountOut: null,
+      quoteError: cirbtcSizeGuard.userMessage,
+      routeStrategy: 'size_limited',
+      routeReason: cirbtcSizeGuard.userMessage,
+      fallbackAvailable: false,
+      recommendedMaxAmountIn: cirbtcSizeGuard.maxAmountIn,
+      recommendedMaxAmountToken: cirbtcSizeGuard.fromToken,
+    };
+  }
 
   if (!isSwapConfigured()) {
     return getDirectSwapFallbackQuote({ fromToken, toToken, amountIn });

@@ -1,17 +1,20 @@
 'use strict';
 
-const POLICY_ID = 'stable_usdc_eurc_curve_v1';
+const POLICY_ID = 'stable_usdc_eurc_lp_manager_v2';
 const DEFAULT_MAX_TRADE_USDC = 25;
 const DEFAULT_MAX_LIQUIDITY_DEPLOY_USDC = 25;
 const DEFAULT_MIN_LIQUIDITY_DEPLOY_USDC = 10;
-const DEFAULT_TARGET_LP_MIN_USD = 20;
-const DEFAULT_TARGET_LP_MAX_USD = 30;
+const DEFAULT_TARGET_LP_ALLOCATION_PCT = 25;
+const DEFAULT_TARGET_LP_MIN_ALLOCATION_PCT = 20;
+const DEFAULT_TARGET_LP_MAX_ALLOCATION_PCT = 30;
 const DEFAULT_MAX_REBALANCE_EURC = 25;
 const DEFAULT_MIN_REBALANCE_EURC = 10;
 const DEFAULT_MAX_ORACLE_DEVIATION_PCT = 2;
+const DEFAULT_HARD_EXIT_ORACLE_DEVIATION_PCT = 12;
 const DEFAULT_MAX_PRICE_IMPACT_PCT = 0.75;
 const DEFAULT_MIN_RESERVE_PER_SIDE = 1000;
 const DEFAULT_MIN_LP_EXIT_AMOUNT = 0.000001;
+const DEFAULT_MARKET_SIGNAL_MAX_AGE_MINUTES = 360;
 
 function readPositiveNumberEnv(name, fallback) {
   const raw = process.env[name];
@@ -30,6 +33,12 @@ function normalizeLpAmount(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return 0;
   return Math.floor(numeric * 1_000_000) / 1_000_000;
+}
+
+function clampFiniteNumber(value, min, max, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(Math.max(numeric, min), max);
 }
 
 function toFiniteNumber(value) {
@@ -58,47 +67,127 @@ function getFirstFailedCheck(checks) {
   return Object.entries(checks).find(([, value]) => value?.passed !== true) || null;
 }
 
+function isFreshIsoTimestamp(value, maxAgeMs) {
+  if (!value || !(maxAgeMs > 0)) return false;
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return false;
+  return (Date.now() - timestamp) <= maxAgeMs;
+}
+
+function isFutureIsoTimestamp(value) {
+  if (!value) return false;
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return false;
+  return timestamp > Date.now();
+}
+
+function resolveAllocationProfile({
+  marketAnalysis,
+  stableCapitalUsd,
+} = {}) {
+  const configuredTargetPct = clampFiniteNumber(
+    process.env.STABLE_AUTOMATION_TARGET_LP_ALLOCATION_PCT,
+    1,
+    100,
+    DEFAULT_TARGET_LP_ALLOCATION_PCT,
+  );
+  const configuredMinPct = clampFiniteNumber(
+    process.env.STABLE_AUTOMATION_MIN_LP_ALLOCATION_PCT,
+    1,
+    100,
+    DEFAULT_TARGET_LP_MIN_ALLOCATION_PCT,
+  );
+  const configuredMaxPct = clampFiniteNumber(
+    process.env.STABLE_AUTOMATION_MAX_LP_ALLOCATION_PCT,
+    configuredMinPct,
+    100,
+    DEFAULT_TARGET_LP_MAX_ALLOCATION_PCT,
+  );
+
+  let minPct = configuredMinPct;
+  let maxPct = configuredMaxPct;
+  let targetPct = clampFiniteNumber(
+    configuredTargetPct,
+    minPct,
+    maxPct,
+    Math.min(Math.max(configuredTargetPct, minPct), maxPct),
+  );
+  let source = 'policy_default';
+  let signalFresh = false;
+
+  const maxAgeMinutes = clampFiniteNumber(
+    process.env.STABLE_AUTOMATION_MARKET_SIGNAL_MAX_AGE_MINUTES,
+    1,
+    1440,
+    DEFAULT_MARKET_SIGNAL_MAX_AGE_MINUTES,
+  );
+  const signal = marketAnalysis?.signal && typeof marketAnalysis.signal === 'object'
+    ? marketAnalysis.signal
+    : null;
+
+  if (signal && String(signal.lane || '').toLowerCase() === 'stable_curve') {
+    signalFresh = isFreshIsoTimestamp(marketAnalysis?.recordedAt, maxAgeMinutes * 60_000);
+    if (signalFresh) {
+      minPct = clampFiniteNumber(signal.stableLpMinAllocationPct, 1, 100, minPct);
+      maxPct = clampFiniteNumber(signal.stableLpMaxAllocationPct, minPct, 100, maxPct);
+      targetPct = clampFiniteNumber(
+        signal.stableLpTargetAllocationPct,
+        minPct,
+        maxPct,
+        clampFiniteNumber(targetPct, minPct, maxPct, targetPct),
+      );
+      source = `market_analysis:${marketAnalysis?.engine || 'unknown'}`;
+    }
+  }
+
+  const normalizedStableCapitalUsd = normalizeUsdcAmount(stableCapitalUsd);
+  const targetUsd = normalizeUsdcAmount(normalizedStableCapitalUsd * (targetPct / 100));
+  const minUsd = normalizeUsdcAmount(normalizedStableCapitalUsd * (minPct / 100));
+  const maxUsd = normalizeUsdcAmount(normalizedStableCapitalUsd * (maxPct / 100));
+
+  return {
+    minPct,
+    maxPct,
+    targetPct,
+    minUsd,
+    maxUsd,
+    targetUsd,
+    source,
+    signalFresh,
+  };
+}
+
 function buildHoldReason({
   positionPresent,
   positionValueUsd,
   targetLpMinUsd,
   targetLpMaxUsd,
   positionBelowTargetBand,
-  signalEligible,
-  buyEurcFromPool,
   suggestedLiquidityDeployUsdc,
   minLiquidityDeployUsdc,
-  suggestedRebalanceAmountEurc,
-  minRebalanceEurc,
 } = {}) {
   if (positionPresent && positionBelowTargetBand && suggestedLiquidityDeployUsdc < minLiquidityDeployUsdc) {
-    return `Stable automation wants to top the LP back into the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band, but deployable USDC is below the minimum ${minLiquidityDeployUsdc} required for a top-up.`;
+    return `Stable LP manager wants to top the position back into the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band, but deployable USDC is below the minimum ${minLiquidityDeployUsdc} required for a top-up.`;
   }
 
   if (positionPresent) {
     const positionValueLabel = Number.isFinite(positionValueUsd)
       ? `${normalizeUsdcAmount(positionValueUsd)} USD`
       : 'the current LP value';
-    return `Stable automation is holding the existing LP position because ${positionValueLabel} remains inside the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band and pool conditions remain healthy.`;
-  }
-
-  if (signalEligible && !buyEurcFromPool && suggestedRebalanceAmountEurc < minRebalanceEurc) {
-    return `Stable automation saw a reverse-direction signal, but the wallet does not hold the minimum ${minRebalanceEurc} EURC needed for a rebalance.`;
+    return `Stable LP manager is holding the existing position because ${positionValueLabel} remains inside the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band and pool conditions remain healthy.`;
   }
 
   if (suggestedLiquidityDeployUsdc < minLiquidityDeployUsdc) {
-    return `No swap or rebalance qualified, and deployable USDC is below the minimum ${minLiquidityDeployUsdc} required to open or top up the LP toward the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band.`;
+    return `Stable LP manager did not open or top up the position because deployable USDC is below the minimum ${minLiquidityDeployUsdc} required to reach the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band.`;
   }
 
-  return 'No stable automation action qualified for this cycle.';
+  return 'No stable LP management action qualified for this cycle.';
 }
 
 function buildSuccessReason({
   operationType,
   amount,
   assetSymbol,
-  sizeClamped,
-  requestedAmount,
   lpAction,
   targetLpMinUsd,
   targetLpMaxUsd,
@@ -107,19 +196,16 @@ function buildSuccessReason({
     const actionLabel = lpAction === 'top_up'
       ? `a Curve liquidity top-up for ${amount} ${assetSymbol} to move the LP back toward the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band`
       : `a Curve liquidity add for ${amount} ${assetSymbol}`;
-    return `Stable automation policy v1 approved ${actionLabel}${sizeClamped ? ` after clamping from ${requestedAmount} USDC` : ''}.`;
+    return `Stable LP manager v2 approved ${actionLabel}.`;
   }
   if (operationType === 'remove_liquidity') {
     if (lpAction === 'trim_to_target') {
-      return `Stable automation policy v1 approved a partial Curve LP trim of ${amount} ${assetSymbol} to bring exposure back under the ${targetLpMaxUsd} USD target cap.`;
+      return `Stable LP manager v2 approved a partial Curve LP trim of ${amount} ${assetSymbol} to bring exposure back under the ${targetLpMaxUsd} USD target cap.`;
     }
-    return `Stable automation policy v1 approved a defensive Curve LP exit for ${amount} ${assetSymbol}.`;
-  }
-  if (operationType === 'rebalance') {
-    return `Stable automation policy v1 approved a ${assetSymbol} -> USDC rebalance for ${amount} ${assetSymbol}${sizeClamped ? ` after clamping from ${requestedAmount} EURC` : ''}.`;
+    return `Stable LP manager v2 approved a defensive Curve LP exit for ${amount} ${assetSymbol}.`;
   }
 
-  return `Stable automation policy v1 approved the verified Curve USDC -> EURC route for ${amount} ${assetSymbol}${sizeClamped ? ` after clamping from ${requestedAmount} USDC` : ''}.`;
+  return `Stable LP manager v2 approved ${amount} ${assetSymbol}.`;
 }
 
 function evaluateStableAutomationPolicy({
@@ -133,6 +219,8 @@ function evaluateStableAutomationPolicy({
   walletBalances,
   walletReserveUsdc: walletReserveUsdcInput,
   position,
+  marketAnalysis,
+  manualCooldownUntil,
 } = {}) {
   const requestedAmount = normalizeUsdcAmount(requestedAmountUsdc);
   const agentMaxTradeUsdc = toFiniteNumber(agent?.max_trade_usdc);
@@ -151,25 +239,9 @@ function evaluateStableAutomationPolicy({
     'STABLE_AUTOMATION_MAX_LIQUIDITY_DEPLOY_USDC',
     DEFAULT_MAX_LIQUIDITY_DEPLOY_USDC,
   );
-  const configuredTargetLpMinUsd = readPositiveNumberEnv(
-    'STABLE_AUTOMATION_TARGET_LP_MIN_USD',
-    DEFAULT_TARGET_LP_MIN_USD,
-  );
-  const configuredTargetLpMaxUsd = readPositiveNumberEnv(
-    'STABLE_AUTOMATION_TARGET_LP_MAX_USD',
-    DEFAULT_TARGET_LP_MAX_USD,
-  );
   const minLiquidityDeployUsdc = readPositiveNumberEnv(
     'STABLE_AUTOMATION_MIN_LIQUIDITY_DEPLOY_USDC',
     DEFAULT_MIN_LIQUIDITY_DEPLOY_USDC,
-  );
-  const maxRebalanceEurc = readPositiveNumberEnv(
-    'STABLE_AUTOMATION_MAX_REBALANCE_EURC',
-    DEFAULT_MAX_REBALANCE_EURC,
-  );
-  const minRebalanceEurc = readPositiveNumberEnv(
-    'STABLE_AUTOMATION_MIN_REBALANCE_EURC',
-    DEFAULT_MIN_REBALANCE_EURC,
   );
   const minLpExitAmount = readPositiveNumberEnv(
     'STABLE_AUTOMATION_MIN_LP_EXIT_AMOUNT',
@@ -185,31 +257,40 @@ function evaluateStableAutomationPolicy({
   const availableUsdcBalance = normalizeUsdcAmount(walletBalances?.usdc);
   const availableEurcBalance = normalizeUsdcAmount(walletBalances?.eurc);
   const deployableUsdcBalance = normalizeUsdcAmount(Math.max(availableUsdcBalance - walletReserveUsdc, 0));
-  const targetLpMinUsd = normalizeUsdcAmount(configuredTargetLpMinUsd);
-  const targetLpMaxUsd = normalizeUsdcAmount(Math.max(configuredTargetLpMaxUsd, targetLpMinUsd));
-  const suggestedRebalanceAmountEurc = normalizeUsdcAmount(Math.min(availableEurcBalance, maxRebalanceEurc));
   const positionLpBalance = toFiniteNumber(position?.lpToken?.balance) || 0;
   const positionPresent = positionLpBalance > 0;
   const positionValueUsd = normalizeUsdcAmount(toFiniteNumber(position?.valuation?.totalUsd));
+  const totalStableCapitalUsd = normalizeUsdcAmount(deployableUsdcBalance + availableEurcBalance + positionValueUsd);
+  const allocationProfile = resolveAllocationProfile({
+    marketAnalysis,
+    stableCapitalUsd: totalStableCapitalUsd,
+  });
+  const targetLpMinUsd = allocationProfile.minUsd;
+  const targetLpMaxUsd = allocationProfile.maxUsd;
+  const targetLpTargetUsd = allocationProfile.targetUsd;
   const positionBelowTargetBand = positionPresent && positionValueUsd > 0 && positionValueUsd < targetLpMinUsd;
   const positionAboveTargetBand = positionPresent && positionValueUsd > targetLpMaxUsd;
+  const positionAllocationPct = totalStableCapitalUsd > 0
+    ? normalizeUsdcAmount((positionValueUsd / totalStableCapitalUsd) * 100)
+    : 0;
   const targetLiquidityGapUsdc = normalizeUsdcAmount(
     positionPresent
-      ? Math.max(targetLpMaxUsd - positionValueUsd, 0)
-      : targetLpMaxUsd,
+      ? Math.max(targetLpTargetUsd - positionValueUsd, 0)
+      : targetLpTargetUsd,
   );
   const suggestedLiquidityDeployUsdc = normalizeUsdcAmount(
     Math.min(deployableUsdcBalance, configuredMaxLiquidityDeployUsdc, targetLiquidityGapUsdc),
   );
-  const observedSwapPriceImpactPct = selectObservedPriceImpactPct(suggestedAmountUsdc, poolState?.priceImpact);
   const observedLiquidityDeployImpactPct = selectObservedPriceImpactPct(suggestedLiquidityDeployUsdc, poolState?.priceImpact);
-  const observedRebalanceImpactPct = selectObservedPriceImpactPct(suggestedRebalanceAmountEurc, poolState?.priceImpact);
   const exitObservedPriceImpactPct = toFiniteNumber(poolState?.priceImpact?.swap1k);
   const minReservePerSide = readPositiveNumberEnv('STABLE_AUTOMATION_MIN_RESERVE_PER_SIDE', DEFAULT_MIN_RESERVE_PER_SIDE);
   const maxOracleDeviationPct = readPositiveNumberEnv('STABLE_AUTOMATION_MAX_ORACLE_DEVIATION_PCT', DEFAULT_MAX_ORACLE_DEVIATION_PCT);
+  const hardExitOracleDeviationPct = readPositiveNumberEnv(
+    'STABLE_AUTOMATION_HARD_EXIT_ORACLE_DEVIATION_PCT',
+    DEFAULT_HARD_EXIT_ORACLE_DEVIATION_PCT,
+  );
   const maxPriceImpactPct = readPositiveNumberEnv('STABLE_AUTOMATION_MAX_PRICE_IMPACT_PCT', DEFAULT_MAX_PRICE_IMPACT_PCT);
   const allowFallbackForex = process.env.STABLE_AUTOMATION_ALLOW_FALLBACK_FOREX === 'true';
-  const buyEurcFromPool = forexRateNumeric != null && poolRateNumeric != null && poolRateNumeric < forexRateNumeric;
   const routeVerified = Boolean(
     pricingPool?.protocol === 'curve'
       && pricingPool?.key === 'EURC-USDC'
@@ -221,26 +302,21 @@ function evaluateStableAutomationPolicy({
       && swapPool?.quoteToken?.symbol === 'EURC'
       && swapPool?.address
   );
-  const signalEligible = Boolean(
-    signal?.opportunity?.found
-      && signal?.opportunity?.confidence !== 'LOW'
-      && Number(signal?.opportunity?.netProfitUsdc || 0) > 0
-  );
   const liveForex = allowFallbackForex || forexRate?.isFallback !== true;
   const liquidityActive = String(poolState?.liquidityState || '').toLowerCase() === 'active';
   const reserveDepthHealthy = Number(poolState?.reserves?.token0 || 0) >= minReservePerSide
     && Number(poolState?.reserves?.token1 || 0) >= minReservePerSide;
   const oracleDeviationWithinBand = oracleDeviationPct != null && oracleDeviationPct <= maxOracleDeviationPct;
-  const swapPriceImpactWithinBand = observedSwapPriceImpactPct != null && observedSwapPriceImpactPct <= maxPriceImpactPct;
+  const oracleDeviationHardBreach = oracleDeviationPct != null && oracleDeviationPct > hardExitOracleDeviationPct;
   const addLiquidityPriceImpactWithinBand = observedLiquidityDeployImpactPct != null && observedLiquidityDeployImpactPct <= maxPriceImpactPct;
-  const rebalancePriceImpactWithinBand = observedRebalanceImpactPct != null && observedRebalanceImpactPct <= maxPriceImpactPct;
   const hardExitRiskTriggered = positionPresent && (
     !liveForex
       || !liquidityActive
       || !reserveDepthHealthy
-      || !oracleDeviationWithinBand
+      || oracleDeviationHardBreach
       || !(exitObservedPriceImpactPct != null && exitObservedPriceImpactPct <= maxPriceImpactPct)
   );
+  const manualCooldownActive = isFutureIsoTimestamp(manualCooldownUntil);
   const bandTrimTriggered = positionPresent && !hardExitRiskTriggered && positionAboveTargetBand;
   const exitRiskTriggered = hardExitRiskTriggered || bandTrimTriggered;
   const suggestedLpExitValueUsd = normalizeUsdcAmount(
@@ -248,7 +324,7 @@ function evaluateStableAutomationPolicy({
       ? 0
       : hardExitRiskTriggered
         ? positionValueUsd
-        : Math.max(positionValueUsd - targetLpMaxUsd, 0),
+        : Math.max(positionValueUsd - targetLpTargetUsd, 0),
   );
   const suggestedLpExitFraction = positionPresent && positionValueUsd > 0
     ? Math.min(Math.max(suggestedLpExitValueUsd / positionValueUsd, 0), 1)
@@ -271,53 +347,11 @@ function evaluateStableAutomationPolicy({
     operationType = 'remove_liquidity';
   } else if (positionPresent && positionBelowTargetBand && suggestedLiquidityDeployUsdc >= minLiquidityDeployUsdc) {
     operationType = 'add_liquidity';
-  } else if (!positionPresent && signalEligible && buyEurcFromPool) {
-    operationType = 'swap';
-  } else if (!positionPresent && !buyEurcFromPool && suggestedRebalanceAmountEurc >= minRebalanceEurc) {
-    operationType = 'rebalance';
   } else if (!positionPresent && suggestedLiquidityDeployUsdc >= minLiquidityDeployUsdc) {
     operationType = 'add_liquidity';
   }
 
   const actionChecks = {
-    swap: {
-      routeVerified: buildCheck(
-        routeVerified,
-        'Only the verified Curve USDC -> EURC stable route is eligible for automation.',
-      ),
-      liveForex: buildCheck(
-        liveForex,
-        'Automation requires a live forex rate and does not trade on fallback FX data by default.',
-      ),
-      directionVerified: buildCheck(
-        buyEurcFromPool,
-        'Automation only buys EURC from the Curve pool. Reverse-direction trades stay manual.',
-      ),
-      signalEligible: buildCheck(
-        signalEligible,
-        'The deterministic signal must remain profitable with at least medium confidence.',
-      ),
-      liquidityActive: buildCheck(
-        liquidityActive,
-        'The stable pool must report active liquidity before automation can trade.',
-      ),
-      reserveDepth: buildCheck(
-        reserveDepthHealthy,
-        `Both stable reserves must stay above ${minReservePerSide} before automation can trade.`,
-      ),
-      sizePositive: buildCheck(
-        suggestedAmountUsdc > 0,
-        'The requested automation size must remain above zero after policy sizing caps.',
-      ),
-      oracleDeviation: buildCheck(
-        oracleDeviationWithinBand,
-        `Pool/forex deviation must stay within ${maxOracleDeviationPct}% to avoid stale or broken executions.`,
-      ),
-      priceImpact: buildCheck(
-        swapPriceImpactWithinBand,
-        `Observed Curve price impact must stay within ${maxPriceImpactPct}% for the sized trade.`,
-      ),
-    },
     add_liquidity: {
       routeVerified: buildCheck(
         routeVerified,
@@ -352,44 +386,6 @@ function evaluateStableAutomationPolicy({
         `Observed Curve price impact must stay within ${maxPriceImpactPct}% for the proposed LP add.`,
       ),
     },
-    rebalance: {
-      routeVerified: buildCheck(
-        routeVerified,
-        'Only the verified Curve EURC -> USDC stable route is eligible for automated rebalances.',
-      ),
-      liveForex: buildCheck(
-        liveForex,
-        'Automation requires a live forex rate before rebalancing stable inventory.',
-      ),
-      noExistingPosition: buildCheck(
-        !positionPresent,
-        'Automation only rebalances wallet inventory when no stable LP position is open.',
-      ),
-      reverseDirection: buildCheck(
-        !buyEurcFromPool,
-        'Stable inventory rebalance only runs when Curve pricing favors rotating EURC back into USDC.',
-      ),
-      liquidityActive: buildCheck(
-        liquidityActive,
-        'The stable pool must report active liquidity before automation can rebalance inventory.',
-      ),
-      reserveDepth: buildCheck(
-        reserveDepthHealthy,
-        `Both stable reserves must stay above ${minReservePerSide} before automation can rebalance inventory.`,
-      ),
-      rebalanceSizePositive: buildCheck(
-        suggestedRebalanceAmountEurc >= minRebalanceEurc,
-        `Wallet EURC balance must stay above ${minRebalanceEurc} before automation can rebalance.`,
-      ),
-      oracleDeviation: buildCheck(
-        oracleDeviationWithinBand,
-        `Pool/forex deviation must stay within ${maxOracleDeviationPct}% before automation can rebalance inventory.`,
-      ),
-      priceImpact: buildCheck(
-        rebalancePriceImpactWithinBand,
-        `Observed Curve price impact must stay within ${maxPriceImpactPct}% for the proposed rebalance.`,
-      ),
-    },
     remove_liquidity: {
       routeVerified: buildCheck(
         routeVerified,
@@ -403,6 +399,12 @@ function evaluateStableAutomationPolicy({
         positionPresent,
         'A stable LP position must exist before automation can remove liquidity.',
       ),
+      manualCooldown: buildCheck(
+        !manualCooldownActive || hardExitRiskTriggered,
+        manualCooldownUntil
+          ? `A recent manual stable LP add is still in cooldown until ${manualCooldownUntil}. Only hard-risk exits are allowed during this window.`
+          : 'A recent manual stable LP add is still in cooldown. Only hard-risk exits are allowed during this window.',
+      ),
       lpExitSizePositive: buildCheck(
         Number(suggestedLpExitAmount) >= minLpExitAmount,
         `LP balance must stay above ${minLpExitAmount} before automation can remove liquidity.`,
@@ -413,17 +415,12 @@ function evaluateStableAutomationPolicy({
   const operationChecks = operationType ? actionChecks[operationType] : null;
   const firstFailedCheck = operationChecks ? getFirstFailedCheck(operationChecks) : null;
   const execute = Boolean(operationType) && !firstFailedCheck;
-  const sizeClamped = requestedAmount > suggestedAmountUsdc;
   const actionAmount = operationType === 'add_liquidity'
     ? suggestedLiquidityDeployUsdc
-    : operationType === 'rebalance'
-      ? suggestedRebalanceAmountEurc
-      : operationType === 'remove_liquidity'
-        ? suggestedLpExitAmount
-        : suggestedAmountUsdc;
-  const actionAssetSymbol = operationType === 'rebalance'
-    ? 'EURC'
     : operationType === 'remove_liquidity'
+      ? suggestedLpExitAmount
+      : suggestedAmountUsdc;
+  const actionAssetSymbol = operationType === 'remove_liquidity'
       ? 'LP'
       : 'USDC';
   const actionParams = execute
@@ -433,6 +430,7 @@ function evaluateStableAutomationPolicy({
           amountIn: String(suggestedLiquidityDeployUsdc),
           lpAction,
           targetMinUsd: targetLpMinUsd,
+          targetUsd: targetLpTargetUsd,
           targetMaxUsd: targetLpMaxUsd,
         }
       : operationType === 'remove_liquidity'
@@ -442,24 +440,16 @@ function evaluateStableAutomationPolicy({
             tokenOut: 'USDC',
             lpAction,
             expectedValueUsd: suggestedLpExitValueUsd,
+            targetUsd: targetLpTargetUsd,
             targetMaxUsd: targetLpMaxUsd,
           }
-        : operationType === 'rebalance'
-          ? {
-              fromToken: 'EURC',
-              toToken: 'USDC',
-              amountIn: String(suggestedRebalanceAmountEurc),
-            }
-          : {
-              fromToken: 'USDC',
-              toToken: 'EURC',
-              amountIn: String(suggestedAmountUsdc),
-            })
+        : null)
     : null;
 
   return {
     policyId: POLICY_ID,
     verdict: {
+      lane: 'stable_curve_lp',
       execute,
       operationType,
       reason: execute
@@ -467,26 +457,20 @@ function evaluateStableAutomationPolicy({
             operationType,
             amount: actionAmount,
             assetSymbol: actionAssetSymbol,
-            sizeClamped,
-            requestedAmount,
             lpAction,
             targetLpMinUsd,
             targetLpMaxUsd,
           })
         : operationChecks && firstFailedCheck
-          ? `Stable automation policy v1 blocked execution: ${firstFailedCheck[1].detail}`
+          ? `Stable LP manager v2 blocked execution: ${firstFailedCheck[1].detail}`
           : buildHoldReason({
               positionPresent,
               positionValueUsd,
               targetLpMinUsd,
               targetLpMaxUsd,
               positionBelowTargetBand,
-              signalEligible,
-              buyEurcFromPool,
               suggestedLiquidityDeployUsdc,
               minLiquidityDeployUsdc,
-              suggestedRebalanceAmountEurc,
-              minRebalanceEurc,
             }),
       suggestedAmountUsdc: execute
         ? operationType === 'remove_liquidity'
@@ -505,14 +489,21 @@ function evaluateStableAutomationPolicy({
       requestedAmountUsdc: requestedAmount,
       suggestedAmountUsdc,
       suggestedLiquidityDeployUsdc,
-      suggestedRebalanceAmountEurc,
       suggestedLpExitAmount,
       suggestedLpExitValueUsd,
       suggestedLpExitFraction,
+      totalStableCapitalUsd,
       targetLpMinUsd,
+      targetLpTargetUsd,
       targetLpMaxUsd,
+      targetLpMinAllocationPct: allocationProfile.minPct,
+      targetLpTargetAllocationPct: allocationProfile.targetPct,
+      targetLpMaxAllocationPct: allocationProfile.maxPct,
+      targetLpAllocationSource: allocationProfile.source,
+      marketSignalFresh: allocationProfile.signalFresh,
+      manualCooldownUntil: manualCooldownUntil || null,
+      manualCooldownActive,
       targetLiquidityGapUsdc,
-      sizeClamped,
       effectiveMaxTradeUsdc,
       walletReserveUsdc,
       availableUsdcBalance,
@@ -521,6 +512,7 @@ function evaluateStableAutomationPolicy({
       positionPresent,
       positionLpBalance,
       positionValueUsd,
+      positionAllocationPct,
       positionBelowTargetBand,
       positionAboveTargetBand,
       exitRiskTriggered,
@@ -528,9 +520,9 @@ function evaluateStableAutomationPolicy({
       bandTrimTriggered,
       lpAction,
       oracleDeviationPct,
-      observedSwapPriceImpactPct,
+      oracleDeviationHardBreach,
+      hardExitOracleDeviationPct,
       observedLiquidityDeployImpactPct,
-      observedRebalanceImpactPct,
       exitObservedPriceImpactPct,
       forexRate: forexRateNumeric,
       poolRate: poolRateNumeric,

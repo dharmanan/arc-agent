@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useAgent } from '../providers/AgentProvider.jsx';
 import { tasks as tasksApi, agents as agentsApi } from '../lib/api.js';
-import { fetchAgentBalance, fetchUsdcBalance, fetchEurcBalance } from '../lib/agentBalances.js';
+import { fetchUsdcBalance, fetchEurcBalance } from '../lib/agentBalances.js';
 import {
   Card, Button, Alert, Spinner, AddressBox,
 } from './ui/index.jsx';
@@ -24,22 +24,22 @@ const AUTOMATION_FEATURES = [
     key: 'oracleEnabled',
     statusKey: 'oracle',
     title: 'Oracle Data Feed',
-    description: 'Background price and opportunity updates.',
-    detail: 'Keeps signals fresh. It does not trade by itself.',
+    description: 'Keeps pricing and opportunity checks up to date.',
+    detail: 'This feeds later decisions. It does not trade by itself.',
   },
   {
     key: 'defiLoopEnabled',
     statusKey: 'defiLoop',
     title: 'Stable DeFi Loop',
-    description: 'Automatic stablecoin actions within your limits.',
-    detail: 'Moves funds only on the verified USDC/EURC stable lane.',
+    description: 'Lets the agent use the stable USDC/EURC route within your limits.',
+    detail: 'This is the stable auto-trading switch.',
   },
   {
     key: 'cirbtcLpEnabled',
     statusKey: 'cirbtcLp',
     title: 'cirBTC LP Automation',
-    description: 'Automatic bootstrap and exit rules for verified direct-pair cirBTC LP.',
-    detail: 'Keeps cirBTC LP automation separate from the stable lane toggle.',
+    description: 'Lets the agent manage the cirBTC LP position on its own.',
+    detail: 'This covers LP only. Normal cirBTC swaps stay separate.',
   },
   {
     key: 'reputationEnabled',
@@ -59,6 +59,11 @@ const EXECUTION_TASK_IDS = new Set([
   'EXEC_CIRBTC_EURC_ZAP_IN',
   'EXEC_CIRBTC_USDC_LP_REMOVE',
   'EXEC_CIRBTC_EURC_LP_REMOVE',
+  'EXEC_LENDING_SUPPLY',
+  'EXEC_LENDING_WITHDRAW',
+  'EXEC_LENDING_BORROW',
+  'EXEC_LENDING_REPAY',
+  'EXEC_LENDING_LIQUIDATE',
   'EXEC_CCTP_BRIDGE',
   'EXEC_ARB',
   'EXEC_REBALANCE',
@@ -95,6 +100,7 @@ const CCTP_CHAIN_OPTIONS = [
   'Arbitrum Sepolia',
 ];
 const REBALANCE_TOKEN_OPTIONS = ['USDC', 'EURC'];
+const LENDING_ASSET_OPTIONS = ['USDC', 'EURC'];
 const REPUTATION_EVENT_LABELS = {
   TRANSACTION_COMPLETED: 'Completed Job',
   ARB_EXECUTED: 'Arbitrage Execution',
@@ -168,6 +174,12 @@ const PAID_TASK_GROUPS = [
     description: 'Manual bridge or signal-triggered execution paths outside the direct LP flows.',
     taskIds: ['EXEC_CCTP_BRIDGE', 'EXEC_ARB'],
   },
+  {
+    key: 'lending_lane',
+    title: 'Lending Actions',
+    description: 'Manual Arc-native lending actions with the same visible guardrails shown in the DeFi lending surface.',
+    taskIds: ['EXEC_LENDING_SUPPLY', 'EXEC_LENDING_WITHDRAW', 'EXEC_LENDING_BORROW', 'EXEC_LENDING_REPAY', 'EXEC_LENDING_DELEVERAGE', 'EXEC_LENDING_LIQUIDATE'],
+  },
 ];
 const PAID_TASK_GROUP_TASK_IDS = new Set(PAID_TASK_GROUPS.flatMap(group => group.taskIds));
 
@@ -203,6 +215,30 @@ function getTaskOperationalAlert(task) {
         badge: 'LP exit',
         title: 'Closes a live cirBTC LP position',
         body: 'This task removes a live direct cirBTC LP position and returns the underlying assets to the agent wallet. It stays on the direct pool path, not a Curve fallback.',
+      };
+
+    case 'EXEC_LENDING_SUPPLY':
+    case 'EXEC_LENDING_WITHDRAW':
+    case 'EXEC_LENDING_BORROW':
+    case 'EXEC_LENDING_REPAY':
+      return {
+        badge: 'Lending lane',
+        title: 'Runs on the Arc-native lending adapter',
+        body: 'This task uses the Arc-native lending lane and re-checks the same visible risk guard before any on-chain write is sent.',
+      };
+
+    case 'EXEC_LENDING_DELEVERAGE':
+      return {
+        badge: 'Recovery',
+        title: 'Emergency-only lending path',
+        body: 'This task only runs when the lending account is already in the critical recovery band and wallet funds can cover the planned repay steps.',
+      };
+
+    case 'EXEC_LENDING_LIQUIDATE':
+      return {
+        badge: 'Liquidation',
+        title: 'Targets another unhealthy lending account',
+        body: 'This task requires another borrower below the liquidation threshold plus a matching debt and collateral pair before any liquidation tx can be sent.',
       };
 
     default:
@@ -1139,12 +1175,74 @@ function getTaskRunErrorMessage(message) {
       return 'This bootstrap task only supports the capped preset size for now.';
     case 'pair_exit_pct_invalid':
       return 'Enter a valid LP withdrawal percentage between 0 and 100.';
+    case 'manual_lending_asset_invalid':
+      return 'Choose USDC or EURC for this lending action.';
+    case 'lending_amount_required':
+      return 'Enter a positive amount for this lending action.';
+    case 'lending_contract_not_configured':
+      return 'The Arc lending contract address is not configured yet on this deployment.';
+    case 'lending_contract_scaffold_only':
+      return 'The Arc lending contract is still in scaffold mode, so live writes stay blocked.';
+    case 'lending_globally_paused':
+      return 'The Arc-native lending lane is globally paused right now.';
+    case 'lending_reserve_not_supported':
+      return 'This lending reserve is not part of the current v1 scope.';
+    case 'lending_reserve_paused':
+      return 'This lending reserve is paused right now.';
+    case 'lending_reserve_borrow_disabled':
+      return 'Borrowing is disabled for this lending reserve right now.';
+    case 'lending_wallet_balance_empty':
+      return 'The agent wallet does not hold enough of that asset for this lending action.';
+    case 'lending_wallet_balance_too_low':
+      return 'The requested amount is above the visible wallet balance for this asset.';
+    case 'lending_supply_position_required':
+      return 'This action needs an existing supplied position first.';
+    case 'lending_borrow_position_required':
+      return 'This action needs an existing debt position first.';
+    case 'lending_supply_cap_reached':
+      return 'The reserve supply cap is already full.';
+    case 'lending_borrow_cap_reached':
+      return 'The reserve borrow cap is already full.';
+    case 'lending_borrow_capacity_unavailable':
+      return 'Borrow capacity is not available for this account right now.';
+    case 'lending_borrow_capacity_exceeded':
+      return 'The requested borrow amount is above the visible borrow capacity.';
+    case 'lending_withdraw_amount_exceeds_supply':
+      return 'The requested withdraw amount is above the visible supplied balance.';
+    case 'lending_repay_amount_exceeds_debt':
+      return 'The requested repay amount is above the visible debt balance.';
+    case 'lending_deleverage_not_required':
+      return 'Emergency deleverage is not required for this account right now.';
+    case 'lending_deleverage_wallet_funds_required':
+      return 'Emergency deleverage needs wallet funds in the same debt asset before any repay step can be sent.';
+    case 'lending_liquidation_borrower_required':
+      return 'Enter the borrower wallet address for liquidation.';
+    case 'lending_liquidation_collateral_asset_invalid':
+      return 'Choose USDC or EURC as the collateral asset for liquidation.';
+    case 'lending_liquidation_amount_required':
+      return 'Enter a positive repay amount for liquidation.';
+    case 'lending_liquidation_self_target_invalid':
+      return 'Liquidation must target another wallet, not the current agent wallet.';
+    case 'lending_liquidation_target_healthy':
+      return 'That borrower is not below the liquidation threshold right now.';
+    case 'lending_liquidation_target_debt_missing':
+      return 'The borrower does not currently hold the selected debt asset.';
+    case 'lending_liquidation_target_collateral_missing':
+      return 'The borrower does not currently hold the selected collateral asset.';
+    case 'lending_liquidation_amount_too_high':
+      return 'The requested liquidation amount is above the visible repayable debt.';
+    case 'lending_liquidation_health_unknown':
+      return 'Liquidation status cannot be determined until a valid borrower health factor is available.';
     case 'swap_not_configured':
       return 'No direct execution rail is configured for this task on this deployment.';
     case 'direct_pair_not_configured':
       return 'This direct cirBTC pair is not configured on the current deployment yet.';
     case 'direct_pair_seed_required':
       return 'The direct cirBTC pair exists but still needs initial seed liquidity before this task can run.';
+    case 'native_lending_execution_error':
+    case 'native_lending_deleverage_error':
+    case 'native_lending_liquidation_error':
+      return 'The lending worker started but the live on-chain step did not complete successfully.';
     case 'wallet_not_configured':
       return 'This agent wallet is not ready for live protocol position checks yet.';
     case 'task_not_found':
@@ -1182,6 +1280,13 @@ function getInitialTaskParams(taskId) {
       return { withdrawPct: DIRECT_PAIR_EXIT_PRESETS.EXEC_CIRBTC_USDC_LP_REMOVE.defaultWithdrawPct };
     case 'EXEC_CIRBTC_EURC_LP_REMOVE':
       return { withdrawPct: DIRECT_PAIR_EXIT_PRESETS.EXEC_CIRBTC_EURC_LP_REMOVE.defaultWithdrawPct };
+    case 'EXEC_LENDING_SUPPLY':
+    case 'EXEC_LENDING_WITHDRAW':
+    case 'EXEC_LENDING_BORROW':
+    case 'EXEC_LENDING_REPAY':
+      return { asset: 'USDC', amount: '' };
+    case 'EXEC_LENDING_LIQUIDATE':
+      return { borrower: '', debtAsset: 'USDC', collateralAsset: 'EURC', amount: '' };
     case 'EXEC_CCTP_BRIDGE':
       return { fromChain: 'Arc Testnet', toChain: 'Base Sepolia', amountUsdc: '' };
     case 'EXEC_ARB':
@@ -1219,6 +1324,19 @@ function getTaskParamError(taskId, params) {
       if (!(Number(params.withdrawPct) > 0) || Number(params.withdrawPct) > 100) {
         return 'Enter an LP withdrawal percentage between 0 and 100.';
       }
+      return '';
+    case 'EXEC_LENDING_SUPPLY':
+    case 'EXEC_LENDING_WITHDRAW':
+    case 'EXEC_LENDING_BORROW':
+    case 'EXEC_LENDING_REPAY':
+      if (!params.asset) return 'Choose USDC or EURC for this lending action.';
+      if (!(Number(params.amount) > 0)) return 'Enter a positive amount for this lending action.';
+      return '';
+    case 'EXEC_LENDING_LIQUIDATE':
+      if (!params.borrower) return 'Enter the borrower wallet address for liquidation.';
+      if (!params.debtAsset) return 'Choose the debt asset used for liquidation.';
+      if (!params.collateralAsset) return 'Choose the collateral asset expected from liquidation.';
+      if (!(Number(params.amount) > 0)) return 'Enter a positive repay amount for liquidation.';
       return '';
     case 'EXEC_CCTP_BRIDGE':
       if (!params.fromChain) return 'Choose a source chain.';
@@ -1267,6 +1385,21 @@ function buildTaskParams(taskId, params) {
       return {
         withdrawPct: Number(params.withdrawPct),
       };
+    case 'EXEC_LENDING_SUPPLY':
+    case 'EXEC_LENDING_WITHDRAW':
+    case 'EXEC_LENDING_BORROW':
+    case 'EXEC_LENDING_REPAY':
+      return {
+        asset: params.asset,
+        amount: Number(params.amount),
+      };
+    case 'EXEC_LENDING_LIQUIDATE':
+      return {
+        borrower: params.borrower,
+        debtAsset: params.debtAsset,
+        collateralAsset: params.collateralAsset,
+        amount: Number(params.amount),
+      };
     case 'EXEC_CCTP_BRIDGE':
       return {
         fromChain: params.fromChain,
@@ -1302,18 +1435,24 @@ function humanizeAutomationStatus(status) {
     db_only: 'Local Only',
     no_signal: 'No Signal',
     gate_blocked: 'Gate Hold',
+    policy_hold: 'Waiting',
     executed: 'Executed',
     dry_run: 'Dry Run',
     no_opportunity: 'No Opportunity',
     cap_reached: 'Daily Cap Reached',
+    insufficient_balance: 'Needs Funds',
+    permission_blocked: 'Permission Needed',
     fetch_error: 'Fetch Error',
     decision_error: 'Decision Error',
     execution_error: 'Execution Error',
+    execution_blocked: 'Execution Blocked',
     dry_run_failed: 'Dry Run Failed',
     disabled: 'Disabled',
     missing_agent: 'Missing Agent',
     no_private_key: 'Missing Key',
     pool_unconfigured: 'Pool Missing',
+    position_guard_unavailable: 'Position Check',
+    balance_check_failed: 'Balance Check',
     swap_error: 'Swap Error',
     db_error: 'DB Warning',
     chain_error: 'Chain Warning',
@@ -1336,7 +1475,7 @@ function getAutomationStatusClasses(status, enabled) {
 
 function getAutomationSummary(feature, state) {
   const bypassNote = state?.bypassDailyCap
-    ? ' Daily cap bypass is active for this whitelisted testnet agent, so the nominal cap is informational only.'
+    ? ' Daily limit is relaxed for this test agent, so this counter is only a guide.'
     : '';
 
   switch (feature.statusKey) {
@@ -1345,17 +1484,17 @@ function getAutomationSummary(feature, state) {
         ? 'Latest market check completed. This step only refreshes context.'
         : 'Runs background market checks. No funds move here.';
     case 'oracle':
-      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 48)} oracle updates completed. This keeps price and opportunity data fresh and does not trade by itself.${bypassNote}`;
+      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 48)} price refreshes completed. This keeps pricing and opportunity data fresh for later decisions.${bypassNote}`;
     case 'defiLoop':
       if (state?.lastStatus === 'dry_run') {
-        return `Simulation mode is active. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} checks ran and ${Number(state?.autoTxToday || 0)} real auto trades were sent.${bypassNote}`;
+        return `Practice mode is active. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} checks ran, and no new live trade was required from this card.${bypassNote}`;
       }
-      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} auto checks ran and ${Number(state?.autoTxToday || 0)} trades were sent. This toggle controls only the verified USDC -> EURC stable lane.${bypassNote}`;
+      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} stable checks ran and ${Number(state?.autoTxToday || 0)} live trades were sent. This card only controls the stable USDC/EURC route.${bypassNote}`;
     case 'cirbtcLp':
       if (state?.lastStatus === 'dry_run') {
-        return `Simulation mode is active. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} shared DeFi loop checks ran and ${Number(state?.autoTxToday || 0)} real auto trades were sent.${bypassNote}`;
+        return `Practice mode is active. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} LP checks ran, and no new live LP change was required from this card.${bypassNote}`;
       }
-      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} shared DeFi loop checks ran and ${Number(state?.autoTxToday || 0)} real auto trades were sent. This toggle controls only the verified cirBTC direct-pair LP lane.${bypassNote}`;
+      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} cirBTC LP checks ran and ${Number(state?.autoTxToday || 0)} live LP actions were sent. This card manages the LP position only, not normal cirBTC swaps.${bypassNote}`;
     case 'reputation':
       return state?.lastStatus === 'db_only'
         ? 'Saving reputation activity locally. On-chain posting is off right now.'
@@ -1541,6 +1680,24 @@ function getTaskExecutionLinks(payload) {
     hash: payload.economy?.gatewayMintTxHash,
   });
 
+  if (payload.executionRail === 'arc_native_lending') {
+    pushTaskExecutionLink(links, {
+      label: payload.action === 'liquidate' ? 'Liquidation tx' : payload.action === 'deleverage' ? 'Recovery tx' : 'Lending tx',
+      chainName: 'Arc Testnet',
+      hash: payload.txHash,
+    });
+
+    if (Array.isArray(payload.stepsExecuted)) {
+      payload.stepsExecuted.forEach((step, index) => {
+        pushTaskExecutionLink(links, {
+          label: `Recovery step ${index + 1}`,
+          chainName: 'Arc Testnet',
+          hash: step?.txHash,
+        });
+      });
+    }
+  }
+
   return links;
 }
 
@@ -1590,6 +1747,18 @@ function getCompletedTaskLabel(task, payload) {
     case 'EXEC_CIRBTC_USDC_LP_REMOVE':
     case 'EXEC_CIRBTC_EURC_LP_REMOVE':
       return 'LP exit completed';
+    case 'EXEC_LENDING_SUPPLY':
+      return 'Supply completed';
+    case 'EXEC_LENDING_WITHDRAW':
+      return 'Withdraw completed';
+    case 'EXEC_LENDING_BORROW':
+      return 'Borrow completed';
+    case 'EXEC_LENDING_REPAY':
+      return 'Repay completed';
+    case 'EXEC_LENDING_DELEVERAGE':
+      return 'Recovery completed';
+    case 'EXEC_LENDING_LIQUIDATE':
+      return 'Liquidation completed';
     default:
       return 'Task completed';
   }
@@ -1902,6 +2071,41 @@ function getTaskExecutionFactLines(payload) {
 
   if (payload.fromChain === 'Sepolia' && Array.isArray(payload.targets) && payload.targets.length > 0) {
     facts.push(`Fanout route: ${payload.targets.map(target => `${target.toChain} ${target.amountEth} ETH`).join(' · ')}`);
+  }
+
+  if (payload.executionRail === 'arc_native_lending') {
+    if (payload.action === 'liquidate') {
+      facts.push(`Liquidation target: ${payload.borrower || 'borrower required'}`);
+      facts.push(`Debt -> collateral: ${payload.debtAsset || 'debt'} -> ${payload.collateralAsset || 'collateral'}`);
+      facts.push(`Repay amount: ${formatTaskMetricAmount(payload.amount || 0)} ${payload.debtAsset || 'asset'}`);
+      if (payload.borrowerHealthFactor != null) {
+        facts.push(`Borrower health factor: ${formatTaskMetricAmount(payload.borrowerHealthFactor)}`);
+      }
+    } else if (payload.action === 'deleverage') {
+      if (payload.currentHealthFactor != null) {
+        facts.push(`Current health factor: ${formatTaskMetricAmount(payload.currentHealthFactor)}`);
+      }
+      if (payload.targetHealthFactor != null) {
+        facts.push(`Target health factor: ${formatTaskMetricAmount(payload.targetHealthFactor)}`);
+      }
+      if (payload.repayUsdPlanned != null) {
+        facts.push(`Repay planned: ${formatTaskMetricAmount(payload.repayUsdPlanned)} USD equivalent`);
+      }
+      if (Array.isArray(payload.stepsExecuted) && payload.stepsExecuted.length > 0) {
+        facts.push(`Recovery steps executed: ${payload.stepsExecuted.length}`);
+      } else if (Array.isArray(payload.plannedSteps) && payload.plannedSteps.length > 0) {
+        facts.push(`Recovery steps planned: ${payload.plannedSteps.length}`);
+      }
+    } else {
+      facts.push(`Lending action: ${String(payload.action || 'action').toUpperCase()} ${payload.asset || 'asset'}`);
+      facts.push(`Requested amount: ${formatTaskMetricAmount(payload.amount || 0)} ${payload.asset || 'asset'}`);
+      if (payload.healthFactor != null) {
+        facts.push(`Health factor after guard: ${formatTaskMetricAmount(payload.healthFactor)}`);
+      }
+      if (payload.availableBorrowUsd != null) {
+        facts.push(`Visible borrow capacity: ${formatTaskMetricAmount(payload.availableBorrowUsd)} USD`);
+      }
+    }
   }
 
   if (payload.swappedAmountIn && payload.amountOut && payload.stableToken) {
@@ -2451,6 +2655,86 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
                 );
               })()}
 
+              {['EXEC_LENDING_SUPPLY', 'EXEC_LENDING_WITHDRAW', 'EXEC_LENDING_BORROW', 'EXEC_LENDING_REPAY'].includes(task.id) && (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Asset</span>
+                    <select
+                      value={params.asset}
+                      onChange={e => setParams(current => ({ ...current, asset: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                    >
+                      {LENDING_ASSET_OPTIONS.map(token => (
+                        <option key={token} value={token}>{token}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Amount</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.000001"
+                      value={params.amount}
+                      onChange={e => setParams(current => ({ ...current, amount: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                      placeholder="1.00"
+                    />
+                  </label>
+                </div>
+              )}
+
+              {task.id === 'EXEC_LENDING_LIQUIDATE' && (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="block sm:col-span-2">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Borrower Wallet</span>
+                    <input
+                      type="text"
+                      value={params.borrower}
+                      onChange={e => setParams(current => ({ ...current, borrower: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                      placeholder="0x..."
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Debt Asset</span>
+                    <select
+                      value={params.debtAsset}
+                      onChange={e => setParams(current => ({ ...current, debtAsset: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                    >
+                      {LENDING_ASSET_OPTIONS.map(token => (
+                        <option key={token} value={token}>{token}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Collateral Asset</span>
+                    <select
+                      value={params.collateralAsset}
+                      onChange={e => setParams(current => ({ ...current, collateralAsset: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                    >
+                      {LENDING_ASSET_OPTIONS.map(token => (
+                        <option key={token} value={token}>{token}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block sm:col-span-2">
+                    <span className="block text-[11px] font-medium text-slate-500 mb-1">Repay Amount</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.000001"
+                      value={params.amount}
+                      onChange={e => setParams(current => ({ ...current, amount: e.target.value }))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 focus:outline-none focus:border-[#66D121]"
+                      placeholder="1.00"
+                    />
+                  </label>
+                </div>
+              )}
+
               {task.id === 'EXEC_CCTP_BRIDGE' && (
                 <div className="space-y-2">
                   <div className="grid gap-2 sm:grid-cols-3">
@@ -2559,6 +2843,11 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
               <p className="text-[11px] text-slate-500">
                 Fill the required fields before running this task.
               </p>
+            </div>
+          )}
+          {task.id === 'EXEC_LENDING_DELEVERAGE' && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-[11px] text-slate-500">
+              This recovery task has no manual amount field. It uses the visible lending surface to build a deterministic repay plan and only runs when the guard says the account needs emergency deleverage.
             </div>
           )}
           {task.id === 'EXEC_SEPOLIA_GAS_FANOUT' && (
@@ -2734,12 +3023,11 @@ export default function TasksTab() {
     }
 
     Promise.all([
-      fetchAgentBalance(agent.walletAddress, 5042002),
       fetchUsdcBalance(agent.walletAddress, 5042002),
       fetchEurcBalance(agent.walletAddress, 5042002),
-    ]).then(([nativeBalance, usdcBalance, eurcBalance]) => {
+    ]).then(([usdcBalance, eurcBalance]) => {
       if (!cancelled) {
-        setAutomationWalletSnapshot({ nativeBalance, usdcBalance, eurcBalance });
+        setAutomationWalletSnapshot({ usdcBalance, eurcBalance });
       }
     }).catch(() => {
       if (!cancelled) {
@@ -2955,7 +3243,7 @@ export default function TasksTab() {
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 flex-wrap">
-              <p className="text-sm font-semibold text-slate-800">Full Autonomous</p>
+              <p className="text-sm font-semibold text-slate-800">Background Automation</p>
               <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${
                 allAutomationEnabled
                   ? 'border-green-200 bg-green-50 text-green-700'
@@ -2965,10 +3253,10 @@ export default function TasksTab() {
               </span>
             </div>
             <p className="text-xs text-slate-500 mt-1">
-              Toggle Market Analysis, Oracle Data Feed, DeFi Loop Execution and Reputation Tracking in one action.
+              Turn the background checks and automation features on or off in one action.
             </p>
             <p className="text-xs text-slate-400 mt-1">
-              The Tasks enable switch remains separate. This control only manages background automation features.
+              The main Tasks switch stays separate. This control only manages the automation features below.
             </p>
           </div>
 
@@ -2982,7 +3270,7 @@ export default function TasksTab() {
             }`}
           >
             {fullAutonomyBusy ? <Spinner size={11} /> : <Brain size={12} />}
-            {allAutomationEnabled ? 'Disable All Automation' : 'Enable Full Autonomous'}
+            {allAutomationEnabled ? 'Disable Automation' : 'Enable Automation'}
           </button>
         </div>
       </div>
@@ -2996,12 +3284,12 @@ export default function TasksTab() {
         </div>
         <div className="mt-2 space-y-1.5 text-xs text-slate-600">
           <p>Market Analysis refreshes context only. It does not move funds.</p>
-          <p>Oracle Data Feed keeps stablecoin signals and pricing updates fresh.</p>
-          <p>DeFi Loop Execution is the only feature that can move funds automatically today.</p>
-          <p>Right now the only automatic on-chain trade is the verified USDC to EURC Curve route.</p>
-          <p>cirBTC actions and LP changes are still manual.</p>
+          <p>Oracle Data Feed keeps pricing and opportunity inputs fresh.</p>
+          <p>Stable DeFi Loop can move funds automatically on the stable USDC/EURC route.</p>
+          <p>cirBTC LP Automation manages the cirBTC LP position only.</p>
+          <p>Direct cirBTC swaps are still shallow, so keep size small.</p>
           <p>Maximum autonomous trade size is capped by your agent setting: <strong>{Number(agent?.settings?.maxTradeUsdc || 0).toFixed(2)} USDC</strong>. The loop uses the smaller of the strategy size and this cap.</p>
-          <p>Automation needs funds in the agent wallet. Current Arc wallet snapshot: <strong>{automationWalletSnapshot?.nativeBalance ?? '—'} ARC</strong>, <strong>{automationWalletSnapshot?.usdcBalance ?? '—'} USDC</strong>, <strong>{automationWalletSnapshot?.eurcBalance ?? '—'} EURC</strong>.</p>
+          <p>Automation needs funds in the agent wallet. Current wallet snapshot: <strong>{automationWalletSnapshot?.usdcBalance ?? '—'} USDC</strong>, <strong>{automationWalletSnapshot?.eurcBalance ?? '—'} EURC</strong>.</p>
         </div>
       </div>
 
@@ -3031,7 +3319,7 @@ export default function TasksTab() {
                   </span>
                   {automationState?.bypassDailyCap && ['oracle', 'defiLoop'].includes(feature.statusKey) && (
                     <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700">
-                      Whitelist bypass active
+                      Daily limit relaxed
                     </span>
                   )}
                 </div>

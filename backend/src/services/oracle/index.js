@@ -39,6 +39,7 @@ module.exports = {
   getMockPoolState:    arcRpc.getMockPoolState,
   resolveOraclePoolStateTarget: pools.resolveOraclePoolStateTarget,
   resolveCurvePool:    pools.resolveCurvePool,
+  resolveDirectSwapFallbackPool: pools.resolveDirectSwapFallbackPool,
   normalizeCurvePoolKey: pools.normalizeCurvePoolKey,
   normalizePoolVenue: pools.normalizePoolVenue,
   getOracleObservabilitySummary: observability.getOracleObservabilitySummary,

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAgent } from '../providers/AgentProvider.jsx';
-import { agents as agentsApi, oracle as oracleApi, defi as defiApi } from '../lib/api.js';
+import { agents as agentsApi, oracle as oracleApi, defi as defiApi, tasks as tasksApi } from '../lib/api.js';
+import { CHAINS } from '../lib/chains.js';
 import { Alert, Card, Spinner } from './ui/index.jsx';
 import {
   Activity,
@@ -729,10 +730,77 @@ function getPositionStatusCards(position) {
 }
 
 function getStatusBadgeClasses(tone) {
+  if (tone === 'blue') return 'border-sky-200 bg-sky-50 text-sky-700';
   if (tone === 'green') return 'border-emerald-200 bg-emerald-50 text-emerald-700';
   if (tone === 'amber') return 'border-amber-200 bg-amber-50 text-amber-700';
   if (tone === 'red') return 'border-rose-200 bg-rose-50 text-rose-700';
   return 'border-slate-200 bg-slate-100 text-slate-700';
+}
+
+function getArcExplorerTxUrl(txHash) {
+  if (!txHash || typeof txHash !== 'string') return null;
+  const explorerBase = CHAINS['Arc Testnet']?.explorerUrl;
+  return explorerBase ? `${explorerBase}/tx/${txHash}` : null;
+}
+
+function isPoolManualRunActive(run) {
+  return ['queued', 'running'].includes(String(run?.status || ''));
+}
+
+function getPoolManualRunStatusMeta(run) {
+  const status = String(run?.status || 'queued');
+  if (status === 'completed') {
+    return { tone: 'green', label: run?.stage_label || 'Completed' };
+  }
+  if (status === 'failed') {
+    return { tone: 'red', label: run?.stage_label || 'Failed' };
+  }
+  if (status === 'running') {
+    return { tone: 'blue', label: run?.stage_label || 'Running' };
+  }
+  if (status === 'queued') {
+    return { tone: 'amber', label: run?.stage_label || 'Queued' };
+  }
+  return {
+    tone: 'slate',
+    label: run?.stage_label || status.replace(/_/g, ' '),
+  };
+}
+
+function getPoolManualRunSummary(run, fallbackLabel = 'Manual action') {
+  if (!run) return '';
+
+  if (run.status === 'failed') {
+    return run.error || run.stage_detail || `${fallbackLabel} failed.`;
+  }
+
+  return run.result_payload?.summary
+    || run.stage_detail
+    || `${fallbackLabel} ${String(run.status || 'queued').replace(/_/g, ' ')}.`;
+}
+
+function getPoolManualRunLinks(run) {
+  const payload = run?.result_payload || {};
+  const economy = payload?.economy || {};
+  const candidates = [
+    { label: 'Execution tx', txHash: payload.txHash || payload.hash || payload.mintTxHash || payload.burnTxHash || payload.swapTxHash || null },
+    { label: 'Swap tx', txHash: payload.swapTxHash || null },
+    { label: 'Mint tx', txHash: payload.mintTxHash || null },
+    { label: 'Burn tx', txHash: payload.burnTxHash || null },
+    { label: 'Fee settlement tx', txHash: economy.gatewayMintTxHash || null },
+  ];
+  const seen = new Set();
+
+  return candidates
+    .filter(({ txHash }) => {
+      if (!txHash || seen.has(txHash)) return false;
+      seen.add(txHash);
+      return true;
+    })
+    .map(item => ({
+      ...item,
+      url: getArcExplorerTxUrl(item.txHash),
+    }));
 }
 
 function getPoolManualActions(poolConfig) {
@@ -1208,6 +1276,7 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [trackedRun, setTrackedRun] = useState(null);
 
   useEffect(() => {
     if (!actions.some(action => action.id === activeActionId)) {
@@ -1220,6 +1289,50 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
     setMessage('');
     setError('');
   }, [poolConfig, activeAction?.id]);
+
+  useEffect(() => {
+    if (!agentId || !trackedRun?.id || !isPoolManualRunActive(trackedRun)) {
+      return undefined;
+    }
+
+    let active = true;
+
+    async function syncTrackedRun() {
+      try {
+        const data = await tasksApi.runs(agentId, 'recent', 20);
+        if (!active) return;
+
+        const updatedRun = Array.isArray(data?.runs)
+          ? data.runs.find(item => item.id === trackedRun.id)
+          : null;
+
+        if (!updatedRun) return;
+
+        setTrackedRun(updatedRun);
+
+        if (!isPoolManualRunActive(updatedRun)) {
+          onRunQueued?.(updatedRun);
+          if (updatedRun.status === 'completed') {
+            setMessage(updatedRun.result_payload?.summary || 'Manual action completed.');
+            setError('');
+          } else if (updatedRun.status === 'failed') {
+            setError(updatedRun.error || updatedRun.stage_detail || 'The manual pool action failed.');
+          }
+        }
+      } catch (pollError) {
+        if (!active) return;
+        setError(current => current || pollError.message || 'Failed to refresh the manual action status.');
+      }
+    }
+
+    syncTrackedRun();
+    const intervalId = window.setInterval(syncTrackedRun, 2500);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [agentId, onRunQueued, trackedRun]);
 
   async function handleSubmit() {
     if (!agentId || !activeAction) return;
@@ -1241,6 +1354,7 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
         : 'Fee applied on submit.';
 
       if (response?.run) {
+        setTrackedRun(response.run);
         setMessage(`Queued. ${feeLabel}`);
         onRunQueued?.(response.run);
         return;
@@ -1248,11 +1362,18 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
 
       setMessage('Submitted.');
     } catch (runError) {
+      if (runError?.data?.run) {
+        setTrackedRun(runError.data.run);
+      }
       setError(runError.message || 'Failed to run the manual pool action.');
     } finally {
       setBusy(false);
     }
   }
+
+  const trackedRunStatus = trackedRun ? getPoolManualRunStatusMeta(trackedRun) : null;
+  const trackedRunSummary = trackedRun ? getPoolManualRunSummary(trackedRun, activeAction?.title || 'Manual action') : '';
+  const trackedRunLinks = trackedRun ? getPoolManualRunLinks(trackedRun) : [];
 
   if (!activeAction) {
     return (
@@ -1337,6 +1458,43 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
             {busy ? 'Submitting...' : activeAction.ctaLabel}
           </button>
         </div>
+
+        {trackedRun && (
+          <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Latest manual action</p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Started {formatTimestamp(trackedRun.created_at)} · Last update {formatTimestamp(trackedRun.updated_at || trackedRun.completed_at || trackedRun.created_at)}
+                </p>
+              </div>
+              {trackedRunStatus && (
+                <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${getStatusBadgeClasses(trackedRunStatus.tone)}`}>
+                  {trackedRunStatus.label}
+                </span>
+              )}
+            </div>
+
+            <p className="mt-3 text-sm leading-6 text-slate-700">{trackedRunSummary}</p>
+
+            {trackedRunLinks.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {trackedRunLinks.map(link => (
+                  <a
+                    key={`${link.label}-${link.txHash}`}
+                    href={link.url || '#'}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                  >
+                    <span>{link.label}</span>
+                    <span>{formatAddressShort(link.txHash)}</span>
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1453,7 +1611,8 @@ function PoolPositionSnapshot({ position }) {
       </div>
 
       <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Underlying Exposure</p>
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Current Redeemable Underlying</p>
+        <p className="mt-1 text-[11px] leading-5 text-slate-500">This is the live token mix your current LP share can withdraw right now, not the last amounts you originally deposited.</p>
         <div className="mt-2 space-y-2">
           {(position.underlying || []).map(asset => (
             <div key={`${position.poolKey}:${asset.symbol}`} className="flex items-start justify-between gap-3">
@@ -1481,6 +1640,44 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
   const executionCard = getLendingExecutionCard(lendingSurface);
   const priceCard = getLendingPriceCard(lendingSurface);
   const risk = lendingSurface?.risk || createEmptyLendingSurface().risk;
+  const recovery = lendingSurface?.recovery || {
+    execute: false,
+    status: 'idle',
+    detail: 'There is no lending debt to deleverage.',
+    repayUsdNeeded: 0,
+    repayUsdPlanned: 0,
+    repayUsdShortfall: 0,
+  };
+  const liquidation = lendingSurface?.liquidation || {
+    liquidatable: false,
+    status: 'idle',
+    detail: 'No debt is active, so liquidation is not relevant for this account.',
+    healthFactor: risk.healthFactor,
+  };
+  const recoveryTone = recovery.execute
+    ? recovery.status === 'partial' ? 'amber' : 'green'
+    : recovery.status === 'needs_funding' ? 'amber' : 'slate';
+  const recoveryLabel = recovery.execute
+    ? recovery.status === 'partial' ? 'Partially funded' : 'Ready'
+    : recovery.status === 'needs_funding' ? 'Needs funding' : recovery.status === 'not_required' ? 'Not required' : 'No debt';
+  const recoveryDetail = `${recovery.detail} Need ${formatUsdAmount(recovery.repayUsdNeeded)} · Planned ${formatUsdAmount(recovery.repayUsdPlanned)}${Number(recovery.repayUsdShortfall || 0) > 0 ? ` · Shortfall ${formatUsdAmount(recovery.repayUsdShortfall)}` : ''}.`;
+  const liquidationTone = liquidation.liquidatable
+    ? 'red'
+    : liquidation.status === 'critical' || liquidation.status === 'unknown'
+      ? 'amber'
+      : liquidation.status === 'safe'
+        ? 'green'
+        : 'slate';
+  const liquidationLabel = liquidation.liquidatable
+    ? 'Liquidatable'
+    : liquidation.status === 'critical'
+      ? 'Critical band'
+      : liquidation.status === 'unknown'
+        ? 'Unknown'
+        : liquidation.status === 'safe'
+          ? 'Safe'
+          : 'No debt';
+  const liquidationDetail = `${liquidation.detail} Health factor ${formatHealthFactor(liquidation.healthFactor)}.`;
   const reserveCards = reserves.length > 0
     ? reserves
     : LENDING_WATCH_ASSETS.map(asset => ({
@@ -1510,6 +1707,18 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
       label: priceCard.label,
       detail: priceCard.detail,
     },
+    {
+      title: 'Recovery',
+      tone: recoveryTone,
+      label: recoveryLabel,
+      detail: recoveryDetail,
+    },
+    {
+      title: 'Liquidation Risk',
+      tone: liquidationTone,
+      label: liquidationLabel,
+      detail: liquidationDetail,
+    },
   ];
 
   return (
@@ -1526,7 +1735,7 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
         {lendingError && <Alert type="error">{lendingError}</Alert>}
         {lendingSurfaceError && <Alert type="error">{lendingSurfaceError}</Alert>}
 
-        <div className="mt-4 grid gap-3 lg:grid-cols-3">
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
           {statusCards.map(card => (
             <div key={card.title} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
               <div className="flex items-start justify-between gap-3">
@@ -1566,6 +1775,9 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
             <Wallet size={14} className="text-slate-400" />
             <p className="text-sm font-semibold text-slate-800">Manual lending controls</p>
           </div>
+          <p className="text-xs text-slate-500">
+            The same supply, withdraw, borrow, repay, recovery and liquidation actions now also appear in Tasks &gt; Paid when you prefer the task-based lane.
+          </p>
           <LendingManualControls agentId={agentId} lendingSurface={lendingSurface} onRunQueued={onRunQueued} />
         </div>
       </Card>
@@ -1682,10 +1894,12 @@ export default function DeFiTab() {
   const [lendingError, setLendingError] = useState('');
   const [lendingSurfaceError, setLendingSurfaceError] = useState('');
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ silent = false } = {}) => {
     if (!agent?.id) return;
 
-    setLoading(true);
+    if (!silent) {
+      setLoading(true);
+    }
     setError('');
 
     try {
@@ -1716,12 +1930,19 @@ export default function DeFiTab() {
     } catch (loadError) {
       setError(loadError.message || 'Failed to load the DeFi surface.');
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
   }, [agent?.id]);
 
   useEffect(() => {
     load();
+  }, [load]);
+  const refreshSurfaceAfterRun = useCallback(() => {
+    window.setTimeout(() => {
+      load({ silent: true });
+    }, 1500);
   }, [load]);
   const positionsByPool = useMemo(() => new Map((positionSnapshot.positions || []).map(position => [position.poolKey, position])), [positionSnapshot.positions]);
 
@@ -1806,11 +2027,7 @@ export default function DeFiTab() {
           lendingSurface={lendingSurface}
           lendingSurfaceError={lendingSurfaceError}
           agentId={agent?.id}
-          onRunQueued={() => {
-            window.setTimeout(() => {
-              load();
-            }, 1500);
-          }}
+            onRunQueued={refreshSurfaceAfterRun}
         />
       ) : loading ? (
         <div className="flex justify-center py-10"><Spinner /></div>
@@ -1854,11 +2071,7 @@ export default function DeFiTab() {
                   <PoolManualControls
                     poolConfig={poolConfig}
                     agentId={agent?.id}
-                    onRunQueued={() => {
-                      window.setTimeout(() => {
-                        load();
-                      }, 1500);
-                    }}
+                    onRunQueued={refreshSurfaceAfterRun}
                   />
                 </div>
               </Card>

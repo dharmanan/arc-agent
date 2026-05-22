@@ -838,6 +838,14 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
     })
     .catch(err => {
       console.error('[AGENT SWAP]', err.message);
+      db.query(
+        'UPDATE transactions SET meta = meta || $1::jsonb WHERE id = $2',
+        [JSON.stringify({
+          error: err.userMessage || err.message || 'Swap failed before confirmation.',
+          errorCode: err.code || null,
+          recommendedMaxAmountIn: Number.isFinite(Number(err.recommendedMaxAmountIn)) ? Number(err.recommendedMaxAmountIn) : null,
+        }), txId],
+      ).catch(() => {});
       updateTxStatus(txId, 'failed').catch(() => {});
       rollbackDailyLimit(agent.id, usdcEquiv);
     });

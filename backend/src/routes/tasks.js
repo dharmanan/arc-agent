@@ -55,6 +55,11 @@ const EXECUTION_TASK_IDS = new Set([
   'EXEC_CIRBTC_EURC_ZAP_IN',
   'EXEC_CIRBTC_USDC_LP_REMOVE',
   'EXEC_CIRBTC_EURC_LP_REMOVE',
+  'EXEC_LENDING_SUPPLY',
+  'EXEC_LENDING_WITHDRAW',
+  'EXEC_LENDING_BORROW',
+  'EXEC_LENDING_REPAY',
+  'EXEC_LENDING_LIQUIDATE',
   'EXEC_CCTP_BRIDGE',
   'EXEC_SEPOLIA_GAS_FANOUT',
   'EXEC_ARB',
@@ -394,6 +399,21 @@ function _validateExecutionParams(taskId, params) {
     case 'EXEC_CIRBTC_EURC_LP_REMOVE':
       if (!_isPositiveNumber(params.withdrawPct)) return 'pair_exit_pct_invalid';
       if (Number(params.withdrawPct) > 100) return 'pair_exit_pct_invalid';
+      return null;
+
+    case 'EXEC_LENDING_SUPPLY':
+    case 'EXEC_LENDING_WITHDRAW':
+    case 'EXEC_LENDING_BORROW':
+    case 'EXEC_LENDING_REPAY':
+      if (!MANUAL_LENDING_ASSETS.has(String(params.asset || '').toUpperCase())) return 'manual_lending_asset_invalid';
+      if (!_isPositiveNumber(params.amount)) return 'lending_amount_required';
+      return null;
+
+    case 'EXEC_LENDING_LIQUIDATE':
+      if (!String(params.borrower || params.borrowerAddress || '').trim()) return 'lending_liquidation_borrower_required';
+      if (!MANUAL_LENDING_ASSETS.has(String(params.debtAsset || params.asset || '').toUpperCase())) return 'manual_lending_asset_invalid';
+      if (!MANUAL_LENDING_ASSETS.has(String(params.collateralAsset || '').toUpperCase())) return 'lending_liquidation_collateral_asset_invalid';
+      if (!_isPositiveNumber(params.amount)) return 'lending_liquidation_amount_required';
       return null;
 
     case 'EXEC_CCTP_BRIDGE':

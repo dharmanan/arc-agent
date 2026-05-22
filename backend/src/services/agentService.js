@@ -13,6 +13,147 @@ const DEFAULT_PERMISSIONS = [
   'aggressive_mode',
 ];
 
+const STABLE_MANUAL_ADD_COOLDOWN_MINUTES = Math.max(
+  Number.parseInt(process.env.STABLE_MANUAL_LP_ADD_COOLDOWN_MINUTES || '45', 10) || 45,
+  1,
+);
+const DEFAULT_STABLE_TARGET_LP_ALLOCATION_PCT = 25;
+const DEFAULT_STABLE_TARGET_LP_MIN_ALLOCATION_PCT = 20;
+const DEFAULT_STABLE_TARGET_LP_MAX_ALLOCATION_PCT = 30;
+
+function parseTimestampMs(value) {
+  const timestamp = Date.parse(value || '');
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function toPositiveFiniteNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function normalizeUsdcAmount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return Math.floor(numeric * 1_000_000) / 1_000_000;
+}
+
+function readStableLpAllocationSnapshot(decision) {
+  const minPct = toPositiveFiniteNumber(decision?.targetLpMinAllocationPct) || DEFAULT_STABLE_TARGET_LP_MIN_ALLOCATION_PCT;
+  const maxPct = toPositiveFiniteNumber(decision?.targetLpMaxAllocationPct) || DEFAULT_STABLE_TARGET_LP_MAX_ALLOCATION_PCT;
+  const unclampedTargetPct = toPositiveFiniteNumber(decision?.targetLpTargetAllocationPct) || DEFAULT_STABLE_TARGET_LP_ALLOCATION_PCT;
+  const targetPct = Math.min(Math.max(unclampedTargetPct, minPct), maxPct);
+
+  return {
+    minPct,
+    targetPct,
+    maxPct,
+    source: String(decision?.targetLpAllocationSource || '').trim() || 'policy_default',
+  };
+}
+
+function readStableLpBandSnapshot(decision, allocationSnapshot) {
+  const availableUsdcBalance = toPositiveFiniteNumber(decision?.availableUsdcBalance) || 0;
+  const availableEurcBalance = toPositiveFiniteNumber(decision?.availableEurcBalance) || 0;
+  const walletReserveUsdc = toPositiveFiniteNumber(decision?.walletReserveUsdc) || 0;
+  const positionValueUsd = toPositiveFiniteNumber(decision?.positionValueUsd) || 0;
+  const deployableUsdcBalance = normalizeUsdcAmount(Math.max(availableUsdcBalance - walletReserveUsdc, 0));
+  const totalStableCapitalUsd = normalizeUsdcAmount(deployableUsdcBalance + availableEurcBalance + positionValueUsd);
+
+  if (totalStableCapitalUsd > 0) {
+    return {
+      minUsd: normalizeUsdcAmount(totalStableCapitalUsd * (allocationSnapshot.minPct / 100)),
+      targetUsd: normalizeUsdcAmount(totalStableCapitalUsd * (allocationSnapshot.targetPct / 100)),
+      maxUsd: normalizeUsdcAmount(totalStableCapitalUsd * (allocationSnapshot.maxPct / 100)),
+    };
+  }
+
+  return {
+    minUsd: normalizeUsdcAmount(decision?.targetLpMinUsd),
+    targetUsd: normalizeUsdcAmount(decision?.targetLpTargetUsd),
+    maxUsd: normalizeUsdcAmount(decision?.targetLpMaxUsd),
+  };
+}
+
+function isLegacyStableDecision(decision) {
+  if (!decision || typeof decision !== 'object') return false;
+  const executionSource = String(decision.executionSource || '').trim();
+  const policyId = String(decision.policyId || '').trim();
+  return executionSource === 'stable_policy_v1' || policyId === 'stable_usdc_eurc_curve_v1';
+}
+
+function buildStableManualCooldownDecision(lastDecision, manualCooldownUntil, { cooldownActive = false } = {}) {
+  const baseDecision = lastDecision && typeof lastDecision === 'object' ? lastDecision : {};
+  const allocationSnapshot = readStableLpAllocationSnapshot(baseDecision);
+  const bandSnapshot = readStableLpBandSnapshot(baseDecision, allocationSnapshot);
+  const cooldownUntilMs = parseTimestampMs(manualCooldownUntil);
+  const legacyRecordedAtMs = parseTimestampMs(baseDecision.recordedAt);
+  const recordedAtMs = cooldownActive && cooldownUntilMs != null
+    ? cooldownUntilMs - (STABLE_MANUAL_ADD_COOLDOWN_MINUTES * 60_000)
+    : (legacyRecordedAtMs != null ? legacyRecordedAtMs : Date.now());
+  const summary = cooldownActive
+    ? (manualCooldownUntil
+      ? `A manual stable LP add was recorded. Stable LP automation is holding until ${manualCooldownUntil}, so soft trims and non-emergency exits stay paused.`
+      : 'A manual stable LP add was recorded. Stable LP automation is holding while soft trims and non-emergency exits stay paused.')
+    : 'This stable card is ignoring an older mixed-policy snapshot and is waiting for the next Stable LP lane review.';
+
+  return {
+    ...baseDecision,
+    ok: true,
+    lane: 'stable_curve_lp',
+    error: null,
+    action: 'hold',
+    reason: cooldownActive ? 'manual_cooldown_active' : 'legacy_snapshot_ignored',
+    status: 'policy_hold',
+    txHash: null,
+    execute: false,
+    summary,
+    lpAction: null,
+    policyId: 'stable_usdc_eurc_lp_manager_v2',
+    blockedBy: cooldownActive ? 'manualCooldown' : 'legacySnapshot',
+    recordedAt: new Date(recordedAtMs).toISOString(),
+    actionParams: null,
+    operationType: null,
+    executionSource: 'stable_lp_policy_v2',
+    suggestedAmountUsdc: 0,
+    suggestedLpExitAmount: null,
+    suggestedLpExitValueUsd: 0,
+    targetLpMinUsd: bandSnapshot.minUsd,
+    targetLpTargetUsd: bandSnapshot.targetUsd,
+    targetLpMaxUsd: bandSnapshot.maxUsd,
+    targetLpMinAllocationPct: allocationSnapshot.minPct,
+    targetLpTargetAllocationPct: allocationSnapshot.targetPct,
+    targetLpMaxAllocationPct: allocationSnapshot.maxPct,
+    targetLpAllocationSource: allocationSnapshot.source,
+    manualCooldownUntil: manualCooldownUntil || null,
+    manualCooldownActive: cooldownActive,
+  };
+}
+
+function resolveStableAutomationState({
+  lastStatus,
+  lastDecision,
+  manualCooldownUntil,
+} = {}) {
+  const cooldownUntilMs = parseTimestampMs(manualCooldownUntil);
+  const cooldownActive = cooldownUntilMs != null && cooldownUntilMs > Date.now();
+  const legacyDecision = isLegacyStableDecision(lastDecision);
+
+  if (!legacyDecision) {
+    return {
+      lastStatus: lastStatus || 'idle',
+      lastDecision,
+      lastRunAt: lastDecision?.recordedAt || null,
+    };
+  }
+
+  const maskedDecision = buildStableManualCooldownDecision(lastDecision, manualCooldownUntil, { cooldownActive });
+  return {
+    lastStatus: 'policy_hold',
+    lastDecision: maskedDecision,
+    lastRunAt: maskedDecision.recordedAt,
+  };
+}
+
 // ── ERC-8004 IdentityRegistry (Arc Testnet) ───────────────────────────────────
 const IDENTITY_REGISTRY_ADDRESS = '0x8004A818BFB912233c491871b3d84c89A494BD9e';
 const IDENTITY_REGISTRY_ABI = [
@@ -338,9 +479,11 @@ async function getAgentStatus(agentId, userId) {
             a.llm_model, a.wallet_address, a.last_reset_day,
           a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
             a.daily_market_analysis_count, a.daily_defi_loop_count, a.daily_auto_tx_count,
-            a.market_analysis_last_run_at, a.market_analysis_last_status,
+            a.market_analysis_last_run_at, a.market_analysis_last_status, a.market_analysis_last_decision,
+            a.stable_manual_cooldown_until,
             a.oracle_last_run_at, a.oracle_last_status,
-          a.defi_loop_last_run_at, a.defi_loop_last_status, a.defi_loop_last_decision,
+            a.defi_loop_last_run_at, a.defi_loop_last_status, a.defi_loop_last_decision,
+            a.cirbtc_lp_last_run_at, a.cirbtc_lp_last_status, a.cirbtc_lp_last_decision,
             a.reputation_last_run_at, a.reputation_last_status
      FROM agents a
      WHERE a.id = $1 AND a.user_id = $2`,
@@ -361,16 +504,28 @@ async function getAgentStatus(agentId, userId) {
   }
 
   const dailyLimitBypass = getDailyLimitBypass(a);
+  const marketAnalysisLastDecision = a.market_analysis_last_decision
+    && typeof a.market_analysis_last_decision === 'object'
+    && Object.keys(a.market_analysis_last_decision).length > 0
+    ? a.market_analysis_last_decision
+    : null;
   const defiLoopLastDecision = a.defi_loop_last_decision
     && typeof a.defi_loop_last_decision === 'object'
     && Object.keys(a.defi_loop_last_decision).length > 0
     ? a.defi_loop_last_decision
     : null;
-  const stableLoopLastDecision = defiLoopLastDecision && defiLoopLastDecision.lane !== 'cirbtc_direct_pair_lp'
+  const rawStableLoopLastDecision = defiLoopLastDecision && defiLoopLastDecision.lane !== 'cirbtc_direct_pair_lp'
     ? defiLoopLastDecision
     : null;
-  const cirbtcLpLastDecision = defiLoopLastDecision?.lane === 'cirbtc_direct_pair_lp'
-    ? defiLoopLastDecision
+  const stableLoopState = resolveStableAutomationState({
+    lastStatus: a.defi_loop_last_status || 'idle',
+    lastDecision: rawStableLoopLastDecision,
+    manualCooldownUntil: a.stable_manual_cooldown_until,
+  });
+  const cirbtcLpLastDecision = a.cirbtc_lp_last_decision
+    && typeof a.cirbtc_lp_last_decision === 'object'
+    && Object.keys(a.cirbtc_lp_last_decision).length > 0
+    ? a.cirbtc_lp_last_decision
     : null;
 
   return {
@@ -392,6 +547,7 @@ async function getAgentStatus(agentId, userId) {
         enabled: a.market_analysis_enabled ?? false,
         lastRunAt: a.market_analysis_last_run_at,
         lastStatus: a.market_analysis_last_status || 'idle',
+        lastDecision: marketAnalysisLastDecision,
       },
       oracle: {
         enabled: a.oracle_enabled ?? false,
@@ -403,9 +559,10 @@ async function getAgentStatus(agentId, userId) {
       },
       defiLoop: {
         enabled: a.defi_loop_enabled ?? false,
-        lastRunAt: a.defi_loop_last_run_at,
-        lastStatus: a.defi_loop_last_status || 'idle',
-        lastDecision: stableLoopLastDecision,
+        lastRunAt: stableLoopState.lastRunAt || a.defi_loop_last_run_at,
+        lastStatus: stableLoopState.lastStatus,
+        lastDecision: stableLoopState.lastDecision,
+        manualCooldownUntil: a.stable_manual_cooldown_until,
         todayCount: a.daily_defi_loop_count ?? 0,
         dailyCap: 10,
         autoTxToday: a.daily_auto_tx_count ?? 0,
@@ -413,8 +570,8 @@ async function getAgentStatus(agentId, userId) {
       },
       cirbtcLp: {
         enabled: a.cirbtc_lp_enabled ?? false,
-        lastRunAt: a.defi_loop_last_run_at,
-        lastStatus: a.defi_loop_last_status || 'idle',
+        lastRunAt: a.cirbtc_lp_last_run_at,
+        lastStatus: a.cirbtc_lp_last_status || 'idle',
         lastDecision: cirbtcLpLastDecision,
         todayCount: a.daily_defi_loop_count ?? 0,
         dailyCap: 10,

@@ -6,6 +6,7 @@
   "scripts": {
     "audit": "npm audit",
     "smoke:prod": "node scripts/prodSmoke.js",
+    "smoke:automation:live": "cd backend && npx -y @railway/cli run --service backend -- node scripts/automationLiveSmoke.js",
     "frontend:dev": "cd frontend && npm run dev",
     "frontend:build": "cd frontend && npm run build",
     "backend:dev": "cd backend && npm run dev",

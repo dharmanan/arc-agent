@@ -18,6 +18,64 @@ function getTxMeta(tx) {
   return tx?.meta && typeof tx.meta === 'object' ? tx.meta : {};
 }
 
+function getAutomationPolicyMeta(meta) {
+  const automationPolicy = meta?.automationPolicy && typeof meta.automationPolicy === 'object'
+    ? meta.automationPolicy
+    : null;
+  const stablePolicy = meta?.stablePolicy && typeof meta.stablePolicy === 'object'
+    ? meta.stablePolicy
+    : null;
+
+  return {
+    executionSource: String(meta?.executionSource || '').trim(),
+    policyId: String(meta?.policyId || automationPolicy?.policyId || stablePolicy?.policyId || '').trim(),
+    policyLane: String(meta?.policyLane || automationPolicy?.verdict?.lane || stablePolicy?.verdict?.lane || '').trim(),
+  };
+}
+
+function getActivityPolicyBadge(tx) {
+  const meta = getTxMeta(tx);
+  const { executionSource, policyId, policyLane } = getAutomationPolicyMeta(meta);
+
+  if (tx?.type === 'curve_lp_add' || tx?.type === 'curve_lp_remove') {
+    if (executionSource === 'stable_policy_v1' || policyId === 'stable_usdc_eurc_curve_v1') {
+      return {
+        label: 'Legacy mixed policy',
+        variant: 'yellow',
+        note: 'Historical row from the older mixed stable policy before LP and oracle lanes were separated.',
+      };
+    }
+
+    if (executionSource === 'stable_lp_policy_v2' || policyId === 'stable_usdc_eurc_lp_manager_v2' || policyLane === 'stable_curve_lp') {
+      return {
+        label: 'Stable LP lane',
+        variant: 'green',
+        note: null,
+      };
+    }
+  }
+
+  if (['defi_loop_swap', 'defi_loop_dry', 'rebalance'].includes(tx?.type)) {
+    if (executionSource === 'oracle_strategy' && !policyId) {
+      return {
+        label: 'Legacy mixed policy',
+        variant: 'yellow',
+        note: 'Historical row from before LP and oracle decisions were split into separate lanes.',
+      };
+    }
+
+    if (executionSource === 'oracle_strategy_v1' || policyId === 'oracle_stable_curve_strategy_v1' || policyLane === 'oracle_strategy') {
+      return {
+        label: 'Oracle lane',
+        variant: 'green',
+        note: null,
+      };
+    }
+  }
+
+  return null;
+}
+
 function isRealHash(hash) {
   return /^0x[0-9a-fA-F]{64}$/.test(hash || '');
 }
@@ -35,6 +93,19 @@ function formatTokenAmountWithZero(amount, token) {
   if (!Number.isFinite(numeric)) return null;
   if (numeric === 0) return `0 ${token}`;
   return formatTokenAmount(numeric, token);
+}
+
+function getExecutionRailLabel(executionRail) {
+  switch (String(executionRail || '').toLowerCase()) {
+    case 'swap_kit':
+      return 'app route';
+    case 'curve_fallback':
+      return 'Curve pool';
+    case 'uniswap_v2_fallback':
+      return 'direct pool';
+    default:
+      return 'swap route';
+  }
 }
 
 function summarizeActivityError(error) {
@@ -278,7 +349,7 @@ function getRewardProgramStatus(program, summary) {
   return {
     tone: 'slate',
     label: 'Seeded paused',
-    detail: 'The reward ledger is wired, but funded emissions are still paused.',
+    detail: 'The reward ledger exists, but live reward emissions are intentionally off. This card is bookkeeping only right now.',
   };
 }
 
@@ -310,7 +381,81 @@ function getRewardSnapshotStatus(snapshot) {
   return {
     tone: 'amber',
     label: 'Pending',
-    detail: 'The snapshot is recorded for ledger visibility, but claimable emissions are not live yet.',
+    detail: 'This snapshot is only a ledger write. Claimable LP rewards are not active yet, so nothing can be claimed from it.',
+  };
+}
+
+function humanizeAutomationSource(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return 'Policy default';
+  if (raw === 'policy_default') return 'Policy default';
+
+  const [prefix, suffix] = raw.split(':');
+  if (prefix === 'market_analysis') {
+    return `Market analysis (${String(suffix || 'unknown').toUpperCase()})`;
+  }
+
+  return humanizeAutomationAction(raw, 'Policy default');
+}
+
+function formatAllocationBandPct(minPct, targetPct, maxPct) {
+  const minLabel = formatPercentAmount(minPct);
+  const targetLabel = formatPercentAmount(targetPct);
+  const maxLabel = formatPercentAmount(maxPct);
+  if ([minLabel, targetLabel, maxLabel].includes('—')) return '—';
+  return `${minLabel} · ${targetLabel} · ${maxLabel}`;
+}
+
+function getMarketAnalysisStatus(marketAnalysisState, lastDecision) {
+  if (!marketAnalysisState?.enabled) {
+    return {
+      tone: 'slate',
+      label: 'Disabled',
+      detail: 'Market analysis is off, so no advisory signal will be refreshed for this agent.',
+    };
+  }
+
+  const status = String(marketAnalysisState?.lastStatus || 'idle');
+  const signal = lastDecision?.signal || null;
+
+  if (status === 'running') {
+    return {
+      tone: 'blue',
+      label: 'Running',
+      detail: 'Market analysis is refreshing the current advisory signal right now.',
+    };
+  }
+
+  if (status === 'success') {
+    return {
+      tone: 'green',
+      label: 'Healthy',
+      detail: signal?.lane === 'stable_curve'
+        ? 'The latest advisory signal is feeding the stable policy allocation band.'
+        : 'The latest advisory signal stayed in observe-only mode.',
+    };
+  }
+
+  if (['permission_blocked', 'disabled'].includes(status)) {
+    return {
+      tone: 'amber',
+      label: humanizeAutomationStatus(status),
+      detail: 'Market analysis is enabled, but it cannot currently refresh a usable advisory signal.',
+    };
+  }
+
+  if (['error', 'missing_agent'].includes(status)) {
+    return {
+      tone: 'red',
+      label: humanizeAutomationStatus(status),
+      detail: 'The latest market analysis cycle did not finish cleanly.',
+    };
+  }
+
+  return {
+    tone: 'slate',
+    label: humanizeAutomationStatus(status),
+    detail: 'Market analysis is waiting for the next eligible cycle.',
   };
 }
 
@@ -350,6 +495,30 @@ function humanizeAutomationAction(value, fallback = 'No action') {
     .join(' ');
 }
 
+function isAutomationErrorStatus(status) {
+  return [
+    'fetch_error',
+    'position_guard_unavailable',
+    'balance_check_failed',
+    'execution_blocked',
+    'execution_error',
+    'dry_run_failed',
+    'pool_unconfigured',
+    'missing_agent',
+    'error',
+  ].includes(String(status || 'idle'));
+}
+
+function getAutomationStatusSummary(status, lastDecision) {
+  if (!lastDecision) return null;
+
+  if (isAutomationErrorStatus(status)) {
+    return lastDecision.error || lastDecision.reason || lastDecision.summary || null;
+  }
+
+  return lastDecision.summary || lastDecision.reason || lastDecision.error || null;
+}
+
 function getStableAutomationStatus(defiLoopState, lastDecision) {
   if (!defiLoopState?.enabled) {
     return {
@@ -360,7 +529,7 @@ function getStableAutomationStatus(defiLoopState, lastDecision) {
   }
 
   const status = String(defiLoopState?.lastStatus || 'idle');
-  const summary = lastDecision?.summary || lastDecision?.reason || null;
+  const summary = getAutomationStatusSummary(status, lastDecision);
 
   if (status === 'running') {
     return {
@@ -419,7 +588,7 @@ function getCirbtcAutomationStatus(cirbtcLoopState, lastDecision) {
   }
 
   const status = String(cirbtcLoopState?.lastStatus || 'idle');
-  const summary = lastDecision?.summary || lastDecision?.reason || null;
+  const summary = getAutomationStatusSummary(status, lastDecision);
 
   if (status === 'running') {
     return {
@@ -559,8 +728,63 @@ function getOracleSignalFollowUp(tx, allTxs) {
   }) || null;
 }
 
+function getVisibleRecentActivity(allTxs = [], agentStatus = null) {
+  const visible = [];
+  const seenOracleSnapshots = new Set();
+  const stableLoopState = agentStatus?.automation?.defiLoop || null;
+  const legacyStableSnapshotActive = stableLoopState?.lastStatus === 'policy_hold'
+    && ['manualCooldown', 'legacySnapshot'].includes(stableLoopState?.lastDecision?.blockedBy);
+  const latestManualStableAddAtMs = allTxs
+    .filter(tx => tx?.type === 'curve_lp_add' && String(getTxMeta(tx)?.taskId || '').startsWith('EXEC_MANUAL_CURVE_LIQUIDITY_ADD'))
+    .map(tx => Date.parse(tx?.created_at || ''))
+    .filter(timestamp => Number.isFinite(timestamp))
+    .sort((left, right) => right - left)[0] || null;
+
+  allTxs.forEach(tx => {
+    if (legacyStableSnapshotActive && tx?.type === 'curve_lp_remove') {
+      const policyBadge = getActivityPolicyBadge(tx);
+      const txCreatedAtMs = Date.parse(tx?.created_at || '');
+      if (
+        policyBadge?.label === 'Legacy mixed policy'
+        && Number.isFinite(txCreatedAtMs)
+        && Number.isFinite(latestManualStableAddAtMs)
+        && txCreatedAtMs >= latestManualStableAddAtMs
+      ) {
+        return;
+      }
+    }
+
+    if (tx?.type !== 'oracle_signal') {
+      visible.push(tx);
+      return;
+    }
+
+    if (getOracleSignalFollowUp(tx, allTxs)) {
+      visible.push(tx);
+      return;
+    }
+
+    const meta = getTxMeta(tx);
+    const snapshotKey = [
+      meta.signal?.strategy || 'oracle',
+      meta.executionState || 'unknown',
+      meta.executionPermissionGranted === true ? 'auto' : 'snapshot',
+    ].join(':');
+
+    if (seenOracleSnapshots.has(snapshotKey)) {
+      return;
+    }
+
+    seenOracleSnapshots.add(snapshotKey);
+    visible.push(tx);
+  });
+
+  return visible;
+}
+
 function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
   const meta = getTxMeta(tx);
+  const activityPolicyBadge = getActivityPolicyBadge(tx);
   const isOracleSignal = tx.type === 'oracle_signal';
   const isOracleStrategyExecution = tx.type === 'defi_loop_swap';
   const isOracleStrategyDryRun = tx.type === 'defi_loop_dry';
@@ -575,16 +799,21 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
 
   if (isOracleSignal) {
     const strategy = meta.signal?.strategy === 'stablecoin_fx'
-      ? 'EURC/USDC oracle signal'
-      : 'Oracle signal';
+      ? 'EURC/USDC oracle snapshot'
+      : 'Oracle snapshot';
     const isDailyCapReached = meta.executionState === 'daily_cap_reached';
     const followUpTx = getOracleSignalFollowUp(tx, allTxs);
     const signalCreatedAtMs = Date.parse(tx.created_at || meta.signal?.timestamp || '');
-    const lastDefiRunAtMs = Date.parse(agentStatus?.automation?.defiLoop?.lastRunAt || '');
+    const defiLoopState = agentStatus?.automation?.defiLoop || null;
+    const lastDefiRunAtMs = Date.parse(defiLoopState?.lastRunAt || '');
+    const latestDefiLoopStatus = String(defiLoopState?.lastStatus || 'idle');
+    const latestDefiLoopDetail = getAutomationStatusSummary(latestDefiLoopStatus, defiLoopState?.lastDecision);
+    const manualCooldownUntil = defiLoopState?.manualCooldownUntil || defiLoopState?.lastDecision?.manualCooldownUntil || null;
+    const manualCooldownUntilMs = Date.parse(manualCooldownUntil || '');
 
     let signalReason = meta.signalOnlyReason
       || (meta.executionPermissionGranted
-        ? 'Autonomous execution is enabled, but this row is only the oracle snapshot. A separate oracle strategy row appears only when the DeFi loop records a result for this exact signal.'
+        ? 'This is a normal oracle snapshot, not a separate trade. The stable automation card shows the latest committed policy result.'
         : 'Signal only — this agent does not currently have permission to auto-execute oracle strategies.');
 
     if (followUpTx) {
@@ -604,20 +833,30 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
       } else {
         signalReason = 'This signal later produced a separate DeFi loop result row below.';
       }
+    } else if (meta.executionPermissionGranted && Number.isFinite(signalCreatedAtMs) && Number.isFinite(manualCooldownUntilMs) && manualCooldownUntilMs > signalCreatedAtMs) {
+      signalReason = `This is a normal oracle snapshot. Stable automation stayed in manual LP cooldown until ${formatDateTime(manualCooldownUntil)}, so no soft trim or exit was allowed for this signal.`;
     } else if (meta.executionPermissionGranted) {
-      signalReason = Number.isFinite(signalCreatedAtMs) && Number.isFinite(lastDefiRunAtMs) && lastDefiRunAtMs < signalCreatedAtMs
-        ? 'Autonomous execution was approved, but the latest recorded DeFi loop run happened before this signal arrived. No execution result has been recorded for this exact opportunity yet.'
-        : 'Autonomous execution was approved for this signal, but no separate DeFi loop result was recorded for this exact opportunity.';
+      if (Number.isFinite(signalCreatedAtMs) && Number.isFinite(lastDefiRunAtMs) && lastDefiRunAtMs < signalCreatedAtMs) {
+        signalReason = 'This is a normal oracle snapshot. The latest recorded DeFi loop run happened before this signal arrived, so no newer execution result exists for this exact opportunity yet.';
+      } else if (Number.isFinite(signalCreatedAtMs) && Number.isFinite(lastDefiRunAtMs) && lastDefiRunAtMs >= signalCreatedAtMs && isAutomationErrorStatus(latestDefiLoopStatus)) {
+        signalReason = latestDefiLoopDetail
+          ? `This is a normal oracle snapshot. The latest DeFi loop run later failed with ${humanizeAutomationStatus(latestDefiLoopStatus)}: ${latestDefiLoopDetail}. No per-signal execution row was recorded for this opportunity.`
+          : `This is a normal oracle snapshot. The latest DeFi loop run later failed with ${humanizeAutomationStatus(latestDefiLoopStatus)}. No per-signal execution row was recorded for this opportunity.`;
+      } else {
+        signalReason = 'This is a normal oracle snapshot. Autonomous execution can approve the signal without creating a one-to-one transaction row for every snapshot.';
+      }
     }
 
     return {
-      title: isDailyCapReached ? 'oracle opportunity not executed' : 'oracle opportunity',
+      title: isDailyCapReached ? 'oracle snapshot not executed' : 'oracle snapshot',
       routeLabel: `Arc Testnet · ${strategy}`,
       amountLabel: Number(tx.amount_usdc) > 0
         ? `${parseFloat(tx.amount_usdc).toFixed(2)} ${tx.token || 'USDC'}`
         : null,
       phase: signalReason,
       links: [],
+      tagLabel: activityPolicyBadge?.label || null,
+      tagVariant: activityPolicyBadge?.variant || 'slate',
     };
   }
 
@@ -674,6 +913,8 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
             url: txUrl,
           }]
         : [],
+      tagLabel: activityPolicyBadge?.label || null,
+      tagVariant: activityPolicyBadge?.variant || 'slate',
     };
   }
 
@@ -794,10 +1035,10 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
       phase: tx.status === 'dry_run'
         ? 'Simulation only. No on-chain liquidity add was submitted.'
         : tx.status === 'skipped'
-          ? (meta.summary || 'No on-chain liquidity add was submitted.')
+          ? ([meta.summary, activityPolicyBadge?.note].filter(Boolean).join(' ')) || 'No on-chain liquidity add was submitted.'
           : meta.minLpAmount
             ? `${lpMintedLabel || 'LP minted.'} Minimum protected LP: ${formatLpAmount(meta.minLpAmount)}.`
-            : (lpMintedLabel || meta.summary || 'Curve liquidity added on-chain'),
+            : ([lpMintedLabel || meta.summary || 'Curve liquidity added on-chain', activityPolicyBadge?.note].filter(Boolean).join(' ')),
       links: txUrl
         ? [{
             key: `${tx.id}-curve-lp-add`,
@@ -806,6 +1047,8 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
             url: txUrl,
           }]
         : [],
+      tagLabel: activityPolicyBadge?.label || null,
+      tagVariant: activityPolicyBadge?.variant || 'slate',
     };
   }
 
@@ -832,14 +1075,15 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
       phase: tx.status === 'dry_run'
         ? 'Simulation only. No on-chain liquidity removal was submitted.'
         : tx.status === 'skipped'
-          ? (meta.summary || 'No on-chain liquidity removal was submitted.')
+          ? ([meta.summary, activityPolicyBadge?.note].filter(Boolean).join(' ')) || 'No on-chain liquidity removal was submitted.'
           : tx.status === 'failed'
-            ? (meta.summary || (summarizedError ? `Failed before confirmation: ${summarizedError}` : 'Curve liquidity removal failed before confirmation.'))
+            ? ([meta.summary || (summarizedError ? `Failed before confirmation: ${summarizedError}` : 'Curve liquidity removal failed before confirmation.'), activityPolicyBadge?.note].filter(Boolean).join(' '))
           : [
               burnLabel,
               isDualCurveExit && returnedBothTokens.length > 0 ? `Returned ${returnedBothTokens.join(' + ')}` : null,
               !isDualCurveExit && returnedLabel ? `Returned ${returnedLabel}` : null,
               !isDualCurveExit && meta.minAmountOut ? `Minimum protected output ${formatTokenAmount(meta.minAmountOut, tokenOut)}` : null,
+              activityPolicyBadge?.note,
             ].filter(Boolean).join('. '),
       links: txUrl
         ? [{
@@ -849,6 +1093,8 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
             url: txUrl,
           }]
         : [],
+      tagLabel: activityPolicyBadge?.label || null,
+      tagVariant: activityPolicyBadge?.variant || 'slate',
     };
   }
 
@@ -857,31 +1103,55 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const toToken = meta.toToken || 'EURC';
     const amountLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, fromToken);
     const outputAmountLabel = formatTokenAmount(meta.amountOut, toToken);
-    const txHash = meta.swapTxHash || tx.tx_hash || tx.txHash || null;
-    const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+    const entryTxHash = meta.entryTxHash || meta.swapTxHash || tx.tx_hash || tx.txHash || null;
+    const sellBackTxHash = meta.sellBackTxHash || null;
+    const entryTxUrl = getExplorerTxUrl('Arc Testnet', entryTxHash);
+    const sellBackTxUrl = getExplorerTxUrl('Arc Testnet', sellBackTxHash);
+    const finalUsdcAmountLabel = formatTokenAmount(meta.finalAmountOutUsdc, 'USDC');
+    const entryEurcAmountLabel = formatTokenAmount(meta.entryAmountOutEurc || meta.amountOut, 'EURC');
 
     let phase = meta.summary || null;
     if (tx.status === 'confirmed') {
-      phase = outputAmountLabel
-        ? `Executed the Curve entry leg and received ${outputAmountLabel}.`
-        : 'Executed the Curve entry leg on-chain.';
+      if (meta.roundTripCompleted) {
+        phase = finalUsdcAmountLabel
+          ? `Bought ${entryEurcAmountLabel || 'EURC'} on Curve, then sold it back for ${finalUsdcAmountLabel}.`
+          : 'Bought EURC on Curve and completed the same-chain sell-back.';
+      } else if (meta.sameChainSellBackPlanned && meta.sellBackError) {
+        phase = `Bought ${entryEurcAmountLabel || 'EURC'} on Curve. Immediate sell-back did not complete, so the agent kept EURC for a later rebalance.`;
+      } else {
+        phase = outputAmountLabel
+          ? `Executed the Curve entry leg and received ${outputAmountLabel}.`
+          : 'Executed the Curve entry leg on-chain.';
+      }
     } else if (tx.status === 'dry_run') {
       phase = 'Simulation only. No on-chain trade was submitted.';
     }
 
     return {
       title: 'signal trade',
-      routeLabel: `Arc Testnet · ${fromToken} -> ${toToken} Curve entry`,
+      routeLabel: meta.roundTripCompleted
+        ? 'Arc Testnet · USDC -> EURC -> USDC'
+        : `Arc Testnet · ${fromToken} -> ${toToken} Curve entry`,
       amountLabel,
       phase,
-      links: txUrl
-        ? [{
-            key: `${tx.id}-task-arb`,
-            label: 'Swap tx',
-            hash: txHash,
-            url: txUrl,
-          }]
-        : [],
+      links: [
+        entryTxUrl
+          ? {
+              key: `${tx.id}-task-arb-entry`,
+              label: meta.roundTripCompleted ? 'Buy tx' : 'Swap tx',
+              hash: entryTxHash,
+              url: entryTxUrl,
+            }
+          : null,
+        sellBackTxUrl
+          ? {
+              key: `${tx.id}-task-arb-sell-back`,
+              label: 'Sell-back tx',
+              hash: sellBackTxHash,
+              url: sellBackTxUrl,
+            }
+          : null,
+      ].filter(Boolean),
     };
   }
 
@@ -900,10 +1170,10 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
       phase: tx.status === 'dry_run'
         ? 'Simulation only. No on-chain rebalance was submitted.'
         : tx.status === 'skipped'
-          ? (meta.summary || 'No on-chain rebalance was submitted.')
+          ? ([meta.summary, activityPolicyBadge?.note].filter(Boolean).join(' ')) || 'No on-chain rebalance was submitted.'
           : outputAmountLabel
             ? `Received ${outputAmountLabel}${meta.executionRail ? ` via ${getExecutionRailLabel(meta.executionRail)}` : ''}`
-            : (meta.summary || 'Portfolio rebalanced on-chain'),
+            : ([meta.summary || 'Portfolio rebalanced on-chain', activityPolicyBadge?.note].filter(Boolean).join(' ')),
       links: txUrl
         ? [{
             key: `${tx.id}-rebalance`,
@@ -912,6 +1182,8 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
             url: txUrl,
           }]
         : [],
+      tagLabel: activityPolicyBadge?.label || null,
+      tagVariant: activityPolicyBadge?.variant || 'slate',
     };
   }
 
@@ -949,16 +1221,19 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     || ['native_gas_topup', 'native_eth_bridge'].includes(meta.kind);
   const token = tx.token || (isNativeBridge ? 'ETH' : 'USDC');
   const isBridge = tx.type === 'bridge' || isNativeBridge;
+  const receiveTokenAmount = Number(meta.tokenAmount);
 
   const sourceTxHash = meta.sourceTxHash || meta.burnTxHash || meta.topUpTxHash || (isBridge ? tx.tx_hash || tx.txHash : null);
   const destinationTxHash = meta.destinationTxHash || meta.mintTxHash || null;
   const amountValue = token === 'ETH'
     ? meta.amountEth
+    : tx.type === 'receive' && Number.isFinite(receiveTokenAmount) && receiveTokenAmount > 0
+      ? receiveTokenAmount
     : (tx.amount_usdc ?? tx.amountUsdc ?? 0);
 
   const amountLabel = token === 'ETH'
     ? (amountValue ? `${parseFloat(amountValue).toFixed(4)} ETH` : null)
-    : (Number(amountValue) > 0 ? `${parseFloat(amountValue).toFixed(2)} ${token}` : null);
+    : formatTokenAmount(amountValue, token);
 
   const routeLabel = fromChain && toChain && fromChain !== toChain
     ? `${fromChain} → ${toChain}`
@@ -1041,17 +1316,37 @@ export default function DashboardTab({ onNavigate }) {
   const latestRewardSnapshot = rewardOverview?.snapshots?.[0] || null;
   const rewardProgramStatus = getRewardProgramStatus(primaryRewardProgram, rewardOverview?.summary);
   const rewardSnapshotStatus = getRewardSnapshotStatus(latestRewardSnapshot);
+  const marketAnalysisState = agentStatus?.automation?.marketAnalysis || null;
+  const lastMarketAnalysisDecision = marketAnalysisState?.lastDecision || null;
+  const marketAnalysisStatus = getMarketAnalysisStatus(marketAnalysisState, lastMarketAnalysisDecision);
+  const marketAnalysisLastSeenAt = lastMarketAnalysisDecision?.recordedAt || marketAnalysisState?.lastRunAt || null;
+  const marketAnalysisBandLabel = formatAllocationBandPct(
+    lastMarketAnalysisDecision?.signal?.stableLpMinAllocationPct,
+    lastMarketAnalysisDecision?.signal?.stableLpTargetAllocationPct,
+    lastMarketAnalysisDecision?.signal?.stableLpMaxAllocationPct,
+  );
   const defiLoopState = agentStatus?.automation?.defiLoop || null;
   const lastStableDecision = defiLoopState?.lastDecision || null;
   const stableAutomationStatus = getStableAutomationStatus(defiLoopState, lastStableDecision);
   const stableAutomationDecisionSize = formatAutomationDecisionSize(lastStableDecision);
+  const stableAutomationAllocationPctLabel = formatAllocationBandPct(
+    lastStableDecision?.targetLpMinAllocationPct,
+    lastStableDecision?.targetLpTargetAllocationPct,
+    lastStableDecision?.targetLpMaxAllocationPct,
+  );
+  const stableAutomationAllocationSourceLabel = humanizeAutomationSource(lastStableDecision?.targetLpAllocationSource);
   const stableAutomationBandLabel = Number(lastStableDecision?.targetLpMinUsd) > 0 && Number(lastStableDecision?.targetLpMaxUsd) > 0
     ? `${formatUsdAmount(lastStableDecision.targetLpMinUsd)} - ${formatUsdAmount(lastStableDecision.targetLpMaxUsd)}`
     : '—';
+  const stableDecisionPolicyMeta = getAutomationPolicyMeta(lastStableDecision || {});
+  const stableDecisionIsLegacy = stableDecisionPolicyMeta.executionSource === 'stable_policy_v1'
+    || stableDecisionPolicyMeta.policyId === 'stable_usdc_eurc_curve_v1';
   const stableAutomationLastSeenAt = lastStableDecision?.recordedAt || defiLoopState?.lastRunAt || null;
   const stableAutomationPositionValue = Number.isFinite(Number(lastStableDecision?.positionValueUsd))
     ? formatUsdAmount(lastStableDecision?.positionValueUsd)
     : '—';
+  const stableManualCooldownUntil = defiLoopState?.manualCooldownUntil || lastStableDecision?.manualCooldownUntil || null;
+  const stableManualCooldownActive = Number.isFinite(Date.parse(stableManualCooldownUntil || '')) && Date.parse(stableManualCooldownUntil) > Date.now();
   const cirbtcStatusMissingFromBackend = Boolean(agentStatus?.automation && !agentStatus?.automation?.cirbtcLp);
   const cirbtcLoopState = agentStatus?.automation?.cirbtcLp || null;
   const lastCirbtcDecision = cirbtcLoopState?.lastDecision || null;
@@ -1064,6 +1359,7 @@ export default function DashboardTab({ onNavigate }) {
   const cirbtcAutomationPositionValue = Number.isFinite(Number(lastCirbtcDecision?.positionValueUsd))
     ? formatUsdAmount(lastCirbtcDecision?.positionValueUsd)
     : '—';
+  const visibleTxs = getVisibleRecentActivity(txs, agentStatus);
 
   function getGasLabel(entry) {
     const symbol = entry?.nativeSymbol || 'ETH';
@@ -1422,6 +1718,82 @@ export default function DashboardTab({ onNavigate }) {
       <Card>
         <div className="mb-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
+            <Activity size={16} className="text-slate-400" />
+            <div>
+              <h3 className="font-semibold text-slate-800">Market Analysis State</h3>
+              <p className="text-xs text-slate-500">This is the advisory market signal layer. Recent Activity may still show oracle snapshots, and that is normal.</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            className="px-3 py-2 text-xs"
+            onClick={() => loadAgentStatus()}
+          >
+            <RefreshCw size={13} /> Refresh
+          </Button>
+        </div>
+
+        {!marketAnalysisState ? (
+          <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+            Market analysis state is not available for this agent yet.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid gap-2 md:grid-cols-4">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Loop Status</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(marketAnalysisStatus.tone)}`}>
+                    {marketAnalysisStatus.label}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{formatDateTime(marketAnalysisLastSeenAt)}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{marketAnalysisStatus.detail}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Latest Lane</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {lastMarketAnalysisDecision?.signal?.lane
+                    ? humanizeAutomationAction(lastMarketAnalysisDecision.signal.lane)
+                    : 'Observe only'}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  Confidence {humanizeAutomationAction(lastMarketAnalysisDecision?.signal?.confidence || 'medium')}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Suggested LP Band</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{marketAnalysisBandLabel}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">Latest advisory allocation band for the stable lane.</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">DeFi Review</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {lastMarketAnalysisDecision?.queuedDefiReview ? 'Queued' : 'Snapshot only'}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  {lastMarketAnalysisDecision?.queuedDefiReview
+                    ? 'A follow-up DeFi review job was queued from the latest advisory signal.'
+                    : 'No extra DeFi review was queued from the latest advisory signal.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <p className="text-sm font-semibold text-slate-900">
+                {lastMarketAnalysisDecision?.opportunity || 'No advisory opportunity recorded yet'}
+              </p>
+              <p className="mt-2 text-sm leading-6 text-slate-700">
+                {lastMarketAnalysisDecision?.action || 'Market analysis has not recorded an advisory action yet.'}
+              </p>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
             <Repeat2 size={16} className="text-slate-400" />
             <div>
               <h3 className="font-semibold text-slate-800">Stable Automation State</h3>
@@ -1470,7 +1842,7 @@ export default function DashboardTab({ onNavigate }) {
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                 <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Target LP Band</p>
                 <p className="mt-2 text-sm font-semibold text-slate-900">{stableAutomationBandLabel}</p>
-                <p className="mt-1 text-[11px] leading-5 text-slate-500">Current LP value {stableAutomationPositionValue}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{stableAutomationAllocationPctLabel} of stable capital via {stableAutomationAllocationSourceLabel}</p>
               </div>
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                 <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Today</p>
@@ -1504,6 +1876,18 @@ export default function DashboardTab({ onNavigate }) {
                 {lastStableDecision?.summary || stableAutomationStatus.detail}
               </p>
 
+              {stableDecisionIsLegacy && (
+                <div className="mt-3 rounded-xl border border-yellow-200 bg-yellow-50 px-3 py-3 text-[11px] leading-5 text-yellow-800">
+                  This snapshot was recorded by the older mixed stable policy before LP and oracle decisions were separated. The next stable automation cycle will refresh this card with the new Stable LP lane metadata.
+                </div>
+              )}
+
+              {stableManualCooldownActive && (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-[11px] leading-5 text-amber-800">
+                  Manual stable LP cooldown is active until {formatDateTime(stableManualCooldownUntil)}. Soft trims and non-emergency exits are paused during this window.
+                </div>
+              )}
+
               <div className="mt-3 grid gap-2 md:grid-cols-3">
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
                   <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Blocked By</p>
@@ -1518,7 +1902,7 @@ export default function DashboardTab({ onNavigate }) {
                     {formatRewardAmount(lastStableDecision?.availableUsdcBalance || 0, 'USDC')}
                   </p>
                   <p className="mt-1 text-[11px] text-slate-500">
-                    {formatRewardAmount(lastStableDecision?.availableEurcBalance || 0, 'EURC')} · reserve {formatRewardAmount(lastStableDecision?.walletReserveUsdc || 0, 'USDC')}
+                    {formatRewardAmount(lastStableDecision?.availableEurcBalance || 0, 'EURC')} · reserve {formatRewardAmount(lastStableDecision?.walletReserveUsdc || 0, 'USDC')} · current LP value {stableAutomationPositionValue}
                   </p>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
@@ -1769,7 +2153,8 @@ export default function DashboardTab({ onNavigate }) {
                 </div>
 
                 <div className="mt-4 rounded-xl border border-slate-200 bg-white px-3 py-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Underlying Assets</p>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Current Redeemable Underlying</p>
+                  <p className="mt-1 text-[11px] leading-5 text-slate-500">This is the live token mix the LP can withdraw now, not the last token amounts you originally deposited.</p>
                   <div className="mt-2 space-y-1.5 text-sm text-slate-600">
                     {position.underlying.map(asset => (
                       <div key={`${position.poolAddress}-${asset.symbol}`} className="flex items-start justify-between gap-3">
@@ -1808,7 +2193,7 @@ export default function DashboardTab({ onNavigate }) {
             <Zap size={16} className="text-slate-400" />
             <div>
               <h3 className="font-semibold text-slate-800">LP Rewards Ledger</h3>
-              <p className="text-xs text-slate-500">Claimable rewards stay separate from fee-only LP yield and can appear here before accruals go live.</p>
+              <p className="text-xs text-slate-500">This card tracks a separate rewards program, not normal LP fee yield. It can stay populated while rewards are still disabled.</p>
             </div>
           </div>
           <Button
@@ -2000,12 +2385,12 @@ export default function DashboardTab({ onNavigate }) {
           <div className="flex justify-center py-8"><Spinner /></div>
         ) : txError ? (
           <Alert type="error">{txError}</Alert>
-        ) : txs.length === 0 ? (
+        ) : visibleTxs.length === 0 ? (
           <div className="py-8 text-center text-sm text-slate-400">No transactions yet. Your agent activity will appear here.</div>
         ) : (
           <div className="space-y-2">
-            {txs.map(tx => {
-              const { title, routeLabel, amountLabel, phase, links } = getTxDisplay(tx, { allTxs: txs, agentStatus });
+            {visibleTxs.map(tx => {
+              const { title, routeLabel, amountLabel, phase, links, tagLabel, tagVariant } = getTxDisplay(tx, { allTxs: txs, agentStatus });
               const isReceive = tx.type === 'receive';
               const isSend    = tx.type === 'send' || tx.type === 'nano_payment';
               const isSwap    = tx.type === 'swap';
@@ -2048,7 +2433,7 @@ export default function DashboardTab({ onNavigate }) {
                 : isRebalance ? 'Rebalance'
                 : title;
 
-              const statusLabel = isOracleSignal ? 'signal' : tx.status;
+              const statusLabel = isOracleSignal ? 'snapshot' : tx.status;
               const statusVariant = isOracleSignal
                 ? 'slate'
                 : tx.status === 'confirmed'
@@ -2071,6 +2456,11 @@ export default function DashboardTab({ onNavigate }) {
                       <span className={`font-semibold ${isReceive ? 'text-arc-green' : isOracleSignal ? 'text-sky-700' : 'text-slate-700'}`}>
                         {isReceive ? '+' : isSend ? '-' : ''}{amountLabel}
                       </span>
+                    )}
+                    {tagLabel && (
+                      <Badge variant={tagVariant}>
+                        {tagLabel}
+                      </Badge>
                     )}
                     <Badge variant={statusVariant} className="ml-auto">
                       {statusLabel}
