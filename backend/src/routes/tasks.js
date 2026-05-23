@@ -59,6 +59,8 @@ const EXECUTION_TASK_IDS = new Set([
   'EXEC_LENDING_WITHDRAW',
   'EXEC_LENDING_BORROW',
   'EXEC_LENDING_REPAY',
+  'EXEC_LENDING_COLLATERAL_TOP_UP',
+  'EXEC_LENDING_SAFE_EXIT',
   'EXEC_LENDING_LIQUIDATE',
   'EXEC_CCTP_BRIDGE',
   'EXEC_SEPOLIA_GAS_FANOUT',
@@ -82,6 +84,8 @@ const MANUAL_LENDING_ACTION_TASK_IDS = {
   withdraw: 'EXEC_MANUAL_LENDING_WITHDRAW',
   borrow: 'EXEC_MANUAL_LENDING_BORROW',
   repay: 'EXEC_MANUAL_LENDING_REPAY',
+  collateral_top_up: 'EXEC_MANUAL_LENDING_COLLATERAL_TOP_UP',
+  safe_exit: 'EXEC_MANUAL_LENDING_SAFE_EXIT',
   deleverage: 'EXEC_MANUAL_LENDING_DELEVERAGE',
   liquidate: 'EXEC_MANUAL_LENDING_LIQUIDATE',
 };
@@ -135,7 +139,7 @@ function _resolveManualLendingExecution(body, params) {
   if (!action) return { error: 'manual_lending_action_required' };
   if (!MANUAL_LENDING_ACTION_TASK_IDS[action]) return { error: 'manual_lending_action_invalid' };
 
-  if (action === 'deleverage') {
+  if (action === 'collateral_top_up' || action === 'safe_exit' || action === 'deleverage') {
     return {
       lane: 'lending',
       taskId: MANUAL_LENDING_ACTION_TASK_IDS[action],
@@ -409,6 +413,10 @@ function _validateExecutionParams(taskId, params) {
       if (!_isPositiveNumber(params.amount)) return 'lending_amount_required';
       return null;
 
+    case 'EXEC_LENDING_COLLATERAL_TOP_UP':
+    case 'EXEC_LENDING_SAFE_EXIT':
+      return null;
+
     case 'EXEC_LENDING_LIQUIDATE':
       if (!String(params.borrower || params.borrowerAddress || '').trim()) return 'lending_liquidation_borrower_required';
       if (!MANUAL_LENDING_ASSETS.has(String(params.debtAsset || params.asset || '').toUpperCase())) return 'manual_lending_asset_invalid';
@@ -482,8 +490,12 @@ function _getInlineTaskFailureStatus(reason) {
     case 'lending_borrow_capacity_exceeded':
     case 'lending_withdraw_amount_exceeds_supply':
     case 'lending_repay_amount_exceeds_debt':
+    case 'lending_collateral_topup_not_required':
+    case 'lending_collateral_topup_wallet_funds_required':
     case 'lending_deleverage_not_required':
     case 'lending_deleverage_wallet_funds_required':
+    case 'lending_safe_exit_not_required':
+    case 'lending_safe_exit_wallet_funds_required':
     case 'lending_liquidation_self_target_invalid':
     case 'lending_liquidation_target_healthy':
     case 'lending_liquidation_target_debt_missing':
@@ -1007,7 +1019,11 @@ router.post('/agents/:id/defi/manual/execute', requireAuth, async (req, res, nex
     if (resolution.lane === 'lending') {
       let validation;
 
-      if (resolution.action === 'deleverage') {
+      if (resolution.action === 'collateral_top_up') {
+        validation = await nativeLendingRiskService.guardAgentCollateralTopUp({ agent });
+      } else if (resolution.action === 'safe_exit') {
+        validation = await nativeLendingRiskService.guardAgentSafeExit({ agent });
+      } else if (resolution.action === 'deleverage') {
         validation = await nativeLendingRiskService.guardAgentEmergencyDeleverage({ agent });
       } else if (resolution.action === 'liquidate') {
         validation = await nativeLendingRiskService.guardAgentLiquidationAction({
@@ -1032,6 +1048,8 @@ router.post('/agents/:id/defi/manual/execute', requireAuth, async (req, res, nex
           detail: validation.verdict?.detail || 'Manual lending action blocked by the current risk guard.',
           risk: validation.surface?.risk || validation.borrowerSurface?.risk || null,
           recovery: validation.surface?.recovery || null,
+          collateralTopUp: validation.surface?.collateralTopUp || null,
+          safeExit: validation.surface?.safeExit || null,
           liquidation: validation.borrowerSurface?.liquidation || validation.surface?.liquidation || null,
           actionGuard: validation.surface?.actionGuards?.[resolution.asset]?.[resolution.action] || null,
         });

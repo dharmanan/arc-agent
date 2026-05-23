@@ -9,6 +9,8 @@ const {
 const { logGateway } = require('./logger');
 
 const DEFAULT_SUPPORTED_CACHE_MS = 5 * 60 * 1000;
+const VERBOSE_GATEWAY_LOGS = process.env.NODE_ENV !== 'production'
+  || ['1', 'true', 'yes', 'on'].includes(String(process.env.VERBOSE_GATEWAY_LOGS || '').trim().toLowerCase());
 
 let facilitatorClient = null;
 let facilitatorFingerprint = null;
@@ -62,11 +64,13 @@ function getGatewayFacilitatorClient() {
     });
     facilitatorFingerprint = fingerprint;
     resetSupportedCache();
-    logGateway('info', 'Facilitator client refreshed', {
-      authMode: config.authMode,
-      networkCount: Array.isArray(config.networks) ? config.networks.length : 0,
-      url: config.url,
-    });
+    if (VERBOSE_GATEWAY_LOGS) {
+      logGateway('info', 'Facilitator client refreshed', {
+        authMode: config.authMode,
+        networkCount: Array.isArray(config.networks) ? config.networks.length : 0,
+        url: config.url,
+      });
+    }
   }
 
   return facilitatorClient;

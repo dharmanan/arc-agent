@@ -9,7 +9,6 @@ import {
   BarChart3,
   Coins,
   Droplets,
-  Layers3,
   MinusCircle,
   PlusCircle,
   RefreshCw,
@@ -125,12 +124,23 @@ const DIRECT_PAIR_MANUAL_ACTIONS = [
 ];
 
 const LENDING_WATCH_ASSETS = ['USDC', 'EURC'];
+const DEFI_SECTION_EXPLANATIONS = {
+  liquidity: {
+    title: 'Liquidity',
+    detail: 'Review live pool data, then add, reduce, or exit LP positions from your agent wallet.',
+  },
+  lending: {
+    title: 'Lending',
+    detail: 'Supply, withdraw, borrow, repay, deleverage, or liquidate from the stable lending market.',
+  },
+};
+
 const LENDING_MANUAL_ACTIONS = [
   {
     id: 'supply',
     label: 'Supply',
     title: 'Supply collateral',
-    description: 'Supply USDC or EURC into the Arc-native lending lane from the agent wallet.',
+    description: 'Move USDC or EURC from the agent wallet into the lending market as collateral.',
     ctaLabel: 'Supply',
     icon: PlusCircle,
   },
@@ -159,10 +169,26 @@ const LENDING_MANUAL_ACTIONS = [
     icon: RefreshCw,
   },
   {
+    id: 'collateral_top_up',
+    label: 'Top-Up',
+    title: 'Repair the collateral buffer',
+    description: 'Use wallet funds to strengthen the position when the collateral buffer gets too thin.',
+    ctaLabel: 'Run top-up',
+    icon: PlusCircle,
+  },
+  {
+    id: 'safe_exit',
+    label: 'Safe Exit',
+    title: 'Close the lending position safely',
+    description: 'Pay back what is owed first, then pull the remaining supplied assets back to the wallet.',
+    ctaLabel: 'Run safe exit',
+    icon: MinusCircle,
+  },
+  {
     id: 'deleverage',
     label: 'Deleverage',
     title: 'Run emergency deleverage',
-    description: 'Follow the deterministic recovery plan that repays visible debt with the same-asset wallet balance.',
+    description: 'Use the visible wallet balance to reduce debt quickly when the position needs help.',
     ctaLabel: 'Run deleverage',
     icon: ShieldCheck,
   },
@@ -302,28 +328,54 @@ function formatLendingRate(value, { hideZero = false } = {}) {
 
 function getLendingSourceStatus(reserve) {
   if (reserve?.source === 'aave_onchain' && reserve?.isFallback !== true) {
-    return { tone: 'green', label: 'On-chain live' };
+    return {
+      tone: 'green',
+      label: 'Live reserve',
+      caption: 'On-chain feed',
+    };
   }
   if (reserve?.isFallback) {
-    return { tone: 'amber', label: 'Fallback watch' };
+    return {
+      tone: 'blue',
+      label: 'Watch only',
+      caption: 'Monitor mode',
+    };
   }
-  return { tone: 'slate', label: 'Waiting' };
+  return {
+    tone: 'slate',
+    label: 'Pending live',
+    caption: 'Waiting for feed',
+  };
 }
 
 function formatLendingFallbackReason(reason) {
   if (reason === 'aave_pool_not_configured') {
-    return 'No live external reserve is configured yet, so this asset stays in watchlist mode while the first lending lane is being built.';
+    return 'No live reserve feed is attached yet, so this card stays in monitor mode for now.';
   }
   if (reason === 'reserve_not_available') {
-    return 'A reserve target exists, but it did not return live on-chain state. The lending build should not trust it as an execution source yet.';
+    return 'A target reserve exists, but it is not returning stable live state yet, so this card stays read-only.';
   }
   if (reason === 'onchain_fetch_failed') {
-    return 'On-chain reserve reads failed, so this card is showing fallback watch data while the lending lane remains under construction.';
+    return 'The last live reserve read failed, so this card fell back to monitor-only data.';
   }
   if (!reason) {
-    return 'This asset is currently part of the lending watchlist while the first Arc lending lane is being designed.';
+    return 'This asset is currently in monitor mode while the reserve model is still being wired.';
   }
   return String(reason).replace(/_/g, ' ');
+}
+
+function formatLendingMarketLabel(value) {
+  const normalized = String(value || 'aave_v3').replace(/_/g, ' ').trim();
+  if (!normalized) return 'Aave V3';
+  return normalized.replace(/\b[a-z]/g, (char) => char.toUpperCase());
+}
+
+function getLendingWatchBadgeClasses(tone) {
+  if (tone === 'blue') return 'border-sky-200 bg-white text-sky-700 shadow-sm shadow-sky-100';
+  if (tone === 'green') return 'border-emerald-200 bg-white text-emerald-700 shadow-sm shadow-emerald-100';
+  if (tone === 'amber') return 'border-amber-200 bg-white text-amber-700 shadow-sm shadow-amber-100';
+  if (tone === 'red') return 'border-rose-200 bg-white text-rose-700 shadow-sm shadow-rose-100';
+  return 'border-slate-200 bg-white text-slate-700 shadow-sm shadow-slate-100';
 }
 
 function formatAddressShort(value) {
@@ -352,30 +404,30 @@ function getLendingExecutionCard(surface) {
     return {
       tone: 'red',
       label: 'Paused',
-      detail: 'The Arc-native lending lane is globally paused.',
+      detail: 'Lending actions are paused right now.',
     };
   }
 
   if (execution.ready) {
     return {
       tone: 'green',
-      label: 'Live write path',
-      detail: `Manual lending writes can use ${execution.source || 'the configured lending adapter'} from this screen.`,
+      label: 'Ready',
+      detail: 'You can use this page to send lending actions from the connected wallet.',
     };
   }
 
   if (execution.contractAddress && execution.buildState === 'scaffold_only') {
     return {
       tone: 'amber',
-      label: 'Scaffold contract',
-      detail: 'The contract address exists, but the contract still reports scaffold-only build state, so writes stay guarded.',
+      label: 'Limited',
+      detail: 'A contract is connected, but this screen is still in a limited setup state.',
     };
   }
 
   return {
     tone: 'amber',
-    label: 'Build in progress',
-    detail: 'The Arc-native lending route is wired, but a live lending contract is not configured yet.',
+    label: 'Coming soon',
+    detail: 'This lending screen is wired, but a live contract is not connected yet.',
   };
 }
 
@@ -387,22 +439,22 @@ function getLendingPriceCard(surface) {
     return {
       tone: 'slate',
       label: 'Waiting',
-      detail: 'Dedicated lending price inputs have not loaded yet.',
+      detail: 'Price data has not loaded yet.',
     };
   }
 
   if (fallbackAssets.length > 0) {
     return {
       tone: 'amber',
-      label: 'Fallback active',
-      detail: `${fallbackAssets.map(asset => asset.symbol).join(', ')} is using a fallback price input right now.`,
+      label: 'Backup in use',
+      detail: `${fallbackAssets.map(asset => asset.symbol).join(', ')} is currently using backup price data.`,
     };
   }
 
   return {
     tone: 'green',
-    label: 'Dedicated source',
-    detail: 'The lending risk layer is using a dedicated stable-price snapshot for this lane.',
+    label: 'Live prices',
+    detail: 'This page is using the current stable price feed.',
   };
 }
 
@@ -410,21 +462,21 @@ function getLendingExecutionGuard(surface, detailWhenReady) {
   if (surface?.execution?.globalPaused) {
     return {
       execute: false,
-      detail: 'The Arc-native lending lane is globally paused right now.',
+      detail: 'Lending actions are paused right now.',
     };
   }
 
   if (!surface?.execution?.contractAddress) {
     return {
       execute: false,
-      detail: 'The Arc lending contract address is not configured yet.',
+      detail: 'A lending contract is not connected yet.',
     };
   }
 
   if (surface?.execution?.buildState === 'scaffold_only') {
     return {
       execute: false,
-      detail: 'The Arc lending contract still reports scaffold-only build state, so live writes stay blocked.',
+      detail: 'This action is still limited while the connected contract setup finishes.',
     };
   }
 
@@ -435,6 +487,22 @@ function getLendingExecutionGuard(surface, detailWhenReady) {
 }
 
 function getLendingActionGuard(surface, assetSymbol, actionId) {
+  if (actionId === 'collateral_top_up') {
+    const topUp = surface?.collateralTopUp;
+    return {
+      execute: topUp?.execute === true,
+      detail: topUp?.detail || 'Collateral top-up state is unavailable right now.',
+    };
+  }
+
+  if (actionId === 'safe_exit') {
+    const safeExit = surface?.safeExit;
+    return {
+      execute: safeExit?.execute === true,
+      detail: safeExit?.detail || 'Safe-exit state is unavailable right now.',
+    };
+  }
+
   if (actionId === 'deleverage') {
     const recovery = surface?.recovery;
     return {
@@ -464,7 +532,7 @@ function getDefaultLendingManualParams(surface, actionId = 'supply') {
   const primaryAsset = assetOptions[0] || 'USDC';
   const secondaryAsset = assetOptions.find(asset => asset !== primaryAsset) || primaryAsset;
 
-  if (actionId === 'deleverage') {
+  if (actionId === 'collateral_top_up' || actionId === 'safe_exit' || actionId === 'deleverage') {
     return {
       asset: primaryAsset,
       amount: '',
@@ -491,6 +559,7 @@ function getDefaultLendingManualParams(surface, actionId = 'supply') {
 }
 
 function getLendingManualActionError(actionId, params) {
+  if (actionId === 'collateral_top_up' || actionId === 'safe_exit') return '';
   if (actionId === 'deleverage') return '';
 
   if (actionId === 'liquidate') {
@@ -507,10 +576,26 @@ function getLendingManualActionError(actionId, params) {
 }
 
 function LendingManualFields({ actionId, assetOptions, params, setParams }) {
+  if (actionId === 'collateral_top_up') {
+    return (
+      <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600">
+        This action uses the visible top-up plan automatically. You do not need to enter an extra amount.
+      </div>
+    );
+  }
+
+  if (actionId === 'safe_exit') {
+    return (
+      <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600">
+        This action repays visible debt first, then withdraws the remaining supplied assets. No extra amount input is needed.
+      </div>
+    );
+  }
+
   if (actionId === 'deleverage') {
     return (
       <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600">
-        This action follows the visible deterministic recovery plan. No extra amount input is needed.
+        This action uses the visible recovery plan automatically. You do not need to enter an extra amount.
       </div>
     );
   }
@@ -683,12 +768,12 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
     try {
       let request;
 
-      if (activeAction.id === 'deleverage') {
+      if (activeAction.id === 'collateral_top_up' || activeAction.id === 'safe_exit' || activeAction.id === 'deleverage') {
         request = {
           lane: 'lending',
-          action: 'deleverage',
+          action: activeAction.id,
           params: {
-            action: 'deleverage',
+            action: activeAction.id,
           },
         };
       } else if (activeAction.id === 'liquidate') {
@@ -863,7 +948,7 @@ function LendingAssetSnapshot({ lendingSurface }) {
   if (assets.length === 0) {
     return (
       <div className="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm text-slate-500">
-        No native lending asset snapshot is available yet.
+        Lending balances are not available yet.
       </div>
     );
   }
@@ -876,7 +961,7 @@ function LendingAssetSnapshot({ lendingSurface }) {
             <div>
               <p className="text-lg font-semibold text-slate-900">{asset.symbol}</p>
               <p className="mt-1 text-xs text-slate-500">
-                Price {formatUsdAmount(asset.price.priceUsd)} · {asset.price.isFallback ? 'Fallback price' : 'Dedicated price source'}
+                Price {formatUsdAmount(asset.price.priceUsd)} · {asset.price.isFallback ? 'Backup price' : 'Live price source'}
               </p>
             </div>
             <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(asset.reserve.paused ? 'red' : asset.reserve.supported ? 'green' : 'amber')}`}>
@@ -1917,6 +2002,23 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
     repayUsdPlanned: 0,
     repayUsdShortfall: 0,
   };
+  const collateralTopUp = lendingSurface?.collateralTopUp || {
+    execute: false,
+    status: 'idle',
+    detail: 'There is no active lending debt, so collateral top-up is not needed.',
+    collateralUsdNeeded: 0,
+    collateralUsdPlanned: 0,
+    collateralUsdShortfall: 0,
+  };
+  const safeExit = lendingSurface?.safeExit || {
+    execute: false,
+    status: 'idle',
+    detail: 'There is no active supplied or borrowed lending position to close.',
+    repayUsdNeeded: 0,
+    repayUsdPlanned: 0,
+    repayUsdShortfall: 0,
+    withdrawUsdPlanned: 0,
+  };
   const liquidation = lendingSurface?.liquidation || {
     liquidatable: false,
     status: 'idle',
@@ -1930,6 +2032,20 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
     ? recovery.status === 'partial' ? 'Partially funded' : 'Ready'
     : recovery.status === 'needs_funding' ? 'Needs funding' : recovery.status === 'not_required' ? 'Not required' : 'No debt';
   const recoveryDetail = `${recovery.detail} Need ${formatUsdAmount(recovery.repayUsdNeeded)} · Planned ${formatUsdAmount(recovery.repayUsdPlanned)}${Number(recovery.repayUsdShortfall || 0) > 0 ? ` · Shortfall ${formatUsdAmount(recovery.repayUsdShortfall)}` : ''}.`;
+  const collateralTopUpTone = collateralTopUp.execute
+    ? collateralTopUp.status === 'partial' ? 'amber' : 'green'
+    : collateralTopUp.status === 'needs_funding' ? 'amber' : 'slate';
+  const collateralTopUpLabel = collateralTopUp.execute
+    ? collateralTopUp.status === 'partial' ? 'Partially funded' : 'Ready'
+    : collateralTopUp.status === 'needs_funding' ? 'Needs funding' : collateralTopUp.status === 'not_required' ? 'Not required' : 'No debt';
+  const collateralTopUpDetail = `${collateralTopUp.detail} Need ${formatUsdAmount(collateralTopUp.collateralUsdNeeded)} · Planned ${formatUsdAmount(collateralTopUp.collateralUsdPlanned)}${Number(collateralTopUp.collateralUsdShortfall || 0) > 0 ? ` · Shortfall ${formatUsdAmount(collateralTopUp.collateralUsdShortfall)}` : ''}.`;
+  const safeExitTone = safeExit.execute
+    ? 'green'
+    : safeExit.status === 'needs_funding' ? 'amber' : 'slate';
+  const safeExitLabel = safeExit.execute
+    ? 'Ready'
+    : safeExit.status === 'needs_funding' ? 'Needs funding' : safeExit.status === 'not_required' ? 'Not required' : 'No position';
+  const safeExitDetail = `${safeExit.detail} Repay ${formatUsdAmount(safeExit.repayUsdPlanned)}${Number(safeExit.withdrawUsdPlanned || 0) > 0 ? ` · Withdraw ${formatUsdAmount(safeExit.withdrawUsdPlanned)}` : ''}${Number(safeExit.repayUsdShortfall || 0) > 0 ? ` · Shortfall ${formatUsdAmount(safeExit.repayUsdShortfall)}` : ''}.`;
   const liquidationTone = liquidation.liquidatable
     ? 'red'
     : liquidation.status === 'critical' || liquidation.status === 'unknown'
@@ -1983,6 +2099,18 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
       detail: recoveryDetail,
     },
     {
+      title: 'Collateral Top-Up',
+      tone: collateralTopUpTone,
+      label: collateralTopUpLabel,
+      detail: collateralTopUpDetail,
+    },
+    {
+      title: 'Safe Exit',
+      tone: safeExitTone,
+      label: safeExitLabel,
+      detail: safeExitDetail,
+    },
+    {
       title: 'Liquidation Risk',
       tone: liquidationTone,
       label: liquidationLabel,
@@ -1997,7 +2125,7 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
           <ShieldCheck size={18} className="text-slate-400 shrink-0 mt-1" />
           <div>
             <h3 className="text-lg font-semibold text-slate-900">Lending</h3>
-            <p className="mt-1 text-sm text-slate-500">This lane now shows the Arc-native lending adapter state, visible account risk, and guarded manual actions for the first stable lending scope.</p>
+            <p className="mt-1 text-sm text-slate-500">Review your lending position, see the current risk picture, and run the available lending actions from one place.</p>
           </div>
         </div>
 
@@ -2023,10 +2151,10 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
             <div>
               <div className="flex items-center gap-2">
                 <Wallet size={14} className="text-slate-400" />
-                <p className="text-sm font-semibold text-slate-800">Execution source</p>
+                <p className="text-sm font-semibold text-slate-800">Connected contract</p>
               </div>
               <p className="mt-2 text-xs leading-5 text-slate-500">
-                Source {lendingSurface?.execution?.source || 'arc_native_scaffold'} · Build state {lendingSurface?.execution?.buildState || 'scaffold_only'} · Contract {formatAddressShort(lendingSurface?.execution?.contractAddress)}
+                This screen is linked to contract {formatAddressShort(lendingSurface?.execution?.contractAddress)}. Actions from this page follow the current connection status shown above.
               </p>
             </div>
             <p className="text-xs text-slate-400">Updated {formatTimestamp(lendingSurface?.prices?.fetchedAt || lendingSnapshot?.fetchedAt)}</p>
@@ -2042,10 +2170,10 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
         <div className="mt-4 space-y-3">
           <div className="flex items-center gap-2">
             <Wallet size={14} className="text-slate-400" />
-            <p className="text-sm font-semibold text-slate-800">Manual lending controls</p>
+            <p className="text-sm font-semibold text-slate-800">Lending actions</p>
           </div>
           <p className="text-xs text-slate-500">
-            The same supply, withdraw, borrow, repay, recovery and liquidation actions now also appear in Tasks &gt; Paid when you prefer the task-based lane.
+            You can also find these same actions in Tasks &gt; Paid if you prefer to run them from the task list.
           </p>
           <LendingManualControls agentId={agentId} lendingSurface={lendingSurface} onRunQueued={onRunQueued} />
         </div>
@@ -2057,7 +2185,7 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
             <Activity size={18} className="text-slate-400 shrink-0 mt-1" />
             <div>
               <h3 className="text-lg font-semibold text-slate-900">Account and Guard Snapshot</h3>
-              <p className="mt-1 text-sm text-slate-500">Wallet balances, supplied amounts, borrowed amounts, and per-asset manual guard status for the v1 stable lending scope.</p>
+              <p className="mt-1 text-sm text-slate-500">See wallet balances, supplied amounts, borrowed amounts, and whether each action is available right now.</p>
             </div>
           </div>
           <p className="text-xs text-slate-400">Supplied {formatUsdAmount(risk.totalSuppliedUsd)} · Borrowed {formatUsdAmount(risk.totalBorrowUsd)}</p>
@@ -2092,15 +2220,32 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
           <div className="flex items-start gap-3">
             <BarChart3 size={18} className="text-slate-400 shrink-0 mt-1" />
             <div>
-              <h3 className="text-lg font-semibold text-slate-900">Reserve Watchlist</h3>
-              <p className="mt-1 text-sm text-slate-500">Watch the first stable assets for supply APY, borrow APY, utilization, and fallback state before live execution opens.</p>
+              <h3 className="text-lg font-semibold text-slate-900">Reserve Readiness Watch</h3>
+              <p className="mt-1 text-sm text-slate-500">Read-only reserve monitor for the first stable assets. It tracks APY, utilization, and whether each reserve feed is live enough for later risk models.</p>
             </div>
           </div>
           <p className="text-xs text-slate-400">Updated {formatTimestamp(lendingSnapshot?.fetchedAt)}</p>
         </div>
 
+        <div className="mt-4 grid gap-3 lg:grid-cols-2">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">What This Does Now</p>
+            <p className="mt-2 text-sm leading-6 text-slate-600">
+              This panel does not move funds. It watches reserve APY, borrow APY, utilization, and whether each feed is live or using backup data while you use the lending actions above.
+            </p>
+          </div>
+          <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-4">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">What It Can Unlock Later</p>
+            <p className="mt-2 text-sm leading-6 text-sky-800">
+              As the reserve model matures, these cards can feed utilization-aware guardrails, market depth checks, and safer lending size limits. Today they are informative, not an execution switch.
+            </p>
+          </div>
+        </div>
+
         {hasFallbackData && (
-          <Alert type="warning">Reserve data is still acting as a market watchlist. Lending execution stays disabled while the first Arc lending lane, reserve model, and risk guard are being implemented.</Alert>
+          <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm leading-6 text-amber-800">
+            Some reserve feeds are still monitor-only, so this section is not deciding or limiting the lending actions above yet.
+          </div>
         )}
 
         {loading && reserves.length === 0 ? (
@@ -2114,11 +2259,15 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <p className="text-lg font-semibold text-slate-900">{reserve.asset}</p>
-                      <p className="mt-1 text-xs text-slate-500">{String(reserve.market || 'aave_v3').replace(/_/g, ' ')}</p>
+                      <p className="mt-1 text-xs text-slate-500">{formatLendingMarketLabel(reserve.market)}</p>
                     </div>
-                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(sourceStatus.tone)}`}>
-                      {sourceStatus.label}
-                    </span>
+                    <div className="flex flex-col items-end gap-1">
+                      <span className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-semibold ${getLendingWatchBadgeClasses(sourceStatus.tone)}`}>
+                        <span className={`h-1.5 w-1.5 rounded-full ${sourceStatus.tone === 'green' ? 'bg-emerald-500' : sourceStatus.tone === 'blue' ? 'bg-sky-500' : 'bg-slate-400'}`} />
+                        {sourceStatus.label}
+                      </span>
+                      <p className="text-[11px] font-medium text-slate-400">{sourceStatus.caption}</p>
+                    </div>
                   </div>
 
                   <div className="mt-4 grid gap-3 sm:grid-cols-3">
@@ -2208,12 +2357,15 @@ export default function DeFiTab() {
   useEffect(() => {
     load();
   }, [load]);
+
   const refreshSurfaceAfterRun = useCallback(() => {
     window.setTimeout(() => {
       load({ silent: true });
     }, 1500);
   }, [load]);
+
   const positionsByPool = useMemo(() => new Map((positionSnapshot.positions || []).map(position => [position.poolKey, position])), [positionSnapshot.positions]);
+  const activeSectionExplanation = DEFI_SECTION_EXPLANATIONS[activeSection] || DEFI_SECTION_EXPLANATIONS.liquidity;
 
   if (!agent) {
     return (
@@ -2231,7 +2383,7 @@ export default function DeFiTab() {
             <Droplets size={20} className="text-[#66D121] shrink-0 mt-1" />
             <div>
               <h2 className="text-xl font-bold text-slate-900">DeFi</h2>
-              <p className="text-sm text-slate-500">Check pool health, add liquidity, remove liquidity, and review your current LP position from one place.</p>
+              <p className="text-sm text-slate-500">Review live pool data, manage LP positions, and switch to Lending for stable supply and borrow actions.</p>
             </div>
           </div>
           <button
@@ -2242,30 +2394,6 @@ export default function DeFiTab() {
           >
             <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> Refresh
           </button>
-        </div>
-
-        <div className="mt-4 grid gap-3 lg:grid-cols-3">
-          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <div className="flex items-center gap-2">
-              <Layers3 size={14} className="text-slate-400" />
-              <p className="text-sm font-semibold text-slate-800">How to use it</p>
-            </div>
-            <p className="mt-2 text-xs leading-5 text-slate-500">Review the pool, choose an action, and submit from your agent wallet when you are ready.</p>
-          </div>
-          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <div className="flex items-center gap-2">
-              <Wallet size={14} className="text-slate-400" />
-              <p className="text-sm font-semibold text-slate-800">cirBTC note</p>
-            </div>
-            <p className="mt-2 text-xs leading-5 text-slate-500">Use the main Swap tab for cirBTC trades. The cirBTC cards here are for LP only.</p>
-          </div>
-          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <div className="flex items-center gap-2">
-              <ShieldCheck size={14} className="text-slate-400" />
-              <p className="text-sm font-semibold text-slate-800">Fees</p>
-            </div>
-            <p className="mt-2 text-xs leading-5 text-slate-500">Each submitted action uses your agent wallet and applies an Arc execution fee.</p>
-          </div>
         </div>
 
         <div className="mt-5 grid gap-3 sm:grid-cols-2">
@@ -2283,6 +2411,11 @@ export default function DeFiTab() {
           >
             <Coins size={14} /> Lending
           </button>
+        </div>
+
+        <div className="mt-3 rounded-xl border border-slate-200 bg-white px-4 py-3">
+          <p className="text-sm font-semibold text-slate-900">{activeSectionExplanation.title}</p>
+          <p className="mt-1 text-xs leading-5 text-slate-500">{activeSectionExplanation.detail}</p>
         </div>
       </Card>
 

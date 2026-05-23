@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS agents (
   max_gas_gwei              INTEGER        NOT NULL DEFAULT 50,
   slippage_percent          NUMERIC(5,2)   NOT NULL DEFAULT 0.5,
   max_trade_usdc            NUMERIC(20,6)  NOT NULL DEFAULT 200,
+  oracle_max_eurc_inventory NUMERIC(20,6),
+  oracle_min_eurc_reserve   NUMERIC(20,6),
   auto_lock_minutes         INTEGER        NOT NULL DEFAULT 5,
   contract_guard_enabled    BOOLEAN        NOT NULL DEFAULT TRUE,
   totp_enabled              BOOLEAN        NOT NULL DEFAULT FALSE,
@@ -98,6 +100,9 @@ CREATE TABLE IF NOT EXISTS agents (
   defi_loop_last_run_at      TIMESTAMPTZ,
   defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle',
   defi_loop_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  lending_automation_last_run_at TIMESTAMPTZ,
+  lending_automation_last_status VARCHAR(30) NOT NULL DEFAULT 'idle',
+  lending_automation_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb,
   cirbtc_lp_last_run_at      TIMESTAMPTZ,
   cirbtc_lp_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle',
   cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -120,6 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id);
 -- ── Migrations (idempotent) ───────────────────────────────────────────────────
 -- Add private_key_encrypted if the column was missing from an earlier schema
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_key_encrypted TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_max_eurc_inventory NUMERIC(20,6);
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_min_eurc_reserve   NUMERIC(20,6);
 
 -- ERC-8004 identity columns (added after initial schema)
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS erc8004_status        VARCHAR(20)  NOT NULL DEFAULT 'pending';
@@ -133,6 +140,7 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_tasks_enabled        BOOLEAN N
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_enabled    BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_enabled             BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_enabled          BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_enabled          BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_enabled         BOOLEAN NOT NULL DEFAULT FALSE;
 
@@ -152,6 +160,9 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_last_status         VARCHAR(3
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_run_at      TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_last_run_at TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_last_status VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_run_at      TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb;

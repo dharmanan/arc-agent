@@ -9,6 +9,8 @@ import PaymentModal from './PaymentModal.jsx';
 import { Wallet, Activity, ArrowRight, ArrowUpRight, ArrowDownLeft, Repeat2, Zap, LogIn, ExternalLink, RefreshCw, QrCode, Send } from 'lucide-react';
 import { CHAINS } from '../lib/chains.js';
 
+const AUTOMATION_SNAPSHOT_TOLERANCE_MS = 60 * 1000;
+
 function formatAddress(address, startChars = 8, endChars = 6) {
   if (!address || address.length <= startChars + endChars) return address;
   return `${address.slice(0, startChars)}....${address.slice(-endChars)}`;
@@ -635,6 +637,82 @@ function getCirbtcAutomationStatus(cirbtcLoopState, lastDecision) {
     label: humanizeAutomationStatus(status),
     detail: summary || 'cirBTC LP automation is waiting for the next eligible cycle.',
   };
+}
+
+function getCirbtcAutomationFreshness(defiLoopState, cirbtcLoopState, lastDecision) {
+  const cirbtcDecisionAtMs = Date.parse(lastDecision?.recordedAt || '');
+  const cirbtcRunAtMs = Date.parse(cirbtcLoopState?.lastRunAt || '');
+  const latestCirbtcSnapshotAtMs = [cirbtcDecisionAtMs, cirbtcRunAtMs]
+    .filter(value => Number.isFinite(value))
+    .sort((left, right) => right - left)[0] || null;
+  const latestDefiLoopAtMs = Date.parse(defiLoopState?.lastRunAt || '');
+  const latestCirbtcSnapshotAt = lastDecision?.recordedAt || cirbtcLoopState?.lastRunAt || null;
+
+  if (!Number.isFinite(latestDefiLoopAtMs)) {
+    return {
+      hasNewerDefiLoop: false,
+      displayLastSeenAt: latestCirbtcSnapshotAt,
+      detail: null,
+    };
+  }
+
+  if (
+    !Number.isFinite(latestCirbtcSnapshotAtMs)
+    || (latestDefiLoopAtMs - latestCirbtcSnapshotAtMs) > AUTOMATION_SNAPSHOT_TOLERANCE_MS
+  ) {
+    return {
+      hasNewerDefiLoop: true,
+      displayLastSeenAt: latestCirbtcSnapshotAt || defiLoopState?.lastRunAt || null,
+      detail: latestCirbtcSnapshotAt
+        ? `Last cirBTC review was at ${formatDateTime(latestCirbtcSnapshotAt)}. Another auto cycle ran at ${formatDateTime(defiLoopState?.lastRunAt)}, and the next cirBTC review is still pending.`
+        : `Another auto cycle ran at ${formatDateTime(defiLoopState?.lastRunAt)}. The first cirBTC LP review is still pending.`,
+    };
+  }
+
+  return {
+    hasNewerDefiLoop: false,
+    displayLastSeenAt: latestCirbtcSnapshotAt,
+    detail: null,
+  };
+}
+
+function findLatestCirbtcLpTx(txs = []) {
+  return [...txs]
+    .filter((tx) => {
+      if (!['direct_lp_add', 'direct_lp_remove'].includes(tx?.type)) return false;
+      const meta = getTxMeta(tx);
+      return getAutomationPolicyMeta(meta).executionSource === 'cirbtc_lp_policy_v1';
+    })
+    .sort((left, right) => Date.parse(right?.created_at || '') - Date.parse(left?.created_at || ''))[0] || null;
+}
+
+function getCirbtcLpMoveLabel(tx) {
+  if (!tx) return 'No LP move yet';
+  return tx.type === 'direct_lp_remove' ? 'Removed LP' : 'Added LP';
+}
+
+function getCirbtcPairStatusLabel(status) {
+  const labels = {
+    executed: 'Sent',
+    ready: 'Ready',
+    eligible: 'Ready next',
+    cooldown: 'Cooldown',
+    needs_funds: 'Needs funds',
+    position_open: 'Position open',
+    pool_inactive: 'Pool inactive',
+    impact_guard: 'Impact limit',
+    exit_ready: 'Needs review',
+    blocked: 'Blocked',
+  };
+
+  return labels[status] || 'Waiting';
+}
+
+function getCirbtcPairStatusTone(status) {
+  if (status === 'executed' || status === 'ready' || status === 'eligible') return 'green';
+  if (status === 'cooldown' || status === 'needs_funds' || status === 'impact_guard') return 'amber';
+  if (status === 'pool_inactive' || status === 'exit_ready' || status === 'blocked') return 'red';
+  return 'slate';
 }
 
 function formatAutomationDecisionSize(decision) {
@@ -1350,15 +1428,67 @@ export default function DashboardTab({ onNavigate }) {
   const cirbtcStatusMissingFromBackend = Boolean(agentStatus?.automation && !agentStatus?.automation?.cirbtcLp);
   const cirbtcLoopState = agentStatus?.automation?.cirbtcLp || null;
   const lastCirbtcDecision = cirbtcLoopState?.lastDecision || null;
-  const cirbtcAutomationStatus = getCirbtcAutomationStatus(cirbtcLoopState, lastCirbtcDecision);
+  const cirbtcAutomationFreshness = getCirbtcAutomationFreshness(defiLoopState, cirbtcLoopState, lastCirbtcDecision);
+  const cirbtcAutomationBaseStatus = getCirbtcAutomationStatus(cirbtcLoopState, lastCirbtcDecision);
+  const latestCirbtcLpTx = findLatestCirbtcLpTx(txs || []);
+  const cirbtcAutomationStatus = cirbtcAutomationFreshness.hasNewerDefiLoop
+    ? {
+        tone: 'slate',
+        label: 'Waiting',
+        detail: cirbtcAutomationFreshness.detail,
+      }
+    : cirbtcAutomationBaseStatus;
+  const cirbtcAutomationStatusDetail = cirbtcAutomationFreshness.hasNewerDefiLoop
+    ? cirbtcAutomationFreshness.detail
+    : lastCirbtcDecision?.execute === true
+      ? 'The latest cirBTC review sent an LP transaction.'
+      : lastCirbtcDecision
+        ? 'The latest cirBTC review kept the current LP setup unchanged.'
+        : cirbtcAutomationBaseStatus.detail;
   const cirbtcAutomationDecisionSize = formatAutomationDecisionSize(lastCirbtcDecision);
   const cirbtcAutomationBandLabel = Number(lastCirbtcDecision?.targetLpMinUsd) > 0 && Number(lastCirbtcDecision?.targetLpMaxUsd) > 0
     ? `${formatUsdAmount(lastCirbtcDecision.targetLpMinUsd)} - ${formatUsdAmount(lastCirbtcDecision.targetLpMaxUsd)}`
     : '—';
-  const cirbtcAutomationLastSeenAt = lastCirbtcDecision?.recordedAt || cirbtcLoopState?.lastRunAt || null;
+  const cirbtcSnapshotSeenAt = lastCirbtcDecision?.recordedAt || cirbtcLoopState?.lastRunAt || null;
+  const cirbtcAutomationLastSeenAt = cirbtcAutomationFreshness.displayLastSeenAt;
   const cirbtcAutomationPositionValue = Number.isFinite(Number(lastCirbtcDecision?.positionValueUsd))
     ? formatUsdAmount(lastCirbtcDecision?.positionValueUsd)
     : '—';
+  const cirbtcAutomationPairSummaries = Array.isArray(lastCirbtcDecision?.pairSummaries) && lastCirbtcDecision.pairSummaries.length > 0
+    ? lastCirbtcDecision.pairSummaries
+    : [{
+        poolKey: lastCirbtcDecision?.poolKey || 'No pair selected yet',
+        status: lastCirbtcDecision?.blockedBy ? 'blocked' : (lastCirbtcDecision?.execute ? 'executed' : 'waiting'),
+        summary: lastCirbtcDecision?.selectedStableToken
+          ? `Uses ${lastCirbtcDecision.selectedStableToken} for the latest cirBTC LP review.`
+          : 'The next cirBTC check will choose the supported pair.',
+      }];
+  const cirbtcAutomationPrimarySummary = lastCirbtcDecision?.summary || cirbtcAutomationBaseStatus.detail;
+  const cirbtcAutomationPreviousSnapshotSummary = cirbtcAutomationFreshness.hasNewerDefiLoop
+    ? cirbtcAutomationFreshness.detail
+    : null;
+  const cirbtcAutomationReasonLabel = lastCirbtcDecision?.execute === true
+      ? 'Action approved'
+      : lastCirbtcDecision?.blockedBy
+        ? humanizeAutomationAction(String(lastCirbtcDecision.blockedBy).replace(/([a-z])([A-Z])/g, '$1_$2'))
+        : 'Waiting';
+  const cirbtcAutomationReasonDetail = lastCirbtcDecision?.execute === true
+      ? 'The latest cirBTC review approved an LP action.'
+      : lastCirbtcDecision
+        ? 'The latest cirBTC review kept funds unchanged.'
+        : 'The first cirBTC review has not been saved yet.';
+  const cirbtcAutomationMoveLabel = getCirbtcLpMoveLabel(latestCirbtcLpTx);
+  const cirbtcAutomationMoveDetail = latestCirbtcLpTx
+    ? formatDateTime(latestCirbtcLpTx.created_at)
+    : 'No confirmed cirBTC LP transaction yet.';
+  const cirbtcAutomationTxLabel = latestCirbtcLpTx?.tx_hash
+    ? `${latestCirbtcLpTx.tx_hash.slice(0, 10)}…`
+    : 'No LP tx yet';
+  const cirbtcAutomationTxDetail = latestCirbtcLpTx?.summary
+    ? latestCirbtcLpTx.summary
+    : latestCirbtcLpTx?.tx_hash
+      ? 'The latest confirmed cirBTC LP transaction is recorded on-chain.'
+      : 'No confirmed cirBTC LP transaction has been saved yet.';
   const visibleTxs = getVisibleRecentActivity(txs, agentStatus);
 
   function getGasLabel(entry) {
@@ -1928,7 +2058,7 @@ export default function DashboardTab({ onNavigate }) {
             <Repeat2 size={16} className="text-slate-400" />
             <div>
               <h3 className="font-semibold text-slate-800">cirBTC Automation State</h3>
-              <p className="text-xs text-slate-500">The verified direct-pair cirBTC lane can bootstrap, trim, or exit based on the current LP policy.</p>
+              <p className="text-xs text-slate-500">See whether the agent is adding, holding, or reducing the cirBTC LP position.</p>
             </div>
           </div>
           <Button
@@ -1943,7 +2073,7 @@ export default function DashboardTab({ onNavigate }) {
         {!cirbtcLoopState ? (
           <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
             {cirbtcStatusMissingFromBackend
-              ? 'cirBTC automation status is not available from the current backend yet. The frontend toggle is newer than the live status payload.'
+              ? 'cirBTC status is not available yet. Refresh again after the next update.'
               : 'cirBTC automation state is not available for this agent yet.'}
           </div>
         ) : (
@@ -1957,19 +2087,15 @@ export default function DashboardTab({ onNavigate }) {
                   </span>
                 </div>
                 <p className="mt-2 text-sm font-semibold text-slate-900">{formatDateTime(cirbtcAutomationLastSeenAt)}</p>
-                <p className="mt-1 text-[11px] leading-5 text-slate-500">{cirbtcAutomationStatus.detail}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{cirbtcAutomationStatusDetail}</p>
               </div>
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Last Decision</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Last LP Move</p>
                 <p className="mt-2 text-sm font-semibold text-slate-900">
-                  {lastCirbtcDecision
-                    ? humanizeAutomationAction(lastCirbtcDecision.operationType, lastCirbtcDecision.execute === false ? 'Hold' : 'No action')
-                    : 'No decision yet'}
+                  {cirbtcAutomationMoveLabel}
                 </p>
                 <p className="mt-1 text-[11px] leading-5 text-slate-500">
-                  {cirbtcAutomationDecisionSize !== '—'
-                    ? cirbtcAutomationDecisionSize
-                    : 'No sized action was selected in the latest cycle.'}
+                  {cirbtcAutomationMoveDetail}
                 </p>
               </div>
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
@@ -1996,7 +2122,11 @@ export default function DashboardTab({ onNavigate }) {
                       ? humanizeAutomationAction(lastCirbtcDecision.operationType, lastCirbtcDecision.execute === false ? 'Hold' : 'No action')
                       : 'Awaiting first cirBTC automation cycle'}
                   </p>
-                  <p className="mt-1 text-xs text-slate-500">Last update {formatDateTime(cirbtcAutomationLastSeenAt)}</p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    {cirbtcAutomationFreshness.hasNewerDefiLoop
+                      ? `Last cirBTC snapshot ${formatDateTime(cirbtcSnapshotSeenAt)}`
+                      : `Last update ${formatDateTime(cirbtcAutomationLastSeenAt)}`}
+                  </p>
                 </div>
                 {lastCirbtcDecision?.lpAction && (
                   <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(lastCirbtcDecision.lpAction === 'full_exit' ? 'red' : lastCirbtcDecision.lpAction === 'trim_to_target' ? 'amber' : 'green')}`}>
@@ -2006,36 +2136,45 @@ export default function DashboardTab({ onNavigate }) {
               </div>
 
               <p className="mt-3 text-sm leading-6 text-slate-700">
-                {lastCirbtcDecision?.summary || cirbtcAutomationStatus.detail}
+                {cirbtcAutomationPrimarySummary}
               </p>
+
+              {cirbtcAutomationPreviousSnapshotSummary && (
+                <p className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
+                  Latest saved cirBTC note: {cirbtcAutomationPreviousSnapshotSummary}
+                </p>
+              )}
 
               <div className="mt-3 grid gap-2 md:grid-cols-3">
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Blocked By</p>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Current Reason</p>
                   <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {lastCirbtcDecision?.blockedBy ? humanizeAutomationAction(lastCirbtcDecision.blockedBy) : 'None'}
+                    {cirbtcAutomationReasonLabel}
                   </p>
-                  <p className="mt-1 text-[11px] text-slate-500">Hold reason appears here when the policy refuses execution.</p>
+                  <p className="mt-1 text-[11px] text-slate-500">{cirbtcAutomationReasonDetail}</p>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Pair Context</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {lastCirbtcDecision?.poolKey ? String(lastCirbtcDecision.poolKey).replace(/_/g, ' / ') : 'No pool selected'}
-                  </p>
-                  <p className="mt-1 text-[11px] text-slate-500">
-                    Funding asset {lastCirbtcDecision?.selectedStableToken || 'USDC'} · withdraw {lastCirbtcDecision?.withdrawPct ? `${lastCirbtcDecision.withdrawPct}%` : '—'}
-                  </p>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">LP Pairs</p>
+                  <div className="mt-2 space-y-2">
+                    {cirbtcAutomationPairSummaries.map((pairSummary) => (
+                      <div key={pairSummary.poolKey} className="rounded-lg border border-slate-200 bg-white px-2.5 py-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-sm font-semibold text-slate-900">{pairSummary.poolKey}</p>
+                          <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getStatusBadgeClasses(getCirbtcPairStatusTone(pairSummary.status))}`}>
+                            {getCirbtcPairStatusLabel(pairSummary.status)}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[11px] text-slate-500">{pairSummary.summary}</p>
+                      </div>
+                    ))}
+                  </div>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Execution Rail</p>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Last Transaction</p>
                   <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {lastCirbtcDecision?.executionSource ? humanizeAutomationAction(lastCirbtcDecision.executionSource) : '—'}
+                    {cirbtcAutomationTxLabel}
                   </p>
-                  <p className="mt-1 text-[11px] text-slate-500">
-                    {lastCirbtcDecision?.txHash
-                      ? `Latest tx ${lastCirbtcDecision.txHash.slice(0, 10)}…`
-                      : 'No transaction hash recorded for the latest cycle.'}
-                  </p>
+                  <p className="mt-1 text-[11px] text-slate-500">{cirbtcAutomationTxDetail}</p>
                 </div>
               </div>
             </div>

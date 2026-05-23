@@ -17,6 +17,10 @@ const STABLE_MANUAL_ADD_COOLDOWN_MINUTES = Math.max(
   Number.parseInt(process.env.STABLE_MANUAL_LP_ADD_COOLDOWN_MINUTES || '45', 10) || 45,
   1,
 );
+const ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES = Math.max(
+  Number.parseInt(process.env.ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES || '60', 10) || 60,
+  0,
+);
 const DEFAULT_STABLE_TARGET_LP_ALLOCATION_PCT = 25;
 const DEFAULT_STABLE_TARGET_LP_MIN_ALLOCATION_PCT = 20;
 const DEFAULT_STABLE_TARGET_LP_MAX_ALLOCATION_PCT = 30;
@@ -79,6 +83,54 @@ function isLegacyStableDecision(decision) {
   const executionSource = String(decision.executionSource || '').trim();
   const policyId = String(decision.policyId || '').trim();
   return executionSource === 'stable_policy_v1' || policyId === 'stable_usdc_eurc_curve_v1';
+}
+
+async function readOracleEntryCooldown(agentId) {
+  if (!agentId || !(ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES > 0)) {
+    return {
+      active: false,
+      until: null,
+      lastExitAt: null,
+      minutes: ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES,
+      txHash: null,
+    };
+  }
+
+  const { rows: [lastExit] } = await db.query(
+    `SELECT created_at::text AS created_at,
+            tx_hash
+       FROM transactions
+      WHERE agent_id = $1
+        AND type = 'rebalance'
+        AND status = 'confirmed'
+        AND meta->>'executionSource' = 'oracle_strategy_v1'
+        AND COALESCE(meta->>'fromToken', '') = 'EURC'
+        AND COALESCE(meta->>'toToken', '') = 'USDC'
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [agentId],
+  );
+
+  const lastExitAtMs = parseTimestampMs(lastExit?.created_at);
+  if (lastExitAtMs == null) {
+    return {
+      active: false,
+      until: null,
+      lastExitAt: null,
+      minutes: ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES,
+      txHash: null,
+    };
+  }
+
+  const untilMs = lastExitAtMs + (ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES * 60_000);
+
+  return {
+    active: untilMs > Date.now(),
+    until: new Date(untilMs).toISOString(),
+    lastExitAt: lastExit.created_at,
+    minutes: ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES,
+    txHash: lastExit.tx_hash || null,
+  };
 }
 
 function buildStableManualCooldownDecision(lastDecision, manualCooldownUntil, { cooldownActive = false } = {}) {
@@ -409,6 +461,8 @@ async function updateAgent(agentId, userId, data) {
     slippagePercent:         'slippage_percent',
     maxTradeUsdc:            'max_trade_usdc',
     defiWalletReserveUsdc:   'defi_wallet_reserve_usdc',
+    oracleMaxEurcInventory:  'oracle_max_eurc_inventory',
+    oracleMinEurcReserve:    'oracle_min_eurc_reserve',
     autoLockMinutes:         'auto_lock_minutes',
     contractGuard:           'contract_guard_enabled',
     llmApiKeyEncrypted:      'llm_api_key_encrypted',
@@ -419,6 +473,7 @@ async function updateAgent(agentId, userId, data) {
     marketAnalysisEnabled:   'market_analysis_enabled',
     oracleEnabled:           'oracle_enabled',
     defiLoopEnabled:         'defi_loop_enabled',
+    lendingAutomationEnabled:'lending_automation_enabled',
     cirbtcLpEnabled:         'cirbtc_lp_enabled',
     reputationEnabled:       'reputation_enabled',
   };
@@ -477,12 +532,13 @@ async function getAgentStatus(agentId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
             a.llm_model, a.wallet_address, a.last_reset_day,
-          a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
+          a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.lending_automation_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
             a.daily_market_analysis_count, a.daily_defi_loop_count, a.daily_auto_tx_count,
             a.market_analysis_last_run_at, a.market_analysis_last_status, a.market_analysis_last_decision,
             a.stable_manual_cooldown_until,
             a.oracle_last_run_at, a.oracle_last_status,
             a.defi_loop_last_run_at, a.defi_loop_last_status, a.defi_loop_last_decision,
+            a.lending_automation_last_run_at, a.lending_automation_last_status, a.lending_automation_last_decision,
             a.cirbtc_lp_last_run_at, a.cirbtc_lp_last_status, a.cirbtc_lp_last_decision,
             a.reputation_last_run_at, a.reputation_last_status
      FROM agents a
@@ -527,6 +583,12 @@ async function getAgentStatus(agentId, userId) {
     && Object.keys(a.cirbtc_lp_last_decision).length > 0
     ? a.cirbtc_lp_last_decision
     : null;
+  const lendingAutomationLastDecision = a.lending_automation_last_decision
+    && typeof a.lending_automation_last_decision === 'object'
+    && Object.keys(a.lending_automation_last_decision).length > 0
+    ? a.lending_automation_last_decision
+    : null;
+  const oracleEntryCooldown = await readOracleEntryCooldown(agentId);
 
   return {
     agentId:       a.id,
@@ -553,6 +615,7 @@ async function getAgentStatus(agentId, userId) {
         enabled: a.oracle_enabled ?? false,
         lastRunAt: a.oracle_last_run_at,
         lastStatus: a.oracle_last_status || 'idle',
+        entryCooldown: oracleEntryCooldown,
         todayCount: a.daily_market_analysis_count ?? 0,
         dailyCap: 48,
         bypassDailyCap: dailyLimitBypass.enabled,
@@ -563,6 +626,16 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: stableLoopState.lastStatus,
         lastDecision: stableLoopState.lastDecision,
         manualCooldownUntil: a.stable_manual_cooldown_until,
+        todayCount: a.daily_defi_loop_count ?? 0,
+        dailyCap: 10,
+        autoTxToday: a.daily_auto_tx_count ?? 0,
+        bypassDailyCap: dailyLimitBypass.enabled,
+      },
+      lendingAutomation: {
+        enabled: a.lending_automation_enabled ?? false,
+        lastRunAt: a.lending_automation_last_run_at,
+        lastStatus: a.lending_automation_last_status || 'idle',
+        lastDecision: lendingAutomationLastDecision,
         todayCount: a.daily_defi_loop_count ?? 0,
         dailyCap: 10,
         autoTxToday: a.daily_auto_tx_count ?? 0,
@@ -621,6 +694,8 @@ function formatAgent(row, perms) {
       slippagePercent: parseFloat(row.slippage_percent),
       maxTradeUsdc:    parseFloat(row.max_trade_usdc),
       defiWalletReserveUsdc: parseFloat(row.defi_wallet_reserve_usdc || 0),
+      oracleMaxEurcInventory: row.oracle_max_eurc_inventory != null ? parseFloat(row.oracle_max_eurc_inventory) : null,
+      oracleMinEurcReserve: row.oracle_min_eurc_reserve != null ? parseFloat(row.oracle_min_eurc_reserve) : null,
       autoLockMinutes: row.auto_lock_minutes,
       contractGuard:   row.contract_guard_enabled,
       passkeyEnabled:  row.passkey_enabled,
@@ -633,6 +708,7 @@ function formatAgent(row, perms) {
       marketAnalysisEnabled: row.market_analysis_enabled ?? false,
       oracleEnabled:         row.oracle_enabled          ?? false,
       defiLoopEnabled:       row.defi_loop_enabled       ?? false,
+      lendingAutomationEnabled: row.lending_automation_enabled ?? false,
       cirbtcLpEnabled:       row.cirbtc_lp_enabled       ?? false,
       reputationEnabled:     row.reputation_enabled      ?? false,
     },

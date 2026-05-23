@@ -16,6 +16,7 @@
     "smoke:route": "npm test -- src/routes/__tests__/routeSmoke.test.js",
     "smoke:paid-readiness": "node scripts/paidReadinessSmoke.js",
     "smoke:automation-live": "node scripts/automationLiveSmoke.js",
+    "smoke:defi-full": "node scripts/defiFullSmoke.js",
     "smoke:readiness": "npm run smoke:route && npm run smoke:paid-readiness",
     "jobs:smoke:e2e": "node scripts/jobsE2ESmoke.js",
     "oracle:buyer:example": "node examples/oraclePublicBuyerExample.js",

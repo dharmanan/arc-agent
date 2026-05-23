@@ -2,6 +2,11 @@
 
 const { ethers } = require('ethers');
 
+const ERC20_APPROVE_ABI = [
+  'function approve(address spender, uint256 amount) returns (bool)',
+  'function allowance(address owner, address spender) view returns (uint256)',
+];
+
 const ARC_LENDING_POOL_ABI = [
   'function treasury() view returns (address)',
   'function globalPaused() view returns (bool)',
@@ -67,6 +72,15 @@ function formatUnits(value, decimals) {
     return ethers.formatUnits(value, decimals);
   } catch {
     return null;
+  }
+}
+
+async function approveIfNeeded(tokenAddress, signer, spender, amountRaw) {
+  const token = new ethers.Contract(tokenAddress, ERC20_APPROVE_ABI, signer);
+  const allowance = await token.allowance(signer.address, spender);
+  if (allowance < amountRaw) {
+    const approveTx = await token.approve(spender, amountRaw);
+    await approveTx.wait(1);
   }
 }
 
@@ -195,6 +209,7 @@ async function executeNativeLendingSupply({ assetAddress, amount, agentPrivateKe
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(decimals || asset.decimals));
+  await approveIfNeeded(asset.address, signer, await contract.getAddress(), amountRaw);
   const tx = await contract.supply(asset.address, amountRaw, onBehalfOf || signer.address);
   const receipt = await tx.wait(1);
   return { txHash: receipt.hash };
@@ -237,6 +252,7 @@ async function executeNativeLendingRepay({ assetAddress, amount, agentPrivateKey
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(decimals || asset.decimals));
+  await approveIfNeeded(asset.address, signer, await contract.getAddress(), amountRaw);
   const tx = await contract.repay(asset.address, amountRaw, onBehalfOf || signer.address);
   const receipt = await tx.wait(1);
   return { txHash: receipt.hash, amountRepaid: String(amount) };
@@ -254,6 +270,7 @@ async function executeNativeLendingLiquidation({ borrower, debtAssetAddress, col
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(debtAssetDecimals || debtAsset.decimals));
+  await approveIfNeeded(debtAsset.address, signer, await contract.getAddress(), amountRaw);
   const tx = await contract.liquidate(borrower, debtAsset.address, amountRaw, collateralAsset.address);
   const receipt = await tx.wait(1);
   return {

@@ -73,6 +73,8 @@ const updateSchema = z.object({
   slippagePercent:   z.number().min(0.1).max(50).optional(),
   maxTradeUsdc:      z.number().positive().max(100_000).optional(),
   defiWalletReserveUsdc: z.number().min(0).max(100_000).optional(),
+  oracleMaxEurcInventory: z.number().positive().max(100_000).nullable().optional(),
+  oracleMinEurcReserve: z.number().min(0).max(100_000).nullable().optional(),
   autoLockMinutes:   z.number().int().min(1).max(60).optional(),
   contractGuard:     z.boolean().optional(),
   isSmartMode:       z.boolean().optional(),
@@ -85,6 +87,7 @@ const updateSchema = z.object({
   marketAnalysisEnabled: z.boolean().optional(),
   oracleEnabled:         z.boolean().optional(),
   defiLoopEnabled:       z.boolean().optional(),
+  lendingAutomationEnabled: z.boolean().optional(),
   cirbtcLpEnabled:       z.boolean().optional(),
   reputationEnabled:     z.boolean().optional(),
 }).strict();
@@ -120,7 +123,7 @@ router.put('/:id', async (req, res, next) => {
         jobId: `oracle-manual-${agent.id}-${Date.now()}`,
       }));
     }
-    if (data.defiLoopEnabled === true || data.cirbtcLpEnabled === true) {
+    if (data.defiLoopEnabled === true || data.lendingAutomationEnabled === true || data.cirbtcLpEnabled === true) {
       kickoffJobs.push(agentQueue.add('DEFI_LOOP', {
         agentId: agent.id,
       }, {

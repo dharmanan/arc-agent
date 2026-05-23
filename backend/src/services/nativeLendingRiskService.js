@@ -10,6 +10,8 @@ const ERC20_BALANCE_ABI = ['function balanceOf(address) view returns (uint256)']
 const HEALTH_FACTOR_WARNING = 1.2;
 const HEALTH_FACTOR_CRITICAL = 1.05;
 const DELEVERAGE_TARGET_HEALTH_FACTOR = Number(process.env.LENDING_DELEVERAGE_TARGET_HF || '1.3');
+const COLLATERAL_TOP_UP_TRIGGER_HEALTH_FACTOR = Number(process.env.LENDING_COLLATERAL_TOP_UP_TRIGGER_HF || String(HEALTH_FACTOR_WARNING));
+const COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR = Number(process.env.LENDING_COLLATERAL_TOP_UP_TARGET_HF || String(DELEVERAGE_TARGET_HEALTH_FACTOR));
 const LIQUIDATION_ELIGIBLE_HEALTH_FACTOR = Number(process.env.LENDING_LIQUIDATION_ELIGIBLE_HF || '1');
 
 function _getArcRpcUrl() {
@@ -384,6 +386,279 @@ function evaluateEmergencyDeleverage(surface) {
   };
 }
 
+function evaluateCollateralTopUp(surface) {
+  const currentHealthFactor = _toNumber(surface?.risk?.healthFactor, NaN);
+  const totalBorrowUsd = _toNumber(surface?.risk?.totalBorrowUsd, 0);
+  const liquidationCapacityUsd = _toNumber(surface?.risk?.liquidationCapacityUsd, 0);
+
+  if (!(totalBorrowUsd > 0)) {
+    return {
+      execute: false,
+      status: 'idle',
+      reason: 'lending_collateral_topup_not_required',
+      detail: 'There is no active lending debt, so collateral top-up is not needed.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      targetHealthFactor: null,
+      projectedHealthFactor: surface?.risk?.healthFactor ?? null,
+      collateralUsdNeeded: 0,
+      collateralUsdPlanned: 0,
+      collateralUsdShortfall: 0,
+      steps: [],
+    };
+  }
+
+  if (Number.isFinite(currentHealthFactor) && currentHealthFactor > COLLATERAL_TOP_UP_TRIGGER_HEALTH_FACTOR) {
+    return {
+      execute: false,
+      status: 'not_required',
+      reason: 'lending_collateral_topup_not_required',
+      detail: 'The current health factor is still above the collateral top-up trigger.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      targetHealthFactor: COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR,
+      projectedHealthFactor: surface?.risk?.healthFactor ?? null,
+      collateralUsdNeeded: 0,
+      collateralUsdPlanned: 0,
+      collateralUsdShortfall: 0,
+      steps: [],
+    };
+  }
+
+  const liquidationCapacityShortfallUsd = Math.max(
+    (totalBorrowUsd * COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR) - liquidationCapacityUsd,
+    0,
+  );
+
+  if (!(liquidationCapacityShortfallUsd > 0)) {
+    return {
+      execute: false,
+      status: 'not_required',
+      reason: 'lending_collateral_topup_not_required',
+      detail: 'Visible collateral capacity is already sufficient for the current top-up target.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      targetHealthFactor: COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR,
+      projectedHealthFactor: surface?.risk?.healthFactor ?? null,
+      collateralUsdNeeded: 0,
+      collateralUsdPlanned: 0,
+      collateralUsdShortfall: 0,
+      steps: [],
+    };
+  }
+
+  let remainingCapacityShortfallUsd = liquidationCapacityShortfallUsd;
+  const supplyAssets = (surface?.assets || [])
+    .filter((assetEntry) => (
+      assetEntry?.reserve?.supported === true
+        && assetEntry?.reserve?.paused !== true
+        && assetEntry?.reserve?.collateralEnabled !== false
+        && _toNumber(assetEntry?.wallet?.amount, 0) > 0
+        && _toNumber(assetEntry?.wallet?.amountUsd, 0) > 0
+        && _toNumber(assetEntry?.price?.priceUsd, 0) > 0
+        && _toNumber(assetEntry?.reserve?.liquidationThresholdBps, 0) > 0
+    ))
+    .sort((left, right) => (
+      _toNumber(right?.wallet?.amountUsd, 0) - _toNumber(left?.wallet?.amountUsd, 0)
+        || _toNumber(right?.reserve?.liquidationThresholdBps, 0) - _toNumber(left?.reserve?.liquidationThresholdBps, 0)
+    ));
+
+  const steps = [];
+
+  for (const assetEntry of supplyAssets) {
+    if (!(remainingCapacityShortfallUsd > 0)) break;
+
+    const priceUsd = _toNumber(assetEntry.price?.priceUsd, 0);
+    const walletUsd = _toNumber(assetEntry.wallet?.amountUsd, 0);
+    const walletAmount = _toNumber(assetEntry.wallet?.amount, 0);
+    const liquidationFactor = _toNumber(assetEntry.reserve?.liquidationThresholdBps, 0) / 10_000;
+
+    if (!(priceUsd > 0) || !(walletUsd > 0) || !(walletAmount > 0) || !(liquidationFactor > 0)) {
+      continue;
+    }
+
+    const neededSupplyUsd = remainingCapacityShortfallUsd / liquidationFactor;
+    const supplyUsd = Math.min(walletUsd, neededSupplyUsd);
+    const supplyAmount = supplyUsd / priceUsd;
+    const liquidationCapacityAddedUsd = supplyUsd * liquidationFactor;
+
+    if (!(supplyUsd > 0) || !(supplyAmount > 0) || !(liquidationCapacityAddedUsd > 0)) {
+      continue;
+    }
+
+    steps.push({
+      action: 'supply',
+      asset: assetEntry.symbol,
+      amount: _roundMetric(supplyAmount),
+      usdAmount: _roundMetric(supplyUsd),
+      availableWalletAmount: assetEntry.wallet.amount,
+      availableWalletUsd: _roundMetric(walletUsd),
+      liquidationThresholdBps: assetEntry.reserve.liquidationThresholdBps,
+      liquidationCapacityAddedUsd: _roundMetric(liquidationCapacityAddedUsd),
+    });
+
+    remainingCapacityShortfallUsd = Math.max(remainingCapacityShortfallUsd - liquidationCapacityAddedUsd, 0);
+  }
+
+  const collateralUsdPlanned = steps.reduce((sum, step) => sum + _toNumber(step.usdAmount, 0), 0);
+  const liquidationCapacityAddedUsd = steps.reduce((sum, step) => sum + _toNumber(step.liquidationCapacityAddedUsd, 0), 0);
+  const projectedHealthFactor = totalBorrowUsd > 0
+    ? _roundMetric((liquidationCapacityUsd + liquidationCapacityAddedUsd) / totalBorrowUsd, 4)
+    : null;
+  const collateralUsdShortfall = _roundMetric(remainingCapacityShortfallUsd);
+
+  if (steps.length === 0) {
+    return {
+      execute: false,
+      status: 'needs_funding',
+      reason: 'lending_collateral_topup_wallet_funds_required',
+      detail: 'Collateral top-up needs wallet funds in a supported collateral asset before any supply step can run.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      targetHealthFactor: COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR,
+      projectedHealthFactor: surface?.risk?.healthFactor ?? null,
+      collateralUsdNeeded: _roundMetric(liquidationCapacityShortfallUsd),
+      collateralUsdPlanned: 0,
+      collateralUsdShortfall: _roundMetric(liquidationCapacityShortfallUsd),
+      steps: [],
+    };
+  }
+
+  return {
+    execute: true,
+    status: remainingCapacityShortfallUsd > 0 ? 'partial' : 'ready',
+    reason: null,
+    detail: remainingCapacityShortfallUsd > 0
+      ? 'Visible wallet collateral can improve the health factor, but more wallet funds are still needed to reach the current top-up target.'
+      : 'Visible wallet collateral is sufficient to top the lending account back to the current target health factor.',
+    currentHealthFactor: surface?.risk?.healthFactor ?? null,
+    targetHealthFactor: COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR,
+    projectedHealthFactor,
+    collateralUsdNeeded: _roundMetric(liquidationCapacityShortfallUsd),
+    collateralUsdPlanned: _roundMetric(collateralUsdPlanned),
+    collateralUsdShortfall,
+    steps,
+  };
+}
+
+function evaluateSafeExit(surface) {
+  const totalBorrowUsd = _toNumber(surface?.risk?.totalBorrowUsd, 0);
+  const totalSuppliedUsd = _toNumber(surface?.risk?.totalSuppliedUsd, 0);
+
+  if (!(totalBorrowUsd > 0) && !(totalSuppliedUsd > 0)) {
+    return {
+      execute: false,
+      status: 'idle',
+      reason: 'lending_safe_exit_not_required',
+      detail: 'There is no active supplied or borrowed lending position to close.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      repayUsdNeeded: 0,
+      repayUsdPlanned: 0,
+      repayUsdShortfall: 0,
+      withdrawUsdPlanned: 0,
+      steps: [],
+    };
+  }
+
+  const debtAssets = (surface?.assets || [])
+    .filter((assetEntry) => _toNumber(assetEntry?.position?.borrowUsd, 0) > 0)
+    .sort((left, right) => _toNumber(right?.position?.borrowUsd, 0) - _toNumber(left?.position?.borrowUsd, 0));
+  const repaySteps = [];
+  let repayUsdPlanned = 0;
+  let repayUsdShortfall = 0;
+
+  for (const assetEntry of debtAssets) {
+    const borrowAmount = _toNumber(assetEntry.position?.borrowAmount, 0);
+    const borrowUsd = _toNumber(assetEntry.position?.borrowUsd, 0);
+    const walletAmount = _toNumber(assetEntry.wallet?.amount, 0);
+    const walletUsd = _toNumber(assetEntry.wallet?.amountUsd, 0);
+    const priceUsd = _toNumber(assetEntry.price?.priceUsd, 0);
+
+    if (!(borrowAmount > 0) || !(borrowUsd > 0)) continue;
+
+    if (!(walletAmount > 0) || !(walletUsd > 0) || !(priceUsd > 0)) {
+      repayUsdShortfall += borrowUsd;
+      continue;
+    }
+
+    const repayAmount = Math.min(walletAmount, borrowAmount);
+    const plannedRepayUsd = Math.min(walletUsd, borrowUsd, repayAmount * priceUsd);
+
+    if (!(repayAmount > 0) || !(plannedRepayUsd > 0)) {
+      repayUsdShortfall += borrowUsd;
+      continue;
+    }
+
+    repaySteps.push({
+      action: 'repay',
+      asset: assetEntry.symbol,
+      amount: _roundMetric(repayAmount),
+      usdAmount: _roundMetric(plannedRepayUsd),
+      availableWalletAmount: assetEntry.wallet.amount,
+      currentDebtAmount: assetEntry.position.borrowAmount,
+    });
+
+    repayUsdPlanned += plannedRepayUsd;
+    repayUsdShortfall += Math.max(borrowUsd - plannedRepayUsd, 0);
+  }
+
+  if (totalBorrowUsd > 0 && repayUsdShortfall > 0) {
+    return {
+      execute: false,
+      status: 'needs_funding',
+      reason: 'lending_safe_exit_wallet_funds_required',
+      detail: 'Safe exit needs enough wallet funds to fully repay every active lending debt before collateral can be withdrawn.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      repayUsdNeeded: _roundMetric(totalBorrowUsd),
+      repayUsdPlanned: _roundMetric(repayUsdPlanned),
+      repayUsdShortfall: _roundMetric(repayUsdShortfall),
+      withdrawUsdPlanned: 0,
+      steps: repaySteps,
+    };
+  }
+
+  const withdrawSteps = (surface?.assets || [])
+    .filter((assetEntry) => _toNumber(assetEntry?.position?.suppliedAmount, 0) > 0)
+    .sort((left, right) => _toNumber(right?.position?.suppliedUsd, 0) - _toNumber(left?.position?.suppliedUsd, 0))
+    .map((assetEntry) => ({
+      action: 'withdraw',
+      asset: assetEntry.symbol,
+      amount: _roundMetric(_toNumber(assetEntry.position?.suppliedAmount, 0)),
+      usdAmount: _roundMetric(_toNumber(assetEntry.position?.suppliedUsd, 0)),
+      currentSuppliedAmount: assetEntry.position.suppliedAmount,
+    }))
+    .filter((step) => _toNumber(step.amount, 0) > 0);
+
+  const withdrawUsdPlanned = withdrawSteps.reduce((sum, step) => sum + _toNumber(step.usdAmount, 0), 0);
+  const steps = [...repaySteps, ...withdrawSteps];
+
+  if (steps.length === 0) {
+    return {
+      execute: false,
+      status: 'idle',
+      reason: 'lending_safe_exit_not_required',
+      detail: 'There is no active lending position left to close safely.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      repayUsdNeeded: 0,
+      repayUsdPlanned: 0,
+      repayUsdShortfall: 0,
+      withdrawUsdPlanned: 0,
+      steps: [],
+    };
+  }
+
+  return {
+    execute: true,
+    status: 'ready',
+    reason: null,
+    detail: totalBorrowUsd > 0
+      ? 'Wallet funds can fully repay the visible debt and withdraw the remaining supplied collateral in one safe exit flow.'
+      : 'No debt is active. Safe exit can withdraw the remaining supplied collateral.',
+    currentHealthFactor: surface?.risk?.healthFactor ?? null,
+    repayUsdNeeded: _roundMetric(totalBorrowUsd),
+    repayUsdPlanned: _roundMetric(repayUsdPlanned),
+    repayUsdShortfall: 0,
+    withdrawUsdPlanned: _roundMetric(withdrawUsdPlanned),
+    steps,
+  };
+}
+
 function evaluateSelfLiquidationStatus(surface) {
   const totalBorrowUsd = _toNumber(surface?.risk?.totalBorrowUsd, 0);
   const healthFactor = _toNumber(surface?.risk?.healthFactor, NaN);
@@ -639,6 +914,8 @@ async function buildLendingSurfaceForWallet(walletAddress) {
   return {
     ...baseSurface,
     recovery: evaluateEmergencyDeleverage(baseSurface),
+    collateralTopUp: evaluateCollateralTopUp(baseSurface),
+    safeExit: evaluateSafeExit(baseSurface),
     liquidation: evaluateSelfLiquidationStatus(baseSurface),
   };
 }
@@ -828,6 +1105,128 @@ async function guardAgentEmergencyDeleverage({ agent }) {
   };
 }
 
+async function guardAgentCollateralTopUp({ agent }) {
+  const walletAddress = agent?.wallet_address || agent?.walletAddress || null;
+  if (!walletAddress) {
+    return {
+      ok: false,
+      code: 'wallet_not_configured',
+      verdict: {
+        execute: false,
+        reason: 'wallet_not_configured',
+        detail: 'This agent does not have a wallet address configured.',
+      },
+      surface: null,
+    };
+  }
+
+  const surface = await buildLendingSurfaceForWallet(walletAddress);
+  const topUp = surface.collateralTopUp || evaluateCollateralTopUp(surface);
+  if (topUp.execute !== true) {
+    return {
+      ok: false,
+      code: topUp.reason || 'lending_collateral_topup_not_available',
+      verdict: topUp,
+      surface,
+    };
+  }
+
+  const executionFailure = _getExecutionReadinessFailure(surface);
+  if (executionFailure) {
+    return {
+      ok: false,
+      code: executionFailure.reason,
+      verdict: executionFailure,
+      surface,
+    };
+  }
+
+  for (const step of topUp.steps) {
+    const verdict = evaluateManualLendingAction({
+      surface,
+      action: step.action,
+      asset: step.asset,
+      amount: step.amount,
+    });
+
+    if (verdict.execute !== true) {
+      return {
+        ok: false,
+        code: verdict.reason || 'lending_collateral_topup_step_blocked',
+        verdict,
+        surface,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    verdict: topUp,
+    surface,
+  };
+}
+
+async function guardAgentSafeExit({ agent }) {
+  const walletAddress = agent?.wallet_address || agent?.walletAddress || null;
+  if (!walletAddress) {
+    return {
+      ok: false,
+      code: 'wallet_not_configured',
+      verdict: {
+        execute: false,
+        reason: 'wallet_not_configured',
+        detail: 'This agent does not have a wallet address configured.',
+      },
+      surface: null,
+    };
+  }
+
+  const surface = await buildLendingSurfaceForWallet(walletAddress);
+  const safeExit = surface.safeExit || evaluateSafeExit(surface);
+  if (safeExit.execute !== true) {
+    return {
+      ok: false,
+      code: safeExit.reason || 'lending_safe_exit_not_available',
+      verdict: safeExit,
+      surface,
+    };
+  }
+
+  const executionFailure = _getExecutionReadinessFailure(surface);
+  if (executionFailure) {
+    return {
+      ok: false,
+      code: executionFailure.reason,
+      verdict: executionFailure,
+      surface,
+    };
+  }
+
+  for (const step of safeExit.steps) {
+    const verdict = evaluateManualLendingAction({
+      surface,
+      action: step.action,
+      asset: step.asset,
+      amount: step.amount,
+    });
+
+    if (verdict.execute !== true) {
+      return {
+        ok: false,
+        code: verdict.reason || 'lending_safe_exit_step_blocked',
+        verdict,
+        surface,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    verdict: safeExit,
+    surface,
+  };
+}
+
 async function guardAgentLiquidationAction({ agent, borrower, debtAsset, collateralAsset, amount }) {
   const walletAddress = agent?.wallet_address || agent?.walletAddress || null;
   if (!walletAddress) {
@@ -888,11 +1287,15 @@ async function getAgentLendingSurface(agentId, userId) {
 
 module.exports = {
   buildLendingSurfaceForWallet,
+  evaluateCollateralTopUp,
   evaluateEmergencyDeleverage,
   evaluateLiquidationOpportunity,
   evaluateManualLendingAction,
+  evaluateSafeExit,
+  guardAgentCollateralTopUp,
   guardAgentEmergencyDeleverage,
   guardAgentLiquidationAction,
   guardAgentManualLendingAction,
+  guardAgentSafeExit,
   getAgentLendingSurface,
 };

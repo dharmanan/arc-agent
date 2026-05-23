@@ -3,7 +3,7 @@
  * Direct ethers.js deploy — no Hardhat CLI needed.
  * Run: node scripts/direct-deploy-lending-pool.js
  */
-require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
+require('/workspaces/arc-agent/backend/node_modules/dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { ethers } = require('/workspaces/arc-agent/backend/node_modules/ethers');
 const fs = require('fs');
 const path = require('path');

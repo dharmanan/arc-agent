@@ -25,6 +25,20 @@ function parseNonNegativeUsdc(value) {
   return parsed;
 }
 
+function parseOptionalPositiveUsdc(value) {
+  if (value == null || value === '') return null;
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function parseOptionalNonNegativeUsdc(value) {
+  if (value == null || value === '') return null;
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 export default function AgentTab() {
   const { address: ownerAddress } = useAccount();
   const { agent, setAgent, setJwt, clearAgent, disconnectSession } = useAgent();
@@ -56,6 +70,7 @@ export default function AgentTab() {
     marketAnalysisEnabled: false,
     oracleEnabled:         false,
     defiLoopEnabled:       false,
+    lendingAutomationEnabled: false,
     cirbtcLpEnabled:       false,
     reputationEnabled:     false,
   });
@@ -193,6 +208,8 @@ export default function AgentTab() {
         slippagePercent: parseFloat(settings.slippagePercent) || 0.5,
         maxTradeUsdc:    parseFloat(settings.maxTradeUsdc)    || 200,
         defiWalletReserveUsdc: parseNonNegativeUsdc(settings.defiWalletReserveUsdc),
+        oracleMaxEurcInventory: parseOptionalPositiveUsdc(settings.oracleMaxEurcInventory),
+        oracleMinEurcReserve: parseOptionalNonNegativeUsdc(settings.oracleMinEurcReserve),
         autoLockMinutes: parseInt(settings.autoLockMinutes)   || 5,
         contractGuard:   settings.contractGuard !== false,
       };
@@ -203,6 +220,7 @@ export default function AgentTab() {
       payload.marketAnalysisEnabled = features.marketAnalysisEnabled;
       payload.oracleEnabled         = features.oracleEnabled;
       payload.defiLoopEnabled       = features.defiLoopEnabled;
+      payload.lendingAutomationEnabled = features.lendingAutomationEnabled;
       payload.cirbtcLpEnabled       = features.cirbtcLpEnabled;
       payload.reputationEnabled     = features.reputationEnabled;
       const updated = await agentApi.update(agent.id, payload);
@@ -493,12 +511,21 @@ export default function AgentTab() {
             onChange={e => setSettings(s => ({ ...s, dailyLimitUsdc: e.target.value }))}
           />
           <Input
-            label="Auto-approve below (USDC) — no passkey needed"
+            label="Max trade size (USDC) — also the auto-approve ceiling"
             type="number"
             min="1"
-            placeholder="50"
+            placeholder="200"
             value={settings.maxTradeUsdc ?? ''}
             onChange={e => setSettings(s => ({ ...s, maxTradeUsdc: e.target.value }))}
+          />
+          <Input
+            label="Wallet EURC cap"
+            type="number"
+            min="1"
+            step="0.01"
+            placeholder="Leave blank to follow the trade cap"
+            value={settings.oracleMaxEurcInventory ?? ''}
+            onChange={e => setSettings(s => ({ ...s, oracleMaxEurcInventory: e.target.value }))}
           />
           <Input
             label="Max Gas (gwei)"
@@ -517,6 +544,15 @@ export default function AgentTab() {
             placeholder="0.5"
             value={settings.slippagePercent ?? ''}
             onChange={e => setSettings(s => ({ ...s, slippagePercent: e.target.value }))}
+          />
+          <Input
+            label="Keep at least (EURC)"
+            type="number"
+            min="0"
+            step="0.01"
+            placeholder="Leave blank to mirror the USDC reserve"
+            value={settings.oracleMinEurcReserve ?? ''}
+            onChange={e => setSettings(s => ({ ...s, oracleMinEurcReserve: e.target.value }))}
           />
           <Input
             label="Auto-lock after (minutes)"
@@ -540,6 +576,21 @@ export default function AgentTab() {
               <p className="text-xs text-slate-500">Block interactions with unverified contracts</p>
             </label>
           </div>
+        </div>
+        <div className="mt-4 rounded-xl border border-slate-100 bg-slate-50 p-3 text-xs text-slate-600 space-y-2">
+          <p>
+            <span className="font-semibold text-slate-800">How the stable oracle lane uses these settings:</span>{' '}
+            each buy or sell cycle is capped by <strong>{Number(settings.maxTradeUsdc || 0).toFixed(2)} USDC</strong>.
+          </p>
+          <p>
+            The wallet keeps your USDC reserve first, then buys EURC only until the wallet reaches the EURC cap. Leave the EURC cap blank if you want it to follow the trade cap.
+          </p>
+          <p>
+            If EURC has already built up, the bot keeps the protected EURC reserve and sells only the excess back into USDC on the live swap route whenever the exit quote is strong enough. Leave the EURC reserve blank to mirror the USDC reserve.
+          </p>
+          <p>
+            When the same-run round trip is profitable enough, the bot can also buy EURC on Curve and sell it back into USDC in the same cycle instead of keeping the EURC inventory.
+          </p>
         </div>
         <p className="mt-3 text-xs text-slate-400 flex items-center gap-1">
           <Zap size={11} /> Transactions below the auto-approve limit are signed automatically by the agent without prompting.

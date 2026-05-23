@@ -13,6 +13,7 @@
  */
 const Bull        = require('bull');
 const Redis       = require('ioredis');
+const os          = require('os');
 const { ethers }  = require('ethers');
 const db          = require('../db');
 const llmService  = require('../services/llmService');
@@ -25,7 +26,9 @@ const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationSe
 const taskEconomyService = require('../services/agenticEconomy/taskEconomyService');
 const agenticTaskExecutionService = require('../services/agenticEconomy/agenticTaskExecutionService');
 const { getDailyLimitBypass, isDailyLimitBypassed } = require('../services/dailyLimitBypass');
+const nativeLendingRiskService = require('../services/nativeLendingRiskService');
 const { evaluateStableAutomationPolicy } = require('../services/stableAutomationPolicy');
+const { evaluateLendingAutomationPolicy } = require('../services/lendingAutomationPolicy');
 const { evaluateOracleStrategyPolicy } = require('../services/oracleStrategyPolicy');
 const { evaluateCirbtcLpAutomationPolicy } = require('../services/cirbtcLpAutomationPolicy');
 const taskRunService = require('../services/taskRunService');
@@ -97,6 +100,32 @@ function getCirbtcAutomationTransactionToken(actionParams = {}, automationPolicy
 
 function getCirbtcAutomationExecutionSource() {
   return 'cirbtc_lp_policy_v1';
+}
+
+function getLendingAutomationTransactionType(operationType, actionParams = {}) {
+  if (operationType === 'forced_lp_reduce') {
+    return String(actionParams?.sourceLane || '').toLowerCase() === 'cirbtc_direct_pair_lp'
+      ? 'direct_lp_remove'
+      : 'curve_lp_remove';
+  }
+  if (operationType === 'collateral_top_up') return 'lending_collateral_top_up';
+  if (operationType === 'utilization_repay') return 'lending_repay';
+  if (operationType === 'deleverage') return 'lending_deleverage';
+  return 'lending_automation';
+}
+
+function getLendingAutomationTransactionToken(actionParams = {}, automationPolicy = null) {
+  if (actionParams?.stableToken) return String(actionParams.stableToken).toUpperCase();
+  if (automationPolicy?.verdict?.actionAssetSymbol) return String(automationPolicy.verdict.actionAssetSymbol).toUpperCase();
+  return 'USDC';
+}
+
+function getLendingAutomationExecutionSource() {
+  return 'lending_automation_policy_v1';
+}
+
+function getLendingAutomationNotionalAmount(automationPolicy) {
+  return normalizeUsdcAmount(automationPolicy?.verdict?.suggestedAmountUsdc);
 }
 
 function getStableAutomationNotionalAmount(stablePolicy) {
@@ -216,8 +245,67 @@ function buildDefiLoopDecisionSnapshot({
     availableEurcBalance: normalizeUsdcAmount(availableEurcBalance),
     availableToTradeUsdc: normalizeUsdcAmount(availableToTradeUsdc),
     walletReserveUsdc: normalizeUsdcAmount(walletReserveUsdc),
+    pairSummaries: Array.isArray(metrics.pairSummaries)
+      ? metrics.pairSummaries.map((pairSummary) => ({
+          poolKey: pairSummary?.poolKey || null,
+          stableToken: pairSummary?.stableToken || null,
+          selected: pairSummary?.selected === true,
+          status: pairSummary?.status || null,
+          blockedBy: pairSummary?.blockedBy || null,
+          walletStableBalance: normalizeUsdcAmount(pairSummary?.walletStableBalance),
+          minBootstrapAmount: normalizeUsdcAmount(pairSummary?.minBootstrapAmount),
+          positionPresent: pairSummary?.positionPresent === true,
+          positionValueUsd: normalizeUsdcAmount(pairSummary?.positionValueUsd),
+          summary: pairSummary?.summary || null,
+        }))
+      : [],
     manualCooldownUntil: metrics.manualCooldownUntil || null,
     manualCooldownActive: metrics.manualCooldownActive ?? false,
+  };
+}
+
+function buildLendingAutomationDecisionSnapshot({
+  status,
+  payload = {},
+  lendingPolicy = null,
+  lendingSurface = null,
+} = {}) {
+  const verdict = lendingPolicy?.verdict || {};
+  const metrics = lendingPolicy?.metrics || {};
+
+  return {
+    recordedAt: new Date().toISOString(),
+    status,
+    ok: payload?.ok === true,
+    action: payload?.action || (verdict.execute === true ? 'execute' : 'hold'),
+    reason: payload?.reason || verdict.reason || null,
+    summary: payload?.summary || verdict.reason || payload?.error || null,
+    error: payload?.error || null,
+    txHash: payload?.txHash || null,
+    policyId: lendingPolicy?.policyId || null,
+    lane: verdict.lane || 'lending_automation',
+    execute: verdict.execute === true,
+    operationType: verdict.operationType || null,
+    blockedBy: verdict.blockedBy || null,
+    actionAssetSymbol: verdict.actionAssetSymbol || null,
+    suggestedAmountUsdc: normalizeUsdcAmount(verdict.suggestedAmountUsdc),
+    actionParams: verdict.actionParams && typeof verdict.actionParams === 'object'
+      ? verdict.actionParams
+      : null,
+    executionSource: getLendingAutomationExecutionSource(),
+    healthFactor: metrics.healthFactor ?? lendingSurface?.risk?.healthFactor ?? null,
+    healthFactorTrigger: metrics.healthFactorTrigger ?? null,
+    totalBorrowUsd: normalizeUsdcAmount(metrics.totalBorrowUsd ?? lendingSurface?.risk?.totalBorrowUsd),
+    totalSuppliedUsd: normalizeUsdcAmount(metrics.totalSuppliedUsd ?? lendingSurface?.risk?.totalSuppliedUsd),
+    utilizationCapPct: normalizeUsdcAmount(metrics.utilizationCapPct),
+    breachedAssets: Array.isArray(metrics.breachedAssets) ? metrics.breachedAssets : [],
+    recoveryStatus: metrics.recoveryStatus || null,
+    collateralTopUpStatus: metrics.collateralTopUpStatus || null,
+    safeExitStatus: metrics.safeExitStatus || null,
+    plannedSteps: Array.isArray(metrics.plannedSteps) ? metrics.plannedSteps : [],
+    neededUsd: normalizeUsdcAmount(metrics.neededUsd),
+    targetDebtAsset: metrics.targetDebtAsset || null,
+    forcedLpReduction: metrics.forcedLpReduction || null,
   };
 }
 
@@ -230,6 +318,111 @@ async function getAgentPermissionMap(agentId) {
   );
 
   return Object.fromEntries(rows.map(row => [row.permission_key, row.is_enabled]));
+}
+
+async function executeLendingAutomationTask({ agent, automationPolicy, dryRunEnabled }) {
+  const operationType = String(automationPolicy?.verdict?.operationType || '').trim().toLowerCase();
+  const actionParams = automationPolicy?.verdict?.actionParams && typeof automationPolicy.verdict.actionParams === 'object'
+    ? automationPolicy.verdict.actionParams
+    : {};
+
+  if (operationType === 'deleverage') {
+    return agenticTaskExecutionService.executeNativeLendingEmergencyDeleverageTask({
+      agent,
+      dryRun: dryRunEnabled,
+    });
+  }
+
+  if (operationType === 'collateral_top_up') {
+    return agenticTaskExecutionService.executeNativeLendingCollateralTopUpTask({
+      agent,
+      dryRun: dryRunEnabled,
+    });
+  }
+
+  if (operationType === 'forced_lp_reduce') {
+    if (String(actionParams?.sourceLane || '').toLowerCase() === 'cirbtc_direct_pair_lp') {
+      return executeCirbtcLpAutomationTask({
+        agent,
+        operationType: 'remove_liquidity',
+        actionParams,
+        dryRunEnabled,
+      });
+    }
+
+    return executeStableAutomationTask({
+      agent,
+      operationType: 'remove_liquidity',
+      actionParams,
+      dryRunEnabled,
+    });
+  }
+
+  if (operationType === 'utilization_repay') {
+    const steps = Array.isArray(actionParams.steps) ? actionParams.steps : [];
+    if (steps.length === 0) {
+      return { ok: false, reason: 'lending_utilization_repay_steps_missing' };
+    }
+
+    const stepResults = [];
+    for (const step of steps) {
+      const result = await agenticTaskExecutionService.executeNativeLendingRepayTask({
+        agent,
+        params: {
+          asset: step.asset,
+          amount: step.amount,
+        },
+        dryRun: dryRunEnabled,
+      });
+
+      if (!result.ok) {
+        if (stepResults.length > 0) {
+          return {
+            ok: true,
+            payload: {
+              action: 'utilization_repay',
+              executionRail: 'arc_native_lending',
+              executionSource: getLendingAutomationExecutionSource(),
+              dryRun: dryRunEnabled,
+              stepsExecuted: stepResults,
+              partialFailure: {
+                reason: result.reason,
+                error: result.error || null,
+              },
+              executedAt: new Date().toISOString(),
+              summary: dryRunEnabled
+                ? 'Would reduce reserve utilization with the visible wallet repay plan, but one repay step is currently blocked.'
+                : 'Reserve utilization repay started, but one later repay step is currently blocked.',
+            },
+          };
+        }
+
+        return result;
+      }
+
+      stepResults.push({
+        ...step,
+        txHash: result?.payload?.txHash || null,
+      });
+    }
+
+    return {
+      ok: true,
+      payload: {
+        action: 'utilization_repay',
+        executionRail: 'arc_native_lending',
+        executionSource: getLendingAutomationExecutionSource(),
+        dryRun: dryRunEnabled,
+        stepsExecuted: stepResults,
+        executedAt: new Date().toISOString(),
+        summary: dryRunEnabled
+          ? 'Would reduce reserve utilization with the visible wallet repay plan.'
+          : 'Reduced reserve utilization with the visible wallet repay plan.',
+      },
+    };
+  }
+
+  return { ok: false, reason: 'lending_automation_operation_unsupported' };
 }
 
 function getErrorText(value) {
@@ -277,26 +470,59 @@ const redisConnection = process.env.REDIS_URL
       password: process.env.REDIS_PASSWORD || undefined,
     };
 
+const VERBOSE_QUEUE_LOGS = process.env.NODE_ENV !== 'production'
+  || ['1', 'true', 'yes', 'on'].includes(String(process.env.VERBOSE_QUEUE_LOGS || '').trim().toLowerCase());
+
+function logQueueVerbose(message, ...args) {
+  if (!VERBOSE_QUEUE_LOGS) return;
+  console.log(message, ...args);
+}
+
+const bullRedisClients = new Set();
+
+function resolveBullRedisListenerCap(registeredHandlerCount = 0) {
+  const normalizedHandlerCount = Math.max(Number(registeredHandlerCount) || 0, 0);
+  return Math.max(128, (normalizedHandlerCount + 8) * 3);
+}
+
+function syncBullRedisListenerCaps(registeredHandlerCount = 0) {
+  const listenerCap = resolveBullRedisListenerCap(registeredHandlerCount);
+  for (const client of bullRedisClients) {
+    client.setMaxListeners(listenerCap);
+  }
+  return listenerCap;
+}
+
 function createBullRedisClient(type) {
+  const connectionName = `arc-agent:${type}:${os.hostname()}:${process.pid}`;
+  logQueueVerbose(`[QUEUE:${type}] creating ${connectionName}`);
   const client = typeof redisConnection === 'string'
     ? new Redis(redisConnection, {
+        connectionName,
         maxRetriesPerRequest: null,
         enableReadyCheck: false,
         lazyConnect: false,
       })
     : new Redis({
         ...redisConnection,
+        connectionName,
         maxRetriesPerRequest: null,
         enableReadyCheck: false,
         lazyConnect: false,
       });
 
-  // Bull attaches a burst of startup listeners to each ioredis client.
-  // Keep the cap comfortably above observed production startup usage.
-  client.setMaxListeners(50);
+  // Bull shares a small set of ioredis clients across every named processor.
+  // The listener count scales with the registered handler set, so keep the
+  // cap tied to that footprint instead of a stale fixed threshold.
+  bullRedisClients.add(client);
+  client.setMaxListeners(resolveBullRedisListenerCap());
 
   client.on('error', (err) => {
     console.error(`[QUEUE:${type}]`, err.message);
+  });
+
+  client.on('ready', () => {
+    logQueueVerbose(`[QUEUE:${type}] ready ${connectionName}`);
   });
 
   return client;
@@ -319,6 +545,33 @@ const queue = new Bull('agent-jobs', {
     maxStalledCount:  2,
   },
 });
+
+let localWorkersPaused = true;
+const initialLocalWorkerPause = queue.pause(true, true)
+  .then(() => {
+    console.log('[QUEUE] Local workers paused at boot');
+  })
+  .catch((err) => {
+    console.error('[QUEUE] Could not pause local workers at boot:', err.message);
+  });
+
+async function resumeLocalWorkers() {
+  await initialLocalWorkerPause;
+  if (!localWorkersPaused) return;
+
+  await queue.resume(true);
+  localWorkersPaused = false;
+  console.log('[QUEUE] Local workers resumed');
+}
+
+async function pauseLocalWorkers(force = true) {
+  await initialLocalWorkerPause;
+  if (localWorkersPaused) return;
+
+  await queue.pause(true, force);
+  localWorkersPaused = true;
+  console.log(`[QUEUE] Local workers paused${force ? ' (forced)' : ''}`);
+}
 
 const REGISTERED_MANUAL_TASK_PROCESSORS = new Map();
 const REGISTERED_PAID_TASK_PROCESSORS = new Set();
@@ -343,12 +596,16 @@ const PAID_TASK_ACTIVITY_SUPPORTED_IDS = new Set([
   'EXEC_LENDING_WITHDRAW',
   'EXEC_LENDING_BORROW',
   'EXEC_LENDING_REPAY',
+  'EXEC_LENDING_COLLATERAL_TOP_UP',
+  'EXEC_LENDING_SAFE_EXIT',
   'EXEC_LENDING_DELEVERAGE',
   'EXEC_LENDING_LIQUIDATE',
   'EXEC_MANUAL_LENDING_SUPPLY',
   'EXEC_MANUAL_LENDING_WITHDRAW',
   'EXEC_MANUAL_LENDING_BORROW',
   'EXEC_MANUAL_LENDING_REPAY',
+  'EXEC_MANUAL_LENDING_COLLATERAL_TOP_UP',
+  'EXEC_MANUAL_LENDING_SAFE_EXIT',
   'EXEC_MANUAL_LENDING_DELEVERAGE',
   'EXEC_MANUAL_LENDING_LIQUIDATE',
   'EXEC_CCTP_BRIDGE',
@@ -932,6 +1189,11 @@ const AUTOMATION_STATE_COLUMNS = {
     lastStatus: 'defi_loop_last_status',
     lastDecision: 'defi_loop_last_decision',
   },
+  lendingAutomation: {
+    lastRunAt: 'lending_automation_last_run_at',
+    lastStatus: 'lending_automation_last_status',
+    lastDecision: 'lending_automation_last_decision',
+  },
   cirbtcLp: {
     lastRunAt: 'cirbtc_lp_last_run_at',
     lastStatus: 'cirbtc_lp_last_status',
@@ -1153,9 +1415,12 @@ const ORACLE_LOOP_INTERVAL_MS = parseInt(process.env.ORACLE_LOOP_INTERVAL_MS || 
 const MARKET_ANALYSIS_LOOP_INTERVAL_MS = parseInt(process.env.MARKET_ANALYSIS_LOOP_INTERVAL_MS || '1800000', 10);
 const CURVE_USDC_EURC_POOL    = process.env.CURVE_USDC_EURC_POOL || null;
 const DEFI_LOOP_INTERVAL_MS   = parseInt(process.env.DEFI_LOOP_INTERVAL_MS   || '3600000',  10); // default 1h
+const DEFI_LOOP_STARTUP_DELAY_MS = parseInt(process.env.DEFI_LOOP_STARTUP_DELAY_MS || '60000', 10);
+const DEFI_LOOP_ORPHAN_JOB_AGE_MS = parseInt(process.env.DEFI_LOOP_ORPHAN_JOB_AGE_MS || '120000', 10);
 const DAILY_DEFI_LOOP_CAP     = 10;
 const GLOBAL_DRY_RUN          = process.env.DRY_RUN === 'true';
-const DEFAULT_ORACLE_SAME_CHAIN_MIN_PROFIT_USDC = 0.05;
+const DEFAULT_ORACLE_SAME_CHAIN_MIN_PROFIT_USDC = 0.01;
+const DEFAULT_ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES = 60;
 
 function readPositiveNumberEnv(name, fallback) {
   const raw = process.env[name];
@@ -1240,6 +1505,138 @@ async function _buildOracleSameChainSellBackPlan({ amountInUsdc, swapPool }) {
   }
 }
 
+function _resolveOracleMinEurcReserve(agent, walletReserveUsdc = 0) {
+  const agentReserve = Number(agent?.oracle_min_eurc_reserve);
+  if (Number.isFinite(agentReserve) && agentReserve >= 0) {
+    return normalizeUsdcAmount(agentReserve);
+  }
+  return normalizeUsdcAmount(Math.max(Number(walletReserveUsdc || 0), 0));
+}
+
+async function _buildOracleInventoryExitPlan({ agent, availableEurcBalance, walletReserveUsdc, forexRate }) {
+  const protectedEurcReserve = _resolveOracleMinEurcReserve(agent, walletReserveUsdc);
+  const sellableEurc = normalizeUsdcAmount(Math.max(Number(availableEurcBalance || 0) - protectedEurcReserve, 0));
+  if (!(sellableEurc > 0)) {
+    return {
+      profitable: false,
+      inputEurc: 0,
+      expectedUsdcOut: 0,
+      expectedProfitUsdc: 0,
+      protectedEurcReserve,
+      routeReason: 'no_sellable_eurc',
+    };
+  }
+
+  try {
+    const sellQuote = await agentWalletService.getSwapQuoteResult({
+      fromToken: 'EURC',
+      toToken: 'USDC',
+      amountIn: sellableEurc,
+    });
+    const expectedUsdcOut = normalizeUsdcAmount(sellQuote?.amountOut);
+    const forexRateNumeric = Number(forexRate?.rate);
+    const liveForexReferenceUsdcValue = Number.isFinite(forexRateNumeric) && forexRateNumeric > 0
+      ? normalizeUsdcAmount(sellableEurc * forexRateNumeric)
+      : 0;
+    const minProfitUsdc = readPositiveNumberEnv(
+      'ORACLE_SAME_CHAIN_MIN_PROFIT_USDC',
+      DEFAULT_ORACLE_SAME_CHAIN_MIN_PROFIT_USDC,
+    );
+    const referenceUsdcValue = normalizeUsdcAmount(sellableEurc);
+    const minimumExpectedUsdcOut = normalizeUsdcAmount(referenceUsdcValue + minProfitUsdc);
+    const expectedProfitUsdc = normalizeUsdcAmount(expectedUsdcOut - referenceUsdcValue);
+
+    return {
+      profitable: expectedUsdcOut >= minimumExpectedUsdcOut,
+      inputEurc: sellableEurc,
+      expectedUsdcOut,
+      expectedProfitUsdc,
+      referenceRate: 1,
+      referenceUsdcValue,
+      minimumExpectedUsdcOut,
+      profitFloorUsdc: minProfitUsdc,
+      liveForexRate: Number.isFinite(forexRateNumeric) && forexRateNumeric > 0 ? forexRateNumeric : null,
+      liveForexReferenceUsdcValue,
+      profitBasis: 'swap_exit_parity_floor',
+      protectedEurcReserve,
+      exitExecutionRail: sellQuote?.executionRail || null,
+      exitRouteStrategy: sellQuote?.routeStrategy || null,
+      exitRouteReason: sellQuote?.routeReason || null,
+    };
+  } catch (error) {
+    console.warn('[QUEUE] ORACLE inventory exit quote unavailable:', error.message);
+    return {
+      profitable: false,
+      inputEurc: sellableEurc,
+      expectedUsdcOut: 0,
+      expectedProfitUsdc: 0,
+      referenceRate: 0,
+      referenceUsdcValue: 0,
+      minimumExpectedUsdcOut: 0,
+      profitFloorUsdc: 0,
+      profitBasis: 'quote_unavailable',
+      protectedEurcReserve,
+      routeReason: error.message,
+    };
+  }
+}
+
+function _getOraclePostExitReentryCooldownMinutes() {
+  return Math.max(
+    Number.parseInt(
+      process.env.ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES || String(DEFAULT_ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES),
+      10,
+    ) || DEFAULT_ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES,
+    0,
+  );
+}
+
+async function _readLatestConfirmedOracleInventoryExit(agentId) {
+  if (!agentId) return null;
+
+  const { rows: [row] } = await db.query(
+    `SELECT created_at::text AS created_at,
+            tx_hash,
+            amount_usdc::text AS amount_usdc
+       FROM transactions
+      WHERE agent_id = $1
+        AND type = 'rebalance'
+        AND status = 'confirmed'
+        AND meta->>'executionSource' = 'oracle_strategy_v1'
+        AND COALESCE(meta->>'fromToken', '') = 'EURC'
+        AND COALESCE(meta->>'toToken', '') = 'USDC'
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [agentId],
+  );
+
+  return row || null;
+}
+
+function _buildOracleEntryCooldown(latestExit) {
+  const cooldownMinutes = _getOraclePostExitReentryCooldownMinutes();
+  const lastExitAtMs = Date.parse(latestExit?.created_at || '');
+
+  if (!(cooldownMinutes > 0) || !Number.isFinite(lastExitAtMs)) {
+    return {
+      active: false,
+      minutes: cooldownMinutes,
+      lastExitAt: latestExit?.created_at || null,
+      until: null,
+      txHash: latestExit?.tx_hash || null,
+    };
+  }
+
+  const untilMs = lastExitAtMs + (cooldownMinutes * 60_000);
+  return {
+    active: untilMs > Date.now(),
+    minutes: cooldownMinutes,
+    lastExitAt: latestExit.created_at,
+    until: new Date(untilMs).toISOString(),
+    txHash: latestExit?.tx_hash || null,
+  };
+}
+
 async function readStableCurvePositionContext(walletAddress) {
   const stablePool = _getUsdcEurcCurvePool();
   const snapshot = await positionsService.getWalletPositions(walletAddress, {
@@ -1287,6 +1684,45 @@ async function readCirbtcDirectPairPositionContext(walletAddress) {
     warningsByKey: Object.fromEntries(
       warnings.map(warning => [String(warning.poolKey || '').toUpperCase(), warning.message || 'position_read_failed']),
     ),
+  };
+}
+
+async function readCirbtcGrowthAddHistory(agentId, stableToken = null) {
+  if (!agentId) {
+    return {
+      totalAddsToday: 0,
+      lastAddAt: null,
+    };
+  }
+
+  const now = new Date();
+  const dayStartUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const normalizedStableToken = stableToken ? String(stableToken).trim().toUpperCase() : null;
+  const queryParams = [agentId, dayStartUtc.toISOString()];
+  const stableTokenFilter = normalizedStableToken
+    ? `
+        AND UPPER(COALESCE(token, meta->>'stableToken', '')) = $3`
+    : '';
+
+  if (normalizedStableToken) {
+    queryParams.push(normalizedStableToken);
+  }
+
+  const { rows } = await db.query(
+    `SELECT COUNT(*)::int AS adds_today,
+            MAX(created_at) AS last_add_at
+       FROM transactions
+      WHERE agent_id = $1
+        AND type = 'direct_lp_add'
+        AND status = 'confirmed'
+        AND created_at >= $2
+        AND COALESCE(meta->>'executionSource', '') = 'cirbtc_lp_policy_v1'${stableTokenFilter}`,
+    queryParams,
+  );
+
+  return {
+    totalAddsToday: Number(rows?.[0]?.adds_today || 0),
+    lastAddAt: rows?.[0]?.last_add_at || null,
   };
 }
 
@@ -1600,7 +2036,7 @@ async function scheduleMarketAnalysisLoop() {
 }
 
 // ── DEFI_LOOP ─────────────────────────────────────────────────────────────────
-// Runs for agents with defi_loop_enabled = TRUE only.
+// Runs for agents with at least one enabled DeFi automation lane.
 // Flow: oracle fetch → arb signal → engine decision → protocol tx (unless dry-run stays enabled for this agent).
 // Hard cap: 10 runs per agent per day (daily_defi_loop_count).
 
@@ -1608,6 +2044,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   const { agentId } = job.data;
 
   let latestStablePolicy = null;
+  let latestLendingPolicy = null;
+  let latestLendingSurface = null;
   let latestExecutionSource = null;
   let latestAvailableUsdcBalance = null;
   let latestAvailableEurcBalance = null;
@@ -1619,17 +2057,30 @@ queue.process('DEFI_LOOP', 1, async (job) => {
 
   const persistAutomationSnapshot = async (automationKey, status, payload) => {
     await _setAutomationState(agentId, automationKey, status);
-    await _setAutomationDecision(agentId, automationKey, buildDefiLoopDecisionSnapshot({
-      status,
-      payload,
-      stablePolicy: latestStablePolicy,
-      executionSource: latestExecutionSource,
-      availableUsdcBalance: latestAvailableUsdcBalance,
-      availableEurcBalance: latestAvailableEurcBalance,
-      availableToTradeUsdc: latestAvailableToTradeUsdc,
-      walletReserveUsdc: latestWalletReserveUsdc,
-      positionSummary: latestPositionSummary,
-    }));
+    const decision = automationKey === 'lendingAutomation'
+      ? buildLendingAutomationDecisionSnapshot({
+          status,
+          payload,
+          lendingPolicy: latestLendingPolicy,
+          lendingSurface: latestLendingSurface,
+        })
+      : buildDefiLoopDecisionSnapshot({
+          status,
+          payload,
+          stablePolicy: latestStablePolicy,
+          executionSource: latestExecutionSource,
+          availableUsdcBalance: latestAvailableUsdcBalance,
+          availableEurcBalance: latestAvailableEurcBalance,
+          availableToTradeUsdc: latestAvailableToTradeUsdc,
+          walletReserveUsdc: latestWalletReserveUsdc,
+          positionSummary: latestPositionSummary,
+        });
+    await _setAutomationDecision(agentId, automationKey, decision);
+
+    if (automationKey === 'oracle') {
+      await _setAutomationState(agentId, 'defiLoop', status);
+      await _setAutomationDecision(agentId, 'defiLoop', decision);
+    }
   };
 
   const finishDefi = async (status, payload) => {
@@ -1640,9 +2091,10 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   // Reload agent — verify flag still on + fetch encrypted key
   const { rows: [agent] } = await db.query(
     `SELECT id, llm_model, llm_api_key_encrypted,
-            defi_loop_enabled, cirbtc_lp_enabled, oracle_enabled,
+            defi_loop_enabled, lending_automation_enabled, cirbtc_lp_enabled, oracle_enabled,
             daily_defi_loop_count, daily_limit_reset_at,
-            daily_limit_usdc, max_trade_usdc, defi_wallet_reserve_usdc, slippage_percent,
+          daily_limit_usdc, max_trade_usdc, defi_wallet_reserve_usdc,
+          oracle_max_eurc_inventory, oracle_min_eurc_reserve, slippage_percent,
             wallet_address, private_key_encrypted,
             market_analysis_last_decision,
             stable_manual_cooldown_until
@@ -1652,38 +2104,52 @@ queue.process('DEFI_LOOP', 1, async (job) => {
 
   if (!agent) return finishDefi('missing_agent', { ok: false, reason: 'agent_not_found' });
 
-  const stableLoopEnabled = Boolean(agent.defi_loop_enabled);
-  const cirbtcLpEnabled = Boolean(agent.cirbtc_lp_enabled);
-  activeAutomationKey = stableLoopEnabled ? 'defiLoop' : 'cirbtcLp';
-
-  if (stableLoopEnabled || cirbtcLpEnabled) {
-    await _setAutomationState(agentId, activeAutomationKey, 'running');
-  }
-
-  if (!stableLoopEnabled && !cirbtcLpEnabled) {
-    return finishDefi('disabled', { ok: false, reason: 'defi_loop_disabled' });
-  }
-
   const permissions = await getAgentPermissionMap(agentId);
-  if (permissions.arbitrage === false) {
-    await db.query(
-      `INSERT INTO transactions
-         (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
-       VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'dry_run', $2::jsonb)`,
-      [agentId, JSON.stringify({
-        executionState: 'permission_blocked',
-        executionSource: 'oracle_strategy',
-        reason: 'Arbitrage strategy preference is disabled for this agent.',
-        permission: 'arbitrage',
-      })],
-    );
+  const arbitragePermissionGranted = permissions.arbitrage !== false;
+  const stableLoopConfigured = Boolean(agent.defi_loop_enabled);
+  const lendingAutomationEnabled = Boolean(agent.lending_automation_enabled);
+  const cirbtcLpConfigured = Boolean(agent.cirbtc_lp_enabled);
+  const stableLoopEnabled = Boolean(stableLoopConfigured && arbitragePermissionGranted);
+  const cirbtcLpEnabled = Boolean(cirbtcLpConfigured && arbitragePermissionGranted);
+  activeAutomationKey = lendingAutomationEnabled
+    ? 'lendingAutomation'
+    : stableLoopConfigured
+      ? 'defiLoop'
+      : 'cirbtcLp';
 
-    return finishDefi('permission_blocked', {
-      ok: true,
-      action: 'hold',
-      reason: 'permission_blocked',
-      permission: 'arbitrage',
-    });
+  if (stableLoopEnabled) {
+    await _setAutomationState(agentId, 'defiLoop', 'running');
+  }
+  if (lendingAutomationEnabled) {
+    await _setAutomationState(agentId, 'lendingAutomation', 'running');
+  }
+  if (cirbtcLpEnabled) {
+    await _setAutomationState(agentId, 'cirbtcLp', 'running');
+  }
+
+  if (!stableLoopEnabled && !lendingAutomationEnabled && !cirbtcLpEnabled) {
+    if (!arbitragePermissionGranted && (stableLoopConfigured || cirbtcLpConfigured)) {
+      await db.query(
+        `INSERT INTO transactions
+           (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
+         VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'dry_run', $2::jsonb)`,
+        [agentId, JSON.stringify({
+          executionState: 'permission_blocked',
+          executionSource: 'oracle_strategy',
+          reason: 'Arbitrage strategy preference is disabled for this agent.',
+          permission: 'arbitrage',
+        })],
+      );
+
+      return finishDefi('permission_blocked', {
+        ok: true,
+        action: 'hold',
+        reason: 'permission_blocked',
+        permission: 'arbitrage',
+      });
+    }
+
+    return finishDefi('disabled', { ok: false, reason: 'defi_loop_disabled' });
   }
 
   const marketAnalysisDecision = agent.market_analysis_last_decision
@@ -1747,6 +2213,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   let pricingPool = null;
   let swapPool = null;
   let positionContext = { ok: true, snapshot: null, position: null };
+  let lendingCirbtcPositionsByKey = {};
 
   if (stableLoopEnabled) {
     try {
@@ -1805,6 +2272,15 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         reason: positionContext.reason,
         error: positionContext.error,
       });
+    }
+  } else if (lendingAutomationEnabled) {
+    try {
+      const lendingStablePositionContext = await readStableCurvePositionContext(agent.wallet_address);
+      if (lendingStablePositionContext.ok) {
+        positionContext = lendingStablePositionContext;
+      }
+    } catch (err) {
+      console.warn(`[QUEUE] DEFI_LOOP lending stable-position snapshot unavailable agent=${agentId}:`, err.message);
     }
   }
 
@@ -1870,6 +2346,46 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     availableEurcBalance,
   });
 
+  let lendingPolicy = null;
+  if (lendingAutomationEnabled) {
+    try {
+      const lendingCirbtcPositionContext = await readCirbtcDirectPairPositionContext(agent.wallet_address).catch((error) => {
+        console.warn(`[QUEUE] DEFI_LOOP lending cirBTC position snapshot unavailable agent=${agentId}:`, error.message);
+        return {
+          ok: true,
+          positionsByKey: {},
+          warningsByKey: {},
+        };
+      });
+      lendingCirbtcPositionsByKey = lendingCirbtcPositionContext?.positionsByKey || {};
+      latestLendingSurface = await nativeLendingRiskService.buildLendingSurfaceForWallet(agent.wallet_address);
+      lendingPolicy = evaluateLendingAutomationPolicy({
+        lendingSurface: latestLendingSurface,
+        stableCurvePosition: positionContext.position || null,
+        cirbtcPositionsByKey: lendingCirbtcPositionsByKey,
+      });
+      latestLendingPolicy = lendingPolicy;
+    } catch (err) {
+      latestLendingSurface = null;
+      latestLendingPolicy = null;
+      activeAutomationKey = 'lendingAutomation';
+
+      if (!stableLoopEnabled && !cirbtcLpEnabled) {
+        return finishDefi('fetch_error', {
+          ok: false,
+          reason: 'lending_surface_unavailable',
+          error: err.message,
+        });
+      }
+
+      await persistAutomationSnapshot('lendingAutomation', 'fetch_error', {
+        ok: false,
+        reason: 'lending_surface_unavailable',
+        error: err.message,
+      });
+    }
+  }
+
   // Increment loop counter regardless of outcome
   await db.query(
     'UPDATE agents SET daily_defi_loop_count = daily_defi_loop_count + 1 WHERE id = $1',
@@ -1889,61 +2405,66 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   let automationType = 'stable';
   let positionSummary = summarizePosition(positionContext.position);
 
-  if (stablePolicy.verdict.execute !== true) {
-    latestExecutionSource = getStableAutomationExecutionSource();
-
-    const oracleStrategyPolicy = stableLoopEnabled
-      ? evaluateOracleStrategyPolicy({
-          agent,
-          forexRate,
-          poolState,
-          signal,
-          executionGate,
-          pricingPool,
-          swapPool,
-          requestedAmountUsdc: requestedPolicyAmountUsdc,
-          walletBalances: {
-            usdc: availableToTradeUsdc,
-            eurc: availableEurcBalance,
-          },
-          walletReserveUsdc: 0,
-        })
-      : null;
-
-    if (oracleStrategyPolicy?.verdict?.execute === true) {
-      if (stableLoopEnabled && !stableStatePersisted) {
-        latestStablePolicy = stablePolicy;
-        latestExecutionSource = getStableAutomationExecutionSource();
-        latestPositionSummary = positionSummary;
-        await persistAutomationSnapshot('defiLoop', 'policy_hold', {
-          ok: true,
-          action: 'hold',
-          reason: 'stable_policy_hold',
-          stablePolicy,
-          executionGate,
-        });
-        stableStatePersisted = true;
-      }
-
-      automationPolicy = oracleStrategyPolicy;
-      automationType = 'oracle';
-      activeAutomationKey = 'oracle';
-      latestExecutionSource = getOracleStrategyExecutionSource();
-      await _setAutomationState(agentId, 'oracle', 'running');
+  if (lendingPolicy?.verdict?.execute === true) {
+    if (stableLoopEnabled && !stableStatePersisted) {
+      latestStablePolicy = stablePolicy;
+      latestExecutionSource = getStableAutomationExecutionSource();
+      latestPositionSummary = positionSummary;
+      await persistAutomationSnapshot('defiLoop', 'policy_hold', {
+        ok: true,
+        action: 'hold',
+        reason: 'lending_guard_priority',
+        summary: 'Stable lane is holding because the lending guard took priority for this cycle.',
+        stablePolicy,
+        executionGate,
+      });
+      stableStatePersisted = true;
     }
 
-    if (automationType === 'stable' && cirbtcLpEnabled) {
+    automationPolicy = lendingPolicy;
+    automationType = 'lending';
+    activeAutomationKey = 'lendingAutomation';
+    latestExecutionSource = getLendingAutomationExecutionSource();
+    const forcedLpPoolKey = String(lendingPolicy?.metrics?.forcedLpReduction?.poolKey || '').toUpperCase();
+    const forcedLpPosition = forcedLpPoolKey === String(positionContext.position?.poolKey || '').toUpperCase()
+      ? positionContext.position
+      : lendingCirbtcPositionsByKey[forcedLpPoolKey] || null;
+    positionSummary = summarizePosition(forcedLpPosition) || positionSummary;
+  } else if (lendingAutomationEnabled && !stableLoopEnabled && !cirbtcLpEnabled) {
+    automationPolicy = lendingPolicy || {
+      policyId: 'lending_autonomous_guard_v1',
+      verdict: {
+        execute: false,
+        lane: 'lending_automation',
+        operationType: null,
+        reason: 'Lending automation is waiting for the first lending review.',
+        suggestedAmountUsdc: 0,
+        actionParams: null,
+      },
+      metrics: {},
+      checks: {},
+    };
+    automationType = 'lending';
+    activeAutomationKey = 'lendingAutomation';
+    latestExecutionSource = getLendingAutomationExecutionSource();
+  } else if (lendingPolicy) {
+    await persistAutomationSnapshot('lendingAutomation', 'policy_hold', {
+      ok: true,
+      action: 'hold',
+      reason: 'lending_policy_hold',
+      summary: lendingPolicy.verdict.reason,
+    });
+  }
+
+  if (automationType === 'stable' && automationPolicy.verdict.execute !== true) {
+    latestExecutionSource = getStableAutomationExecutionSource();
+
+    let cirbtcHoldPayload = null;
+
+    if (cirbtcLpEnabled) {
       if (stableLoopEnabled && !stableStatePersisted) {
         latestStablePolicy = stablePolicy;
         latestPositionSummary = positionSummary;
-        await persistAutomationSnapshot('defiLoop', 'policy_hold', {
-          ok: true,
-          action: 'hold',
-          reason: 'stable_policy_hold',
-          stablePolicy,
-          executionGate,
-        });
-        stableStatePersisted = true;
       }
 
       activeAutomationKey = 'cirbtcLp';
@@ -1975,6 +2496,30 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         });
       }
 
+      let cirbtcGrowthHistoryByToken;
+      try {
+        const [usdcGrowthHistory, eurcGrowthHistory] = await Promise.all([
+          readCirbtcGrowthAddHistory(agentId, 'USDC'),
+          readCirbtcGrowthAddHistory(agentId, 'EURC'),
+        ]);
+        cirbtcGrowthHistoryByToken = {
+          USDC: usdcGrowthHistory,
+          EURC: eurcGrowthHistory,
+        };
+      } catch (err) {
+        console.error(`[QUEUE] DEFI_LOOP cirBTC growth-history error agent=${agentId}:`, err.message);
+        cirbtcGrowthHistoryByToken = {
+          USDC: {
+            totalAddsToday: 0,
+            lastAddAt: null,
+          },
+          EURC: {
+            totalAddsToday: 0,
+            lastAddAt: null,
+          },
+        };
+      }
+
       const cirbtcPolicy = evaluateCirbtcLpAutomationPolicy({
         pairContexts: cirbtcPoolContexts.map((context) => {
           const poolKey = String(context.pool?.key || `${context.stableToken}-CIRBTC`).toUpperCase();
@@ -1986,6 +2531,10 @@ queue.process('DEFI_LOOP', 1, async (job) => {
               ? cirbtcIdleCapitalBudgets.eurc
               : cirbtcIdleCapitalBudgets.usdc,
             position: cirbtcPositionContext.positionsByKey?.[poolKey] || null,
+            growthHistory: cirbtcGrowthHistoryByToken?.[context.stableToken] || {
+              totalAddsToday: 0,
+              lastAddAt: null,
+            },
             warning: cirbtcPositionContext.warningsByKey?.[poolKey] || null,
             error: context.error,
           };
@@ -1996,6 +2545,20 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       ) || positionSummary;
 
       if (cirbtcPolicy.verdict.execute === true) {
+        if (stableLoopEnabled && !stableStatePersisted) {
+          latestStablePolicy = stablePolicy;
+          latestExecutionSource = getStableAutomationExecutionSource();
+          latestPositionSummary = positionSummary;
+          await persistAutomationSnapshot('defiLoop', 'policy_hold', {
+            ok: true,
+            action: 'hold',
+            reason: 'stable_policy_hold',
+            stablePolicy,
+            executionGate,
+          });
+          stableStatePersisted = true;
+        }
+
         automationPolicy = cirbtcPolicy;
         automationType = 'cirbtc';
         latestStablePolicy = cirbtcPolicy;
@@ -2005,7 +2568,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         latestStablePolicy = cirbtcPolicy;
         latestExecutionSource = getCirbtcAutomationExecutionSource();
         latestPositionSummary = cirbtcPositionSummary;
-        const cirbtcHoldPayload = {
+        cirbtcHoldPayload = {
           ok: true,
           action: 'hold',
           reason: 'cirbtc_policy_hold',
@@ -2015,55 +2578,137 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         };
         await persistAutomationSnapshot('cirbtcLp', 'policy_hold', cirbtcHoldPayload);
 
-        if (!stableLoopEnabled || stablePolicy.metrics?.positionPresent !== true) {
-          return cirbtcHoldPayload;
-        }
-
         latestStablePolicy = stablePolicy;
         latestExecutionSource = getStableAutomationExecutionSource();
         latestPositionSummary = positionSummary;
         activeAutomationKey = 'defiLoop';
       }
     }
+
+    const [oracleExitQuote, latestOracleInventoryExit] = automationType === 'stable' && stableLoopEnabled
+      ? await Promise.all([
+          _buildOracleInventoryExitPlan({
+            agent,
+            availableEurcBalance,
+            walletReserveUsdc: 0,
+            forexRate,
+          }),
+          _readLatestConfirmedOracleInventoryExit(agentId),
+        ])
+      : [null, null];
+    const oracleEntryCooldown = latestOracleInventoryExit
+      ? _buildOracleEntryCooldown(latestOracleInventoryExit)
+      : null;
+
+    const oracleStrategyPolicy = automationType === 'stable' && stableLoopEnabled
+      ? evaluateOracleStrategyPolicy({
+          agent,
+          forexRate,
+          poolState,
+          signal,
+          executionGate,
+          pricingPool,
+          swapPool,
+          requestedAmountUsdc: requestedPolicyAmountUsdc,
+          walletBalances: {
+            usdc: availableToTradeUsdc,
+            eurc: availableEurcBalance,
+          },
+          walletReserveUsdc: 0,
+          exitQuote: oracleExitQuote,
+          entryCooldown: oracleEntryCooldown,
+        })
+      : null;
+
+    if (oracleStrategyPolicy?.verdict?.execute === true) {
+      if (stableLoopEnabled && !stableStatePersisted) {
+        latestStablePolicy = stablePolicy;
+        latestExecutionSource = getStableAutomationExecutionSource();
+        latestPositionSummary = positionSummary;
+        await persistAutomationSnapshot('defiLoop', 'policy_hold', {
+          ok: true,
+          action: 'hold',
+          reason: 'stable_policy_hold',
+          stablePolicy,
+          executionGate,
+        });
+        stableStatePersisted = true;
+      }
+
+      automationPolicy = oracleStrategyPolicy;
+      automationType = 'oracle';
+      latestStablePolicy = oracleStrategyPolicy;
+      activeAutomationKey = 'oracle';
+      latestExecutionSource = getOracleStrategyExecutionSource();
+      await _setAutomationState(agentId, 'oracle', 'running');
+    }
+
+    if (automationType === 'stable' && cirbtcHoldPayload && (!stableLoopEnabled || stablePolicy.metrics?.positionPresent !== true)) {
+      return cirbtcHoldPayload;
+    }
   }
 
   if (automationPolicy.verdict.execute !== true) {
     latestPositionSummary = positionSummary;
+    const holdReason = automationType === 'lending'
+      ? 'lending_policy_hold'
+      : automationType === 'cirbtc'
+        ? 'cirbtc_policy_hold'
+        : 'stable_policy_hold';
     return finishDefi('policy_hold', {
       ok: true,
       action: 'hold',
-      reason: 'stable_policy_hold',
-      stablePolicy: automationPolicy,
+      reason: holdReason,
+      stablePolicy: automationType === 'lending' ? undefined : automationPolicy,
+      lendingPolicy: automationType === 'lending' ? automationPolicy : undefined,
       executionGate,
     });
   }
 
   const operationType = automationPolicy.verdict.operationType || 'swap';
   const actionParams = { ...(automationPolicy.verdict.actionParams || {}) };
-  const transactionType = automationType === 'cirbtc'
+  const transactionType = automationType === 'lending'
+    ? getLendingAutomationTransactionType(operationType, actionParams)
+    : automationType === 'cirbtc'
     ? getCirbtcAutomationTransactionType(operationType)
     : automationType === 'oracle'
       ? getOracleStrategyTransactionType(operationType)
       : getStableAutomationTransactionType(operationType);
-  const transactionToken = automationType === 'cirbtc'
+  const transactionToken = automationType === 'lending'
+    ? getLendingAutomationTransactionToken(actionParams, automationPolicy)
+    : automationType === 'cirbtc'
     ? getCirbtcAutomationTransactionToken(actionParams, automationPolicy)
     : automationType === 'oracle'
       ? getOracleStrategyTransactionToken(operationType)
       : getStableAutomationTransactionToken(operationType);
-  const executionSource = automationType === 'cirbtc'
+  const executionSource = automationType === 'lending'
+    ? getLendingAutomationExecutionSource()
+    : automationType === 'cirbtc'
     ? getCirbtcAutomationExecutionSource()
     : automationType === 'oracle'
       ? getOracleStrategyExecutionSource()
       : getStableAutomationExecutionSource();
-  const nominalActionAmountUsdc = automationType === 'cirbtc'
+  const nominalActionAmountUsdc = automationType === 'lending'
+    ? getLendingAutomationNotionalAmount(automationPolicy)
+    : automationType === 'cirbtc'
     ? getCirbtcAutomationNotionalAmount(automationPolicy)
     : automationType === 'oracle'
       ? getOracleStrategyNotionalAmount(automationPolicy)
       : getStableAutomationNotionalAmount(automationPolicy);
   latestPositionSummary = positionSummary;
   latestExecutionSource = executionSource;
-  const defaultFromToken = actionParams.fromToken || actionParams.stableToken || 'USDC';
-  const defaultToToken = automationType === 'cirbtc'
+  const defaultFromToken = automationType === 'lending'
+    ? (actionParams.tokenOut || actionParams.stableToken || automationPolicy?.verdict?.actionAssetSymbol || 'USDC')
+    : actionParams.fromToken || actionParams.stableToken || 'USDC';
+  const defaultToToken = automationType === 'lending'
+    ? (operationType === 'forced_lp_reduce'
+      ? 'wallet'
+      : operationType === 'collateral_top_up'
+        ? 'lending collateral'
+        : operationType === 'utilization_repay' || operationType === 'deleverage'
+          ? 'lending debt'
+          : 'lending account')
+    : automationType === 'cirbtc'
     ? (operationType === 'remove_liquidity' ? 'both pair tokens' : 'direct LP')
     : operationType === 'remove_liquidity'
       ? actionParams.tokenOut || 'both pool tokens'
@@ -2072,6 +2717,13 @@ queue.process('DEFI_LOOP', 1, async (job) => {
 
   let requestedExecutionAmount = normalizeUsdcAmount(actionParams.amountIn);
   let executionAmount = requestedExecutionAmount;
+  const automationLabel = automationType === 'cirbtc'
+    ? 'cirBTC LP automation'
+    : automationType === 'oracle'
+      ? 'Oracle strategy'
+      : automationType === 'lending'
+        ? 'Lending automation'
+        : 'Stable automation';
 
   if (automationType === 'cirbtc' && operationType === 'add_liquidity') {
     if (!balancesAvailable) {
@@ -2138,7 +2790,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         walletReserveUsdc,
         availableToTradeUsdc,
         positionBefore: positionSummary,
-        summary: `${automationType === 'cirbtc' ? 'cirBTC LP automation' : 'Stable automation'} selected ${operationType.replace(/_/g, ' ')}, but the wallet did not have enough immediately available balance to execute it.`,
+        summary: `${automationLabel} selected ${operationType.replace(/_/g, ' ')}, but the wallet did not have enough immediately available balance to execute it.`,
       })],
     );
 
@@ -2157,7 +2809,23 @@ queue.process('DEFI_LOOP', 1, async (job) => {
 
   if (dryRunEnabled) {
     let dryRunPayload = {};
-    if (automationType === 'cirbtc') {
+    if (automationType === 'lending') {
+      const dryRunResult = await executeLendingAutomationTask({
+        agent,
+        automationPolicy,
+        dryRunEnabled: true,
+      });
+      if (!dryRunResult.ok) {
+        return finishDefi('dry_run_failed', {
+          ok: false,
+          reason: dryRunResult.reason,
+          error: dryRunResult.error,
+          operationType,
+          stablePolicy: automationPolicy,
+        });
+      }
+      dryRunPayload = dryRunResult.payload || {};
+    } else if (automationType === 'cirbtc') {
       const dryRunResult = await executeCirbtcLpAutomationTask({
         agent,
         operationType,
@@ -2242,7 +2910,6 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     const { decrypt } = require('../services/cryptoService');
     const privateKey  = decrypt(agent.private_key_encrypted);
     if (automationType !== 'cirbtc' && operationType === 'swap') {
-      const USDC_ADDRESS = process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
       const poolAddress = swapPool?.address || CURVE_USDC_EURC_POOL;
       const sameChainSellBackPlan = automationType === 'oracle'
         ? await _buildOracleSameChainSellBackPlan({
@@ -2257,12 +2924,14 @@ queue.process('DEFI_LOOP', 1, async (job) => {
 
       txResult = await protocols.executeCurveSwap({
         poolAddress,
-        tokenInAddress: USDC_ADDRESS,
+        tokenInAddress: swapPool?.baseToken?.address || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000',
         indexIn: swapPool?.baseToken.index ?? 0,
         indexOut: swapPool?.quoteToken.index ?? 1,
         amountIn: String(executionAmount),
         slippagePct: parseFloat(agent.slippage_percent) || 0.5,
         agentPrivateKey: privateKey,
+        decimalsIn: swapPool?.baseToken?.decimals || 6,
+        decimalsOut: swapPool?.quoteToken?.decimals || 6,
       });
 
       executionPayload = {
@@ -2313,6 +2982,56 @@ queue.process('DEFI_LOOP', 1, async (job) => {
           };
         }
       }
+    } else if (automationType === 'lending') {
+      const executionResult = await executeLendingAutomationTask({
+        agent,
+        automationPolicy,
+        dryRunEnabled: false,
+      });
+      if (!executionResult.ok) {
+        await db.query(
+          `INSERT INTO transactions
+             (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
+           VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, 'failed', $5::jsonb)`,
+          [agentId, transactionType, transactionToken, nominalActionAmountUsdc || executionAmount, JSON.stringify({
+            signal,
+            executionGate,
+            automationPolicy,
+            stablePolicy: automationType === 'stable' ? automationPolicy : undefined,
+            policyId: automationPolicy?.policyId || null,
+            policyLane: automationPolicy?.verdict?.lane || null,
+            executionState: 'failed',
+            executionSource,
+            operationType,
+            fromToken: defaultFromToken,
+            toToken: defaultToToken,
+            amountIn: actionParams.amountIn || executionAmount,
+            requestedAmountIn: requestedExecutionAmount,
+            withdrawPct: actionParams.withdrawPct || null,
+            availableBalanceUsdc: availableUsdcBalance,
+            availableBalanceEurc: availableEurcBalance,
+            walletReserveUsdc,
+            availableToTradeUsdc,
+            positionBefore: positionSummary,
+            summary: `Lending automation could not execute ${operationType.replace(/_/g, ' ')}: ${executionResult.error || executionResult.reason}`,
+            reason: executionResult.reason,
+            error: executionResult.error || null,
+          })],
+        );
+
+        return finishDefi('execution_blocked', {
+          ok: false,
+          reason: executionResult.reason,
+          error: executionResult.error,
+          operationType,
+        });
+      }
+
+      executionPayload = executionResult.payload || {};
+      txResult = {
+        txHash: executionPayload.txHash || executionPayload.hash || executionPayload.stepsExecuted?.[0]?.txHash || null,
+        amountOut: executionPayload.amountOut || null,
+      };
     } else if (automationType === 'cirbtc') {
       const executionResult = await executeCirbtcLpAutomationTask({
         agent,
@@ -2538,25 +3257,76 @@ queue.process('DEFI_LOOP', 1, async (job) => {
 async function scheduleDefiLoop() {
   if (!DEFI_LOOP_INTERVAL_MS || DEFI_LOOP_INTERVAL_MS < 60_000) return;
 
-  setInterval(async () => {
+  const cleanupMalformedActiveDefiLoopJobs = async () => {
+    const activeJobs = await queue.getJobs(['active'], 0, 200, true);
+    const now = Date.now();
+    let removedCount = 0;
+
+    for (const job of activeJobs) {
+      if (job?.name !== 'DEFI_LOOP') continue;
+      if (job?.processedOn) continue;
+
+      const queuedAt = Number(job?.timestamp || 0);
+      if (!Number.isFinite(queuedAt) || queuedAt <= 0) continue;
+      if ((now - queuedAt) < DEFI_LOOP_ORPHAN_JOB_AGE_MS) continue;
+
+      try {
+        await job.remove();
+        removedCount += 1;
+      } catch (err) {
+        console.error(`[DEFI_LOOP] Could not remove malformed active job ${job.id}:`, err.message);
+      }
+    }
+
+    if (removedCount > 0) {
+      logQueueVerbose(`[DEFI_LOOP] Cleaned up ${removedCount} malformed active job(s) before scheduling the next sweep`);
+    }
+  };
+
+  const getQueuedOrActiveDefiLoopAgentIds = async () => {
+    const jobs = await queue.getJobs(['waiting', 'active'], 0, 500, true);
+    return new Set(
+      jobs
+        .filter((job) => job?.name === 'DEFI_LOOP' && job?.data?.agentId)
+        .map((job) => String(job.data.agentId)),
+    );
+  };
+
+  const queueEligibleDefiLoops = async () => {
     try {
+      await cleanupMalformedActiveDefiLoopJobs();
+
       const { rows } = await db.query(
         `SELECT id FROM agents
-         WHERE (defi_loop_enabled = TRUE OR cirbtc_lp_enabled = TRUE)
+         WHERE (defi_loop_enabled = TRUE OR lending_automation_enabled = TRUE OR cirbtc_lp_enabled = TRUE)
            AND status NOT IN ('locked', 'inactive')`,
       );
+
+      const queuedOrActiveAgentIds = await getQueuedOrActiveDefiLoopAgentIds();
+      let queuedCount = 0;
+
       for (const { id } of rows) {
+        if (queuedOrActiveAgentIds.has(String(id))) continue;
         await queue.add('DEFI_LOOP', { agentId: id }, { jobId: `defi-${id}-${Date.now()}` });
+        queuedCount += 1;
       }
-      if (rows.length > 0) {
-        console.log(`[DEFI_LOOP] Queued ${rows.length} defi loop job(s)`);
+      if (queuedCount > 0) {
+        console.log(`[DEFI_LOOP] Queued ${queuedCount} defi loop job(s)`);
       }
     } catch (err) {
       console.error('[DEFI_LOOP] Schedule error:', err.message);
     }
-  }, DEFI_LOOP_INTERVAL_MS);
+  };
 
-  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, GLOBAL_DRY_RUN=${GLOBAL_DRY_RUN}`);
+  await cleanupMalformedActiveDefiLoopJobs();
+  setTimeout(() => {
+    queueEligibleDefiLoops().catch((err) => {
+      console.error('[DEFI_LOOP] Startup schedule error:', err.message);
+    });
+  }, Math.max(DEFI_LOOP_STARTUP_DELAY_MS, 0));
+  setInterval(queueEligibleDefiLoops, DEFI_LOOP_INTERVAL_MS);
+
+  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, startup delay ${Math.max(DEFI_LOOP_STARTUP_DELAY_MS, 0) / 1000}s, GLOBAL_DRY_RUN=${GLOBAL_DRY_RUN}`);
 }
 
 // ── DAILY FREE TASKS (Tier 1) ──────────────────────────────────────────────────
@@ -2781,6 +3551,20 @@ const BUILTIN_TIER2_TASKS = [
     fee_usdc:    PAID_TASK_FEE_USDC,
   },
   {
+    id:          'EXEC_LENDING_COLLATERAL_TOP_UP',
+    title:       'Lending Collateral Top-Up',
+    description: 'Supply the visible wallet collateral needed to rebuild the lending health buffer toward the current target',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_LENDING_SAFE_EXIT',
+    title:       'Lending Safe Exit',
+    description: 'Repay visible lending debt with wallet funds, then withdraw the remaining supplied positions in one deterministic flow',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
     id:          'EXEC_LENDING_DELEVERAGE',
     title:       'Lending Deleverage',
     description: 'Run the deterministic emergency deleverage plan for the current Arc-native lending account',
@@ -2822,6 +3606,22 @@ const BUILTIN_TIER2_TASKS = [
     id:          'EXEC_MANUAL_LENDING_REPAY',
     title:       'Manual Lending Repay',
     description: 'Hidden manual DeFi primitive for Arc lending repay actions',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
+    id:          'EXEC_MANUAL_LENDING_COLLATERAL_TOP_UP',
+    title:       'Manual Lending Collateral Top-Up',
+    description: 'Hidden manual DeFi primitive for deterministic lending collateral top-up actions',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+    enabled:     false,
+  },
+  {
+    id:          'EXEC_MANUAL_LENDING_SAFE_EXIT',
+    title:       'Manual Lending Safe Exit',
+    description: 'Hidden manual DeFi primitive for deterministic lending safe-exit actions',
     tier:        2,
     fee_usdc:    PAID_TASK_FEE_USDC,
     enabled:     false,
@@ -3119,6 +3919,42 @@ async function _recordPaidTaskActivity(agentId, taskId, payload, executionMeta) 
     return;
   }
 
+  if (taskId === 'EXEC_LENDING_COLLATERAL_TOP_UP' || taskId === 'EXEC_MANUAL_LENDING_COLLATERAL_TOP_UP') {
+    const firstStep = Array.isArray(payload?.stepsExecuted) && payload.stepsExecuted.length > 0
+      ? payload.stepsExecuted[0]
+      : (Array.isArray(payload?.plannedSteps) && payload.plannedSteps.length > 0 ? payload.plannedSteps[0] : null);
+
+    await _insertTaskActivityRecord(agentId, {
+      type: 'lending_collateral_topup',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: firstStep?.asset || 'USDC',
+      amount: payload?.collateralUsdPlanned || firstStep?.usdAmount || 0,
+      txHash: firstStep?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_LENDING_SAFE_EXIT' || taskId === 'EXEC_MANUAL_LENDING_SAFE_EXIT') {
+    const firstStep = Array.isArray(payload?.stepsExecuted) && payload.stepsExecuted.length > 0
+      ? payload.stepsExecuted[0]
+      : (Array.isArray(payload?.plannedSteps) && payload.plannedSteps.length > 0 ? payload.plannedSteps[0] : null);
+
+    await _insertTaskActivityRecord(agentId, {
+      type: 'lending_safe_exit',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: firstStep?.asset || 'USDC',
+      amount: payload?.repayUsdPlanned || payload?.withdrawUsdPlanned || firstStep?.usdAmount || 0,
+      txHash: firstStep?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
   if (taskId === 'EXEC_LENDING_DELEVERAGE' || taskId === 'EXEC_MANUAL_LENDING_DELEVERAGE') {
     const firstStep = Array.isArray(payload?.stepsExecuted) && payload.stepsExecuted.length > 0
       ? payload.stepsExecuted[0]
@@ -3384,7 +4220,6 @@ function registerPaidTaskProcessor(name, concurrency, executePaidTask, resolveEc
       taskRunId,
       dryRun: shouldUseDryRun(agent),
     };
-
     const result = await executePaidTask(context);
     if (!result.ok) return result;
 
@@ -3397,7 +4232,6 @@ function registerPaidTaskProcessor(name, concurrency, executePaidTask, resolveEc
       incrementDailyPaidCount,
       ...economyOptions,
     });
-
     return { ...result, payload: storedPayload };
   });
 }
@@ -3852,6 +4686,20 @@ registerPaidTaskProcessor('EXEC_LENDING_REPAY', 2, async ({ agent, params, dryRu
   })
 ));
 
+registerPaidTaskProcessor('EXEC_LENDING_COLLATERAL_TOP_UP', 2, async ({ agent, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingCollateralTopUpTask({
+    agent,
+    dryRun,
+  })
+));
+
+registerPaidTaskProcessor('EXEC_LENDING_SAFE_EXIT', 2, async ({ agent, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingSafeExitTask({
+    agent,
+    dryRun,
+  })
+));
+
 registerPaidTaskProcessor('EXEC_LENDING_DELEVERAGE', 2, async ({ agent, dryRun }) => (
   agenticTaskExecutionService.executeNativeLendingEmergencyDeleverageTask({
     agent,
@@ -3895,6 +4743,20 @@ registerPaidTaskProcessor('EXEC_MANUAL_LENDING_REPAY', 2, async ({ agent, params
   agenticTaskExecutionService.executeNativeLendingRepayTask({
     agent,
     params,
+    dryRun,
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_COLLATERAL_TOP_UP', 2, async ({ agent, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingCollateralTopUpTask({
+    agent,
+    dryRun,
+  })
+), MANUAL_DEFI_PAID_TASK_OPTIONS);
+
+registerPaidTaskProcessor('EXEC_MANUAL_LENDING_SAFE_EXIT', 2, async ({ agent, dryRun }) => (
+  agenticTaskExecutionService.executeNativeLendingSafeExitTask({
+    agent,
     dryRun,
   })
 ), MANUAL_DEFI_PAID_TASK_OPTIONS);
@@ -3994,8 +4856,16 @@ async function scheduleDailyTasks() {
 }
 
 // ── Event listeners ────────────────────────────────────────────────────────────
+const registeredQueueHandlers = Object.keys(queue.handlers || {}).sort();
+console.log(`[QUEUE] Registered Bull handlers (${registeredQueueHandlers.length})`);
+if (VERBOSE_QUEUE_LOGS) {
+  console.log(`[QUEUE] Registered Bull handler names: ${registeredQueueHandlers.join(', ')}`);
+}
+syncBullRedisListenerCaps(registeredQueueHandlers.length);
 queue.on('failed',    (job, err) => console.error(`[QUEUE] Job ${job.id} failed:`, err.message));
-queue.on('completed', (job)      => console.log(`[QUEUE] Job ${job.id} completed`));
+if (VERBOSE_QUEUE_LOGS) {
+  queue.on('completed', (job) => console.log(`[QUEUE] Job ${job.id} completed`));
+}
 
 // ── Export the queue for use in indexerService ─────────────────────────────────
 module.exports = queue;
@@ -4006,3 +4876,5 @@ module.exports.scheduleDailyTasks = scheduleDailyTasks;
 module.exports.canQueueManualTasks = canQueueManualTasks;
 module.exports.queueManualTask = queueManualTask;
 module.exports.runTaskInline = runTaskInline;
+module.exports.resumeLocalWorkers = resumeLocalWorkers;
+module.exports.pauseLocalWorkers = pauseLocalWorkers;

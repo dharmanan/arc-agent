@@ -5,7 +5,7 @@ const { GatewayClient } = require('@circle-fin/x402-batching/client');
 const { decrypt } = require('../cryptoService');
 const { logGateway } = require('./logger');
 
-const DEFAULT_GATEWAY_TRANSFER_MAX_FEE_USDC = process.env.GATEWAY_TRANSFER_MAX_FEE_USDC || '0.001';
+const DEFAULT_GATEWAY_TRANSFER_MAX_FEE_USDC = process.env.GATEWAY_TRANSFER_MAX_FEE_USDC || '0.005';
 const DEFAULT_GATEWAY_PAY_RETRY_ATTEMPTS = process.env.GATEWAY_PAY_RETRY_ATTEMPTS || '2';
 const DEFAULT_GATEWAY_PAY_RETRY_BASE_DELAY_MS = process.env.GATEWAY_PAY_RETRY_BASE_DELAY_MS || '750';
 

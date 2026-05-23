@@ -1,5 +1,5 @@
 'use strict';
-require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
+require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env'), quiet: true });
 
 const { once }   = require('events');
 const fs           = require('fs');
@@ -40,6 +40,24 @@ function isEnvEnabled(name, defaultValue = true) {
 const BACKGROUND_JOBS_ENABLED = isEnvEnabled('BACKGROUND_JOBS_ENABLED', true);
 const HEALTHCHECK_DB_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_DB_PROBE_ENABLED', true);
 const HEALTHCHECK_REDIS_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_REDIS_PROBE_ENABLED', true);
+const QUEUE_WORKER_STARTUP_DELAY_MS = parseInt(process.env.QUEUE_WORKER_STARTUP_DELAY_MS || '60000', 10);
+
+function shouldSkipAccessLog(req, res) {
+  if (process.env.NODE_ENV !== 'production') return false;
+
+  const statusCode = Number(res?.statusCode || 0);
+  const requestPath = req?.path || req?.originalUrl || '';
+  if ((requestPath === '/readyz' || requestPath === '/health') && statusCode > 0 && statusCode < 400) {
+    return true;
+  }
+
+  const userAgent = String(req?.headers?.['user-agent'] || '').toLowerCase();
+  if (requestPath === '/readyz' && userAgent.includes('railwayhealthcheck')) {
+    return true;
+  }
+
+  return false;
+}
 
 // Trust proxy headers (needed for rate limiter behind Codespace/nginx proxy)
 app.set('trust proxy', 1);
@@ -78,7 +96,9 @@ app.use(express.json({ limit: '64kb' }));
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test') {
-  app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+  app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev', {
+    skip: shouldSkipAccessLog,
+  }));
 }
 
 // ── Global rate limit (per IP) ────────────────────────────────────────────────
@@ -247,13 +267,53 @@ async function bootstrap() {
 
     // Start daily free task scheduler (only for agents with daily_tasks_enabled = TRUE)
     agentQueue.scheduleDailyTasks().catch(err => console.error('[DAILY_TASKS] startup error', err));
+
+    setTimeout(() => {
+      agentQueue.resumeLocalWorkers().catch(err => console.error('[QUEUE] resume startup error', err));
+    }, Math.max(QUEUE_WORKER_STARTUP_DELAY_MS, 0));
+    console.log(`[BOOT] Queue workers will resume in ${Math.max(QUEUE_WORKER_STARTUP_DELAY_MS, 0) / 1000}s`);
   } else {
     console.log('[BOOT] Background jobs disabled via BACKGROUND_JOBS_ENABLED=false');
   }
 
-  app.listen(PORT, () =>
+  const server = app.listen(PORT, () =>
     console.log(`[SERVER] Arc Machina backend running on port ${PORT} (${process.env.NODE_ENV})`),
   );
+
+  let shutdownStarted = false;
+  const shutdown = async (signal) => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+
+    console.log(`[BOOT] ${signal} received, shutting down gracefully`);
+
+    if (typeof agentQueue.pauseLocalWorkers === 'function') {
+      await agentQueue.pauseLocalWorkers(true).catch((err) => {
+        console.error('[BOOT] Queue pause before shutdown failed:', err);
+      });
+    }
+
+    await Promise.allSettled([
+      new Promise((resolve) => server.close(resolve)),
+      typeof agentQueue.close === 'function' ? agentQueue.close() : Promise.resolve(),
+    ]);
+
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => {
+    shutdown('SIGTERM').catch((err) => {
+      console.error('[BOOT] Graceful shutdown failed:', err);
+      process.exit(1);
+    });
+  });
+
+  process.on('SIGINT', () => {
+    shutdown('SIGINT').catch((err) => {
+      console.error('[BOOT] Graceful shutdown failed:', err);
+      process.exit(1);
+    });
+  });
 }
 
 bootstrap().catch(err => {

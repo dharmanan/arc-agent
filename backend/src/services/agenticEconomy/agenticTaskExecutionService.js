@@ -15,7 +15,7 @@ const SEPOLIA_GAS_FANOUT_AMOUNT_ETH = String(process.env.SEPOLIA_GAS_FANOUT_AMOU
 const SEPOLIA_GAS_FANOUT_CHAINS = ['Optimism Sepolia', 'Base Sepolia', 'Arbitrum Sepolia'];
 const NATIVE_TOPUP_POLL_MS = parseInt(process.env.NATIVE_TOPUP_POLL_MS || '5000', 10);
 const NATIVE_TOPUP_WAIT_MS = parseInt(process.env.NATIVE_TOPUP_WAIT_MS || '600000', 10);
-const DIRECT_PAIR_ZAP_LIMITS = {
+const DIRECT_PAIR_ZAP_LIMIT_DEFAULTS = {
   USDC: {
     pairKey: 'USDC-cirBTC',
     recommendedAmountIn: '20',
@@ -29,6 +29,41 @@ const DIRECT_PAIR_ZAP_LIMITS = {
     maxSwapAmountIn: '8',
   },
 };
+
+function _readPositiveNumberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  return value;
+}
+
+function _resolveDirectPairZapLimits(stableToken = 'USDC') {
+  const normalizedStableToken = String(stableToken || 'USDC').toUpperCase();
+  const defaults = DIRECT_PAIR_ZAP_LIMIT_DEFAULTS[normalizedStableToken];
+
+  if (!defaults) {
+    return null;
+  }
+
+  const envPrefix = `DIRECT_PAIR_ZAP_${normalizedStableToken}`;
+  return {
+    pairKey: defaults.pairKey,
+    recommendedAmountIn: String(_readPositiveNumberEnv(
+      `${envPrefix}_RECOMMENDED_AMOUNT_IN`,
+      Number(defaults.recommendedAmountIn),
+    )),
+    maxTotalAmountIn: _readPositiveNumberEnv(
+      `${envPrefix}_MAX_TOTAL_AMOUNT_IN`,
+      defaults.maxTotalAmountIn,
+    ),
+    maxSwapAmountIn: String(_readPositiveNumberEnv(
+      `${envPrefix}_MAX_SWAP_AMOUNT_IN`,
+      Number(defaults.maxSwapAmountIn),
+    )),
+  };
+}
 
 function _timestamped(payload) {
   return {
@@ -111,7 +146,7 @@ function _summarizePoolPosition(position) {
 
 function _resolveDirectPairConfig(stableToken = 'USDC') {
   const normalizedStableToken = String(stableToken || 'USDC').toUpperCase();
-  const config = DIRECT_PAIR_ZAP_LIMITS[normalizedStableToken];
+  const config = _resolveDirectPairZapLimits(normalizedStableToken);
   const directPair = resolveDirectSwapFallbackPool(config?.pairKey || `${normalizedStableToken}-cirBTC`);
 
   return {
@@ -436,7 +471,7 @@ async function executeCurveLiquidityRemoveBalancedTask({ agent, params = {}, dry
 
 async function executeDirectPairZapInTask({ agent, params = {}, dryRun = false, stableToken = 'USDC' }) {
   const normalizedStableToken = String(stableToken || 'USDC').toUpperCase();
-  const config = DIRECT_PAIR_ZAP_LIMITS[normalizedStableToken];
+  const config = _resolveDirectPairZapLimits(normalizedStableToken);
   const amountIn = String(params.amountIn ?? config?.recommendedAmountIn ?? '0');
   const swapAmountIn = Math.min(Number(amountIn) / 2, Number(config?.maxSwapAmountIn || 0));
   const remainingAmountIn = Number(amountIn) - swapAmountIn;
@@ -778,7 +813,7 @@ async function executeDirectPairSwapTask({ agent, params = {}, dryRun = false, s
 
 async function executeDirectPairRemoveLiquidityTask({ agent, params = {}, dryRun = false, stableToken = 'USDC' }) {
   const normalizedStableToken = String(stableToken || 'USDC').toUpperCase();
-  const config = DIRECT_PAIR_ZAP_LIMITS[normalizedStableToken];
+  const config = _resolveDirectPairZapLimits(normalizedStableToken);
   const withdrawPct = Number(params.withdrawPct ?? 100);
   const directPair = resolveDirectSwapFallbackPool(config?.pairKey || `${normalizedStableToken}-cirBTC`);
 
@@ -1109,10 +1144,6 @@ async function _executeNativeLendingTask({ agent, params = {}, dryRun = false, a
     };
   }
 
-  if (!agent?.private_key_encrypted) {
-    return { ok: false, reason: 'no_private_key' };
-  }
-
   const assetEntry = validation.asset;
   const walletAddress = agent.wallet_address || agent.walletAddress;
   const basePayload = {
@@ -1137,6 +1168,10 @@ async function _executeNativeLendingTask({ agent, params = {}, dryRun = false, a
         summary: `Would ${action} ${amount} ${assetEntry.symbol} on the Arc-native lending lane.`,
       }),
     };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
   }
 
   try {
@@ -1230,6 +1265,103 @@ async function executeNativeLendingRepayTask({ agent, params = {}, dryRun = fals
   });
 }
 
+async function executeNativeLendingCollateralTopUpTask({ agent, dryRun = false }) {
+  const validation = await nativeLendingRiskService.guardAgentCollateralTopUp({ agent });
+  if (!validation.ok) {
+    return {
+      ok: false,
+      reason: validation.code,
+      error: validation.verdict?.detail || 'Collateral top-up is not available right now.',
+    };
+  }
+
+  const basePayload = {
+    action: 'collateral_top_up',
+    executionRail: 'arc_native_lending',
+    executionSource: validation.surface.execution.source,
+    buildState: validation.surface.execution.buildState,
+    currentHealthFactor: validation.verdict.currentHealthFactor,
+    targetHealthFactor: validation.verdict.targetHealthFactor,
+    projectedHealthFactor: validation.verdict.projectedHealthFactor,
+    collateralUsdNeeded: validation.verdict.collateralUsdNeeded,
+    collateralUsdPlanned: validation.verdict.collateralUsdPlanned,
+    collateralUsdShortfall: validation.verdict.collateralUsdShortfall,
+    topUpStatus: validation.verdict.status,
+    plannedSteps: validation.verdict.steps,
+  };
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        dryRun: true,
+        summary: 'Would run the deterministic lending collateral top-up plan for the current account.',
+      }),
+    };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
+  }
+
+  const agentPrivateKey = decrypt(agent.private_key_encrypted);
+  const walletAddress = agent.wallet_address || agent.walletAddress;
+  const assetMap = new Map((validation.surface.assets || []).map((assetEntry) => [assetEntry.symbol, assetEntry]));
+  const executedSteps = [];
+
+  try {
+    for (const step of validation.verdict.steps || []) {
+      const assetEntry = assetMap.get(step.asset);
+      if (!assetEntry) {
+        throw new Error(`Missing lending asset snapshot for ${step.asset}`);
+      }
+
+      const result = await protocols.executeNativeLendingSupply({
+        assetAddress: assetEntry.assetAddress,
+        amount: step.amount,
+        agentPrivateKey,
+        onBehalfOf: walletAddress,
+        decimals: assetEntry.decimals,
+      });
+
+      executedSteps.push({
+        ...step,
+        txHash: result.txHash || null,
+      });
+    }
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        stepsExecuted: executedSteps,
+        summary: 'Executed the deterministic lending collateral top-up plan for the current account.',
+      }),
+    };
+  } catch (error) {
+    if (executedSteps.length > 0) {
+      return {
+        ok: true,
+        payload: _timestamped({
+          ...basePayload,
+          stepsExecuted: executedSteps,
+          partialFailure: {
+            error: error.message,
+          },
+          summary: 'Collateral top-up started, but not all planned supply steps completed.',
+        }),
+      };
+    }
+
+    return {
+      ok: false,
+      reason: 'native_lending_collateral_topup_error',
+      error: error.message,
+    };
+  }
+}
+
 async function executeNativeLendingEmergencyDeleverageTask({ agent, dryRun = false }) {
   const validation = await nativeLendingRiskService.guardAgentEmergencyDeleverage({ agent });
   if (!validation.ok) {
@@ -1238,10 +1370,6 @@ async function executeNativeLendingEmergencyDeleverageTask({ agent, dryRun = fal
       reason: validation.code,
       error: validation.verdict?.detail || 'Emergency deleverage is not available right now.',
     };
-  }
-
-  if (!agent?.private_key_encrypted) {
-    return { ok: false, reason: 'no_private_key' };
   }
 
   const basePayload = {
@@ -1268,6 +1396,10 @@ async function executeNativeLendingEmergencyDeleverageTask({ agent, dryRun = fal
         summary: 'Would run the deterministic emergency deleverage plan for the current lending account.',
       }),
     };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
   }
 
   const agentPrivateKey = decrypt(agent.private_key_encrypted);
@@ -1327,6 +1459,113 @@ async function executeNativeLendingEmergencyDeleverageTask({ agent, dryRun = fal
   }
 }
 
+async function executeNativeLendingSafeExitTask({ agent, dryRun = false }) {
+  const validation = await nativeLendingRiskService.guardAgentSafeExit({ agent });
+  if (!validation.ok) {
+    return {
+      ok: false,
+      reason: validation.code,
+      error: validation.verdict?.detail || 'Safe exit is not available right now.',
+    };
+  }
+
+  const basePayload = {
+    action: 'safe_exit',
+    executionRail: 'arc_native_lending',
+    executionSource: validation.surface.execution.source,
+    buildState: validation.surface.execution.buildState,
+    currentHealthFactor: validation.verdict.currentHealthFactor,
+    repayUsdNeeded: validation.verdict.repayUsdNeeded,
+    repayUsdPlanned: validation.verdict.repayUsdPlanned,
+    repayUsdShortfall: validation.verdict.repayUsdShortfall,
+    withdrawUsdPlanned: validation.verdict.withdrawUsdPlanned,
+    safeExitStatus: validation.verdict.status,
+    plannedSteps: validation.verdict.steps,
+  };
+
+  if (dryRun) {
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        dryRun: true,
+        summary: 'Would run the deterministic lending safe-exit flow for the current account.',
+      }),
+    };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
+  }
+
+  const agentPrivateKey = decrypt(agent.private_key_encrypted);
+  const walletAddress = agent.wallet_address || agent.walletAddress;
+  const assetMap = new Map((validation.surface.assets || []).map((assetEntry) => [assetEntry.symbol, assetEntry]));
+  const executedSteps = [];
+
+  try {
+    for (const step of validation.verdict.steps || []) {
+      const assetEntry = assetMap.get(step.asset);
+      if (!assetEntry) {
+        throw new Error(`Missing lending asset snapshot for ${step.asset}`);
+      }
+
+      let result;
+      if (step.action === 'withdraw') {
+        result = await protocols.executeNativeLendingWithdraw({
+          assetAddress: assetEntry.assetAddress,
+          amount: step.amount,
+          agentPrivateKey,
+          to: walletAddress,
+          decimals: assetEntry.decimals,
+        });
+      } else {
+        result = await protocols.executeNativeLendingRepay({
+          assetAddress: assetEntry.assetAddress,
+          amount: step.amount,
+          agentPrivateKey,
+          onBehalfOf: walletAddress,
+          decimals: assetEntry.decimals,
+        });
+      }
+
+      executedSteps.push({
+        ...step,
+        txHash: result.txHash || null,
+      });
+    }
+
+    return {
+      ok: true,
+      payload: _timestamped({
+        ...basePayload,
+        stepsExecuted: executedSteps,
+        summary: 'Executed the deterministic lending safe-exit flow for the current account.',
+      }),
+    };
+  } catch (error) {
+    if (executedSteps.length > 0) {
+      return {
+        ok: true,
+        payload: _timestamped({
+          ...basePayload,
+          stepsExecuted: executedSteps,
+          partialFailure: {
+            error: error.message,
+          },
+          summary: 'Safe exit started, but not every planned repay or withdraw step completed.',
+        }),
+      };
+    }
+
+    return {
+      ok: false,
+      reason: 'native_lending_safe_exit_error',
+      error: error.message,
+    };
+  }
+}
+
 async function executeNativeLendingLiquidationTask({ agent, params = {}, dryRun = false }) {
   const borrower = String(params.borrower || params.borrowerAddress || '').trim();
   const debtAsset = String(params.debtAsset || params.asset || '').trim().toUpperCase();
@@ -1347,10 +1586,6 @@ async function executeNativeLendingLiquidationTask({ agent, params = {}, dryRun 
       reason: validation.code,
       error: validation.verdict?.detail || 'Liquidation is not available right now.',
     };
-  }
-
-  if (!agent?.private_key_encrypted) {
-    return { ok: false, reason: 'no_private_key' };
   }
 
   const basePayload = {
@@ -1374,6 +1609,10 @@ async function executeNativeLendingLiquidationTask({ agent, params = {}, dryRun 
         summary: `Would liquidate ${amount} ${debtAsset} of debt from ${borrower}.`,
       }),
     };
+  }
+
+  if (!agent?.private_key_encrypted) {
+    return { ok: false, reason: 'no_private_key' };
   }
 
   try {
@@ -1552,12 +1791,6 @@ async function executeRebalanceTask({ agent, params = {}, dryRun = false }) {
 
   const positionGuard = await _readCurvePositionGuard(agent, curvePool);
   if (!positionGuard.ok) return positionGuard;
-  if (positionGuard.position && Number(positionGuard.position.lpToken?.balance || 0) > 0) {
-    return {
-      ok: false,
-      reason: 'lp_position_exit_required',
-    };
-  }
 
   if (dryRun) {
     return {
@@ -1642,10 +1875,12 @@ module.exports = {
   executeCurveLiquidityRemoveBalancedTask,
   executeCurveLiquidityRemoveTask,
   executeCurveSwapTask,
+  executeNativeLendingCollateralTopUpTask,
   executeNativeLendingEmergencyDeleverageTask,
   executeNativeLendingBorrowTask,
   executeNativeLendingLiquidationTask,
   executeNativeLendingRepayTask,
+  executeNativeLendingSafeExitTask,
   executeNativeLendingSupplyTask,
   executeNativeLendingWithdrawTask,
   executeRebalanceTask,
