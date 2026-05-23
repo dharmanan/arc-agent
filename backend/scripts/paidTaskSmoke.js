@@ -88,7 +88,6 @@ function getSmokePrivateKey() {
   const candidates = [
     process.env.SMOKE_AGENT_PRIVATE_KEY,
     process.env.ORACLE_BUYER_PRIVATE_KEY,
-    process.env['arcmachina-agent-wallet-private-key'],
   ];
 
   return candidates.find((value) => /^0x[a-fA-F0-9]{64}$/.test(String(value || '').trim())) || '';

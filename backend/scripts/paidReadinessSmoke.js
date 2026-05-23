@@ -28,12 +28,11 @@ function getSmokePrivateKey() {
   const candidates = [
     process.env.SMOKE_AGENT_PRIVATE_KEY,
     process.env.ORACLE_BUYER_PRIVATE_KEY,
-    process.env['arcmachina-agent-wallet-private-key'],
   ];
 
   const privateKey = candidates.find((value) => /^0x[a-fA-F0-9]{64}$/.test(String(value || '').trim())) || '';
   if (!privateKey) {
-    throw new Error('Missing smoke private key. Define ORACLE_BUYER_PRIVATE_KEY, SMOKE_AGENT_PRIVATE_KEY, or arcmachina-agent-wallet-private-key in root .env.');
+    throw new Error('Missing smoke private key. Define ORACLE_BUYER_PRIVATE_KEY or SMOKE_AGENT_PRIVATE_KEY in root .env.');
   }
 
   return privateKey;
