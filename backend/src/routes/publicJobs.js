@@ -1,12 +1,29 @@
 'use strict';
 
 const router = require('express').Router();
+const rateLimit = require('express-rate-limit');
 const { ethers } = require('ethers');
 const db = require('../db');
 const jobEconomyService = require('../services/agenticEconomy/jobEconomyService');
 const { buildJobReviewPolicy, JOB_REVIEW_TIMEOUT_HOURS } = require('../services/jobRetentionService');
 
 const ACTIVE_JOB_STATUSES = ['funded', 'delivered', 'open'];
+
+const publicJobsReadRateLimit = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'public_job_read_rate_limit_reached' },
+});
+
+const publicJobsWriteRateLimit = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'public_job_write_rate_limit_reached' },
+});
 
 function normalizeAddress(value) {
   return ethers.getAddress(String(value || '').trim());
@@ -114,7 +131,7 @@ async function loadPublicJob(jobId) {
 }
 
 // ── GET /api/jobs/public/board ───────────────────────────────────────────────
-router.get('/public/board', async (req, res, next) => {
+router.get('/public/board', publicJobsReadRateLimit, async (req, res, next) => {
   try {
     const includeFinalized = req.query.includeFinalized === 'true';
     const limit = Math.min(parseInt(req.query.limit || '40', 10), 100);
@@ -159,7 +176,7 @@ router.get('/public/board', async (req, res, next) => {
 });
 
 // ── GET /api/jobs/public/:jobId ──────────────────────────────────────────────
-router.get('/public/:jobId', async (req, res, next) => {
+router.get('/public/:jobId', publicJobsReadRateLimit, async (req, res, next) => {
   try {
     const job = await loadPublicJob(req.params.jobId);
     if (!job) return res.status(404).json({ error: 'job_not_found' });
@@ -175,7 +192,7 @@ router.get('/public/:jobId', async (req, res, next) => {
 });
 
 // ── POST /api/jobs/public/:jobId/apply ───────────────────────────────────────
-router.post('/public/:jobId/apply', async (req, res, next) => {
+router.post('/public/:jobId/apply', publicJobsWriteRateLimit, async (req, res, next) => {
   try {
     const applicantAddressRaw = String(req.body?.applicantAddress || '').trim();
     const note = String(req.body?.note || '').trim();
@@ -272,7 +289,7 @@ router.post('/public/:jobId/apply', async (req, res, next) => {
 });
 
 // ── POST /api/jobs/public/:jobId/dispute ────────────────────────────────────
-router.post('/public/:jobId/dispute', async (req, res, next) => {
+router.post('/public/:jobId/dispute', publicJobsWriteRateLimit, async (req, res, next) => {
   try {
     const providerAddressRaw = String(req.body?.providerAddress || '').trim();
     const reason = String(req.body?.reason || '').trim();
@@ -361,7 +378,7 @@ router.post('/public/:jobId/dispute', async (req, res, next) => {
 });
 
 // ── POST /api/jobs/public/:jobId/deliver ─────────────────────────────────────
-router.post('/public/:jobId/deliver', async (req, res, next) => {
+router.post('/public/:jobId/deliver', publicJobsWriteRateLimit, async (req, res, next) => {
   try {
     const providerAddressRaw = String(req.body?.providerAddress || '').trim();
     const deliverableHash = String(req.body?.deliverableHash || '').trim();
