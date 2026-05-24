@@ -15,6 +15,13 @@ function bufferToBase64url(buf) {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
 
+function createPasskeyError(message, code) {
+  const error = new Error(message);
+  error.name = 'PasskeyError';
+  error.code = code;
+  return error;
+}
+
 function encodeCredentialForServer(cred) {
   return {
     id:    cred.id,
@@ -43,55 +50,96 @@ function decodeServerOptions(options) {
   return decoded;
 }
 
-export function isPasskeySupported() {
-  return typeof window !== 'undefined' && !!window.PublicKeyCredential;
+function normalizePasskeyError(err, mode) {
+  if (err?.name === 'PasskeyError') return err;
+
+  const name = String(err?.name || '');
+  const message = String(err?.message || '');
+
+  if (message === 'Please connect your wallet first') {
+    return createPasskeyError(message, 'WALLET_REQUIRED');
+  }
+
+  if (message === 'Passkeys require a secure supported browser.') {
+    return createPasskeyError(message, 'UNSUPPORTED_BROWSER');
+  }
+
+  if (mode === 'register' && (name === 'UserRejectedRequestError' || /rejected|denied|cancelled/i.test(message))) {
+    return createPasskeyError(
+      'Wallet signature was cancelled before passkey registration could start.',
+      'WALLET_SIGNATURE_CANCELLED'
+    );
+  }
+
+  if (mode === 'register' && (name === 'InvalidStateError' || message.toLowerCase().includes('already registered'))) {
+    return createPasskeyError(
+      'A passkey is already registered on this device for this wallet. Continue with sign in.',
+      'PASSKEY_ALREADY_REGISTERED'
+    );
+  }
+
+  if (name === 'NotAllowedError') {
+    return createPasskeyError(
+      mode === 'register'
+        ? 'Passkey registration was cancelled or could not be completed.'
+        : 'Passkey authentication was cancelled or could not be completed.',
+      'PASSKEY_CANCELLED'
+    );
+  }
+
+  return createPasskeyError(
+    mode === 'register'
+      ? 'Passkey registration could not be completed securely.'
+      : 'Passkey authentication could not be completed securely.',
+    'PASSKEY_OPERATION_FAILED'
+  );
 }
 
-export async function registerPasskey(ownerAddress, deviceName = 'My Device') {
-  if (!isPasskeySupported()) throw new Error('This browser does not support Passkeys (WebAuthn)');
+export function isPasskeySupported() {
+  return typeof window !== 'undefined' && window.isSecureContext !== false && !!window.PublicKeyCredential;
+}
+
+export async function registerPasskey(ownerAddress, deviceName = 'My Device', signMessageAsync) {
+  if (!isPasskeySupported()) throw createPasskeyError('Passkeys require a secure supported browser.', 'UNSUPPORTED_BROWSER');
   if (!ownerAddress || !/^0x[0-9a-fA-F]{40}$/.test(ownerAddress)) {
-    throw new Error('Please connect your wallet first');
+    throw createPasskeyError('Please connect your wallet first', 'WALLET_REQUIRED');
+  }
+  if (typeof signMessageAsync !== 'function') {
+    throw createPasskeyError('Wallet signature is required before registering a passkey.', 'WALLET_SIGNATURE_REQUIRED');
   }
 
-  const options        = await auth.startRegister(ownerAddress);
-  const decodedOptions = decodeServerOptions(options);
-
-  let credential;
   try {
-    credential = await navigator.credentials.create({ publicKey: decodedOptions });
+    const challenge = await auth.registerChallenge(ownerAddress);
+    const signature = await signMessageAsync({ message: challenge.message });
+    const options = await auth.startRegister(ownerAddress, challenge.challengeId, signature);
+    const decodedOptions = decodeServerOptions(options);
+    const credential = await navigator.credentials.create({ publicKey: decodedOptions });
+    const encoded = encodeCredentialForServer(credential);
+    const result = await auth.finishRegister(ownerAddress, encoded, deviceName);
+    setToken(result.token);
+    return result;
   } catch (err) {
-    if (err.name === 'NotAllowedError') throw new Error('Passkey creation cancelled or timed out');
-    if (err.name === 'InvalidStateError') throw new Error('A passkey is already registered on this device for this account. Please use "Sign In" instead.');
-    throw err;
+    throw normalizePasskeyError(err, 'register');
   }
-
-  const encoded = encodeCredentialForServer(credential);
-  const result  = await auth.finishRegister(ownerAddress, encoded, deviceName);
-  setToken(result.token);
-  return result;
 }
 
 export async function authenticatePasskey(ownerAddress) {
-  if (!isPasskeySupported()) throw new Error('This browser does not support Passkeys (WebAuthn)');
+  if (!isPasskeySupported()) throw createPasskeyError('Passkeys require a secure supported browser.', 'UNSUPPORTED_BROWSER');
   if (!ownerAddress || !/^0x[0-9a-fA-F]{40}$/.test(ownerAddress)) {
-    throw new Error('Please connect your wallet first');
+    throw createPasskeyError('Please connect your wallet first', 'WALLET_REQUIRED');
   }
 
-  const options        = await auth.startLogin(ownerAddress);
-  const decodedOptions = decodeServerOptions(options);
-
-  let credential;
   try {
-    credential = await navigator.credentials.get({ publicKey: decodedOptions });
+    const options = await auth.startLogin(ownerAddress);
+    const decodedOptions = decodeServerOptions(options);
+    const credential = await navigator.credentials.get({ publicKey: decodedOptions });
+    const encoded = encodeCredentialForServer(credential);
+    const result = await auth.finishLogin(ownerAddress, encoded);
+    setToken(result.token);
+    return result;
   } catch (err) {
-    if (err.name === 'NotAllowedError') throw new Error('Passkey authentication cancelled or timed out');
-    throw err;
+    throw normalizePasskeyError(err, 'authenticate');
   }
-
-  const encoded = encodeCredentialForServer(credential);
-  const result  = await auth.finishLogin(ownerAddress, encoded);
-  setToken(result.token);
-  return result;
 }
 
 export async function requestTransactionSignature(ownerAddress) {

@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS agents (
   max_trade_usdc            NUMERIC(20,6)  NOT NULL DEFAULT 200,
   oracle_max_eurc_inventory NUMERIC(20,6),
   oracle_min_eurc_reserve   NUMERIC(20,6),
+  gateway_auto_topup_enabled BOOLEAN       NOT NULL DEFAULT TRUE,
+  gateway_auto_topup_min_usdc NUMERIC(20,6) NOT NULL DEFAULT 1,
+  gateway_auto_topup_target_usdc NUMERIC(20,6) NOT NULL DEFAULT 3,
   auto_lock_minutes         INTEGER        NOT NULL DEFAULT 5,
   contract_guard_enabled    BOOLEAN        NOT NULL DEFAULT TRUE,
   totp_enabled              BOOLEAN        NOT NULL DEFAULT FALSE,
@@ -89,6 +92,9 @@ CREATE TABLE IF NOT EXISTS agents (
 
   -- Runtime state
   status                    VARCHAR(20)    NOT NULL DEFAULT 'idle',  -- idle|active|locked
+  is_active                 BOOLEAN        NOT NULL DEFAULT TRUE,
+  security_frozen_at        TIMESTAMPTZ,
+  security_freeze_reason    VARCHAR(120),
   daily_spent_usdc          NUMERIC(20,6)  NOT NULL DEFAULT 0,
   last_reset_day            DATE           NOT NULL DEFAULT CURRENT_DATE,
   market_analysis_last_run_at TIMESTAMPTZ,
@@ -103,6 +109,9 @@ CREATE TABLE IF NOT EXISTS agents (
   lending_automation_last_run_at TIMESTAMPTZ,
   lending_automation_last_status VARCHAR(30) NOT NULL DEFAULT 'idle',
   lending_automation_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb,
+  carry_automation_last_run_at TIMESTAMPTZ,
+  carry_automation_last_status VARCHAR(30) NOT NULL DEFAULT 'idle',
+  carry_automation_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb,
   cirbtc_lp_last_run_at      TIMESTAMPTZ,
   cirbtc_lp_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle',
   cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -127,6 +136,12 @@ CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id);
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_key_encrypted TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_max_eurc_inventory NUMERIC(20,6);
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_min_eurc_reserve   NUMERIC(20,6);
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS gateway_auto_topup_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS gateway_auto_topup_min_usdc NUMERIC(20,6) NOT NULL DEFAULT 1;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS gateway_auto_topup_target_usdc NUMERIC(20,6) NOT NULL DEFAULT 3;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS security_frozen_at TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS security_freeze_reason VARCHAR(120);
 
 -- ERC-8004 identity columns (added after initial schema)
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS erc8004_status        VARCHAR(20)  NOT NULL DEFAULT 'pending';
@@ -141,6 +156,7 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_enabled    BOOLEAN N
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_enabled             BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_enabled          BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS carry_automation_enabled   BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_enabled          BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_enabled         BOOLEAN NOT NULL DEFAULT FALSE;
 
@@ -163,6 +179,9 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_loop_last_decision    JSONB NOT
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_last_run_at TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_last_status VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS lending_automation_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS carry_automation_last_run_at TIMESTAMPTZ;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS carry_automation_last_status VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS carry_automation_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_run_at      TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_status      VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb;
@@ -217,6 +236,31 @@ CREATE TABLE IF NOT EXISTS transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_tx_agent   ON transactions(agent_id);
 CREATE INDEX IF NOT EXISTS idx_tx_status  ON transactions(status);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 7.5 SECURITY EVENTS (audit trail + suspicious activity freezes)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS security_events (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID REFERENCES users(id) ON DELETE SET NULL,
+  agent_id        UUID REFERENCES agents(id) ON DELETE SET NULL,
+  category        VARCHAR(60) NOT NULL,
+  event_type      VARCHAR(120) NOT NULL,
+  severity        VARCHAR(20) NOT NULL DEFAULT 'info',
+  action          VARCHAR(40) NOT NULL DEFAULT 'logged',
+  owner_address   VARCHAR(42),
+  wallet_address  VARCHAR(42),
+  request_id      VARCHAR(120),
+  ip_address      INET,
+  chain_name      VARCHAR(50),
+  metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  frozen_agent    BOOLEAN NOT NULL DEFAULT FALSE,
+  freeze_reason   VARCHAR(120),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_security_events_agent_created ON security_events(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_security_events_user_created ON security_events(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_security_events_category_created ON security_events(category, created_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 8. CHAIN EVENTS (indexer queue — processed by Bull workers)

@@ -1,5 +1,6 @@
 'use strict';
 
+const { ethers } = require('ethers');
 const oracle = require('../oracle');
 const protocols = require('../protocols');
 const agentWalletService = require('../agentWalletService');
@@ -141,6 +142,57 @@ function _summarizePoolPosition(position) {
     lpBalance: position.lpToken?.balance || '0',
     sharePct: position.sharePct,
     underlying: position.underlying || [],
+  };
+}
+
+const CURVE_LP_DECIMALS = 18;
+const CURVE_LP_ROUNDING_TOLERANCE_WEI = 1_000_000n;
+
+function _resolveRequestedCurveLpAmount(requestedLpAmount, currentLpBalance) {
+  const requestedText = String(requestedLpAmount ?? '').trim();
+  const currentText = String(currentLpBalance ?? '').trim();
+
+  if (!requestedText || !currentText) {
+    return { ok: false, reason: 'curve_liquidity_remove_amount_required' };
+  }
+
+  let requestedRaw;
+  let currentRaw;
+
+  try {
+    requestedRaw = ethers.parseUnits(requestedText, CURVE_LP_DECIMALS);
+    currentRaw = ethers.parseUnits(currentText, CURVE_LP_DECIMALS);
+  } catch {
+    return { ok: false, reason: 'curve_liquidity_remove_amount_required' };
+  }
+
+  if (requestedRaw <= 0n || currentRaw <= 0n) {
+    return { ok: false, reason: 'curve_liquidity_remove_amount_required' };
+  }
+
+  if (requestedRaw > currentRaw) {
+    const overshootRaw = requestedRaw - currentRaw;
+    if (overshootRaw > CURVE_LP_ROUNDING_TOLERANCE_WEI) {
+      return {
+        ok: false,
+        reason: 'insufficient_lp_position',
+        error: `available_lp_balance:${currentText}`,
+      };
+    }
+
+    return {
+      ok: true,
+      lpAmount: currentText,
+      lpAmountRaw: currentRaw,
+      clampedToCurrentBalance: true,
+    };
+  }
+
+  return {
+    ok: true,
+    lpAmount: requestedText,
+    lpAmountRaw: requestedRaw,
+    clampedToCurrentBalance: false,
   };
 }
 
@@ -346,7 +398,7 @@ async function executeCurveLiquidityAddBalancedTask({ agent, params = {}, dryRun
 
 async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = false }) {
   const tokenOut = params.tokenOut || 'USDC';
-  const lpAmount = String(params.lpAmount ?? '1');
+  const requestedLpAmount = String(params.lpAmount ?? '1');
   const curvePool = _resolveStableCurvePoolForToken(tokenOut);
   const poolCoin = _resolveCurveCoin(curvePool, tokenOut);
 
@@ -357,17 +409,15 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
   const positionGuard = await _readCurvePositionGuard(agent, curvePool);
   if (!positionGuard.ok) return positionGuard;
 
-  const currentLpBalance = Number(positionGuard.position?.lpToken?.balance || 0);
-  if (!positionGuard.position || currentLpBalance <= 0) {
+  const currentLpBalance = positionGuard.position?.lpToken?.balance || '0';
+  if (!positionGuard.position || !(Number(currentLpBalance) > 0)) {
     return { ok: false, reason: 'lp_position_not_found' };
   }
-  if (Number(lpAmount) > currentLpBalance) {
-    return {
-      ok: false,
-      reason: 'insufficient_lp_position',
-      error: `available_lp_balance:${positionGuard.position.lpToken.balance}`,
-    };
-  }
+
+  const resolvedLpAmount = _resolveRequestedCurveLpAmount(requestedLpAmount, currentLpBalance);
+  if (!resolvedLpAmount.ok) return resolvedLpAmount;
+
+  const lpAmount = resolvedLpAmount.lpAmount;
 
   if (dryRun) {
     return {
@@ -406,10 +456,10 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
 }
 
 async function executeCurveLiquidityRemoveBalancedTask({ agent, params = {}, dryRun = false }) {
-  const lpAmount = String(params.lpAmount ?? '0');
+  const requestedLpAmount = String(params.lpAmount ?? '0');
   const curvePool = _resolveStableCurvePoolForToken('USDC');
 
-  if (!(Number(lpAmount) > 0)) {
+  if (!(Number(requestedLpAmount) > 0)) {
     return { ok: false, reason: 'curve_liquidity_remove_amount_required' };
   }
 
@@ -420,17 +470,15 @@ async function executeCurveLiquidityRemoveBalancedTask({ agent, params = {}, dry
   const positionGuard = await _readCurvePositionGuard(agent, curvePool);
   if (!positionGuard.ok) return positionGuard;
 
-  const currentLpBalance = Number(positionGuard.position?.lpToken?.balance || 0);
-  if (!positionGuard.position || currentLpBalance <= 0) {
+  const currentLpBalance = positionGuard.position?.lpToken?.balance || '0';
+  if (!positionGuard.position || !(Number(currentLpBalance) > 0)) {
     return { ok: false, reason: 'lp_position_not_found' };
   }
-  if (Number(lpAmount) > currentLpBalance) {
-    return {
-      ok: false,
-      reason: 'insufficient_lp_position',
-      error: `available_lp_balance:${positionGuard.position.lpToken.balance}`,
-    };
-  }
+
+  const resolvedLpAmount = _resolveRequestedCurveLpAmount(requestedLpAmount, currentLpBalance);
+  if (!resolvedLpAmount.ok) return resolvedLpAmount;
+
+  const lpAmount = resolvedLpAmount.lpAmount;
 
   if (dryRun) {
     return {

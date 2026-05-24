@@ -75,6 +75,9 @@ const updateSchema = z.object({
   defiWalletReserveUsdc: z.number().min(0).max(100_000).optional(),
   oracleMaxEurcInventory: z.number().positive().max(100_000).nullable().optional(),
   oracleMinEurcReserve: z.number().min(0).max(100_000).nullable().optional(),
+  gatewayAutoTopupEnabled: z.boolean().optional(),
+  gatewayAutoTopupMinUsdc: z.number().positive().max(100_000).optional(),
+  gatewayAutoTopupTargetUsdc: z.number().positive().max(100_000).optional(),
   autoLockMinutes:   z.number().int().min(1).max(60).optional(),
   contractGuard:     z.boolean().optional(),
   isSmartMode:       z.boolean().optional(),
@@ -88,6 +91,7 @@ const updateSchema = z.object({
   oracleEnabled:         z.boolean().optional(),
   defiLoopEnabled:       z.boolean().optional(),
   lendingAutomationEnabled: z.boolean().optional(),
+  carryAutomationEnabled: z.boolean().optional(),
   cirbtcLpEnabled:       z.boolean().optional(),
   reputationEnabled:     z.boolean().optional(),
 }).strict();
@@ -123,7 +127,12 @@ router.put('/:id', async (req, res, next) => {
         jobId: `oracle-manual-${agent.id}-${Date.now()}`,
       }));
     }
-    if (data.defiLoopEnabled === true || data.lendingAutomationEnabled === true || data.cirbtcLpEnabled === true) {
+    if (
+      data.defiLoopEnabled === true
+      || data.lendingAutomationEnabled === true
+      || data.carryAutomationEnabled === true
+      || data.cirbtcLpEnabled === true
+    ) {
       kickoffJobs.push(agentQueue.add('DEFI_LOOP', {
         agentId: agent.id,
       }, {

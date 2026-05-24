@@ -20,6 +20,7 @@ const { decrypt } = require('./cryptoService');
 const protocols = require('./protocols');
 const { resolveDirectSwapFallbackPool } = require('./oracle/pools');
 const gatewayBuyerService = require('./agenticEconomy/gatewayBuyer');
+const { runProtectedWrite, sendProtectedContractTx } = require('./txSecurityService');
 const { createEthersAdapterFromPrivateKey } = require('@circle-fin/adapter-ethers-v6');
 const { SwapKit, SwapChain, getChainByEnum } = require('@circle-fin/swap-kit');
 
@@ -118,6 +119,33 @@ const SWAP_KIT = new SwapKit();
 const SWAP_QUOTE_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
 const DEFAULT_CIRBTC_MAX_USDC_IN = 10;
 const DEFAULT_CIRBTC_MAX_EURC_IN = 8;
+const EXTERNAL_UNISWAP_V2_ROUTER_ABI = [
+  'function getAmountsOut(uint amountIn, address[] calldata path) view returns (uint[] memory amounts)',
+];
+const EXTERNAL_EXIT_VENUES = Object.freeze({
+  'Sepolia': {
+    venue: 'uniswap_v2',
+    venueLabel: 'Uniswap V2 (Sepolia)',
+    routerAddress: process.env.SEPOLIA_UNISWAP_V2_ROUTER || '0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008',
+    intermediaryToken: 'WETH',
+  },
+});
+const EXTERNAL_CHAIN_TOKEN_CONFIG = Object.freeze({
+  'Sepolia': {
+    USDC: {
+      address: process.env.USDC_ADDRESS_SEPOLIA || CCTP_CHAINS['Sepolia'].usdcAddress,
+      decimals: 6,
+    },
+    EURC: {
+      address: process.env.EURC_ADDRESS_SEPOLIA || null,
+      decimals: 6,
+    },
+    WETH: {
+      address: process.env.WETH_ADDRESS_SEPOLIA || '0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9',
+      decimals: 18,
+    },
+  },
+});
 
 // ── ABI'lar ───────────────────────────────────────────────────────────────────
 const ERC20_ABI = [
@@ -165,6 +193,13 @@ function getAgentPrivateKey(agent) {
 
 function getAgentSigner(agent, chainName = 'Arc Testnet') {
   return new ethers.Wallet(getAgentPrivateKey(agent), getProvider(chainName));
+}
+
+function getAgentIdentity(agent, fallbackWalletAddress = null) {
+  return {
+    agentId: agent?.id || null,
+    walletAddress: agent?.wallet_address || agent?.walletAddress || fallbackWalletAddress || null,
+  };
 }
 
 function getSwapKitKey() {
@@ -270,6 +305,135 @@ function getSwapRouteStrategy({ fromToken, toToken }) {
     routeStrategy: isSwapConfigured() ? 'swap_kit_only' : 'route_unavailable',
     routeReason: 'This pair does not have a working swap route on this deployment right now.',
     fallbackAvailable: false,
+  };
+}
+
+function normalizeTokenSymbol(symbol) {
+  return String(symbol || '').trim().toUpperCase();
+}
+
+function getExternalChainToken(chainName, tokenSymbol) {
+  const chainTokens = EXTERNAL_CHAIN_TOKEN_CONFIG[chainName] || null;
+  if (!chainTokens) {
+    return null;
+  }
+
+  return chainTokens[normalizeTokenSymbol(tokenSymbol)] || null;
+}
+
+function buildExternalRouteCandidates(chainName, fromToken, toToken) {
+  const venue = EXTERNAL_EXIT_VENUES[chainName] || null;
+  const directPath = [fromToken, toToken];
+  const candidates = [directPath];
+
+  if (venue?.intermediaryToken) {
+    const bridgeToken = normalizeTokenSymbol(venue.intermediaryToken);
+    if (bridgeToken !== fromToken && bridgeToken !== toToken) {
+      candidates.push([fromToken, bridgeToken, toToken]);
+    }
+  }
+
+  return candidates;
+}
+
+async function getExternalSwapQuoteResult({ chainName = 'Sepolia', fromToken, toToken, amountIn }) {
+  const normalizedChainName = String(chainName || 'Sepolia').trim() || 'Sepolia';
+  const normalizedFromToken = normalizeTokenSymbol(fromToken);
+  const normalizedToToken = normalizeTokenSymbol(toToken);
+  const venue = EXTERNAL_EXIT_VENUES[normalizedChainName] || null;
+  const tokenIn = getExternalChainToken(normalizedChainName, normalizedFromToken);
+  const tokenOut = getExternalChainToken(normalizedChainName, normalizedToToken);
+  const numericAmountIn = Number(amountIn);
+
+  if (!venue || !venue.routerAddress || !tokenIn?.address || !tokenOut?.address) {
+    return {
+      amountOut: null,
+      quoteError: 'External exit venue is not configured on this deployment.',
+      executionRail: null,
+      venue: venue?.venue || null,
+      venueLabel: venue?.venueLabel || null,
+      chainName: normalizedChainName,
+      routeCandidates: [],
+    };
+  }
+
+  if (!Number.isFinite(numericAmountIn) || numericAmountIn <= 0) {
+    return {
+      amountOut: null,
+      quoteError: 'External exit quote requires a positive amount.',
+      executionRail: null,
+      venue: venue.venue,
+      venueLabel: venue.venueLabel,
+      chainName: normalizedChainName,
+      routeCandidates: [],
+    };
+  }
+
+  if (normalizedFromToken === normalizedToToken) {
+    return {
+      amountOut: String(numericAmountIn),
+      quoteError: null,
+      executionRail: 'external_identity_quote',
+      venue: venue.venue,
+      venueLabel: venue.venueLabel,
+      chainName: normalizedChainName,
+      routeCandidates: [[normalizedFromToken]],
+    };
+  }
+
+  const amountInRaw = ethers.parseUnits(String(numericAmountIn), tokenIn.decimals || 6);
+  const provider = getProvider(normalizedChainName);
+  const router = new ethers.Contract(venue.routerAddress, EXTERNAL_UNISWAP_V2_ROUTER_ABI, provider);
+  const routeCandidates = buildExternalRouteCandidates(normalizedChainName, normalizedFromToken, normalizedToToken);
+  let bestQuote = null;
+
+  for (const candidate of routeCandidates) {
+    const addresses = candidate.map(symbol => getExternalChainToken(normalizedChainName, symbol)?.address).filter(Boolean);
+    if (addresses.length !== candidate.length) {
+      continue;
+    }
+
+    try {
+      const amounts = await router.getAmountsOut(amountInRaw, addresses);
+      const outputRaw = amounts?.[amounts.length - 1];
+      if (!outputRaw || outputRaw <= 0n) {
+        continue;
+      }
+
+      if (!bestQuote || outputRaw > bestQuote.outputRaw) {
+        bestQuote = {
+          path: candidate,
+          outputRaw,
+        };
+      }
+    } catch (error) {
+      console.warn('[AGENT-EXTERNAL-SWAP-QUOTE]', normalizedChainName, candidate.join('->'), error.message);
+    }
+  }
+
+  if (!bestQuote) {
+    return {
+      amountOut: null,
+      quoteError: 'No live external exit quote is available for this pair right now.',
+      executionRail: null,
+      venue: venue.venue,
+      venueLabel: venue.venueLabel,
+      chainName: normalizedChainName,
+      routerAddress: venue.routerAddress,
+      routeCandidates,
+    };
+  }
+
+  return {
+    amountOut: ethers.formatUnits(bestQuote.outputRaw, tokenOut.decimals || 6),
+    quoteError: null,
+    executionRail: 'external_uniswap_v2_quote',
+    venue: venue.venue,
+    venueLabel: venue.venueLabel,
+    chainName: normalizedChainName,
+    routerAddress: venue.routerAddress,
+    routeCandidates,
+    path: bestQuote.path,
   };
 }
 
@@ -505,18 +669,19 @@ async function bridgeNativeGasTopUp({ agent, toChain, recipient, amountEth, amou
 
   if (route.kind === 'op-stack') {
     const portal = new ethers.Contract(route.bridgeAddress, OP_PORTAL_ABI, signer);
-    const tx = await portal.depositTransaction(
-      toAddress,
-      value,
-      BigInt(route.minGasLimit),
-      false,
-      '0x',
-      {
+    const { receipt } = await sendProtectedContractTx({
+      contract: portal,
+      methodName: 'depositTransaction',
+      args: [toAddress, value, BigInt(route.minGasLimit), false, '0x'],
+      txOptions: {
         value,
-        ...(await buildTxOverrides(route.fromChain, 250_000n)),
+        ...(await buildTxOverrides(route.fromChain)),
       },
-    );
-    const receipt = await tx.wait(1);
+      chainName: route.fromChain,
+      ...getAgentIdentity(agent, signer.address),
+      operation: 'native_gas_topup_op_stack',
+      replayFingerprint: [toChain, toAddress, value.toString(), route.bridgeAddress],
+    });
     return {
       topUpTxHash: receipt.hash,
       fromChain: route.fromChain,
@@ -530,11 +695,19 @@ async function bridgeNativeGasTopUp({ agent, toChain, recipient, amountEth, amou
 
   if (route.kind === 'arbitrum') {
     const inbox = new ethers.Contract(route.bridgeAddress, ARBITRUM_INBOX_ABI, signer);
-    const tx = await inbox.depositEth({
-      value,
-      ...(await buildTxOverrides(route.fromChain, 200_000n)),
+    const { receipt } = await sendProtectedContractTx({
+      contract: inbox,
+      methodName: 'depositEth',
+      args: [],
+      txOptions: {
+        value,
+        ...(await buildTxOverrides(route.fromChain)),
+      },
+      chainName: route.fromChain,
+      ...getAgentIdentity(agent, signer.address),
+      operation: 'native_gas_topup_arbitrum',
+      replayFingerprint: [toChain, toAddress, value.toString(), route.bridgeAddress],
     });
-    const receipt = await tx.wait(1);
     return {
       topUpTxHash: receipt.hash,
       fromChain: route.fromChain,
@@ -582,8 +755,16 @@ async function cctpApprove({ agent, fromChain, amountUsdc }) {
   }
 
   console.log(`[CCTP-APPROVE] ${amountUsdc} USDC → TokenMessenger (${fromChain})`);
-  const tx      = await usdc.approve(cfg.tokenMessenger, ethers.MaxUint256, await buildTxOverrides(fromChain, 80_000n));
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: usdc,
+    methodName: 'approve',
+    args: [cfg.tokenMessenger, ethers.MaxUint256],
+    txOptions: await buildTxOverrides(fromChain),
+    chainName: fromChain,
+    ...getAgentIdentity(agent, signer.address),
+    operation: 'cctp_approve',
+    replayFingerprint: [fromChain, cfg.tokenMessenger, amount.toString()],
+  });
   console.log(`[CCTP-APPROVE] ✓ ${receipt.hash}`);
   return { approveTxHash: receipt.hash };
 }
@@ -607,17 +788,24 @@ async function cctpBurn({ agent, fromChain, toChain, amountUsdc }) {
 
   console.log(`[CCTP-BURN] ${amountUsdc} USDC: ${fromChain}(domain ${srcCfg.domain}) → ${toChain}(domain ${dstCfg.domain})`);
 
-  const tx = await messenger.depositForBurn(
-    amount,
-    dstCfg.domain,
-    mintRecipient,
-    srcCfg.usdcAddress,
-    ethers.ZeroHash,   // destinationCaller: any caller can relay
-    0n,               // maxFee: no fee on testnet
-    1000,             // minFinalityThreshold: standard finality
-    await buildTxOverrides(fromChain, 300_000n),
-  );
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: messenger,
+    methodName: 'depositForBurn',
+    args: [
+      amount,
+      dstCfg.domain,
+      mintRecipient,
+      srcCfg.usdcAddress,
+      ethers.ZeroHash,
+      0n,
+      1000,
+    ],
+    txOptions: await buildTxOverrides(fromChain),
+    chainName: fromChain,
+    ...getAgentIdentity(agent, signer.address),
+    operation: 'cctp_burn',
+    replayFingerprint: [fromChain, toChain, amount.toString(), signer.address],
+  });
 
   // MessageSent event'inden message bytes'ını çıkar
   const transmitter = new ethers.Contract(srcCfg.msgTransmitter, MSG_TRANSMITTER_ABI, getProvider(fromChain));
@@ -697,8 +885,16 @@ async function cctpMint({ agent, toChain, message, attestation }) {
   const gasLimit = estimatedGas > 0n ? applyGasMargin(estimatedGas, 12500n) : CCTP_MINT_GAS_LIMIT;
 
   console.log(`[CCTP-MINT] receiveMessage on ${toChain}`);
-  const tx      = await transmitter.receiveMessage(message, attestation, await buildTxOverrides(toChain, gasLimit));
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: transmitter,
+    methodName: 'receiveMessage',
+    args: [message, attestation],
+    txOptions: await buildTxOverrides(toChain, gasLimit),
+    chainName: toChain,
+    ...getAgentIdentity(agent, signer.address),
+    operation: 'cctp_mint',
+    replayFingerprint: [toChain, ethers.keccak256(message)],
+  });
   console.log(`[CCTP-MINT] ✓ mintTxHash=${receipt.hash}`);
   return { mintTxHash: receipt.hash };
 }
@@ -820,13 +1016,18 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 
   if (token === 'USDC') {
     console.log(`[AGENT-NANO] ${agent.wallet_address} → ${toAddress}: ${amountUsdc} ${token} via Gateway`);
-    const result = await gatewayBuyerService.executeGatewayTransfer({
+    const result = await runProtectedWrite({
+      chainName: 'Arc Testnet',
+      ...getAgentIdentity(agent),
+      operation: 'gateway_nano_payment',
+      replayFingerprint: [toAddress, String(amountUsdc), token],
+    }, () => gatewayBuyerService.executeGatewayTransfer({
       agent,
       amountUsdc,
       recipient: toAddress,
       fromChain: 'Arc Testnet',
       toChain: 'Arc Testnet',
-    });
+    }));
     console.log(`[AGENT-NANO] ✓ ${result.transferResult?.mintTxHash || 'gateway-transfer-confirmed'}`);
     return result.transferResult?.mintTxHash || null;
   }
@@ -836,8 +1037,16 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
   const contract  = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
   const amount    = ethers.parseUnits(String(amountUsdc), 6);
   console.log(`[AGENT-NANO] ${agent.wallet_address} → ${toAddress}: ${amountUsdc} ${token}`);
-  const tx      = await contract.transfer(toAddress, amount, { gasLimit: 100_000 });
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract,
+    methodName: 'transfer',
+    args: [toAddress, amount],
+    txOptions: await buildTxOverrides('Arc Testnet'),
+    chainName: 'Arc Testnet',
+    ...getAgentIdentity(agent, signer.address),
+    operation: 'agent_nano_transfer',
+    replayFingerprint: [toAddress, amount.toString(), token],
+  });
   console.log(`[AGENT-NANO] ✓ ${receipt.hash}`);
   return receipt.hash;
 }
@@ -912,7 +1121,12 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
     slippagePct,
   });
 
-  const result = await SWAP_KIT.swap({
+  const result = await runProtectedWrite({
+    chainName: 'Arc Testnet',
+    ...getAgentIdentity(agent),
+    operation: 'swap_kit_swap',
+    replayFingerprint: [fromToken, toToken, String(amountIn), String(slippagePct)],
+  }, () => SWAP_KIT.swap({
     from: { adapter, chain: ARC_SWAP_CHAIN },
     tokenIn: fromToken,
     tokenOut: toToken,
@@ -922,7 +1136,7 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
       slippageBps: toSlippageBps(slippagePct),
       stopLimit: quote.stopLimit.amount,
     },
-  });
+  }));
 
   const amountOut = result.amountOut || quote.estimatedOutput.amount;
   console.log(`[AGENT-SWAP] ✓ ${result.txHash} | out: ${amountOut} ${toToken}`);
@@ -999,8 +1213,16 @@ async function agentSend({ agent, toAddress, amountUsdc, token = 'USDC' }) {
   const contract  = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
   const amount    = ethers.parseUnits(String(amountUsdc), 6);
   console.log(`[AGENT-SEND] ${agent.wallet_address} → ${toAddress}: ${amountUsdc} ${token}`);
-  const tx      = await contract.transfer(toAddress, amount, { gasLimit: 100_000, maxFeePerGas: AGENT_MAX_GAS });
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract,
+    methodName: 'transfer',
+    args: [toAddress, amount],
+    txOptions: await buildTxOverrides('Arc Testnet'),
+    chainName: 'Arc Testnet',
+    ...getAgentIdentity(agent, signer.address),
+    operation: 'agent_send',
+    replayFingerprint: [toAddress, amount.toString(), token],
+  });
   console.log(`[AGENT-SEND] ✓ ${receipt.hash}`);
   return receipt.hash;
 }
@@ -1021,6 +1243,7 @@ module.exports = {
   agentSend,
   getSwapQuote,
   getSwapQuoteResult,
+  getExternalSwapQuoteResult,
   getSwapRouteStrategy,
   isSwapConfigured,
   getAgentSigner,

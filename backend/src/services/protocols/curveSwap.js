@@ -11,6 +11,7 @@
  * All amounts are in the token's native decimals (USDC/EURC = 6).
  */
 const { ethers }  = require('ethers');
+const { sendProtectedContractTx } = require('../txSecurityService');
 
 const CURVE_EXCHANGE_ABI = [
   // Read: how many coins[j] do I get for dx coins[i]?
@@ -34,6 +35,8 @@ const ERC20_APPROVE_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
 ];
 
+const REUSABLE_APPROVAL_AMOUNT = ethers.MaxUint256;
+
 function getArcRpcUrl() {
   return process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
 }
@@ -48,13 +51,56 @@ function buildCurveDepositAmounts(indexIn, amountRaw) {
     : [0n, amountRaw];
 }
 
-async function approveIfNeeded(tokenAddress, signer, spender, amountRaw) {
+async function approveIfNeeded(tokenAddress, signer, spender, amountRaw, txSecurity = {}) {
   const token = new ethers.Contract(tokenAddress, ERC20_APPROVE_ABI, signer);
   const allowance = await token.allowance(signer.address, spender);
-  if (allowance < amountRaw) {
-    const approveTx = await token.approve(spender, amountRaw);
-    await approveTx.wait(1);
+  if (allowance >= amountRaw) {
+    return token;
   }
+
+  try {
+    await sendProtectedContractTx({
+      contract: token,
+      methodName: 'approve',
+      args: [spender, REUSABLE_APPROVAL_AMOUNT],
+      chainName: 'Arc Testnet',
+      walletAddress: txSecurity.walletAddress || signer.address,
+      agentId: txSecurity.agentId || null,
+      operation: txSecurity.operation || 'curve_token_approve',
+      replayFingerprint: txSecurity.replayFingerprint || [tokenAddress, spender, amountRaw.toString()],
+    });
+  } catch (error) {
+    if (allowance > 0n) {
+      await sendProtectedContractTx({
+        contract: token,
+        methodName: 'approve',
+        args: [spender, 0n],
+        chainName: 'Arc Testnet',
+        walletAddress: txSecurity.walletAddress || signer.address,
+        agentId: txSecurity.agentId || null,
+        operation: `${txSecurity.operation || 'curve_token_approve'}_reset`,
+        replayFingerprint: ['reset', tokenAddress, spender],
+      });
+      await sendProtectedContractTx({
+        contract: token,
+        methodName: 'approve',
+        args: [spender, REUSABLE_APPROVAL_AMOUNT],
+        chainName: 'Arc Testnet',
+        walletAddress: txSecurity.walletAddress || signer.address,
+        agentId: txSecurity.agentId || null,
+        operation: txSecurity.operation || 'curve_token_approve',
+        replayFingerprint: txSecurity.replayFingerprint || [tokenAddress, spender, amountRaw.toString()],
+      });
+    } else {
+      throw error;
+    }
+  }
+
+  const refreshedAllowance = await token.allowance(signer.address, spender);
+  if (refreshedAllowance < amountRaw) {
+    throw new Error(`Curve approval remained below the required amount for ${tokenAddress}`);
+  }
+
   return token;
 }
 
@@ -122,16 +168,21 @@ async function executeCurveSwap({
   const minDy    = applySlippageFloor(outRaw, slippagePct);
 
   // Approve pool to spend tokenIn if allowance is insufficient
-  const token      = new ethers.Contract(tokenInAddress, ERC20_APPROVE_ABI, signer);
-  const allowance  = await token.allowance(signer.address, poolAddress);
-  if (allowance < amountRaw) {
-    const approveTx = await token.approve(poolAddress, amountRaw);
-    await approveTx.wait(1);
-  }
+  await approveIfNeeded(tokenInAddress, signer, poolAddress, amountRaw, {
+    operation: 'curve_swap_approve',
+    replayFingerprint: [poolAddress, tokenInAddress, amountRaw.toString()],
+  });
 
   // Execute swap
-  const tx      = await pool.exchange(indexIn, indexOut, amountRaw, minDy);
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: pool,
+    methodName: 'exchange',
+    args: [indexIn, indexOut, amountRaw, minDy],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'curve_swap',
+    replayFingerprint: [poolAddress, indexIn, indexOut, amountRaw.toString(), minDy.toString()],
+  });
 
   return {
     txHash:    receipt.hash,
@@ -162,10 +213,20 @@ async function executeCurveAddLiquidity({
   const lpOutRaw = await pool.calc_token_amount(depositAmounts, true).catch(() => null);
   const minMintAmount = lpOutRaw ? applySlippageFloor(lpOutRaw, slippagePct) : 0n;
 
-  await approveIfNeeded(tokenInAddress, signer, poolAddress, amountRaw);
+  await approveIfNeeded(tokenInAddress, signer, poolAddress, amountRaw, {
+    operation: 'curve_add_liquidity_approve',
+    replayFingerprint: [poolAddress, tokenInAddress, amountRaw.toString()],
+  });
 
-  const tx = await pool.add_liquidity(depositAmounts, minMintAmount);
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: pool,
+    methodName: 'add_liquidity',
+    args: [depositAmounts, minMintAmount],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'curve_add_liquidity',
+    replayFingerprint: [poolAddress, amountRaw.toString(), minMintAmount.toString(), indexIn],
+  });
 
   return {
     txHash: receipt.hash,
@@ -199,11 +260,24 @@ async function executeCurveAddLiquidityBalanced({
   const lpOutRaw = await pool.calc_token_amount(depositAmounts, true).catch(() => null);
   const minMintAmount = lpOutRaw ? applySlippageFloor(lpOutRaw, slippagePct) : 0n;
 
-  await approveIfNeeded(token0Address, signer, poolAddress, amount0Raw);
-  await approveIfNeeded(token1Address, signer, poolAddress, amount1Raw);
+  await approveIfNeeded(token0Address, signer, poolAddress, amount0Raw, {
+    operation: 'curve_add_liquidity_balanced_approve_token0',
+    replayFingerprint: [poolAddress, token0Address, amount0Raw.toString()],
+  });
+  await approveIfNeeded(token1Address, signer, poolAddress, amount1Raw, {
+    operation: 'curve_add_liquidity_balanced_approve_token1',
+    replayFingerprint: [poolAddress, token1Address, amount1Raw.toString()],
+  });
 
-  const tx = await pool.add_liquidity(depositAmounts, minMintAmount);
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: pool,
+    methodName: 'add_liquidity',
+    args: [depositAmounts, minMintAmount],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'curve_add_liquidity_balanced',
+    replayFingerprint: [poolAddress, amount0Raw.toString(), amount1Raw.toString(), minMintAmount.toString()],
+  });
 
   return {
     txHash: receipt.hash,
@@ -234,8 +308,15 @@ async function executeCurveRemoveLiquidityOneCoin({
   const amountOutRaw = await pool.calc_withdraw_one_coin(lpAmountRaw, indexOut).catch(() => null);
   const minAmountOut = amountOutRaw ? applySlippageFloor(amountOutRaw, slippagePct) : 0n;
 
-  const tx = await pool.remove_liquidity_one_coin(lpAmountRaw, indexOut, minAmountOut);
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: pool,
+    methodName: 'remove_liquidity_one_coin',
+    args: [lpAmountRaw, indexOut, minAmountOut],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'curve_remove_liquidity_one_coin',
+    replayFingerprint: [poolAddress, lpAmountRaw.toString(), indexOut, minAmountOut.toString()],
+  });
 
   return {
     txHash: receipt.hash,
@@ -282,8 +363,15 @@ async function executeCurveRemoveLiquidity({
     applySlippageFloor(expectedAmount1Raw, slippagePct),
   ];
 
-  const tx = await pool.remove_liquidity(lpAmountRaw, minAmounts);
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: pool,
+    methodName: 'remove_liquidity',
+    args: [lpAmountRaw, minAmounts],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'curve_remove_liquidity',
+    replayFingerprint: [poolAddress, lpAmountRaw.toString(), minAmounts.map((amount) => amount.toString())],
+  });
 
   const [token0BalanceAfterRaw, token1BalanceAfterRaw] = await Promise.all([
     token0.balanceOf(signer.address),

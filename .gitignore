@@ -6,6 +6,7 @@ AGENTS.md
 .env.railway
 frontend/.env
 *.local.md
+final.md
 dist/
 cache/
 artifacts/build-info/

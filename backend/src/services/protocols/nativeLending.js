@@ -1,6 +1,7 @@
 'use strict';
 
 const { ethers } = require('ethers');
+const { sendProtectedContractTx } = require('../txSecurityService');
 
 const ERC20_APPROVE_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
@@ -35,6 +36,18 @@ const SUPPORTED_LENDING_ASSETS = {
     address: process.env.EURC_ADDRESS_ARC || process.env.EURC_ADDRESS || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
     decimals: 6,
   },
+};
+
+const RESERVE_SNAPSHOT_CACHE_TTL_MS = (() => {
+  const numeric = Number(process.env.ARC_LENDING_RESERVE_CACHE_TTL_MS || '5000');
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : 5000;
+})();
+
+let reserveSnapshotCache = {
+  contractAddress: null,
+  expiresAt: 0,
+  value: null,
+  inflight: null,
 };
 
 function getArcRpcUrl() {
@@ -75,16 +88,43 @@ function formatUnits(value, decimals) {
   }
 }
 
-async function approveIfNeeded(tokenAddress, signer, spender, amountRaw) {
+async function approveIfNeeded(tokenAddress, signer, spender, amountRaw, txSecurity = {}) {
   const token = new ethers.Contract(tokenAddress, ERC20_APPROVE_ABI, signer);
   const allowance = await token.allowance(signer.address, spender);
   if (allowance < amountRaw) {
-    const approveTx = await token.approve(spender, amountRaw);
-    await approveTx.wait(1);
+    await sendProtectedContractTx({
+      contract: token,
+      methodName: 'approve',
+      args: [spender, amountRaw],
+      chainName: 'Arc Testnet',
+      walletAddress: txSecurity.walletAddress || signer.address,
+      agentId: txSecurity.agentId || null,
+      operation: txSecurity.operation || 'native_lending_approve',
+      replayFingerprint: txSecurity.replayFingerprint || [tokenAddress, spender, amountRaw.toString()],
+    });
   }
 }
 
 async function readConfiguredReserveSnapshots(contract) {
+  const contractAddress = getArcLendingPoolAddress();
+  const now = Date.now();
+
+  if (
+    reserveSnapshotCache.contractAddress === contractAddress
+    && reserveSnapshotCache.value
+    && reserveSnapshotCache.expiresAt > now
+  ) {
+    return reserveSnapshotCache.value;
+  }
+
+  if (
+    reserveSnapshotCache.contractAddress === contractAddress
+    && reserveSnapshotCache.inflight
+  ) {
+    return reserveSnapshotCache.inflight;
+  }
+
+  const loadPromise = (async () => {
   const count = Number(await contract.supportedAssetCount());
   const reserves = [];
 
@@ -117,6 +157,33 @@ async function readConfiguredReserveSnapshots(contract) {
   }
 
   return reserves;
+  })();
+
+  reserveSnapshotCache = {
+    contractAddress,
+    expiresAt: reserveSnapshotCache.expiresAt,
+    value: reserveSnapshotCache.value,
+    inflight: loadPromise,
+  };
+
+  try {
+    const reserves = await loadPromise;
+    reserveSnapshotCache = {
+      contractAddress,
+      expiresAt: Date.now() + RESERVE_SNAPSHOT_CACHE_TTL_MS,
+      value: reserves,
+      inflight: null,
+    };
+    return reserves;
+  } catch (error) {
+    reserveSnapshotCache = {
+      contractAddress,
+      expiresAt: 0,
+      value: null,
+      inflight: null,
+    };
+    throw error;
+  }
 }
 
 async function getNativeLendingOverview() {
@@ -209,9 +276,19 @@ async function executeNativeLendingSupply({ assetAddress, amount, agentPrivateKe
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(decimals || asset.decimals));
-  await approveIfNeeded(asset.address, signer, await contract.getAddress(), amountRaw);
-  const tx = await contract.supply(asset.address, amountRaw, onBehalfOf || signer.address);
-  const receipt = await tx.wait(1);
+  await approveIfNeeded(asset.address, signer, await contract.getAddress(), amountRaw, {
+    operation: 'native_lending_supply_approve',
+    replayFingerprint: [asset.address, amountRaw.toString()],
+  });
+  const { receipt } = await sendProtectedContractTx({
+    contract,
+    methodName: 'supply',
+    args: [asset.address, amountRaw, onBehalfOf || signer.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'native_lending_supply',
+    replayFingerprint: [asset.address, amountRaw.toString(), onBehalfOf || signer.address],
+  });
   return { txHash: receipt.hash };
 }
 
@@ -224,8 +301,15 @@ async function executeNativeLendingWithdraw({ assetAddress, amount, agentPrivate
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(decimals || asset.decimals));
-  const tx = await contract.withdraw(asset.address, amountRaw, to || signer.address);
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract,
+    methodName: 'withdraw',
+    args: [asset.address, amountRaw, to || signer.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'native_lending_withdraw',
+    replayFingerprint: [asset.address, amountRaw.toString(), to || signer.address],
+  });
   return { txHash: receipt.hash, amountWithdrawn: String(amount) };
 }
 
@@ -238,8 +322,15 @@ async function executeNativeLendingBorrow({ assetAddress, amount, agentPrivateKe
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(decimals || asset.decimals));
-  const tx = await contract.borrow(asset.address, amountRaw, to || signer.address);
-  const receipt = await tx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract,
+    methodName: 'borrow',
+    args: [asset.address, amountRaw, to || signer.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'native_lending_borrow',
+    replayFingerprint: [asset.address, amountRaw.toString(), to || signer.address],
+  });
   return { txHash: receipt.hash };
 }
 
@@ -252,9 +343,19 @@ async function executeNativeLendingRepay({ assetAddress, amount, agentPrivateKey
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(decimals || asset.decimals));
-  await approveIfNeeded(asset.address, signer, await contract.getAddress(), amountRaw);
-  const tx = await contract.repay(asset.address, amountRaw, onBehalfOf || signer.address);
-  const receipt = await tx.wait(1);
+  await approveIfNeeded(asset.address, signer, await contract.getAddress(), amountRaw, {
+    operation: 'native_lending_repay_approve',
+    replayFingerprint: [asset.address, amountRaw.toString(), onBehalfOf || signer.address],
+  });
+  const { receipt } = await sendProtectedContractTx({
+    contract,
+    methodName: 'repay',
+    args: [asset.address, amountRaw, onBehalfOf || signer.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'native_lending_repay',
+    replayFingerprint: [asset.address, amountRaw.toString(), onBehalfOf || signer.address],
+  });
   return { txHash: receipt.hash, amountRepaid: String(amount) };
 }
 
@@ -270,9 +371,19 @@ async function executeNativeLendingLiquidation({ borrower, debtAssetAddress, col
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const contract = getNativeLendingContract(signer);
   const amountRaw = ethers.parseUnits(String(amount), Number(debtAssetDecimals || debtAsset.decimals));
-  await approveIfNeeded(debtAsset.address, signer, await contract.getAddress(), amountRaw);
-  const tx = await contract.liquidate(borrower, debtAsset.address, amountRaw, collateralAsset.address);
-  const receipt = await tx.wait(1);
+  await approveIfNeeded(debtAsset.address, signer, await contract.getAddress(), amountRaw, {
+    operation: 'native_lending_liquidation_approve',
+    replayFingerprint: [debtAsset.address, amountRaw.toString(), borrower],
+  });
+  const { receipt } = await sendProtectedContractTx({
+    contract,
+    methodName: 'liquidate',
+    args: [borrower, debtAsset.address, amountRaw, collateralAsset.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'native_lending_liquidation',
+    replayFingerprint: [borrower, debtAsset.address, collateralAsset.address, amountRaw.toString()],
+  });
   return {
     txHash: receipt.hash,
     amountLiquidated: String(amount),

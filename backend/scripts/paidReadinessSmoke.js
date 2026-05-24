@@ -8,7 +8,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 
 const { createArcOracleBuyer } = require('../examples/arcOracleBuyerHelper');
 
-const DEFAULT_ORACLE_BASE_URL = 'https://arcmachina.vercel.app';
+const DEFAULT_ORACLE_BASE_URL = 'https://arcmachina.xyz';
 const CORE_TASK_RULES = {
   EXEC_CCTP_BRIDGE: { mode: 'ready' },
   EXEC_CURVE_SWAP: { mode: 'ready' },

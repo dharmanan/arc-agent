@@ -10,11 +10,10 @@ const ORACLE_PRICES = {
   'pool-state':    '0.001',
   'peg-monitor':   '0.002',
   'reserve-state': '0.003',
-  'protocol-tvl':  '0.002',
   'pool-compare':  '0.003',
+  'wallet-asset-snapshot': '0.005',
   'event-odds-compare': '0.005',
   'prediction-market-check': '0.005',
-  'yield-rank':    '0.002',
   'arb-signal':    '0.005',
   'arb-scan-multi': '0.006',
 };

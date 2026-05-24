@@ -14,10 +14,13 @@ const router          = require('express').Router();
 const rateLimit       = require('express-rate-limit');
 const { requireAuth } = require('../middleware/auth');
 const oracle          = require('../services/oracle');
+const protocols       = require('../services/protocols');
+const agentWalletService = require('../services/agentWalletService');
 const agentService    = require('../services/agentService');
 const db              = require('../db');
 const { ORACLE_PRICES } = require('../services/oracle/pricing');
-const { getPredictionMarketPulse } = require('../services/predictionMarketService');
+const { getPredictionMarketPulse, getEventOddsCompare } = require('../services/predictionMarketService');
+const { getWalletAssetSnapshot } = require('../services/walletSnapshotService');
 const {
   createGatewayRouteConfig,
   createGatewaySellerMiddleware,
@@ -37,13 +40,13 @@ const { logOracleGateway } = require('../services/agenticEconomy/logger');
 // Verified Arc Curve pools fall back to known-good live addresses when envs are absent.
 const ORACLE_PAY_ADDRESS = process.env.ORACLE_PAY_ADDRESS || null;
 const ORACLE_BUYER_DOCS_URL = process.env.ORACLE_BUYER_DOCS_URL
-  || 'https://arcmachina.vercel.app/oracle-public-buyer-guide.html';
+  || 'https://arcmachina.xyz/oracle-public-buyer-guide.html';
 const ORACLE_BUYER_MACHINE_DOCS_URL = process.env.ORACLE_BUYER_MACHINE_DOCS_URL
-  || 'https://arcmachina.vercel.app/oracle-public-buyer-manifest.json';
+  || 'https://arcmachina.xyz/oracle-public-buyer-manifest.json';
 const ORACLE_BUYER_EXAMPLE_URL = process.env.ORACLE_BUYER_EXAMPLE_URL
-  || 'https://arcmachina.vercel.app/downloads/oraclePublicBuyerExample.js';
+  || 'https://arcmachina.xyz/downloads/oraclePublicBuyerExample.js';
 const ORACLE_BUYER_HELPER_URL = process.env.ORACLE_BUYER_HELPER_URL
-  || 'https://arcmachina.vercel.app/downloads/arcOracleBuyerHelper.js';
+  || 'https://arcmachina.xyz/downloads/arcOracleBuyerHelper.js';
 const ORACLE_MANUAL_GATEWAY_FUND_USDC = process.env.ORACLE_MANUAL_GATEWAY_FUND_USDC || '1';
 const USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
 const EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
@@ -58,6 +61,9 @@ const ORACLE_RESERVE_STATE_SUPPORTED_ASSETS = Object.keys(ORACLE_RESERVE_STATE_A
 const ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS = ['aave', 'morpho', 'maple', 'centrifuge', 'superform'];
 const ORACLE_POOL_COMPARE_DEFAULT_TARGETS = ['curve:USDC-EURC', 'curve:EURC-WUSDC', 'uniswap_v2_like:QTM-WUSDC'];
 const ORACLE_ARB_SCAN_MULTI_DEFAULT_TARGETS = ['curve:EURC-USDC', 'curve:EURC-WUSDC', 'curve:WUSDC-USDC'];
+const DEFAULT_ORACLE_ARB_BRIDGE_FEE_USDC = 0.1;
+const DEFAULT_ORACLE_ARB_GAS_ESTIMATE_USDC = 0.15;
+const DEFAULT_ORACLE_ARB_EXIT_FEE_PCT = 0.3;
 const ORACLE_PUBLIC_RATE_LIMIT_WINDOW_MS = Math.max(parseInt(process.env.ORACLE_PUBLIC_RATE_LIMIT_WINDOW_MS || '60000', 10), 1000);
 const ORACLE_PUBLIC_RATE_LIMIT_MAX = Math.max(parseInt(process.env.ORACLE_PUBLIC_RATE_LIMIT_MAX || '30', 10), 1);
 const ORACLE_PUBLIC_MAX_QUERY_KEYS = Math.max(parseInt(process.env.ORACLE_PUBLIC_MAX_QUERY_KEYS || '4', 10), 1);
@@ -67,6 +73,7 @@ const ORACLE_PUBLIC_BLOCKED_UA_PATTERNS = (process.env.ORACLE_PUBLIC_BLOCKED_UA_
   .split(',')
   .map(item => item.trim().toLowerCase())
   .filter(Boolean);
+const ORACLE_PUBLIC_RESERVE_STATE_ENABLED = Boolean(String(process.env.AAVE_POOL_ADDRESS || '').trim());
 const ORACLE_PUBLIC_ENDPOINTS = [
   {
     key: 'stablecoin-fx',
@@ -106,28 +113,19 @@ const ORACLE_PUBLIC_ENDPOINTS = [
       '/api/oracle/public/peg-monitor?assets=USDC,EURC,USDT',
     ],
   },
-  {
-    key: 'reserve-state',
-    title: 'Reserve State',
-    path: '/api/oracle/public/reserve-state',
-    priceUsdc: ORACLE_PRICES['reserve-state'],
-    description: 'Aave-style reserve APY and utilization surface for the supported stablecoin watchlist.',
-    supportedPairs: ORACLE_RESERVE_STATE_SUPPORTED_ASSETS,
-    exampleQueries: [
-      '/api/oracle/public/reserve-state?assets=USDC,EURC,WUSDC',
-    ],
-  },
-  {
-    key: 'protocol-tvl',
-    title: 'Protocol TVL',
-    path: '/api/oracle/public/protocol-tvl',
-    priceUsdc: ORACLE_PRICES['protocol-tvl'],
-    description: 'Current TVL and 24h change across the supported ARC protocol watchlist.',
-    supportedPairs: ORACLE_PROTOCOL_TVL_SUPPORTED_PROTOCOLS,
-    exampleQueries: [
-      '/api/oracle/public/protocol-tvl?protocols=aave,morpho,maple',
-    ],
-  },
+  ...(ORACLE_PUBLIC_RESERVE_STATE_ENABLED
+    ? [{
+        key: 'reserve-state',
+        title: 'Reserve State',
+        path: '/api/oracle/public/reserve-state',
+        priceUsdc: ORACLE_PRICES['reserve-state'],
+        description: 'Aave-style reserve APY and utilization surface for the supported stablecoin watchlist.',
+        supportedPairs: ORACLE_RESERVE_STATE_SUPPORTED_ASSETS,
+        exampleQueries: [
+          '/api/oracle/public/reserve-state?assets=USDC,EURC,WUSDC',
+        ],
+      }]
+    : []),
   {
     key: 'pool-compare',
     title: 'Pool Compare',
@@ -138,6 +136,16 @@ const ORACLE_PUBLIC_ENDPOINTS = [
     supportedPools: ['USDC-EURC', 'EURC-WUSDC', 'QTM-WUSDC', 'MUSDC-MEURC'],
     exampleQueries: [
       '/api/oracle/public/pool-compare?targets=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC',
+    ],
+  },
+  {
+    key: 'wallet-asset-snapshot',
+    title: 'Wallet Asset Snapshot',
+    path: '/api/oracle/public/wallet-asset-snapshot',
+    priceUsdc: ORACLE_PRICES['wallet-asset-snapshot'],
+    description: 'Arc wallet balances, live LP positions, and a yesterday UTC activity recap when the wallet is already indexed as an Arc agent.',
+    exampleQueries: [
+      '/api/oracle/public/wallet-asset-snapshot?walletAddress=0x000000000000000000000000000000000000dEaD',
     ],
   },
   {
@@ -153,11 +161,16 @@ const ORACLE_PUBLIC_ENDPOINTS = [
     ],
   },
   {
-    key: 'yield-rank',
-    title: 'Yield Rank',
-    path: '/api/oracle/public/yield-rank',
-    priceUsdc: ORACLE_PRICES['yield-rank'],
-    description: 'Top APY opportunities across supported stablecoin protocols.',
+    key: 'event-odds-compare',
+    title: 'Event Odds Compare',
+    path: '/api/oracle/public/event-odds-compare',
+    priceUsdc: ORACLE_PRICES['event-odds-compare'],
+    description: 'Live Polymarket comparison between two topic clusters, scored as aligned, split or divergent with Arc action guidance.',
+    supportedTopics: ['bitcoin', 'ethereum', 'crypto'],
+    exampleQueries: [
+      '/api/oracle/public/event-odds-compare?primaryTopic=bitcoin&secondaryTopic=ethereum',
+      '/api/oracle/public/event-odds-compare?primaryTopic=crypto&secondaryTopic=ethereum&limit=4',
+    ],
   },
   {
     key: 'arb-signal',
@@ -320,6 +333,11 @@ function _normalizePublicOracleQueryValue(value) {
   return String(value || '').trim();
 }
 
+function _readPositiveOracleNumberEnv(name, fallback) {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function _rejectPublicOracleRequest(req, res, statusCode, error, detail) {
   const meta = {
     error,
@@ -359,19 +377,20 @@ const PUBLIC_ORACLE_QUERY_RULES = Object.freeze({
   'reserve-state': {
     assets: { maxLength: 48, pattern: /^[A-Za-z0-9_,-]{3,48}$/ },
   },
-  'protocol-tvl': {
-    protocols: { maxLength: 96, pattern: /^[A-Za-z0-9_,-]{3,96}$/ },
-  },
   'pool-compare': {
     targets: { maxLength: 180, pattern: /^[A-Za-z0-9:_,-]{3,180}$/ },
+  },
+  'wallet-asset-snapshot': {
+    walletAddress: { maxLength: 42, pattern: /^0x[a-fA-F0-9]{40}$/ },
   },
   'prediction-market-check': {
     topic: { maxLength: 48, pattern: /^[A-Za-z0-9 _-]{2,48}$/ },
     limit: { maxLength: 1, pattern: /^[1-8]$/ },
   },
-  'yield-rank': {
-    asset: { maxLength: 12, pattern: /^[A-Za-z0-9]{2,12}$/ },
-    minApy: { maxLength: 16, pattern: /^-?\d+(\.\d+)?$/ },
+  'event-odds-compare': {
+    primaryTopic: { maxLength: 48, pattern: /^[A-Za-z0-9 _-]{2,48}$/ },
+    secondaryTopic: { maxLength: 48, pattern: /^[A-Za-z0-9 _-]{2,48}$/ },
+    limit: { maxLength: 1, pattern: /^[1-8]$/ },
   },
   'arb-signal': {
     strategy: { maxLength: 32, allowedValues: ['stablecoin_fx'] },
@@ -655,6 +674,28 @@ async function _buildPredictionMarketCheckResponse(topic, limit) {
   };
 }
 
+async function _buildEventOddsCompareResponse(primaryTopic, secondaryTopic, limit) {
+  const snapshot = await getEventOddsCompare({ primaryTopic, secondaryTopic, limit });
+
+  return {
+    sku: 'event-odds-compare',
+    chargeModel: 'x402_circle_gateway',
+    priceUsdc: ORACLE_PRICES['event-odds-compare'],
+    ...snapshot,
+  };
+}
+
+async function _buildWalletAssetSnapshotResponse(walletAddress) {
+  const snapshot = await getWalletAssetSnapshot({ walletAddress });
+
+  return {
+    sku: 'wallet-asset-snapshot',
+    chargeModel: 'x402_circle_gateway',
+    priceUsdc: ORACLE_PRICES['wallet-asset-snapshot'],
+    ...snapshot,
+  };
+}
+
 function _buildNoOpportunitySignal({ venue, poolKey, pair, note, reason, poolState, forex }) {
   return {
     timestamp: new Date().toISOString(),
@@ -698,6 +739,157 @@ function _buildNoOpportunitySignal({ venue, poolKey, pair, note, reason, poolSta
   };
 }
 
+async function _buildOracleArbExecutionContext({ snapshot, amountUsdc, baseToken, quoteToken }) {
+  const execution = {
+    bridgeFeeUsdc: _readPositiveOracleNumberEnv('ORACLE_ARB_BRIDGE_FEE_USDC', DEFAULT_ORACLE_ARB_BRIDGE_FEE_USDC),
+    gasEstimateUsdc: _readPositiveOracleNumberEnv('ORACLE_ARB_GAS_ESTIMATE_USDC', DEFAULT_ORACLE_ARB_GAS_ESTIMATE_USDC),
+    exitFeePct: _readPositiveOracleNumberEnv('ORACLE_ARB_EXIT_FEE_PCT', DEFAULT_ORACLE_ARB_EXIT_FEE_PCT),
+    exitVenue: process.env.ORACLE_ARB_EXIT_VENUE || 'External exit venue',
+    bridgeRequired: true,
+    requireLiveExit: false,
+    liveExitQuote: null,
+  };
+
+  if (snapshot.venue !== 'curve' || !snapshot.pool?.address) {
+    return execution;
+  }
+
+  const normalizedAmountUsdc = Number(amountUsdc);
+  if (!Number.isFinite(normalizedAmountUsdc) || normalizedAmountUsdc <= 0) {
+    return execution;
+  }
+
+  const entryPoolFeePct = Number(snapshot.state?.fee);
+  const entryPoolFeeUsdc = Number.isFinite(entryPoolFeePct) && entryPoolFeePct > 0
+    ? _roundTo(normalizedAmountUsdc * (entryPoolFeePct / 100), 6)
+    : 0;
+
+  const entryInIndex = snapshot.pool.quoteToken?.index;
+  const entryOutIndex = snapshot.pool.baseToken?.index;
+  if (!Number.isInteger(entryInIndex) || !Number.isInteger(entryOutIndex)) {
+    return execution;
+  }
+
+  try {
+    const entryQuote = await protocols.getCurveQuote(
+      snapshot.pool.address,
+      entryInIndex,
+      entryOutIndex,
+      String(normalizedAmountUsdc),
+      snapshot.pool.quoteToken?.decimals || 6,
+      snapshot.pool.baseToken?.decimals || 6,
+    );
+
+    const expectedBaseOut = Number(entryQuote?.amountOut || 0);
+    if (!Number.isFinite(expectedBaseOut) || expectedBaseOut <= 0) {
+      return execution;
+    }
+
+    const buildLiveExitExecution = ({
+      exitQuote,
+      exitVenue,
+      bridgeRequired,
+      bridgeFeeUsdc,
+      routeStrategy,
+      chainName = null,
+      bridgeProtocol = null,
+      path = null,
+    }) => {
+      const expectedUsdcOut = Number(exitQuote?.amountOut || 0);
+      if (!Number.isFinite(expectedUsdcOut) || expectedUsdcOut <= 0) {
+        return null;
+      }
+
+      const minimumExpectedUsdcOut = _roundTo(
+        normalizedAmountUsdc + entryPoolFeeUsdc + bridgeFeeUsdc + execution.gasEstimateUsdc,
+        6,
+      );
+      const expectedNetProfitUsdc = _roundTo(expectedUsdcOut - minimumExpectedUsdcOut, 6);
+
+      return {
+        ...execution,
+        bridgeFeeUsdc,
+        exitVenue,
+        bridgeRequired,
+        liveExitQuote: {
+          profitable: expectedNetProfitUsdc > 0,
+          expectedBaseOut: _roundTo(expectedBaseOut, 6),
+          expectedUsdcOut: _roundTo(expectedUsdcOut, 6),
+          expectedNetProfitUsdc,
+          minimumExpectedUsdcOut,
+          executionRail: exitQuote?.executionRail || null,
+          routeStrategy: routeStrategy || exitQuote?.routeStrategy || null,
+          routeReason: exitQuote?.quoteError || exitQuote?.routeReason || null,
+          chainName,
+          bridgeProtocol,
+          path,
+        },
+      };
+    };
+
+    try {
+      const externalExitQuote = await agentWalletService.getExternalSwapQuoteResult({
+        chainName: 'Sepolia',
+        fromToken: baseToken,
+        toToken: quoteToken,
+        amountIn: String(expectedBaseOut),
+      });
+      const externalExecution = buildLiveExitExecution({
+        exitQuote: externalExitQuote,
+        exitVenue: externalExitQuote?.venueLabel || process.env.ORACLE_ARB_EXIT_VENUE || 'External exit venue',
+        bridgeRequired: true,
+        bridgeFeeUsdc: execution.bridgeFeeUsdc,
+        routeStrategy: externalExitQuote?.path ? externalExitQuote.path.join(' -> ') : null,
+        chainName: externalExitQuote?.chainName || 'Sepolia',
+        bridgeProtocol: 'CCTP',
+        path: externalExitQuote?.path || null,
+      });
+
+      if (externalExecution) {
+        return externalExecution;
+      }
+    } catch (error) {
+      oracle.recordOracleSignal('arb_external_exit_quote_unavailable', {
+        venue: snapshot.venue,
+        poolKey: snapshot.poolKey,
+        baseToken,
+        quoteToken,
+        detail: error.message,
+      });
+    }
+
+    const liveArcExitQuote = await agentWalletService.getSwapQuoteResult({
+      fromToken: baseToken,
+      toToken: quoteToken,
+      amountIn: String(expectedBaseOut),
+    });
+    const liveArcExecution = buildLiveExitExecution({
+      exitQuote: liveArcExitQuote,
+      exitVenue: liveArcExitQuote?.executionRail === 'swap_kit'
+        ? 'Live ARC sell quote'
+        : 'Live fallback sell quote',
+      bridgeRequired: false,
+      bridgeFeeUsdc: 0,
+      chainName: 'Arc Testnet',
+    });
+
+    if (liveArcExecution) {
+      return liveArcExecution;
+    }
+
+    return execution;
+  } catch (error) {
+    oracle.recordOracleSignal('arb_live_exit_quote_unavailable', {
+      venue: snapshot.venue,
+      poolKey: snapshot.poolKey,
+      baseToken,
+      quoteToken,
+      detail: error.message,
+    });
+    return execution;
+  }
+}
+
 async function _buildStablecoinArbSignalResponse(poolKey = 'EURC-USDC', venue = 'curve') {
   const snapshot = await _getOraclePoolStateSnapshot(poolKey, venue);
   const poolState = snapshot.state;
@@ -736,6 +928,16 @@ async function _buildStablecoinArbSignalResponse(poolKey = 'EURC-USDC', venue = 
     });
   }
 
+  const optimalAmountUsdc = oracle.calcOptimalSwapSize(
+    poolState.priceImpact?.swap1k,
+    poolState.priceImpact?.swap10k,
+  );
+  const execution = await _buildOracleArbExecutionContext({
+    snapshot,
+    amountUsdc: optimalAmountUsdc,
+    baseToken,
+    quoteToken,
+  });
   const signal = oracle.buildArbSignal({
     strategy: 'stablecoin_fx',
     forexRate: forexRate.rate,
@@ -745,12 +947,21 @@ async function _buildStablecoinArbSignalResponse(poolKey = 'EURC-USDC', venue = 
     priceImpacts: poolState.priceImpact,
     baseToken,
     quoteToken,
+    execution,
   });
 
   signal.venue = snapshot.venue;
   signal.poolKey = snapshot.poolKey;
   signal.pair = pair;
   signal.note = snapshot.note || null;
+  signal.executionAssumptions = {
+    bridgeFeeUsdc: execution.bridgeFeeUsdc,
+    gasEstimateUsdc: execution.gasEstimateUsdc,
+    exitFeePct: execution.exitFeePct,
+    exitVenue: execution.exitVenue,
+    bridgeRequired: execution.bridgeRequired,
+    liveExitQuoteAvailable: Boolean(execution.liveExitQuote),
+  };
   signal.isFallback = Boolean(forexRate?.isFallback)
     || Boolean(poolState?.isFallback)
     || poolState?.source === 'mock_testnet';
@@ -765,6 +976,13 @@ async function _buildStablecoinArbSignalResponse(poolKey = 'EURC-USDC', venue = 
       isFallback: Boolean(poolState.isFallback) || poolState.source === 'mock_testnet',
       fallbackReason: poolState.fallbackReason || null,
     },
+    liveExitQuote: execution.liveExitQuote
+      ? {
+          source: execution.liveExitQuote.executionRail || 'quote',
+          isFallback: false,
+          fallbackReason: execution.liveExitQuote.routeReason || null,
+        }
+      : null,
   };
 
   return signal;
@@ -1208,11 +1426,13 @@ function _createOracleGatewayMiddleware(path, endpointKey) {
 const stablecoinFxGateway = _createOracleGatewayMiddleware('/stablecoin-fx', 'stablecoin-fx');
 const poolStateGateway = _createOracleGatewayMiddleware('/pool-state', 'pool-state');
 const pegMonitorGateway = _createOracleGatewayMiddleware('/peg-monitor', 'peg-monitor');
-const reserveStateGateway = _createOracleGatewayMiddleware('/reserve-state', 'reserve-state');
-const protocolTvlGateway = _createOracleGatewayMiddleware('/protocol-tvl', 'protocol-tvl');
+const reserveStateGateway = ORACLE_PUBLIC_RESERVE_STATE_ENABLED
+  ? _createOracleGatewayMiddleware('/reserve-state', 'reserve-state')
+  : null;
 const poolCompareGateway = _createOracleGatewayMiddleware('/pool-compare', 'pool-compare');
+const walletAssetSnapshotGateway = _createOracleGatewayMiddleware('/wallet-asset-snapshot', 'wallet-asset-snapshot');
 const predictionMarketCheckGateway = _createOracleGatewayMiddleware('/prediction-market-check', 'prediction-market-check');
-const yieldRankGateway = _createOracleGatewayMiddleware('/yield-rank', 'yield-rank');
+const eventOddsCompareGateway = _createOracleGatewayMiddleware('/event-odds-compare', 'event-odds-compare');
 const arbSignalGateway = _createOracleGatewayMiddleware('/arb-signal', 'arb-signal');
 const arbScanMultiGateway = _createOracleGatewayMiddleware('/arb-scan-multi', 'arb-scan-multi');
 
@@ -1253,6 +1473,63 @@ async function _getAgenticPaymentAuditStats() {
     jobCreateEvents: row.job_create_events,
     jobPayoutEvents: row.job_payout_events,
     lastEventAt: row.last_event_at ? new Date(row.last_event_at).toISOString() : null,
+  };
+}
+
+async function _getAgentGatewayUsage(agentId) {
+  const [{ rows: summaryRows }, { rows: recentRows }] = await Promise.all([
+    db.query(
+      `SELECT rail,
+              reference_type,
+              COUNT(*)::int AS count,
+              COALESCE(SUM(amount_usdc), 0)::float AS total_usdc,
+              MAX(created_at) AS last_at
+         FROM agentic_payment_events
+        WHERE agent_id = $1
+          AND status = 'confirmed'
+        GROUP BY rail, reference_type
+        ORDER BY MAX(created_at) DESC
+        LIMIT 6`,
+      [agentId],
+    ),
+    db.query(
+      `SELECT created_at,
+              event_type,
+              rail,
+              reference_type,
+              reference_id,
+              amount_usdc::float AS amount_usdc,
+              tx_hash,
+              status
+         FROM agentic_payment_events
+        WHERE agent_id = $1
+          AND status = 'confirmed'
+        ORDER BY created_at DESC
+        LIMIT 8`,
+      [agentId],
+    ),
+  ]);
+
+  return {
+    sharedBalance: true,
+    note: 'Gateway available balance is a shared warm balance. Confirmed public x402 payments, automation/task/job fees, and other Gateway-backed buyer flows can all spend it before the next on-demand refill from the wallet.',
+    summary: summaryRows.map((row) => ({
+      rail: row.rail,
+      referenceType: row.reference_type,
+      count: Number(row.count || 0),
+      totalUsdc: Number(row.total_usdc || 0),
+      lastAt: row.last_at ? new Date(row.last_at).toISOString() : null,
+    })),
+    recent: recentRows.map((row) => ({
+      createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+      eventType: row.event_type,
+      rail: row.rail,
+      referenceType: row.reference_type,
+      referenceId: row.reference_id,
+      amountUsdc: Number(row.amount_usdc || 0),
+      txHash: row.tx_hash || null,
+      status: row.status,
+    })),
   };
 }
 
@@ -1404,7 +1681,10 @@ router.get('/debug/gateway-balance', requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'agent_signer_not_found' });
     }
 
-    const balances = await getAgentGatewayBalances(rawAgent, { chainName });
+    const [balances, usage] = await Promise.all([
+      getAgentGatewayBalances(rawAgent, { chainName }),
+      _getAgentGatewayUsage(agentId),
+    ]);
 
     res.json({
       agentId,
@@ -1420,6 +1700,7 @@ router.get('/debug/gateway-balance', requireAuth, async (req, res, next) => {
         withdrawingUsdc: balances.gateway.formattedWithdrawing,
         withdrawableUsdc: balances.gateway.formattedWithdrawable,
       },
+      usage,
       funded: balances.gateway.available > 0n,
       fetchedAt: new Date().toISOString(),
     });
@@ -1491,10 +1772,29 @@ router.get('/pool-compare', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /api/oracle/wallet-asset-snapshot ───────────────────────────────────
+router.get('/wallet-asset-snapshot', requireAuth, async (req, res, next) => {
+  try {
+    const walletAddress = String(req.query.walletAddress || '').trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      return res.status(400).json({ error: 'wallet_address_invalid' });
+    }
+
+    res.json(await _buildWalletAssetSnapshotResponse(walletAddress));
+  } catch (err) { next(err); }
+});
+
 // ── GET /api/oracle/prediction-market-check ─────────────────────────────────
 router.get('/prediction-market-check', requireAuth, async (req, res, next) => {
   try {
     res.json(await _buildPredictionMarketCheckResponse(req.query.topic, req.query.limit));
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/oracle/event-odds-compare ──────────────────────────────────────
+router.get('/event-odds-compare', requireAuth, async (req, res, next) => {
+  try {
+    res.json(await _buildEventOddsCompareResponse(req.query.primaryTopic, req.query.secondaryTopic, req.query.limit));
   } catch (err) { next(err); }
 });
 
@@ -1621,24 +1921,26 @@ publicRouter.get('/peg-monitor', _createPublicOracleQueryGuard('peg-monitor'), _
   } catch (err) { next(err); }
 });
 
-// GET /api/oracle/public/reserve-state
-publicRouter.get('/reserve-state', _createPublicOracleQueryGuard('reserve-state'), _createOraclePaymentAuditMiddleware('reserve-state'), reserveStateGateway, async (req, res, next) => {
-  try {
-    res.json(await _buildReserveStateResponse(req.query.assets));
-  } catch (err) { next(err); }
-});
-
-// GET /api/oracle/public/protocol-tvl
-publicRouter.get('/protocol-tvl', _createPublicOracleQueryGuard('protocol-tvl'), _createOraclePaymentAuditMiddleware('protocol-tvl'), protocolTvlGateway, async (req, res, next) => {
-  try {
-    res.json(await _buildProtocolTvlResponse(req.query.protocols));
-  } catch (err) { next(err); }
-});
+if (ORACLE_PUBLIC_RESERVE_STATE_ENABLED) {
+  // GET /api/oracle/public/reserve-state
+  publicRouter.get('/reserve-state', _createPublicOracleQueryGuard('reserve-state'), _createOraclePaymentAuditMiddleware('reserve-state'), reserveStateGateway, async (req, res, next) => {
+    try {
+      res.json(await _buildReserveStateResponse(req.query.assets));
+    } catch (err) { next(err); }
+  });
+}
 
 // GET /api/oracle/public/pool-compare
 publicRouter.get('/pool-compare', _createPublicOracleQueryGuard('pool-compare'), _createOraclePaymentAuditMiddleware('pool-compare'), poolCompareGateway, async (req, res, next) => {
   try {
     res.json(await _buildPoolCompareResponse(req.query.targets));
+  } catch (err) { next(err); }
+});
+
+// GET /api/oracle/public/wallet-asset-snapshot
+publicRouter.get('/wallet-asset-snapshot', _createPublicOracleQueryGuard('wallet-asset-snapshot'), _createOraclePaymentAuditMiddleware('wallet-asset-snapshot'), walletAssetSnapshotGateway, async (req, res, next) => {
+  try {
+    res.json(await _buildWalletAssetSnapshotResponse(req.query.walletAddress));
   } catch (err) { next(err); }
 });
 
@@ -1649,18 +1951,10 @@ publicRouter.get('/prediction-market-check', _createPublicOracleQueryGuard('pred
   } catch (err) { next(err); }
 });
 
-// GET /api/oracle/public/yield-rank
-publicRouter.get('/yield-rank', _createPublicOracleQueryGuard('yield-rank'), _createOraclePaymentAuditMiddleware('yield-rank'), yieldRankGateway, async (req, res, next) => {
+// GET /api/oracle/public/event-odds-compare
+publicRouter.get('/event-odds-compare', _createPublicOracleQueryGuard('event-odds-compare'), _createOraclePaymentAuditMiddleware('event-odds-compare'), eventOddsCompareGateway, async (req, res, next) => {
   try {
-    const asset     = (req.query.asset || 'USDC').toString().toUpperCase();
-    const minApy    = parseFloat(req.query.minApy || '1.0');
-    const protocols = await oracle.getYieldOpportunities(asset, isNaN(minApy) ? 1.0 : minApy);
-    res.json({
-      asset,
-      protocols: protocols.slice(0, 5),
-      isFallback: protocols.some(item => item.isFallback),
-      fetchedAt: new Date().toISOString(),
-    });
+    res.json(await _buildEventOddsCompareResponse(req.query.primaryTopic, req.query.secondaryTopic, req.query.limit));
   } catch (err) { next(err); }
 });
 

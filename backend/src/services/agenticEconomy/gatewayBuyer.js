@@ -8,6 +8,8 @@ const { logGateway } = require('./logger');
 const DEFAULT_GATEWAY_TRANSFER_MAX_FEE_USDC = process.env.GATEWAY_TRANSFER_MAX_FEE_USDC || '0.005';
 const DEFAULT_GATEWAY_PAY_RETRY_ATTEMPTS = process.env.GATEWAY_PAY_RETRY_ATTEMPTS || '2';
 const DEFAULT_GATEWAY_PAY_RETRY_BASE_DELAY_MS = process.env.GATEWAY_PAY_RETRY_BASE_DELAY_MS || '750';
+const DEFAULT_GATEWAY_WARM_MIN_AVAILABLE_USDC = process.env.GATEWAY_WARM_MIN_AVAILABLE_USDC || '1';
+const DEFAULT_GATEWAY_WARM_TARGET_USDC = process.env.GATEWAY_WARM_TARGET_USDC || '3';
 
 const GATEWAY_CHAIN_MAP = {
   'Arc Testnet': {
@@ -417,6 +419,91 @@ async function depositGatewayBalance(client, amountUsdc, options = {}) {
   };
 }
 
+async function ensureGatewayWarmBalance(agent, options = {}) {
+  if (!agent) {
+    return {
+      attempted: false,
+      deposited: false,
+      reason: 'agent_missing',
+    };
+  }
+
+  const chainName = options.chainName || 'Arc Testnet';
+  const minAvailableUsdc = normalizeUsdcAmount(
+    options.minAvailableUsdc == null ? DEFAULT_GATEWAY_WARM_MIN_AVAILABLE_USDC : options.minAvailableUsdc,
+  );
+  const targetAvailableUsdc = normalizeUsdcAmount(
+    options.targetAvailableUsdc == null ? DEFAULT_GATEWAY_WARM_TARGET_USDC : options.targetAvailableUsdc,
+  );
+
+  if (!(minAvailableUsdc > 0) || !(targetAvailableUsdc > 0) || targetAvailableUsdc < minAvailableUsdc) {
+    return {
+      attempted: false,
+      deposited: false,
+      reason: 'invalid_target',
+    };
+  }
+
+  const client = createGatewayClientForAgent(agent, { chainName });
+  const balancesBefore = await readGatewayBalances(client, options.address);
+  const currentAvailableUsdc = Number(balancesBefore.gateway?.formattedAvailable || 0);
+
+  if (Number.isFinite(currentAvailableUsdc) && currentAvailableUsdc >= minAvailableUsdc) {
+    return {
+      attempted: false,
+      deposited: false,
+      reason: 'already_warm',
+      minAvailableUsdc,
+      targetAvailableUsdc,
+      balancesBefore,
+      balancesAfter: balancesBefore,
+      amountUsdc: '0',
+    };
+  }
+
+  const depositAmountUsdc = normalizeUsdcAmount(Math.max(targetAvailableUsdc - currentAvailableUsdc, 0));
+  if (!(depositAmountUsdc > 0)) {
+    return {
+      attempted: false,
+      deposited: false,
+      reason: 'target_already_met',
+      minAvailableUsdc,
+      targetAvailableUsdc,
+      balancesBefore,
+      balancesAfter: balancesBefore,
+      amountUsdc: '0',
+    };
+  }
+
+  const walletAvailableUsdc = Number(balancesBefore.wallet?.formattedAvailable || 0);
+  if (!Number.isFinite(walletAvailableUsdc) || walletAvailableUsdc < depositAmountUsdc) {
+    return {
+      attempted: false,
+      deposited: false,
+      reason: 'wallet_balance_too_low',
+      minAvailableUsdc,
+      targetAvailableUsdc,
+      balancesBefore,
+      balancesAfter: balancesBefore,
+      amountUsdc: String(depositAmountUsdc),
+    };
+  }
+
+  const funding = await depositGatewayBalance(client, depositAmountUsdc, options);
+  return {
+    attempted: true,
+    deposited: true,
+    reason: 'funded',
+    minAvailableUsdc,
+    targetAvailableUsdc,
+    balancesBefore: funding.balancesBefore,
+    balancesAfter: funding.balancesAfter,
+    amountUsdc: funding.amountUsdc,
+    depositResult: funding.depositResult,
+    funded: funding.funded,
+  };
+}
+
 async function payGatewayProtectedResource({
   agent,
   url,
@@ -486,6 +573,7 @@ module.exports = {
   ensureGatewayPaymentBalance,
   executeGatewayTransfer,
   executeGatewayProtectedPayment,
+  ensureGatewayWarmBalance,
   getAgentGatewayBalances,
   getGatewayBuyerSummary,
   getAgentGatewayPrivateKey,

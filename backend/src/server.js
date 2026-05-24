@@ -30,6 +30,113 @@ const db                   = require('./db');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+const TRUST_PROXY_PRESETS = new Set(['loopback', 'linklocal', 'uniquelocal']);
+
+function sanitizeLogValue(value, depth = 0) {
+  if (depth > 4) return '[Truncated]';
+  if (value == null) return value;
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((entry) => sanitizeLogValue(entry, depth + 1));
+  }
+
+  if (value instanceof Error) {
+    return sanitizeErrorForLog(value);
+  }
+
+  if (typeof value === 'object') {
+    const redactedKeys = new Set([
+      'authorization',
+      'cookie',
+      'set-cookie',
+      'x-api-key',
+      'api-key',
+      'apikey',
+      'token',
+      'accessToken',
+      'refreshToken',
+      'idToken',
+      'signature',
+      'privateKey',
+      'private_key',
+      'credential',
+      'attestationObject',
+      'clientDataJSON',
+    ]);
+    const normalized = {};
+
+    for (const [key, entry] of Object.entries(value)) {
+      if (redactedKeys.has(String(key || '').trim())) {
+        normalized[key] = '[Redacted]';
+      } else {
+        normalized[key] = sanitizeLogValue(entry, depth + 1);
+      }
+    }
+
+    return normalized;
+  }
+
+  if (typeof value === 'string' && value.length > 2048) {
+    return `${value.slice(0, 2048)}…`;
+  }
+
+  return value;
+}
+
+function sanitizeErrorForLog(error) {
+  if (!error) return error;
+
+  return {
+    name: error.name || 'Error',
+    message: error.message || 'Unknown error',
+    status: error.status || error.statusCode || null,
+    code: error.code || null,
+    details: sanitizeLogValue(error.details || error.meta || error.data || null),
+    stack: process.env.NODE_ENV === 'production'
+      ? undefined
+      : (typeof error.stack === 'string' ? error.stack.split('\n').slice(0, 8).join('\n') : undefined),
+  };
+}
+
+function resolveTrustProxySetting() {
+  const raw = String(process.env.TRUST_PROXY || process.env.EXPRESS_TRUST_PROXY || '1').trim();
+  const normalized = raw.toLowerCase();
+
+  if (!raw) return 1;
+  if (['true', 'false'].includes(normalized)) {
+    return normalized === 'true';
+  }
+
+  if (/^\d+$/.test(raw)) {
+    return Number.parseInt(raw, 10);
+  }
+
+  const list = raw.split(',').map((entry) => entry.trim()).filter(Boolean);
+  if (list.length > 0 && list.every((entry) => TRUST_PROXY_PRESETS.has(entry.toLowerCase()))) {
+    return list.map((entry) => entry.toLowerCase()).join(', ');
+  }
+
+  console.warn(`[SECURITY] Invalid TRUST_PROXY value "${raw}". Falling back to 1.`);
+  return 1;
+}
+
+function buildContentSecurityPolicyDirectives() {
+  return {
+    defaultSrc: ["'none'"],
+    baseUri: ["'none'"],
+    frameAncestors: ["'none'"],
+    formAction: ["'self'"],
+    imgSrc: ["'self'", 'data:'],
+    scriptSrc: ["'none'"],
+    styleSrc: ["'none'"],
+    fontSrc: ["'none'"],
+    connectSrc: ["'self'"],
+    objectSrc: ["'none'"],
+    manifestSrc: ["'self'"],
+    frameSrc: ["'none'"],
+  };
+}
+
 function isEnvEnabled(name, defaultValue = true) {
   const raw = process.env[name];
   if (raw == null || raw === '') return defaultValue;
@@ -59,11 +166,30 @@ function shouldSkipAccessLog(req, res) {
   return false;
 }
 
-// Trust proxy headers (needed for rate limiter behind Codespace/nginx proxy)
-app.set('trust proxy', 1);
+function readSanitizedPath(req) {
+  const requestUrl = String(req?.originalUrl || req?.url || '/');
+
+  try {
+    return new URL(requestUrl, 'http://localhost').pathname || '/';
+  } catch {
+    return requestUrl.split('?')[0] || '/';
+  }
+}
+
+// Trust proxy headers for Railway / reverse-proxy deployments.
+app.set('trust proxy', resolveTrustProxySetting());
 
 // ── Security headers ──────────────────────────────────────────────────────────
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: false,
+    directives: buildContentSecurityPolicyDirectives(),
+  },
+  crossOriginEmbedderPolicy: false,
+  hsts: process.env.NODE_ENV === 'production'
+    ? { maxAge: 15552000, includeSubDomains: true }
+    : false,
+}));
 
 // ── CORS — only allow the trusted frontend origin ─────────────────────────────
 const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173,http://localhost:5174,http://localhost:5500')
@@ -96,7 +222,14 @@ app.use(express.json({ limit: '64kb' }));
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test') {
-  app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev', {
+  morgan.token('safe-path', (req) => readSanitizedPath(req));
+  morgan.token('safe-ip', (req) => req.ip || req.socket?.remoteAddress || '-');
+
+  const accessLogFormat = process.env.NODE_ENV === 'production'
+    ? ':safe-ip :method :safe-path :status :res[content-length] - :response-time ms'
+    : 'dev';
+
+  app.use(morgan(accessLogFormat, {
     skip: shouldSkipAccessLog,
   }));
 }
@@ -179,7 +312,7 @@ app.use((err, _req, res, _next) => {
     return res.status(400).json({ error: msg || 'Invalid request body' });
   }
   const status = err.status || 500;
-  if (status >= 500) console.error('[ERROR]', err);
+  if (status >= 500) console.error('[ERROR]', sanitizeErrorForLog(err));
   // Never leak stack traces or internal messages to clients in production
   const isProd = process.env.NODE_ENV === 'production';
   const message = isProd && status >= 500

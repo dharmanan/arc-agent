@@ -2,11 +2,11 @@
   "version": "1.0",
   "product": "arc-oracle-public-buyer",
   "sellerMode": "circle_gateway",
-  "humanDocsUrl": "https://arcmachina.vercel.app/oracle-public-buyer-guide.html",
-  "machineDocsUrl": "https://arcmachina.vercel.app/oracle-public-buyer-manifest.json",
+  "humanDocsUrl": "https://arcmachina.xyz/oracle-public-buyer-guide.html",
+  "machineDocsUrl": "https://arcmachina.xyz/oracle-public-buyer-manifest.json",
   "downloads": {
-    "exampleUrl": "https://arcmachina.vercel.app/downloads/oraclePublicBuyerExample.js",
-    "helperUrl": "https://arcmachina.vercel.app/downloads/arcOracleBuyerHelper.js"
+    "exampleUrl": "https://arcmachina.xyz/downloads/oraclePublicBuyerExample.js",
+    "helperUrl": "https://arcmachina.xyz/downloads/arcOracleBuyerHelper.js"
   },
   "requirements": {
     "walletType": "EOA",
@@ -38,11 +38,12 @@
       "ORACLE_PUBLIC_POOL",
       "ORACLE_PUBLIC_PAIR",
       "ORACLE_PUBLIC_ASSETS",
-      "ORACLE_PUBLIC_PROTOCOLS",
       "ORACLE_PUBLIC_TARGETS",
+      "ORACLE_PUBLIC_WALLET_ADDRESS",
       "ORACLE_PUBLIC_TOPIC",
+      "ORACLE_PUBLIC_PRIMARY_TOPIC",
+      "ORACLE_PUBLIC_SECONDARY_TOPIC",
       "ORACLE_PUBLIC_LIMIT",
-      "ORACLE_PUBLIC_ASSET",
       "ORACLE_PUBLIC_STRATEGY",
       "ORACLE_BUYER_PRIVATE_KEY",
       "ORACLE_BUYER_CHAIN",
@@ -86,32 +87,22 @@
       ]
     },
     {
-      "key": "reserve-state",
-      "path": "/api/oracle/public/reserve-state",
-      "query": [
-        {
-          "name": "assets",
-          "example": "USDC,EURC,WUSDC"
-        }
-      ]
-    },
-    {
-      "key": "protocol-tvl",
-      "path": "/api/oracle/public/protocol-tvl",
-      "query": [
-        {
-          "name": "protocols",
-          "example": "aave,morpho,maple"
-        }
-      ]
-    },
-    {
       "key": "pool-compare",
       "path": "/api/oracle/public/pool-compare",
       "query": [
         {
           "name": "targets",
           "example": "curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC"
+        }
+      ]
+    },
+    {
+      "key": "wallet-asset-snapshot",
+      "path": "/api/oracle/public/wallet-asset-snapshot",
+      "query": [
+        {
+          "name": "walletAddress",
+          "example": "0x000000000000000000000000000000000000dEaD"
         }
       ]
     },
@@ -130,12 +121,20 @@
       ]
     },
     {
-      "key": "yield-rank",
-      "path": "/api/oracle/public/yield-rank",
+      "key": "event-odds-compare",
+      "path": "/api/oracle/public/event-odds-compare",
       "query": [
         {
-          "name": "asset",
-          "example": "USDC"
+          "name": "primaryTopic",
+          "example": "bitcoin"
+        },
+        {
+          "name": "secondaryTopic",
+          "example": "ethereum"
+        },
+        {
+          "name": "limit",
+          "example": "4"
         }
       ]
     },
@@ -163,6 +162,8 @@
   "notes": [
     "Use the same public seller base URL that returned the 402 challenge.",
     "If Gateway available balance is short, fund Gateway before the paid retry.",
+    "reserve-state stays hidden until this deployment has a live reserve source configured.",
+    "wallet-asset-snapshot adds a yesterday UTC recap only when the requested wallet is already indexed as an Arc agent.",
     "EOA wallets are required for this payment flow."
   ]
 }

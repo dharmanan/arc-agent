@@ -2,7 +2,7 @@
 
 const db = require('../db');
 
-const DEFAULT_RETENTION_DAYS = 1;
+const DEFAULT_RETENTION_DAYS = 7;
 const DEFAULT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PRUNE_BATCH_SIZE = 1000;
 const DEFAULT_MAX_BATCHES_PER_RUN = 25;

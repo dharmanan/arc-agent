@@ -330,11 +330,10 @@
           <li><code>/api/oracle/public/pool-state?pool=USDC-EURC</code></li>
           <li><code>/api/oracle/public/pool-state?pool=EURC-WUSDC</code></li>
           <li><code>/api/oracle/public/peg-monitor?assets=USDC,EURC,USDT</code></li>
-          <li><code>/api/oracle/public/reserve-state?assets=USDC,EURC,WUSDC</code></li>
-          <li><code>/api/oracle/public/protocol-tvl?protocols=aave,morpho,maple</code></li>
           <li><code>/api/oracle/public/pool-compare?targets=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC</code></li>
+          <li><code>/api/oracle/public/wallet-asset-snapshot?walletAddress=0x000000000000000000000000000000000000dEaD</code></li>
           <li><code>/api/oracle/public/prediction-market-check?topic=crypto&amp;limit=4</code></li>
-          <li><code>/api/oracle/public/yield-rank?asset=USDC</code></li>
+          <li><code>/api/oracle/public/event-odds-compare?primaryTopic=bitcoin&amp;secondaryTopic=ethereum&amp;limit=4</code></li>
           <li><code>/api/oracle/public/arb-signal?strategy=stablecoin_fx</code></li>
           <li><code>/api/oracle/public/arb-scan-multi?targets=curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC</code></li>
         </ul>
@@ -351,14 +350,20 @@
         <div class="accent-box">
           <strong>New Oracle SKU additions:</strong>
           <code>peg-monitor</code> returns spot stablecoin peg health with explicit fallback metadata,
-          <code>reserve-state</code> returns Aave-style reserve APY state with fallback yield hints,
-          <code>protocol-tvl</code> returns TVL and 24h change across the protocol watchlist,
           <code>pool-compare</code> compares multiple pool targets side by side across
           <code>curve</code>, <code>uniswap_v2_like</code>, and <code>arcfx</code>,
+          <code>wallet-asset-snapshot</code> returns Arc wallet balances, live LP positions, and a yesterday UTC recap when the requested wallet is already indexed as an Arc agent,
           and <code>prediction-market-check</code> returns a live Polymarket-based crypto regime snapshot with
-          liquidity, movement, and Arc action guidance.
+          liquidity, movement, and Arc action guidance. <code>event-odds-compare</code> compares two live
+          Polymarket topic clusters and scores whether they stay aligned, split, or diverge enough to
+          change the next Arc move.
           <code>arb-scan-multi</code>
           scans several stable lanes at once and returns the strongest profitable lane.
+        </div>
+
+        <div class="accent-box">
+          <strong>Reserve-state visibility:</strong>
+          <code>reserve-state</code> stays out of the public seller catalog until this deployment has a live reserve source configured.
         </div>
 
         <div class="accent-box">
@@ -374,7 +379,7 @@
   "price": "0.001 USDC",
   "sellerMode": "circle_gateway",
   "callbackEndpoint": "/pool-state",
-  "docsUrl": "https://arcmachina.vercel.app/oracle-public-buyer-guide.html",
+  "docsUrl": "https://arcmachina.xyz/oracle-public-buyer-guide.html",
   "note": "Retry with the payment headers returned by the Circle Gateway x402 flow."
 }</code></pre>
       </section>
@@ -388,7 +393,7 @@
           <strong>Tip:</strong>
           use your public Arc Oracle API base URL here. If you received a <code>402</code> challenge first,
           keep using the same seller base URL that returned the payment terms. During the testnet phase,
-          the default public base URL is <code>https://arcmachina.vercel.app/api</code>.
+          the default public base URL is <code>https://arcmachina.xyz/api</code>.
         </div>
 
         <p>Preview a live <code>402</code> response first:</p>
@@ -414,18 +419,6 @@ node oraclePublicBuyerExample.js --preview</code></pre>
       ORACLE_PUBLIC_ASSETS=USDC,EURC,USDT \
       node oraclePublicBuyerExample.js --preview</code></pre>
 
-        <p>Preview the protocol TVL SKU:</p>
-        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
-      ORACLE_PUBLIC_ENDPOINT=protocol-tvl \
-      ORACLE_PUBLIC_PROTOCOLS=aave,morpho,maple \
-      node oraclePublicBuyerExample.js --preview</code></pre>
-
-        <p>Preview the reserve-state SKU:</p>
-        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
-      ORACLE_PUBLIC_ENDPOINT=reserve-state \
-      ORACLE_PUBLIC_ASSETS=USDC,EURC,WUSDC \
-      node oraclePublicBuyerExample.js --preview</code></pre>
-
         <p>Preview the pool comparison SKU:</p>
         <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
       ORACLE_PUBLIC_ENDPOINT=pool-compare \
@@ -438,6 +431,27 @@ node oraclePublicBuyerExample.js --preview</code></pre>
       ORACLE_PUBLIC_TOPIC=crypto \
       ORACLE_PUBLIC_LIMIT=4 \
       node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the event comparison SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=event-odds-compare \
+      ORACLE_PUBLIC_PRIMARY_TOPIC=bitcoin \
+      ORACLE_PUBLIC_SECONDARY_TOPIC=ethereum \
+      ORACLE_PUBLIC_LIMIT=4 \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>Preview the wallet snapshot SKU:</p>
+        <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+      ORACLE_PUBLIC_ENDPOINT=wallet-asset-snapshot \
+      ORACLE_PUBLIC_WALLET_ADDRESS=0x000000000000000000000000000000000000dEaD \
+      node oraclePublicBuyerExample.js --preview</code></pre>
+
+        <p>
+          If the requested wallet already exists as an indexed Arc agent, the response also includes a
+          yesterday UTC recap of swaps, LP changes, lending actions, and modeled oracle signals.
+          Non-indexed wallets still return balances and positions, but <code>dailySummary.status</code>
+          stays <code>unavailable</code>.
+        </p>
 
         <p>Preview the multi-lane arbitrage scanner SKU:</p>
         <pre><code>ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
@@ -479,7 +493,7 @@ node oraclePublicBuyerExample.js</code></pre>
             </tr>
             <tr>
               <td><code>ORACLE_PUBLIC_ENDPOINT</code></td>
-              <td>One of <code>stablecoin-fx</code>, <code>pool-state</code>, <code>peg-monitor</code>, <code>reserve-state</code>, <code>protocol-tvl</code>, <code>pool-compare</code>, <code>prediction-market-check</code>, <code>yield-rank</code>, <code>arb-signal</code>, <code>arb-scan-multi</code>.</td>
+              <td>One of <code>stablecoin-fx</code>, <code>pool-state</code>, <code>peg-monitor</code>, <code>pool-compare</code>, <code>wallet-asset-snapshot</code>, <code>prediction-market-check</code>, <code>event-odds-compare</code>, <code>arb-signal</code>, <code>arb-scan-multi</code>.</td>
             </tr>
             <tr>
               <td><code>ORACLE_BUYER_CHAIN</code></td>
@@ -495,23 +509,31 @@ node oraclePublicBuyerExample.js</code></pre>
             </tr>
             <tr>
               <td><code>ORACLE_PUBLIC_ASSETS</code></td>
-              <td>Comma-separated asset list for <code>peg-monitor</code> or <code>reserve-state</code>.</td>
-            </tr>
-            <tr>
-              <td><code>ORACLE_PUBLIC_PROTOCOLS</code></td>
-              <td>Comma-separated protocol list for <code>protocol-tvl</code>.</td>
+              <td>Comma-separated asset list for <code>peg-monitor</code>.</td>
             </tr>
             <tr>
               <td><code>ORACLE_PUBLIC_TARGETS</code></td>
               <td>Comma-separated <code>venue:pool</code> list for <code>pool-compare</code> or <code>arb-scan-multi</code>.</td>
             </tr>
             <tr>
+              <td><code>ORACLE_PUBLIC_WALLET_ADDRESS</code></td>
+              <td>Target wallet address for <code>wallet-asset-snapshot</code>.</td>
+            </tr>
+            <tr>
               <td><code>ORACLE_PUBLIC_TOPIC</code></td>
               <td>Topic string for <code>prediction-market-check</code>, for example <code>crypto</code> or <code>bitcoin</code>.</td>
             </tr>
             <tr>
+              <td><code>ORACLE_PUBLIC_PRIMARY_TOPIC</code></td>
+              <td>First topic cluster for <code>event-odds-compare</code>, for example <code>bitcoin</code>.</td>
+            </tr>
+            <tr>
+              <td><code>ORACLE_PUBLIC_SECONDARY_TOPIC</code></td>
+              <td>Second topic cluster for <code>event-odds-compare</code>, for example <code>ethereum</code>.</td>
+            </tr>
+            <tr>
               <td><code>ORACLE_PUBLIC_LIMIT</code></td>
-              <td>Optional market sample size for <code>prediction-market-check</code>. Supported range is <code>1</code> to <code>8</code>.</td>
+              <td>Optional market sample size for <code>prediction-market-check</code> or <code>event-odds-compare</code>. Supported range is <code>1</code> to <code>8</code>.</td>
             </tr>
           </tbody>
         </table>

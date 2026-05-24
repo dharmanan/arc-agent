@@ -160,7 +160,7 @@ export default function LandingPage({ onEnterApp }) {
             className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-[#347A3D]/30 bg-[#347A3D]/10 mb-6"
           >
             <span className="w-2.5 h-2.5 rounded-full bg-[#347A3D] animate-pulse"></span>
-            <span className="text-xs font-bold text-[#347A3D] tracking-widest uppercase mt-0.5">NETWORK LIVE</span>
+            <span className="text-xs font-bold text-[#347A3D] tracking-widest uppercase mt-0.5">TESTNET LIVE</span>
           </motion.div>
 
           <motion.div 

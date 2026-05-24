@@ -29,14 +29,18 @@ const { getDailyLimitBypass, isDailyLimitBypassed } = require('../services/daily
 const nativeLendingRiskService = require('../services/nativeLendingRiskService');
 const { evaluateStableAutomationPolicy } = require('../services/stableAutomationPolicy');
 const { evaluateLendingAutomationPolicy } = require('../services/lendingAutomationPolicy');
+const { evaluateCarryAutomationPolicy } = require('../services/carryAutomationPolicy');
 const { evaluateOracleStrategyPolicy } = require('../services/oracleStrategyPolicy');
 const { evaluateCirbtcLpAutomationPolicy } = require('../services/cirbtcLpAutomationPolicy');
 const taskRunService = require('../services/taskRunService');
+const { ensureGatewayWarmBalance } = require('../services/agenticEconomy/gatewayBuyer');
 
 const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
 const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
 const ARC_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || process.env.EURC_ADDRESS || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
 const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
+const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC = 1;
+const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC = 3;
 
 function shouldUseDryRun(agent) {
   return GLOBAL_DRY_RUN;
@@ -46,6 +50,70 @@ function normalizeUsdcAmount(amount) {
   const numeric = Number(amount);
   if (!Number.isFinite(numeric) || numeric <= 0) return 0;
   return Math.floor(numeric * 1_000_000) / 1_000_000;
+}
+
+function getAgentGatewayAutoTopupConfig(agent) {
+  const minAvailableUsdc = normalizeUsdcAmount(
+    agent?.gateway_auto_topup_min_usdc ?? DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC,
+  ) || DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC;
+  const targetAvailableUsdc = normalizeUsdcAmount(
+    agent?.gateway_auto_topup_target_usdc ?? DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC,
+  ) || DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC;
+
+  return {
+    enabled: agent?.gateway_auto_topup_enabled !== false,
+    minAvailableUsdc,
+    targetAvailableUsdc: Math.max(targetAvailableUsdc, minAvailableUsdc),
+  };
+}
+
+async function maybeWarmAgentGatewayBalance(agent, trigger, overrides = {}) {
+  const baseConfig = getAgentGatewayAutoTopupConfig(agent);
+  const config = {
+    ...baseConfig,
+    minAvailableUsdc: normalizeUsdcAmount(
+      overrides.minAvailableUsdc == null ? baseConfig.minAvailableUsdc : overrides.minAvailableUsdc,
+    ) || baseConfig.minAvailableUsdc,
+    targetAvailableUsdc: Math.max(
+      normalizeUsdcAmount(
+        overrides.targetAvailableUsdc == null ? baseConfig.targetAvailableUsdc : overrides.targetAvailableUsdc,
+      ) || baseConfig.targetAvailableUsdc,
+      normalizeUsdcAmount(
+        overrides.minAvailableUsdc == null ? baseConfig.minAvailableUsdc : overrides.minAvailableUsdc,
+      ) || baseConfig.minAvailableUsdc,
+    ),
+  };
+  if (!config.enabled || !agent?.private_key_encrypted) {
+    return {
+      attempted: false,
+      deposited: false,
+      reason: config.enabled ? 'signer_unavailable' : 'disabled',
+    };
+  }
+
+  try {
+    const result = await ensureGatewayWarmBalance(agent, {
+      chainName: 'Arc Testnet',
+      minAvailableUsdc: config.minAvailableUsdc,
+      targetAvailableUsdc: config.targetAvailableUsdc,
+    });
+
+    if (result?.deposited) {
+      console.log(
+        `[GATEWAY] Auto-warmed agent=${agent.id} trigger=${trigger} amount=${result.amountUsdc} available=${result?.balancesAfter?.gateway?.formattedAvailable || '0'}`,
+      );
+    }
+
+    return result;
+  } catch (error) {
+    console.warn(`[GATEWAY] Auto-warm skipped agent=${agent?.id || 'unknown'} trigger=${trigger}: ${error.message}`);
+    return {
+      attempted: false,
+      deposited: false,
+      reason: 'error',
+      error: error.message,
+    };
+  }
 }
 
 async function getArcTokenBalance(walletAddress, tokenAddress, decimals = 6) {
@@ -90,6 +158,46 @@ function getOracleStrategyExecutionSource() {
   return 'oracle_strategy_v1';
 }
 
+const STABLE_COST_BASIS_TRANSACTION_TYPES = new Set(['swap', 'rebalance', 'defi_loop_swap']);
+
+function normalizeExecutionSource(value) {
+  const normalized = String(value || '').trim();
+  return normalized || null;
+}
+
+function classifyStableCostBasisTransaction(row) {
+  const type = String(row?.type || '').trim().toLowerCase();
+  if (!STABLE_COST_BASIS_TRANSACTION_TYPES.has(type)) return null;
+
+  const meta = row?.meta && typeof row.meta === 'object' ? row.meta : {};
+  const fromToken = String(meta.fromToken || '').trim().toUpperCase();
+  const toToken = String(meta.toToken || '').trim().toUpperCase();
+  const isStableSwap = (
+    (fromToken === 'USDC' && toToken === 'EURC')
+    || (fromToken === 'EURC' && toToken === 'USDC')
+  );
+
+  if (!isStableSwap) return null;
+
+  const executionSource = normalizeExecutionSource(meta.executionSource);
+  if (executionSource === getOracleStrategyExecutionSource()) return 'oracle_strategy';
+  if (!executionSource) return 'manual_stable_swap';
+  return null;
+}
+
+function resolveOracleCostBasisSource(trackedSources) {
+  const trackedSourceSet = trackedSources instanceof Set
+    ? trackedSources
+    : new Set(Array.isArray(trackedSources) ? trackedSources : []);
+  const hasOracle = trackedSourceSet.has('oracle_strategy');
+  const hasManual = trackedSourceSet.has('manual_stable_swap');
+
+  if (hasOracle && hasManual) return 'oracle_and_manual_stable_swaps';
+  if (hasOracle) return 'oracle_strategy';
+  if (hasManual) return 'manual_stable_swaps';
+  return null;
+}
+
 function getCirbtcAutomationTransactionType(operationType) {
   return operationType === 'remove_liquidity' ? 'direct_lp_remove' : 'direct_lp_add';
 }
@@ -122,6 +230,25 @@ function getLendingAutomationTransactionToken(actionParams = {}, automationPolic
 
 function getLendingAutomationExecutionSource() {
   return 'lending_automation_policy_v1';
+}
+
+function getCarryAutomationTransactionType() {
+  return 'carry_automation';
+}
+
+function getCarryAutomationTransactionToken(actionParams = {}, automationPolicy = null) {
+  if (actionParams?.stableToken) return String(actionParams.stableToken).toUpperCase();
+  if (actionParams?.asset) return String(actionParams.asset).toUpperCase();
+  if (automationPolicy?.verdict?.actionAssetSymbol) return String(automationPolicy.verdict.actionAssetSymbol).toUpperCase();
+  return 'USDC';
+}
+
+function getCarryAutomationExecutionSource() {
+  return 'carry_automation_policy_v1';
+}
+
+function getCarryAutomationNotionalAmount(automationPolicy) {
+  return normalizeUsdcAmount(automationPolicy?.verdict?.suggestedAmountUsdc);
 }
 
 function getLendingAutomationNotionalAmount(automationPolicy) {
@@ -162,15 +289,29 @@ function getCirbtcIdleCapitalBudgets({
 } = {}) {
   const stableMetrics = stablePolicy?.metrics || {};
   const stableOperationType = String(stablePolicy?.verdict?.operationType || '').trim().toLowerCase();
+  const stableActionParams = stablePolicy?.verdict?.actionParams || {};
+  const stableAddMode = String(stableActionParams.mode || '').trim().toLowerCase();
+  const requestedStableAddUsdc = normalizeUsdcAmount(
+    stableAddMode === 'balanced'
+      ? (stableActionParams.amountUsdc ?? stableActionParams.amount0)
+      : (stableActionParams.amountIn ?? stableMetrics.suggestedLiquidityDeployUsdc),
+  );
+  const requestedStableAddEurc = normalizeUsdcAmount(
+    stableAddMode === 'balanced'
+      ? (stableActionParams.amountEurc ?? stableActionParams.amount1)
+      : 0,
+  );
   const reservedUsdc = normalizeUsdcAmount(
     stableOperationType === 'add_liquidity'
-      ? Math.min(Number(stableMetrics.suggestedLiquidityDeployUsdc || 0), Number(availableToTradeUsdc || 0))
+      ? Math.min(Number(requestedStableAddUsdc || 0), Number(availableToTradeUsdc || 0))
       : stableOperationType === 'swap'
         ? Math.min(Number(stablePolicy?.verdict?.suggestedAmountUsdc || 0), Number(availableToTradeUsdc || 0))
         : 0,
   );
   const reservedEurc = normalizeUsdcAmount(
-    stableOperationType === 'rebalance'
+    stableOperationType === 'add_liquidity' && stableAddMode === 'balanced'
+      ? Math.min(Number(requestedStableAddEurc || 0), Number(availableEurcBalance || 0))
+      : stableOperationType === 'rebalance'
       ? Math.min(
           Number(stableMetrics.suggestedRebalanceAmountEurc || stablePolicy?.verdict?.suggestedAmountUsdc || 0),
           Number(availableEurcBalance || 0),
@@ -190,12 +331,14 @@ function buildDefiLoopDecisionSnapshot({
   status,
   payload = {},
   stablePolicy = null,
+  stableLanePolicy = null,
   executionSource = null,
   availableUsdcBalance = null,
   availableEurcBalance = null,
   availableToTradeUsdc = null,
   walletReserveUsdc = null,
   positionSummary = null,
+  includeStableLaneDecision = true,
 } = {}) {
   const verdict = stablePolicy?.verdict || {};
   const metrics = stablePolicy?.metrics || {};
@@ -203,6 +346,50 @@ function buildDefiLoopDecisionSnapshot({
   const derivedExecutionSource = executionSource || (operationType ? getStableAutomationExecutionSource(operationType) : null);
   const actionParams = verdict.actionParams && typeof verdict.actionParams === 'object'
     ? verdict.actionParams
+    : null;
+  const exitQuote = metrics.exitQuote && typeof metrics.exitQuote === 'object'
+    ? {
+        profitable: metrics.exitQuote.profitable === true,
+        inputEurc: normalizeUsdcAmount(metrics.exitQuote.inputEurc),
+        expectedUsdcOut: normalizeUsdcAmount(metrics.exitQuote.expectedUsdcOut),
+        expectedProfitUsdc: normalizeUsdcAmount(metrics.exitQuote.expectedProfitUsdc),
+        referenceUsdcValue: normalizeUsdcAmount(metrics.exitQuote.referenceUsdcValue),
+        parityReferenceUsdcValue: normalizeUsdcAmount(metrics.exitQuote.parityReferenceUsdcValue),
+        costBasisReferenceUsdcValue: normalizeUsdcAmount(metrics.exitQuote.costBasisReferenceUsdcValue),
+        minimumExpectedUsdcOut: normalizeUsdcAmount(metrics.exitQuote.minimumExpectedUsdcOut),
+        averageEntryPriceUsdc: normalizeUsdcAmount(metrics.exitQuote.averageEntryPriceUsdc),
+        trackedInventoryEurc: normalizeUsdcAmount(metrics.exitQuote.trackedInventoryEurc),
+        trackedInventoryCostUsdc: normalizeUsdcAmount(metrics.exitQuote.trackedInventoryCostUsdc),
+        protectedEurcReserve: normalizeUsdcAmount(metrics.exitQuote.protectedEurcReserve),
+        profitFloorUsdc: normalizeUsdcAmount(metrics.exitQuote.profitFloorUsdc),
+        profitBasis: metrics.exitQuote.profitBasis || null,
+        costBasisSource: metrics.exitQuote.costBasisSource || null,
+        trackedSources: Array.isArray(metrics.exitQuote.trackedSources)
+          ? metrics.exitQuote.trackedSources.filter(Boolean)
+          : [],
+        exitExecutionRail: metrics.exitQuote.exitExecutionRail || null,
+        exitRouteStrategy: metrics.exitQuote.exitRouteStrategy || null,
+        exitRouteReason: metrics.exitQuote.exitRouteReason || null,
+      }
+    : null;
+  const sameChainSellBackQuoteSource = payload?.sameChainSellBackQuote && typeof payload.sameChainSellBackQuote === 'object'
+    ? payload.sameChainSellBackQuote
+    : metrics.sameChainSellBackQuote && typeof metrics.sameChainSellBackQuote === 'object'
+      ? metrics.sameChainSellBackQuote
+      : null;
+  const sameChainSellBackQuote = sameChainSellBackQuoteSource
+    ? {
+        profitable: sameChainSellBackQuoteSource.profitable === true,
+        inputUsdc: normalizeUsdcAmount(sameChainSellBackQuoteSource.inputUsdc),
+        expectedEurcOut: normalizeUsdcAmount(sameChainSellBackQuoteSource.expectedEurcOut),
+        expectedUsdcOut: normalizeUsdcAmount(sameChainSellBackQuoteSource.expectedUsdcOut),
+        expectedProfitUsdc: normalizeUsdcAmount(sameChainSellBackQuoteSource.expectedProfitUsdc),
+        minimumExpectedUsdcOut: normalizeUsdcAmount(sameChainSellBackQuoteSource.minimumExpectedUsdcOut),
+        profitFloorUsdc: normalizeUsdcAmount(sameChainSellBackQuoteSource.profitFloorUsdc),
+        exitExecutionRail: sameChainSellBackQuoteSource.exitExecutionRail || null,
+        exitRouteStrategy: sameChainSellBackQuoteSource.exitRouteStrategy || null,
+        exitRouteReason: sameChainSellBackQuoteSource.exitRouteReason || null,
+      }
     : null;
 
   return {
@@ -245,6 +432,8 @@ function buildDefiLoopDecisionSnapshot({
     availableEurcBalance: normalizeUsdcAmount(availableEurcBalance),
     availableToTradeUsdc: normalizeUsdcAmount(availableToTradeUsdc),
     walletReserveUsdc: normalizeUsdcAmount(walletReserveUsdc),
+    exitQuote,
+    sameChainSellBackQuote,
     pairSummaries: Array.isArray(metrics.pairSummaries)
       ? metrics.pairSummaries.map((pairSummary) => ({
           poolKey: pairSummary?.poolKey || null,
@@ -261,7 +450,49 @@ function buildDefiLoopDecisionSnapshot({
       : [],
     manualCooldownUntil: metrics.manualCooldownUntil || null,
     manualCooldownActive: metrics.manualCooldownActive ?? false,
+    stableLaneDecision: includeStableLaneDecision
+      && stableLanePolicy?.verdict?.lane
+      && stableLanePolicy?.verdict?.lane !== verdict.lane
+      ? buildStableLaneDecisionSnapshot({
+          stableLanePolicy,
+          availableUsdcBalance,
+          availableEurcBalance,
+          availableToTradeUsdc,
+          walletReserveUsdc,
+          positionSummary,
+        })
+      : null,
   };
+}
+
+function buildStableLaneDecisionSnapshot({
+  stableLanePolicy = null,
+  availableUsdcBalance = null,
+  availableEurcBalance = null,
+  availableToTradeUsdc = null,
+  walletReserveUsdc = null,
+  positionSummary = null,
+} = {}) {
+  if (!stableLanePolicy?.verdict?.lane) return null;
+
+  return buildDefiLoopDecisionSnapshot({
+    status: stableLanePolicy.verdict.execute === true ? 'executed' : 'policy_hold',
+    payload: {
+      ok: stableLanePolicy.verdict.execute === true,
+      action: stableLanePolicy.verdict.execute === true ? 'execute' : 'hold',
+      reason: stableLanePolicy.verdict.reason || null,
+      summary: stableLanePolicy.verdict.reason || null,
+      operationType: stableLanePolicy.verdict.operationType || null,
+    },
+    stablePolicy: stableLanePolicy,
+    executionSource: getStableAutomationExecutionSource(),
+    availableUsdcBalance,
+    availableEurcBalance,
+    availableToTradeUsdc,
+    walletReserveUsdc,
+    positionSummary,
+    includeStableLaneDecision: false,
+  });
 }
 
 function buildLendingAutomationDecisionSnapshot({
@@ -309,6 +540,55 @@ function buildLendingAutomationDecisionSnapshot({
   };
 }
 
+function buildCarryAutomationDecisionSnapshot({
+  status,
+  payload = {},
+  carryPolicy = null,
+  lendingSurface = null,
+} = {}) {
+  const verdict = carryPolicy?.verdict || {};
+  const metrics = carryPolicy?.metrics || {};
+
+  return {
+    recordedAt: new Date().toISOString(),
+    status,
+    ok: payload?.ok === true,
+    action: payload?.action || (verdict.execute === true ? 'execute' : 'hold'),
+    reason: payload?.reason || verdict.reason || null,
+    summary: payload?.summary || verdict.reason || payload?.error || null,
+    error: payload?.error || null,
+    txHash: payload?.txHash || null,
+    policyId: carryPolicy?.policyId || null,
+    lane: verdict.lane || 'carry_stable_lp',
+    execute: verdict.execute === true,
+    operationType: verdict.operationType || null,
+    blockedBy: verdict.blockedBy || null,
+    actionAssetSymbol: verdict.actionAssetSymbol || null,
+    suggestedAmountUsdc: normalizeUsdcAmount(verdict.suggestedAmountUsdc),
+    actionParams: verdict.actionParams && typeof verdict.actionParams === 'object'
+      ? verdict.actionParams
+      : null,
+    executionSource: getCarryAutomationExecutionSource(),
+    healthFactor: metrics.healthFactor ?? lendingSurface?.risk?.healthFactor ?? null,
+    projectedOpenHealthFactor: metrics.projectedOpenHealthFactor ?? null,
+    availableBorrowUsd: normalizeUsdcAmount(metrics.availableBorrowUsd ?? lendingSurface?.risk?.availableBorrowUsd),
+    totalBorrowUsd: normalizeUsdcAmount(metrics.selectedAsset?.borrowUsd ?? lendingSurface?.risk?.totalBorrowUsd),
+    positionValueUsd: normalizeUsdcAmount(metrics.positionValueUsd),
+    carryState: metrics.carryState || null,
+    exclusiveMode: metrics.exclusiveMode === true,
+    selectedStableToken: metrics.selectedAssetSymbol || verdict.actionAssetSymbol || null,
+    lpAprPct: normalizeUsdcAmount(metrics.lpYield?.aprPct),
+    lpApyPct: normalizeUsdcAmount(metrics.lpYield?.apyPct),
+    borrowAprPct: normalizeUsdcAmount(metrics.selectedAsset?.borrowAprPct),
+    borrowApyPct: normalizeUsdcAmount(metrics.selectedAsset?.borrowApyPct),
+    netCarryAprPct: normalizeUsdcAmount(metrics.selectedAsset?.netCarryAprPct),
+    netCarryApyPct: normalizeUsdcAmount(metrics.selectedAsset?.netCarryApyPct),
+    estimatedLpUsdPerYear: normalizeUsdcAmount(metrics.estimatedLpUsdPerYear),
+    estimatedBorrowCostUsdPerYear: normalizeUsdcAmount(metrics.estimatedBorrowCostUsdPerYear),
+    estimatedNetUsdPerYear: normalizeUsdcAmount(metrics.estimatedNetUsdPerYear),
+  };
+}
+
 async function getAgentPermissionMap(agentId) {
   if (!agentId) return {};
 
@@ -318,6 +598,48 @@ async function getAgentPermissionMap(agentId) {
   );
 
   return Object.fromEntries(rows.map(row => [row.permission_key, row.is_enabled]));
+}
+
+function getTaskPermissionRequirement(taskName) {
+  return TASK_PERMISSION_REQUIREMENTS[String(taskName || '').trim().toUpperCase()] || null;
+}
+
+function buildTaskPermissionBlockedMessage(taskName, permission) {
+  if (permission === 'defi_scan') {
+    return `Task ${taskName} is blocked because DeFi Protocol Scanner is disabled for this agent.`;
+  }
+
+  if (permission === 'arbitrage') {
+    return `Task ${taskName} is blocked because Arbitrage is disabled for this agent.`;
+  }
+
+  return `Task ${taskName} is blocked because the required ${permission} permission is disabled for this agent.`;
+}
+
+async function guardTaskPermission(taskName, agentId) {
+  const normalizedTaskName = String(taskName || '').trim().toUpperCase();
+  const permission = getTaskPermissionRequirement(normalizedTaskName);
+
+  if (!permission || !agentId) {
+    return { ok: true };
+  }
+
+  const permissions = await getAgentPermissionMap(agentId);
+  if (permissions[permission] === false) {
+    const detail = buildTaskPermissionBlockedMessage(normalizedTaskName, permission);
+    return {
+      ok: false,
+      error: 'permission_blocked',
+      reason: 'permission_blocked',
+      permission,
+      stageKey: 'permission_blocked',
+      stageLabel: 'Permission Blocked',
+      stageDetail: detail,
+      errorSummary: detail,
+    };
+  }
+
+  return { ok: true };
 }
 
 async function executeLendingAutomationTask({ agent, automationPolicy, dryRunEnabled }) {
@@ -423,6 +745,218 @@ async function executeLendingAutomationTask({ agent, automationPolicy, dryRunEna
   }
 
   return { ok: false, reason: 'lending_automation_operation_unsupported' };
+}
+
+async function executeCarryAutomationTask({ agent, automationPolicy, dryRunEnabled }) {
+  const operationType = String(automationPolicy?.verdict?.operationType || '').trim().toLowerCase();
+  const actionParams = automationPolicy?.verdict?.actionParams && typeof automationPolicy.verdict.actionParams === 'object'
+    ? automationPolicy.verdict.actionParams
+    : {};
+  const stableToken = String(actionParams?.stableToken || actionParams?.asset || automationPolicy?.verdict?.actionAssetSymbol || 'USDC').trim().toUpperCase();
+
+  if (operationType === 'deploy_wallet_balance') {
+    const deployResult = await agenticTaskExecutionService.executeCurveLiquidityAddTask({
+      agent,
+      params: {
+        tokenIn: stableToken,
+        amountIn: actionParams.amountIn,
+      },
+      dryRun: dryRunEnabled,
+    });
+
+    if (!deployResult.ok) return deployResult;
+
+    return {
+      ok: true,
+      payload: {
+        ...(deployResult.payload || {}),
+        action: 'deploy_wallet_balance',
+        executionRail: 'carry_stable_lp',
+        executionSource: getCarryAutomationExecutionSource(),
+        stableToken,
+        summary: dryRunEnabled
+          ? `Would deploy idle ${actionParams.amountIn} ${stableToken} into the stable LP carry lane.`
+          : `Deployed idle ${actionParams.amountIn} ${stableToken} into the stable LP carry lane.`,
+      },
+    };
+  }
+
+  if (operationType === 'repay_wallet_balance') {
+    const repayResult = await agenticTaskExecutionService.executeNativeLendingRepayTask({
+      agent,
+      params: {
+        asset: stableToken,
+        amount: actionParams.amount,
+      },
+      dryRun: dryRunEnabled,
+    });
+
+    if (!repayResult.ok) return repayResult;
+
+    return {
+      ok: true,
+      payload: {
+        ...(repayResult.payload || {}),
+        action: 'repay_wallet_balance',
+        executionRail: 'carry_stable_lp',
+        executionSource: getCarryAutomationExecutionSource(),
+        stableToken,
+        summary: dryRunEnabled
+          ? `Would repay idle ${stableToken} debt from the wallet to unwind carry risk.`
+          : `Repaid idle ${stableToken} debt from the wallet to unwind carry risk.`,
+      },
+    };
+  }
+
+  if (operationType === 'open_carry') {
+    const borrowResult = await agenticTaskExecutionService.executeNativeLendingBorrowTask({
+      agent,
+      params: {
+        asset: stableToken,
+        amount: actionParams.borrowAmount,
+      },
+      dryRun: dryRunEnabled,
+    });
+
+    if (!borrowResult.ok) return borrowResult;
+
+    return {
+      ok: true,
+      payload: {
+        ...(borrowResult.payload || {}),
+        action: 'open_carry',
+        executionRail: 'carry_stable_lp',
+        executionSource: getCarryAutomationExecutionSource(),
+        stableToken,
+        borrowTxHash: borrowResult?.payload?.txHash || null,
+        stagedLpDeployAmount: actionParams.amountIn || actionParams.borrowAmount,
+        stepsExecuted: [
+          {
+            step: 'borrow',
+            asset: stableToken,
+            amount: actionParams.borrowAmount,
+            txHash: borrowResult?.payload?.txHash || null,
+          },
+        ],
+        summary: dryRunEnabled
+          ? `Would borrow ${actionParams.borrowAmount} ${stableToken}. The next carry cycle would deploy the borrowed balance into the stable LP lane.`
+          : `Borrowed ${actionParams.borrowAmount} ${stableToken}. The next carry cycle will deploy the borrowed balance into the stable LP lane.`,
+      },
+    };
+  }
+
+  if (operationType === 'close_carry') {
+    const removeResult = await agenticTaskExecutionService.executeCurveLiquidityRemoveTask({
+      agent,
+      params: {
+        lpAmount: actionParams.lpAmount,
+        tokenOut: stableToken,
+      },
+      dryRun: dryRunEnabled,
+    });
+
+    if (!removeResult.ok) return removeResult;
+
+    const debtAmount = normalizeUsdcAmount(Number(actionParams?.debtAmount || 0));
+    const partialRepayAmount = normalizeUsdcAmount(Math.min(
+      Number(removeResult?.payload?.amountOut || 0),
+      Number(actionParams?.debtAmount || 0),
+    ));
+    let repayAmount = debtAmount > 0 ? debtAmount : partialRepayAmount;
+
+    if (!(repayAmount > 0)) {
+      return {
+        ok: true,
+        payload: {
+          ...(removeResult.payload || {}),
+          action: 'close_carry',
+          executionRail: 'carry_stable_lp',
+          executionSource: getCarryAutomationExecutionSource(),
+          stableToken,
+          summary: dryRunEnabled
+            ? `Would remove stable LP liquidity back into ${stableToken}.`
+            : `Removed stable LP liquidity back into ${stableToken}.`,
+        },
+      };
+    }
+
+    let repayResult = await agenticTaskExecutionService.executeNativeLendingRepayTask({
+      agent,
+      params: {
+        asset: stableToken,
+        amount: String(repayAmount),
+      },
+      dryRun: dryRunEnabled,
+    });
+
+    if (
+      !repayResult.ok
+      && Number(partialRepayAmount) > 0
+      && Number(partialRepayAmount) < Number(repayAmount)
+      && repayResult.reason === 'lending_wallet_balance_too_low'
+    ) {
+      repayAmount = partialRepayAmount;
+      repayResult = await agenticTaskExecutionService.executeNativeLendingRepayTask({
+        agent,
+        params: {
+          asset: stableToken,
+          amount: String(repayAmount),
+        },
+        dryRun: dryRunEnabled,
+      });
+    }
+
+    if (!repayResult.ok) {
+      return {
+        ok: true,
+        payload: {
+          ...(removeResult.payload || {}),
+          action: 'close_carry_partial',
+          executionRail: 'carry_stable_lp',
+          executionSource: getCarryAutomationExecutionSource(),
+          stableToken,
+          removeLiquidityTxHash: removeResult?.payload?.txHash || null,
+          partialFailure: {
+            reason: repayResult.reason,
+            error: repayResult.error || null,
+          },
+          summary: `Closed the stable LP leg into ${stableToken}, but the immediate repay step is currently blocked. The funds remain in the wallet for a later repay.`,
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      payload: {
+        ...(repayResult.payload || {}),
+        action: 'close_carry',
+        executionRail: 'carry_stable_lp',
+        executionSource: getCarryAutomationExecutionSource(),
+        stableToken,
+        removeLiquidityTxHash: removeResult?.payload?.txHash || null,
+        repayTxHash: repayResult?.payload?.txHash || null,
+        stepsExecuted: [
+          {
+            step: 'remove_liquidity',
+            asset: stableToken,
+            amount: actionParams.lpAmount,
+            txHash: removeResult?.payload?.txHash || null,
+          },
+          {
+            step: 'repay',
+            asset: stableToken,
+            amount: String(repayAmount),
+            txHash: repayResult?.payload?.txHash || null,
+          },
+        ],
+        summary: dryRunEnabled
+          ? `Would unwind the ${stableToken} carry leg by removing stable LP and repaying debt.`
+          : `Unwound the ${stableToken} carry leg by removing stable LP and repaying debt.`,
+      },
+    };
+  }
+
+  return { ok: false, reason: 'unsupported_carry_operation' };
 }
 
 function getErrorText(value) {
@@ -745,6 +1279,23 @@ function registerTaskProcessor(name, concurrency, handler) {
     const taskRunId = job?.data?.taskRunId || null;
     const agentId = job?.data?.agentId || null;
 
+    const permissionGuard = await guardTaskPermission(name, agentId);
+    if (!permissionGuard.ok) {
+      if (taskRunId) {
+        await taskRunService.failTaskRun(taskRunId, {
+          error: permissionGuard.error || permissionGuard.reason || 'permission_blocked',
+          stageKey: permissionGuard.stageKey || 'permission_blocked',
+          stageLabel: permissionGuard.stageLabel || 'Permission Blocked',
+          stageDetail: permissionGuard.stageDetail || permissionGuard.errorSummary || null,
+          resultPayload: {
+            permission: permissionGuard.permission || null,
+            reason: permissionGuard.reason || 'permission_blocked',
+          },
+        }).catch(() => {});
+      }
+      return permissionGuard;
+    }
+
     if (taskRunId) {
       await taskRunService.markTaskRunRunning(taskRunId, {
         stageKey: 'starting',
@@ -758,9 +1309,10 @@ function registerTaskProcessor(name, concurrency, handler) {
 
       if (taskRunId) {
         if (result && result.ok === false) {
+          const failureMessage = result.errorSummary || result.stageDetail || result.error || result.reason || 'task_run_failed';
           await taskRunService.failTaskRun(taskRunId, {
-            error: result.error || result.reason || 'task_run_failed',
-            stageDetail: result.errorSummary || result.error || null,
+            error: failureMessage,
+            stageDetail: result.errorSummary || result.stageDetail || result.error || result.reason || null,
             resultPayload: result.payload || null,
           }).catch(() => {});
         } else {
@@ -778,9 +1330,11 @@ function registerTaskProcessor(name, concurrency, handler) {
       return result;
     } catch (err) {
       if (taskRunId) {
+        const errorDetails = buildExecutionErrorDetails(err);
         await taskRunService.failTaskRun(taskRunId, {
-          error: err.message,
-          stageDetail: err.message,
+          error: errorDetails.errorSummary || errorDetails.error,
+          stageDetail: errorDetails.errorSummary || errorDetails.error,
+          resultPayload: errorDetails,
         }).catch(() => {});
       }
       throw err;
@@ -1194,6 +1748,11 @@ const AUTOMATION_STATE_COLUMNS = {
     lastStatus: 'lending_automation_last_status',
     lastDecision: 'lending_automation_last_decision',
   },
+  carryAutomation: {
+    lastRunAt: 'carry_automation_last_run_at',
+    lastStatus: 'carry_automation_last_status',
+    lastDecision: 'carry_automation_last_decision',
+  },
   cirbtcLp: {
     lastRunAt: 'cirbtc_lp_last_run_at',
     lastStatus: 'cirbtc_lp_last_status',
@@ -1314,9 +1873,18 @@ queue.process('INCOMING_TRANSFER', 5, async (job) => {
 
   // Smart mode — run market analysis (LLM if key present, rule engine otherwise)
   const { rows: [agent] } = await db.query(
-    'SELECT id, llm_model, llm_api_key_encrypted FROM agents WHERE id = $1',
+    `SELECT id, llm_model, llm_api_key_encrypted,
+            private_key_encrypted,
+            gateway_auto_topup_enabled, gateway_auto_topup_min_usdc, gateway_auto_topup_target_usdc
+       FROM agents WHERE id = $1`,
     [agentId],
   );
+
+  if (agent && String(token || '').trim().toUpperCase() === 'USDC') {
+    await maybeWarmAgentGatewayBalance(agent, 'incoming_transfer', {
+      targetAvailableUsdc: agent.gateway_auto_topup_min_usdc ?? DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC,
+    });
+  }
 
   try {
     const { engine, apiKey } = await resolveEngine(agent);
@@ -1488,13 +2056,16 @@ async function _buildOracleSameChainSellBackPlan({ amountInUsdc, swapPool }) {
       'ORACLE_SAME_CHAIN_MIN_PROFIT_USDC',
       DEFAULT_ORACLE_SAME_CHAIN_MIN_PROFIT_USDC,
     );
+    const minimumExpectedUsdcOut = normalizeUsdcAmount(normalizedInputUsdc + minProfitUsdc);
 
     return {
-      profitable: expectedUsdcOut > normalizedInputUsdc && expectedProfitUsdc >= minProfitUsdc,
+      profitable: expectedUsdcOut >= minimumExpectedUsdcOut,
       inputUsdc: normalizedInputUsdc,
       expectedEurcOut,
       expectedUsdcOut,
       expectedProfitUsdc,
+      minimumExpectedUsdcOut,
+      profitFloorUsdc: minProfitUsdc,
       exitExecutionRail: sellBackQuote?.executionRail || null,
       exitRouteStrategy: sellBackQuote?.routeStrategy || null,
       exitRouteReason: sellBackQuote?.routeReason || null,
@@ -1503,6 +2074,90 @@ async function _buildOracleSameChainSellBackPlan({ amountInUsdc, swapPool }) {
     console.warn('[QUEUE] ORACLE same-chain sell-back quote unavailable:', error.message);
     return null;
   }
+}
+
+async function _readOracleInventoryCostBasis(agentId) {
+  if (!agentId) {
+    return {
+      trackedInventoryEurc: 0,
+      trackedInventoryCostUsdc: 0,
+      averageEntryPriceUsdc: 0,
+      costBasisSource: null,
+      trackedSources: [],
+    };
+  }
+
+  const { rows } = await db.query(
+    `SELECT id::text AS id,
+            type,
+            amount_usdc::text AS amount_usdc,
+            meta,
+            created_at::text AS created_at
+       FROM transactions
+      WHERE agent_id = $1
+        AND status = 'confirmed'
+        AND type IN ('swap', 'rebalance', 'defi_loop_swap')
+        AND (
+          (COALESCE(meta->>'fromToken', '') = 'USDC' AND COALESCE(meta->>'toToken', '') = 'EURC')
+          OR
+          (COALESCE(meta->>'fromToken', '') = 'EURC' AND COALESCE(meta->>'toToken', '') = 'USDC')
+        )
+      ORDER BY created_at ASC, id ASC`,
+    [agentId],
+  );
+
+  let trackedInventoryEurc = 0;
+  let trackedInventoryCostUsdc = 0;
+  const trackedSources = new Set();
+
+  for (const row of rows) {
+    const trackedSource = classifyStableCostBasisTransaction(row);
+    if (!trackedSource) continue;
+
+    trackedSources.add(trackedSource);
+    const meta = row.meta && typeof row.meta === 'object' ? row.meta : {};
+    const fromToken = String(meta.fromToken || '').toUpperCase();
+    const toToken = String(meta.toToken || '').toUpperCase();
+
+    if (fromToken === 'USDC' && toToken === 'EURC') {
+      const spentUsdc = normalizeUsdcAmount(meta.requestedAmountIn || meta.amountIn || row.amount_usdc || 0);
+      const receivedEurc = normalizeUsdcAmount(meta.amountOut || meta.entryAmountOutEurc || 0);
+      if (spentUsdc > 0 && receivedEurc > 0) {
+        trackedInventoryEurc = normalizeUsdcAmount(trackedInventoryEurc + receivedEurc);
+        trackedInventoryCostUsdc = normalizeUsdcAmount(trackedInventoryCostUsdc + spentUsdc);
+      }
+      continue;
+    }
+
+    if (fromToken === 'EURC' && toToken === 'USDC' && trackedInventoryEurc > 0 && trackedInventoryCostUsdc > 0) {
+      const soldEurc = normalizeUsdcAmount(meta.amountIn || 0);
+      if (!(soldEurc > 0)) continue;
+
+      const matchedEurc = Math.min(soldEurc, trackedInventoryEurc);
+      const averageTrackedEntryPrice = trackedInventoryCostUsdc / trackedInventoryEurc;
+      trackedInventoryCostUsdc = normalizeUsdcAmount(
+        Math.max(trackedInventoryCostUsdc - (matchedEurc * averageTrackedEntryPrice), 0),
+      );
+      trackedInventoryEurc = normalizeUsdcAmount(Math.max(trackedInventoryEurc - matchedEurc, 0));
+
+      if (!(trackedInventoryEurc > 0) || !(trackedInventoryCostUsdc > 0)) {
+        trackedInventoryEurc = 0;
+        trackedInventoryCostUsdc = 0;
+      }
+    }
+  }
+
+  const averageEntryPriceUsdc = trackedInventoryEurc > 0 && trackedInventoryCostUsdc > 0
+    ? normalizeUsdcAmount(trackedInventoryCostUsdc / trackedInventoryEurc)
+    : 0;
+
+  return {
+    trackedInventoryEurc,
+    trackedInventoryCostUsdc,
+    averageEntryPriceUsdc,
+    costBasisSource: resolveOracleCostBasisSource(trackedSources),
+    trackedSources: Array.from(trackedSources).sort(),
+  };
 }
 
 function _resolveOracleMinEurcReserve(agent, walletReserveUsdc = 0) {
@@ -1528,6 +2183,7 @@ async function _buildOracleInventoryExitPlan({ agent, availableEurcBalance, wall
   }
 
   try {
+    const inventoryCostBasis = await _readOracleInventoryCostBasis(agent?.id || agent?.agent_id);
     const sellQuote = await agentWalletService.getSwapQuoteResult({
       fromToken: 'EURC',
       toToken: 'USDC',
@@ -1542,9 +2198,23 @@ async function _buildOracleInventoryExitPlan({ agent, availableEurcBalance, wall
       'ORACLE_SAME_CHAIN_MIN_PROFIT_USDC',
       DEFAULT_ORACLE_SAME_CHAIN_MIN_PROFIT_USDC,
     );
-    const referenceUsdcValue = normalizeUsdcAmount(sellableEurc);
-    const minimumExpectedUsdcOut = normalizeUsdcAmount(referenceUsdcValue + minProfitUsdc);
-    const expectedProfitUsdc = normalizeUsdcAmount(expectedUsdcOut - referenceUsdcValue);
+    const parityReferenceUsdcValue = normalizeUsdcAmount(sellableEurc);
+    const trackedInventoryEurc = normalizeUsdcAmount(inventoryCostBasis.trackedInventoryEurc || 0);
+    const trackedInventoryCostUsdc = normalizeUsdcAmount(inventoryCostBasis.trackedInventoryCostUsdc || 0);
+    const averageEntryPriceUsdc = normalizeUsdcAmount(inventoryCostBasis.averageEntryPriceUsdc || 0);
+    const costBasisSource = inventoryCostBasis.costBasisSource || null;
+    const trackedSources = Array.isArray(inventoryCostBasis.trackedSources)
+      ? inventoryCostBasis.trackedSources.filter(Boolean)
+      : [];
+    const costBasisReferenceUsdcValue = averageEntryPriceUsdc > 0
+      ? normalizeUsdcAmount(sellableEurc * averageEntryPriceUsdc)
+      : 0;
+    const effectiveReferenceUsdcValue = normalizeUsdcAmount(Math.max(parityReferenceUsdcValue, costBasisReferenceUsdcValue));
+    const minimumExpectedUsdcOut = normalizeUsdcAmount(effectiveReferenceUsdcValue + minProfitUsdc);
+    const expectedProfitUsdc = normalizeUsdcAmount(expectedUsdcOut - effectiveReferenceUsdcValue);
+    const profitBasis = costBasisReferenceUsdcValue > parityReferenceUsdcValue
+      ? 'oracle_inventory_cost_basis'
+      : 'swap_exit_parity_floor';
 
     return {
       profitable: expectedUsdcOut >= minimumExpectedUsdcOut,
@@ -1552,12 +2222,19 @@ async function _buildOracleInventoryExitPlan({ agent, availableEurcBalance, wall
       expectedUsdcOut,
       expectedProfitUsdc,
       referenceRate: 1,
-      referenceUsdcValue,
+      referenceUsdcValue: effectiveReferenceUsdcValue,
+      parityReferenceUsdcValue,
+      costBasisReferenceUsdcValue,
       minimumExpectedUsdcOut,
       profitFloorUsdc: minProfitUsdc,
       liveForexRate: Number.isFinite(forexRateNumeric) && forexRateNumeric > 0 ? forexRateNumeric : null,
       liveForexReferenceUsdcValue,
-      profitBasis: 'swap_exit_parity_floor',
+      profitBasis,
+      costBasisSource,
+      trackedSources,
+      trackedInventoryEurc,
+      trackedInventoryCostUsdc,
+      averageEntryPriceUsdc,
       protectedEurcReserve,
       exitExecutionRail: sellQuote?.executionRail || null,
       exitRouteStrategy: sellQuote?.routeStrategy || null,
@@ -1767,6 +2444,14 @@ async function loadCirbtcDirectPairPoolContexts() {
 
 async function executeStableAutomationTask({ agent, operationType, actionParams, dryRunEnabled }) {
   if (operationType === 'add_liquidity') {
+    if (String(actionParams?.mode || '').toLowerCase() === 'balanced') {
+      return agenticTaskExecutionService.executeCurveLiquidityAddBalancedTask({
+        agent,
+        params: actionParams,
+        dryRun: dryRunEnabled,
+      });
+    }
+
     return agenticTaskExecutionService.executeCurveLiquidityAddTask({
       agent,
       params: actionParams,
@@ -1848,7 +2533,9 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   const { rows: [agent] } = await db.query(
     `SELECT id, llm_model, llm_api_key_encrypted, oracle_enabled,
             daily_market_analysis_count, daily_limit_reset_at,
-            daily_tasks_enabled, defi_loop_enabled, daily_defi_loop_count, wallet_address
+            daily_tasks_enabled, defi_loop_enabled, daily_defi_loop_count, wallet_address,
+            private_key_encrypted,
+            gateway_auto_topup_enabled, gateway_auto_topup_min_usdc, gateway_auto_topup_target_usdc
      FROM agents WHERE id = $1`,
     [agentId],
   );
@@ -1878,6 +2565,8 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
     console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} daily cap reached`);
     return finishOracle('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_market_analysis_count });
   }
+
+  await maybeWarmAgentGatewayBalance(agent, 'oracle_query');
 
   // ── Fetch oracle data ──────────────────────────────────────────────────────
   let forexRate, poolState;
@@ -2044,7 +2733,9 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   const { agentId } = job.data;
 
   let latestStablePolicy = null;
+  let latestStableLanePolicy = null;
   let latestLendingPolicy = null;
+  let latestCarryPolicy = null;
   let latestLendingSurface = null;
   let latestExecutionSource = null;
   let latestAvailableUsdcBalance = null;
@@ -2064,10 +2755,18 @@ queue.process('DEFI_LOOP', 1, async (job) => {
           lendingPolicy: latestLendingPolicy,
           lendingSurface: latestLendingSurface,
         })
+      : automationKey === 'carryAutomation'
+        ? buildCarryAutomationDecisionSnapshot({
+            status,
+            payload,
+            carryPolicy: latestCarryPolicy,
+            lendingSurface: latestLendingSurface,
+          })
       : buildDefiLoopDecisionSnapshot({
           status,
           payload,
           stablePolicy: latestStablePolicy,
+          stableLanePolicy: latestStableLanePolicy,
           executionSource: latestExecutionSource,
           availableUsdcBalance: latestAvailableUsdcBalance,
           availableEurcBalance: latestAvailableEurcBalance,
@@ -2091,10 +2790,11 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   // Reload agent — verify flag still on + fetch encrypted key
   const { rows: [agent] } = await db.query(
     `SELECT id, llm_model, llm_api_key_encrypted,
-            defi_loop_enabled, lending_automation_enabled, cirbtc_lp_enabled, oracle_enabled,
+            defi_loop_enabled, lending_automation_enabled, carry_automation_enabled, cirbtc_lp_enabled, oracle_enabled,
             daily_defi_loop_count, daily_limit_reset_at,
           daily_limit_usdc, max_trade_usdc, defi_wallet_reserve_usdc,
           oracle_max_eurc_inventory, oracle_min_eurc_reserve, slippage_percent,
+            gateway_auto_topup_enabled, gateway_auto_topup_min_usdc, gateway_auto_topup_target_usdc,
             wallet_address, private_key_encrypted,
             market_analysis_last_decision,
             stable_manual_cooldown_until
@@ -2108,26 +2808,32 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   const arbitragePermissionGranted = permissions.arbitrage !== false;
   const stableLoopConfigured = Boolean(agent.defi_loop_enabled);
   const lendingAutomationEnabled = Boolean(agent.lending_automation_enabled);
+  const carryAutomationEnabled = Boolean(agent.carry_automation_enabled);
   const cirbtcLpConfigured = Boolean(agent.cirbtc_lp_enabled);
   const stableLoopEnabled = Boolean(stableLoopConfigured && arbitragePermissionGranted);
   const cirbtcLpEnabled = Boolean(cirbtcLpConfigured && arbitragePermissionGranted);
   activeAutomationKey = lendingAutomationEnabled
     ? 'lendingAutomation'
+    : carryAutomationEnabled
+      ? 'carryAutomation'
     : stableLoopConfigured
       ? 'defiLoop'
       : 'cirbtcLp';
 
-  if (stableLoopEnabled) {
+  if (stableLoopEnabled && !carryAutomationEnabled) {
     await _setAutomationState(agentId, 'defiLoop', 'running');
   }
   if (lendingAutomationEnabled) {
     await _setAutomationState(agentId, 'lendingAutomation', 'running');
   }
-  if (cirbtcLpEnabled) {
+  if (carryAutomationEnabled) {
+    await _setAutomationState(agentId, 'carryAutomation', 'running');
+  }
+  if (cirbtcLpEnabled && !carryAutomationEnabled) {
     await _setAutomationState(agentId, 'cirbtcLp', 'running');
   }
 
-  if (!stableLoopEnabled && !lendingAutomationEnabled && !cirbtcLpEnabled) {
+  if (!stableLoopEnabled && !lendingAutomationEnabled && !carryAutomationEnabled && !cirbtcLpEnabled) {
     if (!arbitragePermissionGranted && (stableLoopConfigured || cirbtcLpConfigured)) {
       await db.query(
         `INSERT INTO transactions
@@ -2196,6 +2902,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     return finishDefi('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_defi_loop_count });
   }
 
+  await maybeWarmAgentGatewayBalance(agent, 'defi_loop');
+
   let forexRate = null;
   let poolState = null;
   let signal = {
@@ -2215,15 +2923,22 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   let positionContext = { ok: true, snapshot: null, position: null };
   let lendingCirbtcPositionsByKey = {};
 
-  if (stableLoopEnabled) {
+  if (stableLoopEnabled || carryAutomationEnabled) {
     try {
       forexRate = await oracle.getForexRate('EURC', 'USDC');
       poolState = await _getOracleStablePoolState(forexRate);
     } catch (err) {
       console.error(`[QUEUE] DEFI_LOOP oracle error agent=${agentId}:`, err.message);
-      return finishDefi('fetch_error', { ok: false, reason: 'oracle_fetch_error', error: err.message });
+      activeAutomationKey = carryAutomationEnabled && !stableLoopEnabled ? 'carryAutomation' : activeAutomationKey;
+      return finishDefi('fetch_error', {
+        ok: false,
+        reason: stableLoopEnabled ? 'oracle_fetch_error' : 'stable_pool_state_unavailable',
+        error: err.message,
+      });
     }
+  }
 
+  if (stableLoopEnabled) {
     signal = oracle.buildArbSignal({
       strategy:      'stablecoin_fx',
       forexRate:     forexRate.rate,
@@ -2273,7 +2988,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         error: positionContext.error,
       });
     }
-  } else if (lendingAutomationEnabled) {
+  } else if (lendingAutomationEnabled || carryAutomationEnabled) {
     try {
       const lendingStablePositionContext = await readStableCurvePositionContext(agent.wallet_address);
       if (lendingStablePositionContext.ok) {
@@ -2340,6 +3055,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         checks: {},
       };
   latestStablePolicy = stablePolicy;
+  latestStableLanePolicy = stablePolicy;
   const cirbtcIdleCapitalBudgets = getCirbtcIdleCapitalBudgets({
     stablePolicy,
     availableToTradeUsdc,
@@ -2347,42 +3063,76 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   });
 
   let lendingPolicy = null;
-  if (lendingAutomationEnabled) {
+  if (lendingAutomationEnabled || carryAutomationEnabled) {
     try {
-      const lendingCirbtcPositionContext = await readCirbtcDirectPairPositionContext(agent.wallet_address).catch((error) => {
-        console.warn(`[QUEUE] DEFI_LOOP lending cirBTC position snapshot unavailable agent=${agentId}:`, error.message);
-        return {
-          ok: true,
-          positionsByKey: {},
-          warningsByKey: {},
-        };
-      });
+      const lendingCirbtcPositionContext = lendingAutomationEnabled
+        ? await readCirbtcDirectPairPositionContext(agent.wallet_address).catch((error) => {
+            console.warn(`[QUEUE] DEFI_LOOP lending cirBTC position snapshot unavailable agent=${agentId}:`, error.message);
+            return {
+              ok: true,
+              positionsByKey: {},
+              warningsByKey: {},
+            };
+          })
+        : {
+            ok: true,
+            positionsByKey: {},
+            warningsByKey: {},
+          };
       lendingCirbtcPositionsByKey = lendingCirbtcPositionContext?.positionsByKey || {};
       latestLendingSurface = await nativeLendingRiskService.buildLendingSurfaceForWallet(agent.wallet_address);
-      lendingPolicy = evaluateLendingAutomationPolicy({
-        lendingSurface: latestLendingSurface,
-        stableCurvePosition: positionContext.position || null,
-        cirbtcPositionsByKey: lendingCirbtcPositionsByKey,
-      });
-      latestLendingPolicy = lendingPolicy;
+      if (lendingAutomationEnabled) {
+        lendingPolicy = evaluateLendingAutomationPolicy({
+          lendingSurface: latestLendingSurface,
+          stableCurvePosition: positionContext.position || null,
+          cirbtcPositionsByKey: lendingCirbtcPositionsByKey,
+        });
+        latestLendingPolicy = lendingPolicy;
+      }
+      if (carryAutomationEnabled) {
+        latestCarryPolicy = evaluateCarryAutomationPolicy({
+          lendingSurface: latestLendingSurface,
+          stablePoolState: poolState,
+          stableCurvePosition: positionContext.position || null,
+          walletBalances: {
+            usdc: availableUsdcBalance,
+            eurc: availableEurcBalance,
+          },
+          maxTradeUsdc: Number(agent.max_trade_usdc || 0),
+          walletReserveUsdc,
+        });
+      }
     } catch (err) {
       latestLendingSurface = null;
       latestLendingPolicy = null;
-      activeAutomationKey = 'lendingAutomation';
+      latestCarryPolicy = null;
 
-      if (!stableLoopEnabled && !cirbtcLpEnabled) {
-        return finishDefi('fetch_error', {
+      if (lendingAutomationEnabled) {
+        activeAutomationKey = 'lendingAutomation';
+
+        if (!stableLoopEnabled && !cirbtcLpEnabled && !carryAutomationEnabled) {
+          return finishDefi('fetch_error', {
+            ok: false,
+            reason: 'lending_surface_unavailable',
+            error: err.message,
+          });
+        }
+
+        await persistAutomationSnapshot('lendingAutomation', 'fetch_error', {
           ok: false,
           reason: 'lending_surface_unavailable',
           error: err.message,
         });
       }
 
-      await persistAutomationSnapshot('lendingAutomation', 'fetch_error', {
-        ok: false,
-        reason: 'lending_surface_unavailable',
-        error: err.message,
-      });
+      if (carryAutomationEnabled) {
+        activeAutomationKey = 'carryAutomation';
+        return finishDefi('fetch_error', {
+          ok: false,
+          reason: 'lending_surface_unavailable',
+          error: err.message,
+        });
+      }
     }
   }
 
@@ -2420,6 +3170,14 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       });
       stableStatePersisted = true;
     }
+    if (carryAutomationEnabled) {
+      await persistAutomationSnapshot('carryAutomation', 'policy_hold', {
+        ok: true,
+        action: 'hold',
+        reason: 'lending_guard_priority',
+        summary: 'Carry lane is holding because the lending guard took priority for this cycle.',
+      });
+    }
 
     automationPolicy = lendingPolicy;
     automationType = 'lending';
@@ -2454,6 +3212,56 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       reason: 'lending_policy_hold',
       summary: lendingPolicy.verdict.reason,
     });
+  }
+
+  if (carryAutomationEnabled && automationType !== 'lending') {
+    if (stableLoopEnabled && !stableStatePersisted) {
+      latestStablePolicy = stablePolicy;
+      latestExecutionSource = getStableAutomationExecutionSource();
+      latestPositionSummary = positionSummary;
+      await persistAutomationSnapshot('defiLoop', 'policy_hold', {
+        ok: true,
+        action: 'hold',
+        reason: 'carry_mode_exclusive',
+        summary: 'Stable DeFi Loop is paused because Auto Carry owns the stable LP lane while it is enabled.',
+        stablePolicy,
+        executionGate,
+      });
+      stableStatePersisted = true;
+    }
+
+    if (cirbtcLpEnabled) {
+      await _setAutomationState(agentId, 'cirbtcLp', 'policy_hold');
+    }
+
+    automationPolicy = latestCarryPolicy || {
+      policyId: 'carry_stable_lp_v1',
+      verdict: {
+        execute: false,
+        lane: 'carry_stable_lp',
+        operationType: null,
+        reason: 'Carry automation is waiting for the first carry review.',
+        suggestedAmountUsdc: 0,
+        actionAssetSymbol: 'USDC',
+        actionParams: null,
+        blockedBy: 'waiting_for_snapshot',
+      },
+      metrics: {},
+      checks: {},
+    };
+    automationType = 'carry';
+    activeAutomationKey = 'carryAutomation';
+    latestExecutionSource = getCarryAutomationExecutionSource();
+
+    if (automationPolicy.verdict.execute !== true) {
+      latestPositionSummary = positionSummary;
+      return finishDefi('policy_hold', {
+        ok: true,
+        action: 'hold',
+        reason: 'carry_policy_hold',
+        summary: automationPolicy.verdict.reason,
+      });
+    }
   }
 
   if (automationType === 'stable' && automationPolicy.verdict.execute !== true) {
@@ -2669,6 +3477,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   const actionParams = { ...(automationPolicy.verdict.actionParams || {}) };
   const transactionType = automationType === 'lending'
     ? getLendingAutomationTransactionType(operationType, actionParams)
+    : automationType === 'carry'
+    ? getCarryAutomationTransactionType(operationType, actionParams)
     : automationType === 'cirbtc'
     ? getCirbtcAutomationTransactionType(operationType)
     : automationType === 'oracle'
@@ -2676,6 +3486,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       : getStableAutomationTransactionType(operationType);
   const transactionToken = automationType === 'lending'
     ? getLendingAutomationTransactionToken(actionParams, automationPolicy)
+    : automationType === 'carry'
+    ? getCarryAutomationTransactionToken(actionParams, automationPolicy)
     : automationType === 'cirbtc'
     ? getCirbtcAutomationTransactionToken(actionParams, automationPolicy)
     : automationType === 'oracle'
@@ -2683,6 +3495,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       : getStableAutomationTransactionToken(operationType);
   const executionSource = automationType === 'lending'
     ? getLendingAutomationExecutionSource()
+    : automationType === 'carry'
+    ? getCarryAutomationExecutionSource()
     : automationType === 'cirbtc'
     ? getCirbtcAutomationExecutionSource()
     : automationType === 'oracle'
@@ -2690,6 +3504,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       : getStableAutomationExecutionSource();
   const nominalActionAmountUsdc = automationType === 'lending'
     ? getLendingAutomationNotionalAmount(automationPolicy)
+    : automationType === 'carry'
+    ? getCarryAutomationNotionalAmount(automationPolicy)
     : automationType === 'cirbtc'
     ? getCirbtcAutomationNotionalAmount(automationPolicy)
     : automationType === 'oracle'
@@ -2699,6 +3515,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   latestExecutionSource = executionSource;
   const defaultFromToken = automationType === 'lending'
     ? (actionParams.tokenOut || actionParams.stableToken || automationPolicy?.verdict?.actionAssetSymbol || 'USDC')
+    : automationType === 'carry'
+    ? (actionParams.asset || actionParams.stableToken || automationPolicy?.verdict?.actionAssetSymbol || 'USDC')
     : actionParams.fromToken || actionParams.stableToken || 'USDC';
   const defaultToToken = automationType === 'lending'
     ? (operationType === 'forced_lp_reduce'
@@ -2708,6 +3526,10 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         : operationType === 'utilization_repay' || operationType === 'deleverage'
           ? 'lending debt'
           : 'lending account')
+    : automationType === 'carry'
+    ? (operationType === 'close_carry' || operationType === 'repay_wallet_balance'
+      ? 'lending debt'
+      : 'Curve LP')
     : automationType === 'cirbtc'
     ? (operationType === 'remove_liquidity' ? 'both pair tokens' : 'direct LP')
     : operationType === 'remove_liquidity'
@@ -2721,6 +3543,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     ? 'cirBTC LP automation'
     : automationType === 'oracle'
       ? 'Oracle strategy'
+      : automationType === 'carry'
+        ? 'Auto Carry'
       : automationType === 'lending'
         ? 'Lending automation'
         : 'Stable automation';
@@ -2738,6 +3562,31 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       ? normalizeUsdcAmount(Math.min(availableEurcBalance, automationBudgetStableBalance || availableEurcBalance))
       : normalizeUsdcAmount(Math.min(availableToTradeUsdc, automationBudgetStableBalance || availableToTradeUsdc));
     executionAmount = normalizeUsdcAmount(Math.min(requestedExecutionAmount, availableStableBalance));
+    actionParams.amountIn = String(executionAmount);
+  } else if (
+    automationType === 'stable'
+    && operationType === 'add_liquidity'
+    && String(actionParams?.mode || '').toLowerCase() === 'balanced'
+  ) {
+    if (!balancesAvailable) {
+      return finishDefi('balance_check_failed', {
+        ok: false,
+        reason: 'wallet_balance_unavailable',
+        stablePolicy: automationPolicy,
+      });
+    }
+
+    const requestedUsdcSide = normalizeUsdcAmount(actionParams.amountUsdc ?? actionParams.amount0);
+    const requestedEurcSide = normalizeUsdcAmount(actionParams.amountEurc ?? actionParams.amount1);
+    const executionAmountUsdc = normalizeUsdcAmount(Math.min(requestedUsdcSide, availableToTradeUsdc));
+    const executionAmountEurc = normalizeUsdcAmount(Math.min(requestedEurcSide, availableEurcBalance));
+
+    requestedExecutionAmount = normalizeUsdcAmount(requestedUsdcSide + requestedEurcSide);
+    executionAmount = normalizeUsdcAmount(executionAmountUsdc + executionAmountEurc);
+    actionParams.amountUsdc = String(executionAmountUsdc);
+    actionParams.amountEurc = String(executionAmountEurc);
+    actionParams.amount0 = String(executionAmountUsdc);
+    actionParams.amount1 = String(executionAmountEurc);
     actionParams.amountIn = String(executionAmount);
   } else if (operationType === 'swap' || operationType === 'add_liquidity') {
     if (!balancesAvailable) {
@@ -2811,6 +3660,22 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     let dryRunPayload = {};
     if (automationType === 'lending') {
       const dryRunResult = await executeLendingAutomationTask({
+        agent,
+        automationPolicy,
+        dryRunEnabled: true,
+      });
+      if (!dryRunResult.ok) {
+        return finishDefi('dry_run_failed', {
+          ok: false,
+          reason: dryRunResult.reason,
+          error: dryRunResult.error,
+          operationType,
+          stablePolicy: automationPolicy,
+        });
+      }
+      dryRunPayload = dryRunResult.payload || {};
+    } else if (automationType === 'carry') {
+      const dryRunResult = await executeCarryAutomationTask({
         agent,
         automationPolicy,
         dryRunEnabled: true,
@@ -2917,6 +3782,35 @@ queue.process('DEFI_LOOP', 1, async (job) => {
             swapPool,
           })
         : null;
+
+      if (automationType === 'oracle' && sameChainSellBackPlan?.profitable !== true) {
+        const guardReason = sameChainSellBackPlan?.expectedUsdcOut > 0
+          ? `Oracle strategy held the EURC entry because buying ${sameChainSellBackPlan.inputUsdc} USDC on Curve would only quote ${sameChainSellBackPlan.expectedUsdcOut} USDC on the live same-chain exit, below the required ${sameChainSellBackPlan.minimumExpectedUsdcOut} USDC floor.`
+          : 'Oracle strategy held the EURC entry because the live same-chain EURC -> USDC exit quote was unavailable or not profitable enough to protect the buy leg.';
+
+        latestStablePolicy = {
+          ...automationPolicy,
+          verdict: {
+            ...(automationPolicy?.verdict || {}),
+            execute: false,
+            blockedBy: 'same_chain_exit_unprofitable',
+            reason: guardReason,
+          },
+          metrics: {
+            ...(automationPolicy?.metrics || {}),
+            sameChainSellBackQuote: sameChainSellBackPlan || null,
+          },
+        };
+
+        return finishDefi('policy_hold', {
+          ok: true,
+          action: 'hold',
+          reason: 'same_chain_exit_unprofitable',
+          summary: guardReason,
+          operationType,
+          sameChainSellBackQuote: sameChainSellBackPlan || null,
+        });
+      }
 
       if (!poolAddress) {
         return finishDefi('pool_unconfigured', { ok: false, reason: 'pool_address_not_configured' });
@@ -3032,6 +3926,97 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         txHash: executionPayload.txHash || executionPayload.hash || executionPayload.stepsExecuted?.[0]?.txHash || null,
         amountOut: executionPayload.amountOut || null,
       };
+    } else if (automationType === 'carry') {
+      const executionResult = await executeCarryAutomationTask({
+        agent,
+        automationPolicy,
+        dryRunEnabled: false,
+      });
+      if (!executionResult.ok) {
+        await db.query(
+          `INSERT INTO transactions
+             (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
+           VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, 'failed', $5::jsonb)`,
+          [agentId, transactionType, transactionToken, nominalActionAmountUsdc || executionAmount, JSON.stringify({
+            signal,
+            executionGate,
+            automationPolicy,
+            policyId: automationPolicy?.policyId || null,
+            policyLane: automationPolicy?.verdict?.lane || null,
+            executionState: 'failed',
+            executionSource,
+            operationType,
+            fromToken: defaultFromToken,
+            toToken: defaultToToken,
+            amountIn: actionParams.amountIn || executionAmount,
+            requestedAmountIn: requestedExecutionAmount,
+            availableBalanceUsdc: availableUsdcBalance,
+            availableBalanceEurc: availableEurcBalance,
+            walletReserveUsdc,
+            availableToTradeUsdc,
+            positionBefore: positionSummary,
+            summary: `Auto Carry could not execute ${operationType.replace(/_/g, ' ')}: ${executionResult.error || executionResult.reason}`,
+            reason: executionResult.reason,
+            error: executionResult.error || null,
+          })],
+        );
+
+        return finishDefi('execution_blocked', {
+          ok: false,
+          reason: executionResult.reason,
+          error: executionResult.error,
+          operationType,
+        });
+      }
+
+      executionPayload = executionResult.payload || {};
+      txResult = {
+        txHash: executionPayload.txHash
+          || executionPayload.hash
+          || executionPayload.repayTxHash
+          || executionPayload.addLiquidityTxHash
+          || executionPayload.removeLiquidityTxHash
+          || executionPayload.borrowTxHash
+          || executionPayload.stepsExecuted?.[0]?.txHash
+          || null,
+        amountOut: executionPayload.amountOut || null,
+      };
+
+      try {
+        const [refreshedLendingSurface, refreshedPositionContext] = await Promise.all([
+          nativeLendingRiskService.buildLendingSurfaceForWallet(agent.wallet_address),
+          readStableCurvePositionContext(agent.wallet_address),
+        ]);
+        const refreshedUsdcWalletBalance = Number(
+          refreshedLendingSurface?.assets?.find((assetEntry) => assetEntry.symbol === 'USDC')?.wallet?.amount || 0,
+        );
+        const refreshedEurcWalletBalance = Number(
+          refreshedLendingSurface?.assets?.find((assetEntry) => assetEntry.symbol === 'EURC')?.wallet?.amount || 0,
+        );
+        const refreshedStablePosition = refreshedPositionContext?.ok === true
+          ? refreshedPositionContext.position || null
+          : positionContext.position || null;
+
+        latestLendingSurface = refreshedLendingSurface;
+        latestCarryPolicy = evaluateCarryAutomationPolicy({
+          lendingSurface: refreshedLendingSurface,
+          stablePoolState: poolState,
+          stableCurvePosition: refreshedStablePosition,
+          walletBalances: {
+            usdc: refreshedUsdcWalletBalance,
+            eurc: refreshedEurcWalletBalance,
+          },
+          maxTradeUsdc: Number(agent.max_trade_usdc || 0),
+          walletReserveUsdc,
+        });
+        positionContext = refreshedPositionContext?.ok === true
+          ? refreshedPositionContext
+          : positionContext;
+        positionSummary = summarizePosition(refreshedStablePosition) || positionSummary;
+        latestPositionSummary = positionSummary;
+      } catch (refreshError) {
+        console.warn(`[QUEUE] DEFI_LOOP carry post-execution refresh failed agent=${agentId}:`, refreshError.message);
+      }
     } else if (automationType === 'cirbtc') {
       const executionResult = await executeCirbtcLpAutomationTask({
         agent,
@@ -3340,6 +4325,7 @@ const BUILTIN_DAILY_TASKS = [
     id: 'DAILY_PRICE_REPORT',
     title: 'FX Peg Proxy Report',
     description: 'EURC/USDC + BRLA/USDC fiat peg proxies via Frankfurter',
+    enabled: false,
   },
   {
     id: 'DAILY_POOL_HEALTH',
@@ -3350,21 +4336,23 @@ const BUILTIN_DAILY_TASKS = [
     id: 'DAILY_YIELD_RANK',
     title: 'Yield Ranking',
     description: 'Top 3 APY opportunities across USDC/EURC pools',
+    enabled: false,
   },
   {
     id: 'DAILY_ARB_SCAN',
-    title: 'Arb Signal Scan',
-    description: 'Stablecoin spread arbitrage opportunity detector',
+    title: 'Arb Signal Simulation',
+    description: 'Estimated stablecoin spread check before live fees and execution change the edge',
   },
   {
     id: 'DAILY_WALLET_DIGEST',
     title: 'Wallet Digest',
     description: '24h activity summary and agent wallet balance snapshot',
+    enabled: false,
   },
   {
     id: 'DAILY_FOREX_MATRIX',
-    title: 'FX Peg Proxy Matrix',
-    description: 'EURC, BRLA, MXNB and JPYC fiat peg proxies against USDC',
+    title: 'FX Reference Board',
+    description: 'Merged fiat peg board for EURC, BRLA, MXNB and JPYC against USDC',
   },
   {
     id: 'DAILY_USDC_PEG_CHECK',
@@ -3375,16 +4363,18 @@ const BUILTIN_DAILY_TASKS = [
     id: 'DAILY_MARKET_TAPE',
     title: 'Market Tape',
     description: 'USDC, EURC, ETH and BTC prices with 24h move summary',
+    enabled: false,
   },
   {
     id: 'DAILY_PROTOCOL_TVL',
     title: 'Protocol TVL Monitor',
     description: 'Aave, Morpho and Maple TVL change snapshot',
+    enabled: false,
   },
   {
     id: 'DAILY_ACTIVITY_RECAP',
-    title: 'Activity Recap',
-    description: 'Recent transaction mix and latest activity recap',
+    title: 'Wallet & Activity',
+    description: 'Recent transaction mix plus wallet task and automation counts for the last 24h',
   },
 ];
 const DAILY_TASK_TYPES = BUILTIN_DAILY_TASKS.map(task => task.id);
@@ -3677,6 +4667,15 @@ const _ALL_SEEDED_TASKS = [
   ...BUILTIN_DAILY_TASKS.map(t => ({ ...t, tier: 1, fee_usdc: 0 })),
   ...BUILTIN_TIER2_TASKS,
 ];
+const TASK_PERMISSION_REQUIREMENTS = Object.freeze({
+  DAILY_POOL_HEALTH: 'defi_scan',
+  DAILY_YIELD_RANK: 'defi_scan',
+  DAILY_ARB_SCAN: 'defi_scan',
+  DAILY_MARKET_TAPE: 'defi_scan',
+  DAILY_PROTOCOL_TVL: 'defi_scan',
+  EXEC_ARB: 'arbitrage',
+  EXEC_REBALANCE: 'arbitrage',
+});
 const EXECUTION_TASK_FEE_BY_ID = Object.fromEntries(
   BUILTIN_TIER2_TASKS.map(task => [task.id, Number(task.fee_usdc) || 0]),
 );
@@ -4341,12 +5340,24 @@ registerTaskProcessor('DAILY_ARB_SCAN', 3, async (job) => {
     baseToken:     'EURC',
     quoteToken:    'USDC',
   });
+  const referenceAmountUsdc = Number(signal.opportunity?.amountUsdc || 0);
+  const formatArbMetric = (value, maximumFractionDigits = 2) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return String(value || '0');
+    return numeric.toLocaleString('en-US', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits,
+    });
+  };
 
   const payload = {
+    mode: 'simulation',
     signal: signal.opportunity.found ? signal : null,
+    referenceSwapAmountUsdc: referenceAmountUsdc > 0 ? referenceAmountUsdc : null,
     summary: signal.opportunity.found
-      ? `Arbitrage signal ${signal.opportunity.confidence} confidence, est. ${Number(signal.opportunity.expectedProfitUsdc || 0).toFixed(2)} USDC profit.`
-      : 'No profitable arbitrage setup was found in the latest scan.',
+      ? `Reference only: if you swapped about ${formatArbMetric(referenceAmountUsdc, 0)} USDC on the Curve leg, the current spread suggests roughly ${formatArbMetric(signal.opportunity.expectedProfitUsdc || signal.opportunity.netProfitUsdc || 0)} USDC before bridge, exit and live fees.`
+      : 'Simulation did not find a profitable arbitrage setup in the latest scan.',
+    disclaimer: 'Estimate only. Live bridge, exit pricing and fees can change before execution.',
     fetchedAt: new Date().toISOString(),
   };
   await _saveTaskResult(agentId, 'DAILY_ARB_SCAN', payload);
@@ -4388,12 +5399,15 @@ registerTaskProcessor('DAILY_FOREX_MATRIX', 3, async (job) => {
   const rates = await oracle.getAllForexRates();
   const pairs = Object.entries(rates || {});
   const strongest = pairs.sort((left, right) => (right[1]?.rate ?? 0) - (left[1]?.rate ?? 0))[0];
+  const featuredPairs = ['EURC/USDC', 'BRLA/USDC']
+    .map((pair) => (rates?.[pair] ? `${pair} ${rates[pair].rate}` : null))
+    .filter(Boolean);
 
   const payload = {
     rates,
-    summary: strongest
-      ? `Tracked ${pairs.length} fiat peg proxies. Highest proxy: ${strongest[0]} ${strongest[1].rate}.`
-      : 'Tracked fiat peg proxies for the daily matrix.',
+    summary: featuredPairs.length
+      ? `${featuredPairs.join(' · ')} · tracked ${pairs.length} fiat peg proxies${strongest ? ` · highest proxy ${strongest[0]} ${strongest[1].rate}` : ''}`
+      : 'Tracked fiat peg proxies for the daily reference board.',
     fetchedAt: new Date().toISOString(),
   };
   await _saveTaskResult(agentId, 'DAILY_FOREX_MATRIX', payload);
@@ -4475,7 +5489,7 @@ registerTaskProcessor('DAILY_ACTIVITY_RECAP', 3, async (job) => {
   const guard = await _dailyTaskGuard(agentId);
   if (!guard.ok) return guard;
 
-  const [countsResult, recentResult] = await Promise.all([
+  const [countsResult, recentResult, agentRow, taskCount] = await Promise.all([
     db.query(
       `SELECT
          COUNT(*) AS total,
@@ -4497,13 +5511,35 @@ registerTaskProcessor('DAILY_ACTIVITY_RECAP', 3, async (job) => {
        LIMIT 3`,
       [agentId],
     ),
+    db.query(
+      `SELECT wallet_address, daily_free_task_count, daily_auto_tx_count
+         FROM agents
+        WHERE id = $1`,
+      [agentId],
+    ),
+    db.query(
+      `SELECT COUNT(*) AS cnt
+         FROM agent_task_results
+        WHERE agent_id = $1
+          AND created_at > NOW() - INTERVAL '24 hours'`,
+      [agentId],
+    ),
   ]);
 
   const counts = countsResult.rows[0] || {};
+  const agentSummary = agentRow.rows[0] || {};
+  const totalCount = parseInt(counts.total || '0', 10);
+  const confirmedCount = parseInt(counts.confirmed_count || '0', 10);
+  const taskRecordCount = parseInt(taskCount.rows[0]?.cnt || '0', 10);
+  const dailyAutoTxCount = agentSummary.daily_auto_tx_count ?? 0;
   const payload = {
     counts,
     recent: recentResult.rows,
-    summary: `Recent activity: ${parseInt(counts.total || '0', 10)} total, ${parseInt(counts.confirmed_count || '0', 10)} confirmed, ${parseInt(counts.receive_count || '0', 10)} receive events in the last 24h.`,
+    walletAddress: agentSummary.wallet_address || null,
+    tasksToday: taskRecordCount,
+    dailyFreeCount: agentSummary.daily_free_task_count ?? 0,
+    dailyAutoTxCount,
+    summary: `Wallet & activity: ${totalCount} tx, ${confirmedCount} confirmed, ${taskRecordCount} task records and ${dailyAutoTxCount} auto tx in the last 24h.`,
     fetchedAt: new Date().toISOString(),
   };
   await _saveTaskResult(agentId, 'DAILY_ACTIVITY_RECAP', payload);
@@ -4876,5 +5912,6 @@ module.exports.scheduleDailyTasks = scheduleDailyTasks;
 module.exports.canQueueManualTasks = canQueueManualTasks;
 module.exports.queueManualTask = queueManualTask;
 module.exports.runTaskInline = runTaskInline;
+module.exports.guardTaskPermission = guardTaskPermission;
 module.exports.resumeLocalWorkers = resumeLocalWorkers;
 module.exports.pauseLocalWorkers = pauseLocalWorkers;

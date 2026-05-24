@@ -3,6 +3,19 @@
   "buildCommand": "npm install && npm run build",
   "installCommand": "npm install",
   "outputDirectory": "dist",
+  "redirects": [
+    {
+      "source": "/:path*",
+      "has": [
+        {
+          "type": "host",
+          "value": "arcmachina.vercel.app"
+        }
+      ],
+      "destination": "https://arcmachina.xyz/:path*",
+      "permanent": true
+    }
+  ],
   "rewrites": [
     {
       "source": "/api/(.*)",

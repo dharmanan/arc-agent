@@ -4,6 +4,10 @@ const POLICY_ID = 'lending_autonomous_guard_v1';
 const DEFAULT_HEALTH_FACTOR_TRIGGER = Number(process.env.LENDING_AUTOMATION_TRIGGER_HF || '1.2');
 const DEFAULT_MAX_RESERVE_UTILIZATION_PCT = Number(process.env.LENDING_AUTOMATION_MAX_UTILIZATION_PCT || '85');
 const DEFAULT_MIN_LP_REDUCTION_USD = Number(process.env.LENDING_AUTOMATION_MIN_LP_REDUCTION_USD || '5');
+const DEFAULT_MIN_AUTOMATION_ACTION_USD = (() => {
+  const numeric = Number(process.env.LENDING_AUTOMATION_MIN_ACTION_USD || '1');
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 1;
+})();
 
 function toNumber(value, fallback = 0) {
   const numeric = Number(value);
@@ -83,18 +87,31 @@ function buildDebtAssetSnapshot(assetEntry, maxReserveUtilizationPct) {
   };
 }
 
-function buildUtilizationRepayPlan({ debtAssets }) {
+function buildUtilizationRepayPlan({ debtAssets, minAutomationActionUsd }) {
   const steps = [];
   let plannedRepayUsd = 0;
+  let requiredRepayUsd = 0;
+  const belowMinRepayAssets = [];
 
   for (const asset of debtAssets) {
     if (!asset.utilizationCapBreached) continue;
+    requiredRepayUsd += toNumber(asset.utilizationRepayUsd, 0);
     if (!(asset.utilizationRepayAmount > 0) || !(asset.priceUsd > 0)) continue;
 
     const repayAmount = Math.min(asset.walletAmount, asset.utilizationRepayAmount, asset.debtAmount);
     if (!(repayAmount > 0)) continue;
 
     const repayUsd = repayAmount * asset.priceUsd;
+    if (!(repayUsd >= minAutomationActionUsd)) {
+      belowMinRepayAssets.push({
+        asset: asset.symbol,
+        plannedRepayUsd: roundMetric(repayUsd),
+        currentDebtUsd: asset.debtUsd,
+        reserveUtilizationPct: asset.reserveUtilizationPct,
+      });
+      continue;
+    }
+
     steps.push({
       action: 'repay',
       asset: asset.symbol,
@@ -120,10 +137,9 @@ function buildUtilizationRepayPlan({ debtAssets }) {
   return {
     steps,
     breachedAssets,
+    belowMinRepayAssets,
     plannedRepayUsd: roundMetric(plannedRepayUsd),
-    requiredRepayUsd: roundMetric(
-      debtAssets.reduce((sum, asset) => sum + toNumber(asset.utilizationRepayUsd, 0), 0),
-    ),
+    requiredRepayUsd: roundMetric(requiredRepayUsd),
   };
 }
 
@@ -272,13 +288,14 @@ function evaluateLendingAutomationPolicy({
   const healthFactorTrigger = DEFAULT_HEALTH_FACTOR_TRIGGER;
   const maxReserveUtilizationPct = DEFAULT_MAX_RESERVE_UTILIZATION_PCT;
   const minLpReductionUsd = DEFAULT_MIN_LP_REDUCTION_USD;
+  const minAutomationActionUsd = DEFAULT_MIN_AUTOMATION_ACTION_USD;
   const debtAssets = (surface?.assets || [])
     .map((assetEntry) => buildDebtAssetSnapshot(assetEntry, maxReserveUtilizationPct))
     .filter((asset) => asset.debtAmount > 0)
     .sort((left, right) => toNumber(right.debtUsd, 0) - toNumber(left.debtUsd, 0));
-  const utilizationPlan = buildUtilizationRepayPlan({ debtAssets });
+  const utilizationPlan = buildUtilizationRepayPlan({ debtAssets, minAutomationActionUsd });
   const healthFactorTriggered = totalBorrowUsd > 0 && Number.isFinite(healthFactor) && healthFactor <= healthFactorTrigger;
-  const utilizationCapTriggered = utilizationPlan.breachedAssets.length > 0;
+  const utilizationCapTriggered = toNumber(utilizationPlan.requiredRepayUsd, 0) >= minAutomationActionUsd;
 
   const metrics = {
     healthFactor: roundMetric(healthFactor, 4),
@@ -286,7 +303,9 @@ function evaluateLendingAutomationPolicy({
     totalBorrowUsd: roundMetric(totalBorrowUsd),
     totalSuppliedUsd: roundMetric(totalSuppliedUsd),
     utilizationCapPct: roundMetric(maxReserveUtilizationPct, 2),
+    minAutomationActionUsd: roundMetric(minAutomationActionUsd, 2),
     breachedAssets: utilizationPlan.breachedAssets,
+    belowMinRepayAssets: utilizationPlan.belowMinRepayAssets,
     recoveryStatus: surface?.recovery?.status || 'idle',
     collateralTopUpStatus: surface?.collateralTopUp?.status || 'idle',
     safeExitStatus: surface?.safeExit?.status || 'idle',
@@ -303,6 +322,13 @@ function evaluateLendingAutomationPolicy({
   }
 
   if (!healthFactorTriggered && !utilizationCapTriggered) {
+    if (toNumber(utilizationPlan.requiredRepayUsd, 0) > 0) {
+      return buildHoldVerdict('Lending automation is holding because the visible reserve-utilization fix stays below the minimum automatic action size.', metrics, {
+        ...checks,
+        belowMinAction: true,
+      });
+    }
+
     return buildHoldVerdict('Lending automation is holding because health factor and reserve utilization both remain inside the current guardrails.', metrics, checks);
   }
 
@@ -390,6 +416,17 @@ function evaluateLendingAutomationPolicy({
         toNumber(surface?.collateralTopUp?.collateralUsdNeeded, 0),
       )
     : Math.max(utilizationPlan.requiredRepayUsd, 0);
+
+  if (neededUsd > 0 && neededUsd < minAutomationActionUsd) {
+    return buildHoldVerdict('Lending automation is holding because the current repay or top-up need stays below the minimum automatic action size.', {
+      ...metrics,
+      neededUsd: roundMetric(neededUsd),
+    }, {
+      ...checks,
+      belowMinAction: true,
+    });
+  }
+
   const forcedLpReduction = buildForcedLpReductionCandidate({
     targetAsset: targetDebtAsset?.symbol,
     neededUsd,

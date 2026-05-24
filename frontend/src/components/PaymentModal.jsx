@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAccount } from 'wagmi';
 import { useAgent } from '../providers/AgentProvider.jsx';
-import { transactions as txApi } from '../lib/api.js';
+import { agents as agentsApi, transactions as txApi } from '../lib/api.js';
 import { authenticatePasskey } from '../lib/passkey.js';
 import { buildPaymentURI, generateQRDataURL } from '../lib/qrPayment.js';
 import { startScan, stopScan, parsePaymentURI } from '../lib/qrScanner.js';
@@ -15,7 +15,11 @@ function formatUsdcAmount(amount) {
   return numeric.toFixed(4).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
 }
 
-const RECEIVE_CLOCK_SKEW_MS = 1000;
+const RECEIVE_CLOCK_SKEW_MS = 2 * 60 * 1000;
+
+function normalizeAddress(address) {
+  return String(address || '').trim().toLowerCase();
+}
 
 function parseTxCreatedAt(tx) {
   const createdAt = Date.parse(tx?.created_at || tx?.createdAt || '');
@@ -23,9 +27,12 @@ function parseTxCreatedAt(tx) {
 }
 
 function matchesRequestedAmount(tx, requestedAmount) {
-  const txAmount = Number(tx?.amount_usdc ?? tx?.amountUsdc);
+  const tokenAmount = Number(tx?.meta?.tokenAmount);
+  const txAmount = Number.isFinite(tokenAmount)
+    ? tokenAmount
+    : Number(tx?.amount_usdc ?? tx?.amountUsdc);
   if (!Number.isFinite(txAmount) || !Number.isFinite(requestedAmount)) return false;
-  return Math.abs(txAmount - requestedAmount) < 0.000001;
+  return Math.abs(txAmount - requestedAmount) < 0.0005;
 }
 
 // ── SendResult: shows amount, recipient, polls for confirmed tx hash ───────────
@@ -129,6 +136,7 @@ function ReceiveFlow({ agent, onClose }) {
   const [error, setError]           = useState('');
   const [loading, setLoading]       = useState(false);
   const [receivedTx, setReceivedTx] = useState(null);
+  const [senderFallbackName, setSenderFallbackName] = useState('');
   const pollRef                     = useRef(null);
   const knownIdsRef                 = useRef(new Set());
   const listeningSinceRef           = useRef(0);
@@ -136,6 +144,7 @@ function ReceiveFlow({ agent, onClose }) {
 
   function isFreshReceive(tx, requestedAmount) {
     if (tx?.type !== 'receive' || tx?.status !== 'confirmed') return false;
+    if (String(tx?.token || '').toUpperCase() !== 'USDC') return false;
     if (!matchesRequestedAmount(tx, requestedAmount)) return false;
     if (knownIdsRef.current.has(tx.id)) return false;
 
@@ -196,6 +205,37 @@ function ReceiveFlow({ agent, onClose }) {
     return () => clearInterval(pollRef.current);
   }, [step, agent.id]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const senderAgentName = String(receivedTx?.meta?.senderAgentName || '').trim();
+    const fromAddress = normalizeAddress(receivedTx?.from_address);
+    setSenderFallbackName('');
+
+    if (step !== 3 || !receivedTx || senderAgentName || !fromAddress) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    agentsApi.list().then((data) => {
+      if (cancelled || !Array.isArray(data)) return;
+
+      const matchedAgent = data.find((candidate) => {
+        const candidateAddress = normalizeAddress(candidate?.walletAddress || candidate?.wallet_address);
+        return candidateAddress && candidateAddress === fromAddress;
+      });
+
+      if (!cancelled) {
+        setSenderFallbackName(String(matchedAgent?.name || '').trim());
+      }
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [receivedTx, step]);
+
   async function handleGenerate() {
     setError('');
     const val = parseFloat(amount);
@@ -204,6 +244,7 @@ function ReceiveFlow({ agent, onClose }) {
     try {
       requestedAmountRef.current = val;
       setReceivedTx(null);
+      setSenderFallbackName('');
       const payUri = buildPaymentURI(agent.walletAddress, val);
       const dataUrl = await generateQRDataURL(payUri);
       setUri(payUri);
@@ -227,7 +268,7 @@ function ReceiveFlow({ agent, onClose }) {
   if (step === 3 && receivedTx) {
     const rxAmount = formatUsdcAmount(receivedTx.amount_usdc ?? receivedTx.amountUsdc ?? '?');
     const fromAddr = receivedTx.from_address || '';
-    const senderAgentName = receivedTx.meta?.senderAgentName || '';
+    const senderAgentName = String(receivedTx.meta?.senderAgentName || senderFallbackName || '').trim();
     return (
       <div className="p-6 text-center">
         <CheckCircle size={40} className="mx-auto mb-3 text-arc-green" />
@@ -291,7 +332,7 @@ function ReceiveFlow({ agent, onClose }) {
 }
 
 // ── SEND FLOW ─────────────────────────────────────────────────────────────────
-function SendFlow({ agent, ownerAddress, onClose }) {
+function SendFlow({ agent, ownerAddress, onClose, isAuthenticated, clearAgent }) {
   const [step, setStep]               = useState(1); // 1=input, 2=confirm, 3=result
   const [inputMode, setInputMode]     = useState('scan'); // 'scan' | 'manual'
   const [scanning, setScanning]       = useState(false);
@@ -303,15 +344,59 @@ function SendFlow({ agent, ownerAddress, onClose }) {
   const [loading, setLoading]         = useState(false);
   const [result, setResult]           = useState(null); // { txHash } | { error }
   const [formError, setFormError]     = useState('');
+  const [sessionState, setSessionState] = useState(isAuthenticated ? 'checking' : 'missing');
+  const [sessionError, setSessionError] = useState('');
   const videoRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function validateSession() {
+      stopCamera();
+
+      if (!isAuthenticated) {
+        setSessionState('missing');
+        setSessionError('Session expired. Reconnect with your passkey before sending funds.');
+        return;
+      }
+
+      setSessionState('checking');
+      setSessionError('');
+
+      try {
+        await agentsApi.list();
+        if (!cancelled) {
+          setSessionState('ready');
+        }
+      } catch (err) {
+        if (cancelled) return;
+
+        if (err?.status === 401) {
+          clearAgent?.();
+          setSessionState('missing');
+          setSessionError('Session expired. Reconnect with your passkey before scanning a QR code.');
+          return;
+        }
+
+        setSessionState('error');
+        setSessionError(err?.message || 'Could not verify your session right now.');
+      }
+    }
+
+    validateSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clearAgent, isAuthenticated]);
 
   // Start/stop camera on mount/unmount when scan mode
   useEffect(() => {
-    if (inputMode === 'scan' && step === 1) {
+    if (sessionState === 'ready' && inputMode === 'scan' && step === 1) {
       startCamera();
     }
     return () => stopCamera();
-  }, [inputMode, step]);
+  }, [inputMode, sessionState, step]);
 
   async function startCamera() {
     setScanning(true);
@@ -323,7 +408,7 @@ function SendFlow({ agent, ownerAddress, onClose }) {
         videoRef.current,
         (result) => {
           stopCamera();
-          setParsed(result);
+          setParsed({ ...result, source: 'scan' });
           setStep(2);
         },
         (err) => {
@@ -350,7 +435,7 @@ function SendFlow({ agent, ownerAddress, onClose }) {
       setFormError('Enter a valid amount');
       return;
     }
-    setParsed({ recipient, amountUsdc: val });
+    setParsed({ recipient, amountUsdc: val, source: 'manual' });
     setStep(2);
   }
 
@@ -432,9 +517,38 @@ function SendFlow({ agent, ownerAddress, onClose }) {
   const dailyLimit = agent?.settings?.dailyLimitUsdc ?? agent?.dailyLimitUsdc ?? 1000;
   const needsPasskey  = parsed && parsed.amountUsdc > maxTrade;
   const dailyBlocked  = parsed && parsed.amountUsdc > dailyLimit;
+  const qrAmountWarning = parsed?.source === 'scan' && parsed.amountUsdc > maxTrade * 10
+    ? `This QR requests ${formatUsdcAmount(parsed.amountUsdc)} USDC, which is more than 10x your auto-approve limit (${formatUsdcAmount(maxTrade)} USDC). Double-check the amount and recipient before sending.`
+    : '';
 
   // ── Step 1: Input
   if (step === 1) {
+    if (sessionState !== 'ready') {
+      return (
+        <div className="p-6">
+          <h2 className="mb-1 text-lg font-bold text-slate-900">Send USDC</h2>
+          <p className="mb-4 text-sm text-slate-500">A valid agent session is required before the camera or send form can open.</p>
+
+          <div className={`rounded-xl border px-4 py-3 text-sm ${sessionState === 'checking' ? 'border-slate-200 bg-slate-50 text-slate-500' : 'border-red-200 bg-red-50 text-red-600'}`}>
+            {sessionState === 'checking' ? (
+              <div className="flex items-center gap-2">
+                <Loader2 size={14} className="animate-spin" /> Verifying active session…
+              </div>
+            ) : (
+              sessionError || 'Session is not available.'
+            )}
+          </div>
+
+          <div className="mt-4 flex gap-2">
+            <Button variant="outline" onClick={onClose} className="flex-1">Close</Button>
+            {sessionState !== 'checking' && (
+              <Button onClick={() => window.location.reload()} className="flex-1">Retry Session Check</Button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="p-6">
         <h2 className="mb-1 text-lg font-bold text-slate-900">Send USDC</h2>
@@ -523,6 +637,13 @@ function SendFlow({ agent, ownerAddress, onClose }) {
           </div>
         </div>
 
+        {qrAmountWarning && (
+          <div className="mb-4 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
+            <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+            {qrAmountWarning}
+          </div>
+        )}
+
         {limitInfo && (
           <div className={`mb-4 flex items-start gap-2 rounded-xl border px-3 py-2 text-xs ${dailyBlocked ? 'border-red-200 bg-red-50 text-red-600' : needsPasskey ? 'border-yellow-200 bg-yellow-50 text-yellow-700' : 'border-green-200 bg-green-50 text-green-700'}`}>
             <AlertTriangle size={14} className="mt-0.5 shrink-0" />
@@ -563,7 +684,7 @@ function SendFlow({ agent, ownerAddress, onClose }) {
  * @param {{ mode: 'send'|'receive', onClose: () => void }} props
  */
 export default function PaymentModal({ mode, onClose }) {
-  const { agent }              = useAgent();
+  const { agent, clearAgent, isAuthenticated } = useAgent();
   const { address: ownerAddr } = useAccount();
 
   if (!agent) {
@@ -581,7 +702,7 @@ export default function PaymentModal({ mode, onClose }) {
     <ModalOverlay onClose={onClose}>
       {mode === 'receive'
         ? <ReceiveFlow agent={agent} onClose={onClose} />
-        : <SendFlow agent={agent} ownerAddress={ownerAddr} onClose={onClose} />
+        : <SendFlow agent={agent} ownerAddress={ownerAddr} onClose={onClose} isAuthenticated={isAuthenticated} clearAgent={clearAgent} />
       }
     </ModalOverlay>
   );

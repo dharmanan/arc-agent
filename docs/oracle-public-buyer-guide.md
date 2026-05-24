@@ -87,10 +87,10 @@ Smart contract accounts are not supported for this nanopayment flow because Circ
 - `/api/oracle/public/stablecoin-fx`
 - `/api/oracle/public/pool-state`
 - `/api/oracle/public/peg-monitor`
-- `/api/oracle/public/reserve-state`
-- `/api/oracle/public/protocol-tvl`
 - `/api/oracle/public/pool-compare`
-- `/api/oracle/public/yield-rank`
+- `/api/oracle/public/wallet-asset-snapshot`
+- `/api/oracle/public/prediction-market-check`
+- `/api/oracle/public/event-odds-compare`
 - `/api/oracle/public/arb-signal`
 - `/api/oracle/public/arb-scan-multi`
 
@@ -101,10 +101,13 @@ For supported verified pairs, `/api/oracle/public/stablecoin-fx` also returns an
 New catalog additions:
 
 - `/api/oracle/public/peg-monitor` returns spot stablecoin peg health with explicit `isFallback` metadata when upstream pricing degrades.
-- `/api/oracle/public/reserve-state` returns Aave-style reserve APY state for the supported Arc stablecoin watchlist and falls back to protocol yield hints when on-chain reserve reads are unavailable.
-- `/api/oracle/public/protocol-tvl` returns TVL and 24h change across the supported protocol watchlist.
 - `/api/oracle/public/pool-compare` compares multiple pool targets side by side across `curve`, `uniswap_v2_like`, and `arcfx`.
+- `/api/oracle/public/wallet-asset-snapshot` returns Arc wallet balances, live LP positions, and a yesterday UTC recap when the requested wallet is already indexed as an Arc agent.
+- `/api/oracle/public/prediction-market-check` returns a live Polymarket-based crypto regime snapshot with liquidity, movement and Arc action guidance.
+- `/api/oracle/public/event-odds-compare` compares two Polymarket topic clusters and scores whether they stay aligned, split, or diverge enough to change the next Arc move.
 - `/api/oracle/public/arb-scan-multi` scans multiple stable lanes at once and returns the best currently profitable arbitrage candidate.
+
+`reserve-state` stays out of the public seller catalog until the deployment has a live reserve source configured.
 
 ## Current Verified Arc Pair Coverage
 
@@ -207,28 +210,6 @@ ORACLE_PUBLIC_ASSETS=USDC,EURC,USDT \
 node examples/oraclePublicBuyerExample.js --preview
 ```
 
-Preview the protocol TVL SKU:
-
-```bash
-cd backend
-ORACLE_BUYER_PRIVATE_KEY=0xyour_eoa_private_key \
-ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
-ORACLE_PUBLIC_ENDPOINT=protocol-tvl \
-ORACLE_PUBLIC_PROTOCOLS=aave,morpho,maple \
-node examples/oraclePublicBuyerExample.js --preview
-```
-
-Preview the reserve-state SKU:
-
-```bash
-cd backend
-ORACLE_BUYER_PRIVATE_KEY=0xyour_eoa_private_key \
-ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
-ORACLE_PUBLIC_ENDPOINT=reserve-state \
-ORACLE_PUBLIC_ASSETS=USDC,EURC,WUSDC \
-node examples/oraclePublicBuyerExample.js --preview
-```
-
 Preview the pool comparison SKU:
 
 ```bash
@@ -239,6 +220,32 @@ ORACLE_PUBLIC_ENDPOINT=pool-compare \
 ORACLE_PUBLIC_TARGETS=curve:USDC-EURC,curve:EURC-WUSDC,uniswap_v2_like:QTM-WUSDC \
 node examples/oraclePublicBuyerExample.js --preview
 ```
+
+Preview the event comparison SKU:
+
+```bash
+cd backend
+ORACLE_BUYER_PRIVATE_KEY=0xyour_eoa_private_key \
+ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+ORACLE_PUBLIC_ENDPOINT=event-odds-compare \
+ORACLE_PUBLIC_PRIMARY_TOPIC=bitcoin \
+ORACLE_PUBLIC_SECONDARY_TOPIC=ethereum \
+ORACLE_PUBLIC_LIMIT=4 \
+node examples/oraclePublicBuyerExample.js --preview
+```
+
+Preview the wallet snapshot SKU:
+
+```bash
+cd backend
+ORACLE_BUYER_PRIVATE_KEY=0xyour_eoa_private_key \
+ORACLE_PUBLIC_BASE_URL=https://your-public-arc-oracle-base-url \
+ORACLE_PUBLIC_ENDPOINT=wallet-asset-snapshot \
+ORACLE_PUBLIC_WALLET_ADDRESS=0x000000000000000000000000000000000000dEaD \
+node examples/oraclePublicBuyerExample.js --preview
+```
+
+If the requested wallet already exists as an indexed Arc agent, the response also includes a yesterday UTC recap of swaps, LP changes, lending actions, and modeled oracle signals. Non-indexed wallets still return balances and positions, but `dailySummary.status` stays `unavailable`.
 
 Preview the multi-lane arbitrage scanner SKU:
 
@@ -251,21 +258,24 @@ ORACLE_PUBLIC_TARGETS=curve:EURC-USDC,curve:EURC-WUSDC,curve:WUSDC-USDC \
 node examples/oraclePublicBuyerExample.js --preview
 ```
 
-The API base URL is not an admin secret. These paid Oracle routes are public seller endpoints by design, so third-party buyers must be able to reach them. Protect private and operator-only routes separately with JWT or admin auth, keep rate limits enabled, and during testnet prefer the Vercel public alias (`https://arcmachina.vercel.app/api`) instead of documenting a raw infrastructure hostname. Revisit a dedicated custom domain only after the testnet phase.
+The API base URL is not an admin secret. These paid Oracle routes are public seller endpoints by design, so third-party buyers must be able to reach them. Protect private and operator-only routes separately with JWT or admin auth, keep rate limits enabled, and during testnet prefer the public alias (`https://arcmachina.xyz/api`) instead of documenting a raw infrastructure hostname.
 
 ## Environment Variables Used By The Example
 
 - `ORACLE_BUYER_PRIVATE_KEY`: EOA private key used for Gateway deposit and x402 signing
 - `ORACLE_PUBLIC_BASE_URL`: Arc backend base URL
-- `ORACLE_PUBLIC_ENDPOINT`: one of `stablecoin-fx`, `pool-state`, `peg-monitor`, `reserve-state`, `protocol-tvl`, `pool-compare`, `yield-rank`, `arb-signal`, `arb-scan-multi`
+- `ORACLE_PUBLIC_ENDPOINT`: one of `stablecoin-fx`, `pool-state`, `peg-monitor`, `pool-compare`, `wallet-asset-snapshot`, `prediction-market-check`, `event-odds-compare`, `arb-signal`, `arb-scan-multi`
 - `ORACLE_BUYER_CHAIN`: defaults to `arcTestnet`
 - `ORACLE_BUYER_RPC_URL`: optional RPC override
 - `ORACLE_PUBLIC_PAIR`: query parameter for `stablecoin-fx`
 - `ORACLE_PUBLIC_POOL`: query parameter for `pool-state`
-- `ORACLE_PUBLIC_ASSETS`: comma-separated assets for `peg-monitor` or `reserve-state`
-- `ORACLE_PUBLIC_PROTOCOLS`: comma-separated protocols for `protocol-tvl`
+- `ORACLE_PUBLIC_ASSETS`: comma-separated assets for `peg-monitor`
 - `ORACLE_PUBLIC_TARGETS`: comma-separated `venue:pool` targets for `pool-compare` or `arb-scan-multi`
-- `ORACLE_PUBLIC_ASSET`: query parameter for `yield-rank`
+- `ORACLE_PUBLIC_WALLET_ADDRESS`: target wallet for `wallet-asset-snapshot`
+- `ORACLE_PUBLIC_TOPIC`: query parameter for `prediction-market-check`
+- `ORACLE_PUBLIC_PRIMARY_TOPIC`: first topic cluster for `event-odds-compare`
+- `ORACLE_PUBLIC_SECONDARY_TOPIC`: second topic cluster for `event-odds-compare`
+- `ORACLE_PUBLIC_LIMIT`: optional sample size for `prediction-market-check` or `event-odds-compare`
 - `ORACLE_PUBLIC_STRATEGY`: query parameter for `arb-signal`
 
 ## Example Unpaid Response Body
@@ -274,10 +284,10 @@ The API base URL is not an admin secret. These paid Oracle routes are public sel
 {
   "error": "payment_required",
   "endpoint": "pool-state",
-  "price": "0.01 USDC",
+  "price": "0.001 USDC",
   "sellerMode": "circle_gateway",
   "callbackEndpoint": "https://your-public-arc-oracle-base-url/api/oracle/public/pool-state?pool=USDC-EURC",
-  "docsUrl": "https://arcmachina.vercel.app/oracle-public-buyer-guide.html",
+  "docsUrl": "https://arcmachina.xyz/oracle-public-buyer-guide.html",
   "note": "Retry with the payment headers returned by the Circle Gateway x402 flow."
 }
 ```

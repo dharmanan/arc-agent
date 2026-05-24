@@ -3,6 +3,7 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const { encrypt, decrypt } = require('./cryptoService');
 const { getDailyLimitBypass } = require('./dailyLimitBypass');
+const { assertAgentOperational } = require('./securityEventService');
 
 const DEFAULT_PERMISSIONS = [
   'defi_scan',
@@ -186,24 +187,39 @@ function resolveStableAutomationState({
   lastDecision,
   manualCooldownUntil,
 } = {}) {
+  const stableDecision = extractStableAutomationDecision(lastDecision);
   const cooldownUntilMs = parseTimestampMs(manualCooldownUntil);
   const cooldownActive = cooldownUntilMs != null && cooldownUntilMs > Date.now();
-  const legacyDecision = isLegacyStableDecision(lastDecision);
+  const legacyDecision = isLegacyStableDecision(stableDecision);
 
   if (!legacyDecision) {
     return {
-      lastStatus: lastStatus || 'idle',
-      lastDecision,
-      lastRunAt: lastDecision?.recordedAt || null,
+      lastStatus: stableDecision?.status || lastStatus || 'idle',
+      lastDecision: stableDecision,
+      lastRunAt: stableDecision?.recordedAt || null,
     };
   }
 
-  const maskedDecision = buildStableManualCooldownDecision(lastDecision, manualCooldownUntil, { cooldownActive });
+  const maskedDecision = buildStableManualCooldownDecision(stableDecision, manualCooldownUntil, { cooldownActive });
   return {
     lastStatus: 'policy_hold',
     lastDecision: maskedDecision,
     lastRunAt: maskedDecision.recordedAt,
   };
+}
+
+function extractStableAutomationDecision(lastDecision) {
+  if (!lastDecision || typeof lastDecision !== 'object') return null;
+
+  const embeddedStableDecision = lastDecision.stableLaneDecision
+    && typeof lastDecision.stableLaneDecision === 'object'
+    && Object.keys(lastDecision.stableLaneDecision).length > 0
+      ? lastDecision.stableLaneDecision
+      : null;
+
+  if (embeddedStableDecision) return embeddedStableDecision;
+  if (lastDecision.lane === 'cirbtc_direct_pair_lp') return null;
+  return lastDecision;
 }
 
 // ── ERC-8004 IdentityRegistry (Arc Testnet) ───────────────────────────────────
@@ -463,6 +479,9 @@ async function updateAgent(agentId, userId, data) {
     defiWalletReserveUsdc:   'defi_wallet_reserve_usdc',
     oracleMaxEurcInventory:  'oracle_max_eurc_inventory',
     oracleMinEurcReserve:    'oracle_min_eurc_reserve',
+    gatewayAutoTopupEnabled: 'gateway_auto_topup_enabled',
+    gatewayAutoTopupMinUsdc: 'gateway_auto_topup_min_usdc',
+    gatewayAutoTopupTargetUsdc: 'gateway_auto_topup_target_usdc',
     autoLockMinutes:         'auto_lock_minutes',
     contractGuard:           'contract_guard_enabled',
     llmApiKeyEncrypted:      'llm_api_key_encrypted',
@@ -474,6 +493,7 @@ async function updateAgent(agentId, userId, data) {
     oracleEnabled:           'oracle_enabled',
     defiLoopEnabled:         'defi_loop_enabled',
     lendingAutomationEnabled:'lending_automation_enabled',
+    carryAutomationEnabled:  'carry_automation_enabled',
     cirbtcLpEnabled:         'cirbtc_lp_enabled',
     reputationEnabled:       'reputation_enabled',
   };
@@ -532,13 +552,14 @@ async function getAgentStatus(agentId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
             a.llm_model, a.wallet_address, a.last_reset_day,
-          a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.lending_automation_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
+          a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.lending_automation_enabled, a.carry_automation_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
             a.daily_market_analysis_count, a.daily_defi_loop_count, a.daily_auto_tx_count,
             a.market_analysis_last_run_at, a.market_analysis_last_status, a.market_analysis_last_decision,
             a.stable_manual_cooldown_until,
             a.oracle_last_run_at, a.oracle_last_status,
             a.defi_loop_last_run_at, a.defi_loop_last_status, a.defi_loop_last_decision,
             a.lending_automation_last_run_at, a.lending_automation_last_status, a.lending_automation_last_decision,
+            a.carry_automation_last_run_at, a.carry_automation_last_status, a.carry_automation_last_decision,
             a.cirbtc_lp_last_run_at, a.cirbtc_lp_last_status, a.cirbtc_lp_last_decision,
             a.reputation_last_run_at, a.reputation_last_status
      FROM agents a
@@ -570,12 +591,9 @@ async function getAgentStatus(agentId, userId) {
     && Object.keys(a.defi_loop_last_decision).length > 0
     ? a.defi_loop_last_decision
     : null;
-  const rawStableLoopLastDecision = defiLoopLastDecision && defiLoopLastDecision.lane !== 'cirbtc_direct_pair_lp'
-    ? defiLoopLastDecision
-    : null;
   const stableLoopState = resolveStableAutomationState({
     lastStatus: a.defi_loop_last_status || 'idle',
-    lastDecision: rawStableLoopLastDecision,
+    lastDecision: defiLoopLastDecision,
     manualCooldownUntil: a.stable_manual_cooldown_until,
   });
   const cirbtcLpLastDecision = a.cirbtc_lp_last_decision
@@ -587,6 +605,11 @@ async function getAgentStatus(agentId, userId) {
     && typeof a.lending_automation_last_decision === 'object'
     && Object.keys(a.lending_automation_last_decision).length > 0
     ? a.lending_automation_last_decision
+    : null;
+  const carryAutomationLastDecision = a.carry_automation_last_decision
+    && typeof a.carry_automation_last_decision === 'object'
+    && Object.keys(a.carry_automation_last_decision).length > 0
+    ? a.carry_automation_last_decision
     : null;
   const oracleEntryCooldown = await readOracleEntryCooldown(agentId);
 
@@ -636,6 +659,16 @@ async function getAgentStatus(agentId, userId) {
         lastRunAt: a.lending_automation_last_run_at,
         lastStatus: a.lending_automation_last_status || 'idle',
         lastDecision: lendingAutomationLastDecision,
+        todayCount: a.daily_defi_loop_count ?? 0,
+        dailyCap: 10,
+        autoTxToday: a.daily_auto_tx_count ?? 0,
+        bypassDailyCap: dailyLimitBypass.enabled,
+      },
+      carryAutomation: {
+        enabled: a.carry_automation_enabled ?? false,
+        lastRunAt: a.carry_automation_last_run_at,
+        lastStatus: a.carry_automation_last_status || 'idle',
+        lastDecision: carryAutomationLastDecision,
         todayCount: a.daily_defi_loop_count ?? 0,
         dailyCap: 10,
         autoTxToday: a.daily_auto_tx_count ?? 0,
@@ -696,6 +729,9 @@ function formatAgent(row, perms) {
       defiWalletReserveUsdc: parseFloat(row.defi_wallet_reserve_usdc || 0),
       oracleMaxEurcInventory: row.oracle_max_eurc_inventory != null ? parseFloat(row.oracle_max_eurc_inventory) : null,
       oracleMinEurcReserve: row.oracle_min_eurc_reserve != null ? parseFloat(row.oracle_min_eurc_reserve) : null,
+      gatewayAutoTopupEnabled: row.gateway_auto_topup_enabled ?? true,
+      gatewayAutoTopupMinUsdc: parseFloat(row.gateway_auto_topup_min_usdc || 1),
+      gatewayAutoTopupTargetUsdc: parseFloat(row.gateway_auto_topup_target_usdc || 3),
       autoLockMinutes: row.auto_lock_minutes,
       contractGuard:   row.contract_guard_enabled,
       passkeyEnabled:  row.passkey_enabled,
@@ -709,6 +745,7 @@ function formatAgent(row, perms) {
       oracleEnabled:         row.oracle_enabled          ?? false,
       defiLoopEnabled:       row.defi_loop_enabled       ?? false,
       lendingAutomationEnabled: row.lending_automation_enabled ?? false,
+      carryAutomationEnabled: row.carry_automation_enabled ?? false,
       cirbtcLpEnabled:       row.cirbtc_lp_enabled       ?? false,
       reputationEnabled:     row.reputation_enabled      ?? false,
     },
@@ -726,7 +763,7 @@ async function getAgentWithKey(agentId, userId) {
     'SELECT * FROM agents WHERE id = $1 AND user_id = $2',
     [agentId, userId],
   );
-  return rows[0] || null;
+  return rows[0] ? assertAgentOperational(rows[0]) : null;
 }
 
 // Background poller injection: fetch agent by ID without userId check (internal use only)
@@ -735,7 +772,7 @@ async function getAgentWithKeyById(agentId) {
     'SELECT * FROM agents WHERE id = $1',
     [agentId],
   );
-  return rows[0] || null;
+  return rows[0] ? assertAgentOperational(rows[0]) : null;
 }
 
 module.exports = {

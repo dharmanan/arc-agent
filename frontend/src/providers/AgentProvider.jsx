@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
-import { setToken, getToken, agents } from '../lib/api.js';
+import { setToken, getToken, agents, auth } from '../lib/api.js';
 
 const AgentContext = createContext(null);
 
@@ -15,10 +15,20 @@ export function AgentProvider({ children }) {
   }, []);
 
   // Clear only the JWT session (agent record stays in DB, user can reconnect via passkey)
-  const disconnectSession = useCallback(() => {
-    setAgentState(null);
-    setToken(null);
-    setJwtState(null);
+  const disconnectSession = useCallback(async () => {
+    try {
+      if (getToken()) {
+        await auth.logout();
+      }
+    } catch (err) {
+      if (err?.status !== 401) {
+        console.warn('[AUTH] logout request failed:', err?.message || err);
+      }
+    } finally {
+      setAgentState(null);
+      setToken(null);
+      setJwtState(null);
+    }
   }, []);
 
   // Clear JWT + agent state (used after deletion)

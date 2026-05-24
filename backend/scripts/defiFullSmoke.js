@@ -389,12 +389,15 @@ async function main() {
     const stable = buildStableCurveFixture();
     assert.equal(stable.verdict.execute, true, 'Stable Curve fixture should execute.');
     assert.equal(stable.verdict.operationType, 'add_liquidity');
-    assert.equal(stable.verdict.actionParams?.tokenIn, 'USDC');
-    assert.ok(Number(stable.verdict.suggestedAmountUsdc) >= 20, 'Stable Curve deploy size should stay positive.');
+    assert.equal(stable.verdict.actionParams?.mode, 'balanced');
+    assert.ok(Number(stable.verdict.actionParams?.amountUsdc) > 0, 'Balanced stable add should include a USDC side.');
+    assert.ok(Number(stable.verdict.actionParams?.amountEurc) > 0, 'Balanced stable add should include a EURC side.');
+    assert.ok(Number(stable.verdict.suggestedAmountUsdc) >= 10, 'Stable Curve deploy size should stay positive.');
 
     return {
       operationType: stable.verdict.operationType,
       suggestedAmountUsdc: stable.verdict.suggestedAmountUsdc,
+      addMode: stable.verdict.actionParams?.mode,
       reason: stable.verdict.reason,
     };
   }));

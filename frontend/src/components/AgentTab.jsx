@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useAccount } from 'wagmi';
+import { useAccount, useSignMessage } from 'wagmi';
 import { useAgent } from '../providers/AgentProvider.jsx';
 import { agents as agentApi } from '../lib/api.js';
 import { AGENT_PERMISSIONS } from '../lib/chains.js';
@@ -41,6 +41,7 @@ function parseOptionalNonNegativeUsdc(value) {
 
 export default function AgentTab() {
   const { address: ownerAddress } = useAccount();
+  const { signMessageAsync } = useSignMessage();
   const { agent, setAgent, setJwt, clearAgent, disconnectSession } = useAgent();
 
   const [step, setStep]         = useState('idle');
@@ -71,6 +72,7 @@ export default function AgentTab() {
     oracleEnabled:         false,
     defiLoopEnabled:       false,
     lendingAutomationEnabled: false,
+    carryAutomationEnabled: false,
     cirbtcLpEnabled:       false,
     reputationEnabled:     false,
   });
@@ -137,10 +139,10 @@ export default function AgentTab() {
     try {
       let authResult;
       try {
-        authResult = await registerPasskey(ownerAddress, deviceName);
+        authResult = await registerPasskey(ownerAddress, deviceName, signMessageAsync);
       } catch (regErr) {
         // Passkey already exists on this device — fall back to authentication
-        if (regErr.message && regErr.message.includes('already registered')) {
+        if (regErr?.code === 'PASSKEY_ALREADY_REGISTERED') {
           authResult = await authenticatePasskey(ownerAddress);
         } else {
           throw regErr;
@@ -167,14 +169,25 @@ export default function AgentTab() {
     setStep('idle');
   }
 
+  async function loadFirstAgentWithDetails() {
+    const list = await agentApi.list();
+    if (!list.length) return null;
+
+    try {
+      return await agentApi.get(list[0].id);
+    } catch {
+      return list[0];
+    }
+  }
+
   async function handleLogin() {
     setError('');
     setLoading(true);
     try {
       const authResult = await authenticatePasskey(ownerAddress);
       setJwt(authResult.token);
-      const list = await agentApi.list();
-      if (list.length > 0) setAgent(list[0]);
+      const fullAgent = await loadFirstAgentWithDetails();
+      if (fullAgent) setAgent(fullAgent);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -221,6 +234,7 @@ export default function AgentTab() {
       payload.oracleEnabled         = features.oracleEnabled;
       payload.defiLoopEnabled       = features.defiLoopEnabled;
       payload.lendingAutomationEnabled = features.lendingAutomationEnabled;
+      payload.carryAutomationEnabled = features.carryAutomationEnabled;
       payload.cirbtcLpEnabled       = features.cirbtcLpEnabled;
       payload.reputationEnabled     = features.reputationEnabled;
       const updated = await agentApi.update(agent.id, payload);
@@ -401,14 +415,16 @@ export default function AgentTab() {
           {agent?.isSmartMode && (
             <Badge variant="blue" className="flex items-center gap-1"><Brain size={11} /> Smart Mode</Badge>
           )}
-          <Button
-            variant="outline"
-            onClick={disconnectSession}
-            className="ml-auto flex items-center gap-2 text-slate-500 hover:text-red-600 hover:border-red-300"
-          >
-            <LogOut size={14} />
-            Disconnect Session
-          </Button>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              onClick={disconnectSession}
+              className="flex items-center gap-2 text-slate-500 hover:text-red-600 hover:border-red-300"
+            >
+              <LogOut size={14} />
+              Disconnect Session
+            </Button>
+          </div>
         </div>
         <AddressBox address={agent?.walletAddress} label="Agent Wallet Address" />
         <p className="mt-2 text-xs text-slate-400">

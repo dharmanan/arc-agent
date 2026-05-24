@@ -14,6 +14,10 @@ const db = require('../db');
 
 const RP_ID     = process.env.WEBAUTHN_RP_ID     || 'localhost';
 const RP_NAME   = process.env.WEBAUTHN_RP_NAME   || 'Arc Machina';
+const MAX_PASSKEY_CREDENTIALS_PER_USER = Math.max(
+  1,
+  Number.parseInt(process.env.MAX_PASSKEY_CREDENTIALS_PER_USER || '8', 10) || 8,
+);
 // Support multiple origins (comma-separated) + auto-detect dev Codespace origins
 const _configuredOrigins = (process.env.WEBAUTHN_ORIGIN || 'http://localhost:5173').split(',').map(s => s.trim());
 function getAllowedOrigins(requestOrigin) {
@@ -68,6 +72,59 @@ async function getCredentials(userId) {
   }));
 }
 
+async function storeCredential(userId, credential, deviceName) {
+  const client = await db.getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    const existingCredential = await client.query(
+      'SELECT user_id FROM passkey_credentials WHERE credential_id = $1 LIMIT 1',
+      [credential.id],
+    );
+
+    if (existingCredential.rows.length && existingCredential.rows[0].user_id !== userId) {
+      throw new Error('Passkey credential already belongs to another account');
+    }
+
+    await client.query(
+      `INSERT INTO passkey_credentials (user_id, credential_id, public_key, counter, device_name)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (credential_id) DO UPDATE
+         SET public_key = EXCLUDED.public_key,
+             counter = EXCLUDED.counter,
+             device_name = EXCLUDED.device_name`,
+      [
+        userId,
+        credential.id,
+        Buffer.from(credential.publicKey).toString('base64url'),
+        credential.counter,
+        deviceName || 'My Device',
+      ],
+    );
+
+    await client.query(
+      `DELETE FROM passkey_credentials
+       WHERE user_id = $1
+         AND id IN (
+           SELECT id
+           FROM passkey_credentials
+           WHERE user_id = $1
+           ORDER BY created_at DESC, id DESC
+           OFFSET $2
+         )`,
+      [userId, MAX_PASSKEY_CREDENTIALS_PER_USER],
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // ── Registration ──────────────────────────────────────────────────────────────
 async function generateRegistrationOptions(userId, ownerAddress) {
   const existingCreds = await getCredentials(userId);
@@ -110,19 +167,7 @@ async function verifyRegistration(userId, credentialResponse, deviceName, reques
 
   const { credential } = verification.registrationInfo;
 
-  await db.query(
-    `INSERT INTO passkey_credentials (user_id, credential_id, public_key, counter, device_name)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (credential_id) DO UPDATE
-       SET counter = EXCLUDED.counter`,
-    [
-      userId,
-      credential.id,
-      Buffer.from(credential.publicKey).toString('base64url'),
-      credential.counter,
-      deviceName || 'My Device',
-    ],
-  );
+  await storeCredential(userId, credential, deviceName);
 }
 
 // ── Authentication ────────────────────────────────────────────────────────────

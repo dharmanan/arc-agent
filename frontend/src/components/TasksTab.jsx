@@ -13,6 +13,7 @@ import {
 import { CHAINS } from '../lib/chains.js';
 
 const AUTOMATION_SNAPSHOT_TOLERANCE_MS = 60 * 1000;
+const CARRY_STALE_STATUSES = new Set(['fetch_error', 'decision_error']);
 
 const AUTOMATION_FEATURES = [
   {
@@ -44,6 +45,13 @@ const AUTOMATION_FEATURES = [
     detail: 'Can auto-repay, top up collateral, or reduce LP positions to free stable funds.',
   },
   {
+    key: 'carryAutomationEnabled',
+    statusKey: 'carryAutomation',
+    title: 'Auto Carry',
+    description: 'Exclusive stable carry mode that can borrow one stable and deploy it into the stable LP when net carry stays positive.',
+    detail: 'While enabled, this lane owns the stable LP carry path and pauses Stable DeFi Loop plus cirBTC LP growth actions.',
+  },
+  {
     key: 'cirbtcLpEnabled',
     statusKey: 'cirbtcLp',
     title: 'cirBTC LP Automation',
@@ -60,6 +68,15 @@ const AUTOMATION_FEATURES = [
 ];
 const FULL_AUTONOMY_FEATURE_KEYS = AUTOMATION_FEATURES.map(feature => feature.key);
 const ACTIVE_TASK_RUN_STATUSES = new Set(['queued', 'running']);
+const FREE_TASK_SURFACE_TASK_IDS = [
+  'DAILY_POOL_HEALTH',
+  'DAILY_ACTIVITY_RECAP',
+  'DAILY_FOREX_MATRIX',
+  'DAILY_USDC_PEG_CHECK',
+  'DAILY_ARB_SCAN',
+];
+const FREE_TASK_SURFACE_TASK_ID_SET = new Set(FREE_TASK_SURFACE_TASK_IDS);
+const FREE_TASK_SIMULATION_IDS = new Set(['DAILY_ARB_SCAN']);
 const EXECUTION_TASK_IDS = new Set([
   'EXEC_CURVE_SWAP',
   'EXEC_CURVE_LIQUIDITY_ADD',
@@ -168,6 +185,12 @@ const REPUTATION_SCORE_RULES = [
 
 const PAID_TASK_GROUPS = [
   {
+    key: 'bridge_setup',
+    title: 'Bridge Setup',
+    description: 'Start here on a new wallet. Fund at least 0.06 ETH on Sepolia first, then spread gas to the three supported Sepolia L2 testnets before running other bridge actions.',
+    taskIds: ['EXEC_SEPOLIA_GAS_FANOUT'],
+  },
+  {
     key: 'stable_curve',
     title: 'Stable Curve Actions',
     description: 'Manual Arc actions on the verified USDC/EURC stable rail.',
@@ -193,9 +216,27 @@ const PAID_TASK_GROUPS = [
   },
 ];
 const PAID_TASK_GROUP_TASK_IDS = new Set(PAID_TASK_GROUPS.flatMap(group => group.taskIds));
+const TASK_ID_WORD_OVERRIDES = {
+  arb: 'Arbitrage',
+  cirbtc: 'cirBTC',
+  cctp: 'CCTP',
+  defi: 'DeFi',
+  eurc: 'EURC',
+  lp: 'LP',
+  tvl: 'TVL',
+  usd: 'USD',
+  usdc: 'USDC',
+};
 
 function getTaskOperationalAlert(task) {
   switch (task?.id) {
+    case 'EXEC_SEPOLIA_GAS_FANOUT':
+      return {
+        badge: 'Start here',
+        title: 'Fund bridge gas before other cross-chain actions',
+        body: 'A new wallet should hold at least 0.06 ETH on Sepolia before this run. This task then sends 0.01 ETH each to Base Sepolia, Optimism Sepolia and Arbitrum Sepolia so later bridge and destination-side actions do not fail for missing gas.',
+      };
+
     case 'EXEC_CURVE_SWAP':
       return {
         badge: 'Live now',
@@ -326,6 +367,35 @@ function formatCirclePaidUsdCompact(value) {
   return `$${numeric.toFixed(0)}`;
 }
 
+function formatCirclePaidUsd(value, maximumFractionDigits = 2) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+
+  return numeric.toLocaleString('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: numeric >= 1000 ? 0 : Math.min(maximumFractionDigits, 2),
+    maximumFractionDigits,
+  });
+}
+
+function formatCirclePaidNumber(value, maximumFractionDigits = 6) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+
+  const absoluteValue = Math.abs(numeric);
+  const resolvedDigits = absoluteValue >= 100
+    ? 2
+    : absoluteValue >= 1
+      ? Math.min(maximumFractionDigits, 4)
+      : maximumFractionDigits;
+
+  return numeric.toLocaleString('en-US', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: resolvedDigits,
+  });
+}
+
 function truncateCirclePaidText(value, maxLength = 140) {
   const normalized = String(value || '').trim();
   if (!normalized) return 'Saved live market snapshot';
@@ -385,8 +455,75 @@ function getCirclePaidComparisonStateClasses(state) {
   }
 }
 
+function isCirclePaidWalletSnapshotPayload(payload) {
+  return Boolean(
+    payload?.walletAddress
+      && (Array.isArray(payload?.balances) || Array.isArray(payload?.positions) || payload?.dailySummary),
+  );
+}
+
+function formatCirclePaidWalletPosture(posture) {
+  switch (String(posture || '').toLowerCase()) {
+    case 'lp_exposure_present':
+      return 'LP exposure live';
+    case 'stable_lp_present':
+      return 'Stable LP live';
+    case 'balanced_stable_idle':
+      return 'Idle stables ready';
+    case 'stable_concentration':
+      return 'Stable mix skewed';
+    case 'single_asset_stable':
+      return 'Single stable heavy';
+    case 'informational':
+      return 'Wallet snapshot';
+    default:
+      return 'Wallet snapshot';
+  }
+}
+
+function getCirclePaidWalletPostureClasses(posture) {
+  switch (String(posture || '').toLowerCase()) {
+    case 'lp_exposure_present':
+    case 'stable_lp_present':
+      return 'border-amber-200 bg-amber-50 text-amber-700';
+    case 'balanced_stable_idle':
+      return 'border-green-200 bg-green-50 text-green-700';
+    case 'stable_concentration':
+      return 'border-red-200 bg-red-50 text-red-700';
+    case 'single_asset_stable':
+      return 'border-sky-200 bg-sky-50 text-sky-700';
+    default:
+      return 'border-slate-200 bg-slate-50 text-slate-600';
+  }
+}
+
 function getCirclePaidSnapshotMeta(preview, isEventOddsCompare = false) {
   const meta = [];
+
+  if (isCirclePaidWalletSnapshotPayload(preview)) {
+    if (Number.isFinite(Number(preview?.metrics?.totalWalletUsd))) {
+      meta.push(`Wallet ${formatCirclePaidUsdCompact(preview.metrics.totalWalletUsd)}`);
+    }
+
+    if (Number.isFinite(Number(preview?.metrics?.positionCount))) {
+      const positionCount = Number(preview.metrics.positionCount);
+      meta.push(`${positionCount} position${positionCount === 1 ? '' : 's'}`);
+    }
+
+    if (Number(preview?.dailySummary?.counts?.swaps) > 0) {
+      meta.push(`Yesterday ${preview.dailySummary.counts.swaps} swaps`);
+    }
+
+    if (Number(preview?.dailySummary?.counts?.lpAdds) > 0 || Number(preview?.dailySummary?.counts?.lpRemoves) > 0) {
+      meta.push(`LP ${preview?.dailySummary?.counts?.lpAdds || 0} add / ${preview?.dailySummary?.counts?.lpRemoves || 0} remove`);
+    }
+
+    if (preview?.dailySummary?.status && preview.dailySummary.status !== 'available') {
+      meta.push('Wallet-only recap');
+    }
+
+    return meta;
+  }
 
   if (isEventOddsCompare && preview?.comparison?.state) {
     meta.push(formatCirclePaidComparisonState(preview.comparison.state));
@@ -575,6 +712,7 @@ function getCirclePaidErrorMessage(message) {
 }
 
 function CirclePaidCard({ item, agentId }) {
+  const { agent: activeAgent } = useAgent();
   const [expanded, setExpanded] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [unlockBusy, setUnlockBusy] = useState(false);
@@ -586,6 +724,7 @@ function CirclePaidCard({ item, agentId }) {
   const [previewResponse, setPreviewResponse] = useState(null);
   const [unlockedResponse, setUnlockedResponse] = useState(null);
   const [savedSnapshots, setSavedSnapshots] = useState([]);
+  const isWalletSnapshot = item.id === 'ARC_WALLET_ASSET_SNAPSHOT';
   const isEventOddsCompare = item.id === 'ARC_EVENT_ODDS_COMPARE';
   const isActionFirst = item.arcTestnetActionable;
   const hasLiveRuntime = item.status === 'live';
@@ -593,8 +732,9 @@ function CirclePaidCard({ item, agentId }) {
   const statusLabel = formatCirclePaidStatus(item.status);
   const preview = previewResponse?.preview || null;
   const liveResult = unlockedResponse?.liveResult || null;
-  const previewComparison = preview?.comparison || null;
-  const liveComparison = liveResult?.comparison || null;
+  const previewComparison = isWalletSnapshot ? null : preview?.comparison || null;
+  const liveComparison = isWalletSnapshot ? null : liveResult?.comparison || null;
+  const connectedWalletAddress = activeAgent?.walletAddress || activeAgent?.wallet_address || preview?.walletAddress || liveResult?.walletAddress || '';
 
   const loadSavedSnapshots = useCallback(async () => {
     if (!agentId || !hasLiveRuntime) return;
@@ -619,6 +759,189 @@ function CirclePaidCard({ item, agentId }) {
     loadSavedSnapshots();
   }, [agentId, expanded, hasLiveRuntime, loadSavedSnapshots]);
 
+  function renderWalletSnapshotMetrics(metrics = {}) {
+    const metricItems = [
+      {
+        label: 'Liquid balance',
+        value: formatCirclePaidUsd(metrics?.liquidUsd),
+        note: 'Wallet tokens',
+      },
+      {
+        label: 'Position value',
+        value: formatCirclePaidUsd(metrics?.positionUsd),
+        note: 'LP and direct-pair exposure',
+      },
+      {
+        label: 'Total wallet',
+        value: formatCirclePaidUsd(metrics?.totalWalletUsd),
+        note: 'Liquid plus positions',
+      },
+      {
+        label: 'Open positions',
+        value: Number.isFinite(Number(metrics?.positionCount)) ? String(Number(metrics.positionCount)) : '—',
+        note: Number(metrics?.warningCount) > 0
+          ? `${Number(metrics.warningCount)} warning${Number(metrics.warningCount) === 1 ? '' : 's'}`
+          : 'Live reads clean',
+      },
+    ];
+
+    return (
+      <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
+        {metricItems.map(metric => (
+          <div key={`${item.id}:${metric.label}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{metric.label}</p>
+            <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{metric.value}</p>
+            <p className="mt-1 text-[11px] leading-5 text-slate-500">{metric.note}</p>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  function renderWalletSnapshotBalances(balances = []) {
+    const visibleBalances = Array.isArray(balances) ? balances.filter(Boolean) : [];
+    if (!visibleBalances.length) return null;
+
+    return (
+      <div>
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Token mix</p>
+        <div className="mt-2 grid gap-2 md:grid-cols-3">
+          {visibleBalances.map((balance, index) => (
+            <div key={`${item.id}:balance:${balance.symbol || index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <p className="text-xs font-semibold text-slate-900">{balance.symbol || 'Asset'}</p>
+                {Number.isFinite(Number(balance.exposurePct)) && (
+                  <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                    {formatCirclePaidPercent(balance.exposurePct)}
+                  </span>
+                )}
+              </div>
+              <p className="mt-2 text-sm font-semibold tabular-nums text-slate-900">
+                {formatCirclePaidNumber(balance.amount, balance.symbol === 'cirBTC' ? 8 : 6)}
+              </p>
+              <p className="mt-1 text-[11px] text-slate-500">{formatCirclePaidUsd(balance.usdValue)}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function renderWalletSnapshotPositions(positions = []) {
+    const visiblePositions = Array.isArray(positions) ? positions.filter(Boolean) : [];
+
+    return (
+      <div>
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Open positions</p>
+        {visiblePositions.length === 0 ? (
+          <p className="mt-2 text-xs leading-5 text-slate-500">No LP or direct-pair position is open right now.</p>
+        ) : (
+          <div className="mt-2 space-y-2">
+            {visiblePositions.map((position, index) => (
+              <div key={`${item.id}:position:${position.poolKey || position.protocol || index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-xs font-semibold text-slate-900">{position.poolKey || 'Tracked position'}</p>
+                      {position.protocol && (
+                        <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                          {String(position.protocol).replace(/_/g, ' ')}
+                        </span>
+                      )}
+                    </div>
+                    {Array.isArray(position.underlying) && position.underlying.length > 0 && (
+                      <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                        {position.underlying.slice(0, 3).map(asset => `${asset.symbol} ${formatCirclePaidNumber(asset.amount, asset.symbol === 'cirBTC' ? 8 : 6)}`).join(' · ')}
+                      </p>
+                    )}
+                  </div>
+                  <div className="sm:text-right">
+                    <p className="text-xs font-semibold text-slate-900">{formatCirclePaidUsd(position.totalUsd)}</p>
+                    {Number.isFinite(Number(position.sharePct)) && (
+                      <p className="mt-1 text-[11px] text-slate-500">Share {formatCirclePaidPercent(position.sharePct)}</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function renderWalletSnapshotYesterdayPanel(dailySummary, { showRecent = false } = {}) {
+    if (!dailySummary) return null;
+
+    const statItems = [
+      { label: 'Swaps', value: Number(dailySummary?.counts?.swaps || 0) },
+      { label: 'LP adds', value: Number(dailySummary?.counts?.lpAdds || 0) },
+      { label: 'LP removes', value: Number(dailySummary?.counts?.lpRemoves || 0) },
+      { label: 'Rebalances', value: Number(dailySummary?.counts?.rebalances || 0) },
+      { label: 'Borrows', value: Number(dailySummary?.counts?.lendingBorrows || 0) },
+      { label: 'Arb signals', value: Number(dailySummary?.counts?.arbSignalsFound || 0) },
+    ].filter(entry => entry.value > 0);
+    const recentItems = showRecent && Array.isArray(dailySummary.recent)
+      ? dailySummary.recent.slice(0, 3)
+      : [];
+    const isIndexedSummary = dailySummary.status === 'available';
+
+    return (
+      <div className="rounded-xl border border-sky-200 bg-gradient-to-br from-sky-50 to-cyan-50 px-3 py-3">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0 flex-1">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">Yesterday (UTC)</p>
+            <p className="mt-1 text-sm font-semibold leading-6 text-slate-900">{dailySummary.summary || 'No yesterday recap is available yet.'}</p>
+            {!isIndexedSummary && (
+              <p className="mt-1 text-xs leading-5 text-slate-600">
+                This panel fills in only when the connected wallet already exists as an indexed Arc agent.
+              </p>
+            )}
+          </div>
+          <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${
+            isIndexedSummary
+              ? 'border-sky-200 bg-white text-sky-700'
+              : 'border-slate-200 bg-white text-slate-600'
+          }`}>
+            {isIndexedSummary ? 'Indexed history' : 'Wallet only'}
+          </span>
+        </div>
+
+        {statItems.length > 0 && (
+          <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+            {statItems.map(entry => (
+              <div key={`${item.id}:yesterday:${entry.label}`} className="rounded-lg border border-white bg-white/80 px-3 py-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{entry.label}</p>
+                <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{entry.value}</p>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {recentItems.length > 0 && (
+          <div className="mt-3 space-y-2">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">Latest tracked moves</p>
+            {recentItems.map((activity, index) => (
+              <div key={`${item.id}:recent:${activity.type || index}:${activity.createdAt || index}`} className="rounded-lg border border-white bg-white/80 px-3 py-2.5">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-semibold text-slate-900">{activity.label || activity.type || 'Tracked activity'}</p>
+                    <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                      {[activity.token, Number(activity.amountUsd) > 0 ? formatCirclePaidUsd(activity.amountUsd) : null, formatTimestamp(activity.createdAt)].filter(Boolean).join(' · ')}
+                    </p>
+                  </div>
+                  <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium capitalize text-slate-600">
+                    {String(activity.status || 'tracked').replace(/_/g, ' ')}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   async function handlePreviewRun() {
     if (!agentId || !hasLiveRuntime) return;
 
@@ -626,13 +949,13 @@ function CirclePaidCard({ item, agentId }) {
     setRunError('');
 
     try {
-      const response = await tasksApi.circlePaidPreview(
-        agentId,
-        item.id,
-        isEventOddsCompare
+      const previewParams = isWalletSnapshot
+        ? {}
+        : isEventOddsCompare
           ? { primaryTopic: topic, secondaryTopic: comparisonTopic, limit: 4 }
-          : { topic },
-      );
+          : { topic };
+
+      const response = await tasksApi.circlePaidPreview(agentId, item.id, previewParams);
       setActiveSnapshotId('');
       setPreviewResponse(response);
       setUnlockedResponse(null);
@@ -712,20 +1035,56 @@ function CirclePaidCard({ item, agentId }) {
     && topic.trim()
     && comparisonTopic.trim()
     && topic.trim().toLowerCase() === comparisonTopic.trim().toLowerCase();
+  const suggestedTaskLabel = unlockedResponse?.recommendedTask?.title || liveResult?.recommendedTaskId || '';
 
   const todayCopy = hasLiveRuntime
     ? isEventOddsCompare
       ? 'Start with a free preview. Pay only if you want the full comparison saved to your account.'
-      : 'Start with a free preview. Pay only if you want the full result saved to your account.'
+      : isWalletSnapshot
+        ? 'Start with a free preview. This card reads the connected Arc wallet now and opens a clearer Yesterday panel whenever indexed history exists.'
+        : 'Start with a free preview. Pay only if you want the full result saved to your account.'
     : 'This card is still a preview. Opening it does not charge anything and does not start any on-chain step yet.';
 
   const paymentCopy = hasLiveRuntime
     ? isEventOddsCompare
       ? 'Free preview is live. Payment unlocks the full comparison and saves it. Any later Arc action is still separate.'
-      : 'Free preview is live. Payment unlocks the full result and saves it. Any later Arc action is still separate.'
+      : isWalletSnapshot
+        ? 'Free preview is live. Payment unlocks the full wallet readout and saves it. Any later Arc action is still separate.'
+        : 'Free preview is live. Payment unlocks the full result and saves it. Any later Arc action is still separate.'
     : 'This card is still in preview. Prices shown here are planning estimates until it goes live.';
 
   const currentSourceLabel = hasLiveRuntime ? 'Data source' : 'Planned source';
+  const teaserCopy = hasLiveRuntime
+    ? isWalletSnapshot
+      ? 'Open the card to preview the connected wallet first. Paying later only saves the full result and Yesterday recap.'
+      : 'Open the card to start a free preview. Paying later only unlocks the full result and saved copy.'
+    : 'Open the card to see what is planned and what it may cost later.';
+
+  const renderUnlockBox = (
+    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-800">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">Unlock full result + save snapshot</p>
+          <p className="mt-1 leading-5">
+            Pay <strong>{formatCirclePaidFeeUsdc(previewTotalFeeUsdc)} USDC</strong> to reveal the {isWalletSnapshot ? 'full wallet readout and Yesterday panel' : isEventOddsCompare ? 'full side-by-side comparison' : 'full matched markets'} and save this result as a reusable snapshot.
+          </p>
+          <p className="mt-1 leading-5">{previewActionHint}</p>
+          {previewExpiresAt && (
+            <p className="mt-1 text-[11px] text-amber-700">Preview expires at {formatTimestamp(previewExpiresAt)}.</p>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={handleUnlock}
+          disabled={unlockBusy || previewBusy || !previewResponse?.previewId}
+          className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-amber-600 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {unlockBusy ? <Spinner size={11} /> : <Lock size={11} />}
+          {unlockBusy ? 'Unlocking...' : 'Unlock full result'}
+        </button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4">
@@ -766,11 +1125,7 @@ function CirclePaidCard({ item, agentId }) {
       <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0 flex-1">
           <p className="text-xs text-slate-600">{item.whyItMatters || item.description}</p>
-          <p className="mt-1 text-[11px] text-slate-400">
-            {hasLiveRuntime
-              ? 'Open the card to start a free preview. Paying later only unlocks the full result and saved copy.'
-              : 'Open the card to see what is planned and what it may cost later.'}
-          </p>
+          <p className="mt-1 text-[11px] text-slate-400">{teaserCopy}</p>
         </div>
         <button
           type="button"
@@ -778,7 +1133,7 @@ function CirclePaidCard({ item, agentId }) {
           className="shrink-0 inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-slate-800"
         >
           {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-          {expanded ? 'Close' : hasLiveRuntime ? 'Open live preview' : 'View details'}
+          {expanded ? 'Close' : isWalletSnapshot ? 'Open wallet preview' : hasLiveRuntime ? 'Open live preview' : 'View details'}
         </button>
       </div>
       {expanded && (
@@ -790,39 +1145,52 @@ function CirclePaidCard({ item, agentId }) {
 
           {hasLiveRuntime && (
             <div className="rounded-lg border border-slate-200 bg-white px-3 py-3">
-              <div className={`grid gap-2 ${isEventOddsCompare ? 'sm:grid-cols-2' : ''}`}>
-                <label className="min-w-0 flex-1">
-                  <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                    {isEventOddsCompare ? 'Primary topic' : 'Preview topic'}
-                  </span>
-                  <input
-                    type="text"
-                    value={topic}
-                    maxLength={80}
-                    onChange={(event) => setTopic(event.target.value)}
-                    placeholder={isEventOddsCompare ? 'bitcoin' : 'crypto, bitcoin, stablecoin'}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-indigo-300 focus:bg-white"
-                  />
-                </label>
-                {isEventOddsCompare && (
+              {isWalletSnapshot ? (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Connected agent wallet</p>
+                  <p className="mt-2 break-all rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-700">
+                    {connectedWalletAddress || 'Agent wallet is not available yet.'}
+                  </p>
+                  <p className="mt-2 text-[11px] leading-5 text-slate-500">
+                    Free preview reads the connected Arc wallet, current LP exposure, and the Yesterday panel when indexed history already exists.
+                  </p>
+                </div>
+              ) : (
+                <div className={`grid gap-2 ${isEventOddsCompare ? 'sm:grid-cols-2' : ''}`}>
                   <label className="min-w-0 flex-1">
-                    <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Comparison topic</span>
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                      {isEventOddsCompare ? 'Primary topic' : 'Preview topic'}
+                    </span>
                     <input
                       type="text"
-                      value={comparisonTopic}
+                      value={topic}
                       maxLength={80}
-                      onChange={(event) => setComparisonTopic(event.target.value)}
-                      placeholder="ethereum"
+                      onChange={(event) => setTopic(event.target.value)}
+                      placeholder={isEventOddsCompare ? 'bitcoin' : 'crypto, bitcoin, stablecoin'}
                       className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-indigo-300 focus:bg-white"
                     />
                   </label>
-                )}
-              </div>
+                  {isEventOddsCompare && (
+                    <label className="min-w-0 flex-1">
+                      <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Comparison topic</span>
+                      <input
+                        type="text"
+                        value={comparisonTopic}
+                        maxLength={80}
+                        onChange={(event) => setComparisonTopic(event.target.value)}
+                        placeholder="ethereum"
+                        className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-indigo-300 focus:bg-white"
+                      />
+                    </label>
+                  )}
+                </div>
+              )}
+
               <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <button
                   type="button"
                   onClick={handlePreviewRun}
-                  disabled={isAnyBusy || !agentId || !topic.trim() || (isEventOddsCompare && (!comparisonTopic.trim() || hasInvalidComparisonTopics))}
+                  disabled={isAnyBusy || !agentId || (!isWalletSnapshot && !topic.trim()) || (isEventOddsCompare && (!comparisonTopic.trim() || hasInvalidComparisonTopics))}
                   className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {previewBusy ? <Spinner size={11} /> : <Play size={11} />}
@@ -833,9 +1201,11 @@ function CirclePaidCard({ item, agentId }) {
                 )}
               </div>
               <p className="mt-2 text-[11px] leading-5 text-slate-500">
-                {isEventOddsCompare
-                  ? 'Free preview compares two topic clusters and shows whether they stay aligned, split, or diverge. Unlock is a separate paid step for the full comparison and saved snapshot only.'
-                  : 'Free preview runs the live market adapter and returns a lightweight signal. Unlock is a separate paid step for the full result and saved snapshot only.'}
+                {isWalletSnapshot
+                  ? 'Free preview reads the live Arc wallet and surfaces a balances + positions readout. Unlock is a separate paid step for the full saved wallet snapshot.'
+                  : isEventOddsCompare
+                    ? 'Free preview compares two topic clusters and shows whether they stay aligned, split, or diverge. Unlock is a separate paid step for the full comparison and saved snapshot only.'
+                    : 'Free preview runs the live market adapter and returns a lightweight signal. Unlock is a separate paid step for the full result and saved snapshot only.'}
               </p>
               {runError && (
                 <p className="mt-2 text-xs text-red-500">{runError}</p>
@@ -845,123 +1215,163 @@ function CirclePaidCard({ item, agentId }) {
 
           {hasLiveRuntime && preview && !liveResult && (
             <div className="space-y-3 rounded-xl border border-indigo-200 bg-white p-3">
-              <div className="space-y-2">
-                <div className="min-w-0">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Free preview</p>
-                  <p className="mt-1 text-sm font-semibold leading-6 text-slate-900">{preview.summary}</p>
-                  {previewResponse?.note && (
-                    <p className="mt-1 text-xs leading-5 text-slate-500">{previewResponse.note}</p>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getCirclePaidRegimeClasses(preview.regime)}`}>
-                    {String(preview.regime || 'UNKNOWN').toLowerCase()}
-                  </span>
-                  <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
-                    Confidence {String(preview.confidence || 'LOW').toLowerCase()}
-                  </span>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Combined matches' : 'Matches'}</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{preview.metrics?.matchingMarkets ?? '—'}</p>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Move gap' : 'Avg 24h move'}</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidPercent(isEventOddsCompare ? preview.metrics?.movementGapPct : preview.metrics?.averageOneDayMovePct)}</p>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Liquidity gap' : 'Avg liquidity'}</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(isEventOddsCompare ? preview.metrics?.liquidityGapUsd : preview.metrics?.averageLiquidityUsd)}</p>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">24h volume</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(preview.metrics?.totalVolume24hrUsd)}</p>
-                </div>
-              </div>
-
-              {isEventOddsCompare && previewComparison && (
-                <CirclePaidComparisonPanel comparison={previewComparison} />
-              )}
-
-              {!liveResult && (
-                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-800">
-                  <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                    <div className="min-w-0 flex-1">
-                      <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">Unlock full result + save snapshot</p>
-                      <p className="mt-1 leading-5">
-                        Pay <strong>{formatCirclePaidFeeUsdc(previewTotalFeeUsdc)} USDC</strong> to reveal the {isEventOddsCompare ? 'full side-by-side comparison' : 'full matched markets'} and save this result as a reusable snapshot.
-                      </p>
-                      <p className="mt-1 leading-5">{previewActionHint}</p>
-                      {previewExpiresAt && (
-                        <p className="mt-1 text-[11px] text-amber-700">Preview expires at {formatTimestamp(previewExpiresAt)}.</p>
+              {isWalletSnapshot ? (
+                <>
+                  <div className="space-y-2">
+                    <div className="min-w-0">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Free preview</p>
+                      <p className="mt-1 text-sm font-semibold leading-6 text-slate-900">{preview.summary}</p>
+                      {previewResponse?.note && (
+                        <p className="mt-1 text-xs leading-5 text-slate-500">{previewResponse.note}</p>
                       )}
                     </div>
-                    <button
-                      type="button"
-                      onClick={handleUnlock}
-                      disabled={unlockBusy || previewBusy || !previewResponse?.previewId}
-                      className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-amber-600 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {unlockBusy ? <Spinner size={11} /> : <Lock size={11} />}
-                      {unlockBusy ? 'Unlocking...' : 'Unlock full result'}
-                    </button>
+                    <div className="flex flex-wrap gap-1.5">
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getCirclePaidWalletPostureClasses(preview.posture)}`}>
+                        {formatCirclePaidWalletPosture(preview.posture)}
+                      </span>
+                    </div>
                   </div>
-                </div>
+
+                  {renderWalletSnapshotMetrics(preview.metrics)}
+                  {renderWalletSnapshotBalances(preview.balances)}
+                  {renderWalletSnapshotPositions(preview.positions)}
+                  {renderWalletSnapshotYesterdayPanel(preview.dailySummary)}
+                  {!liveResult && renderUnlockBox}
+                </>
+              ) : (
+                <>
+                  <div className="space-y-2">
+                    <div className="min-w-0">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Free preview</p>
+                      <p className="mt-1 text-sm font-semibold leading-6 text-slate-900">{preview.summary}</p>
+                      {previewResponse?.note && (
+                        <p className="mt-1 text-xs leading-5 text-slate-500">{previewResponse.note}</p>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getCirclePaidRegimeClasses(preview.regime)}`}>
+                        {String(preview.regime || 'UNKNOWN').toLowerCase()}
+                      </span>
+                      <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                        Confidence {String(preview.confidence || 'LOW').toLowerCase()}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Combined matches' : 'Matches'}</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{preview.metrics?.matchingMarkets ?? '—'}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Move gap' : 'Avg 24h move'}</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidPercent(isEventOddsCompare ? preview.metrics?.movementGapPct : preview.metrics?.averageOneDayMovePct)}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Liquidity gap' : 'Avg liquidity'}</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(isEventOddsCompare ? preview.metrics?.liquidityGapUsd : preview.metrics?.averageLiquidityUsd)}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">24h volume</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(preview.metrics?.totalVolume24hrUsd)}</p>
+                    </div>
+                  </div>
+
+                  {isEventOddsCompare && previewComparison && (
+                    <CirclePaidComparisonPanel comparison={previewComparison} />
+                  )}
+                  {!liveResult && renderUnlockBox}
+                </>
               )}
             </div>
           )}
 
           {hasLiveRuntime && liveResult && (
             <div className="space-y-3 rounded-xl border border-green-200 bg-white p-3">
-              <div className="space-y-2.5">
-                <div className="w-full min-w-0">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                    {isViewingSavedSnapshot ? 'Saved snapshot result' : 'Unlocked result'}
-                  </p>
-                  <p className="mt-1 w-full min-w-0 text-sm font-semibold leading-6 text-slate-900">{liveResult.summary}</p>
-                  {liveResultNote && (
-                    <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-500">{liveResultNote}</p>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getCirclePaidRegimeClasses(liveResult.regime)}`}>
-                    {String(liveResult.regime || 'UNKNOWN').toLowerCase()}
-                  </span>
-                  <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
-                    Confidence {String(liveResult.confidence || 'LOW').toLowerCase()}
-                  </span>
-                  {unlockedResponse?.economy?.status && !isViewingSavedSnapshot && (
-                    <span className="inline-flex items-center rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[11px] font-medium text-green-700">
-                      Payment {String(unlockedResponse.economy.status).toLowerCase()}
-                    </span>
-                  )}
-                </div>
-              </div>
+              {isWalletSnapshot ? (
+                <>
+                  <div className="space-y-2.5">
+                    <div className="w-full min-w-0">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                        {isViewingSavedSnapshot ? 'Saved snapshot result' : 'Unlocked result'}
+                      </p>
+                      <p className="mt-1 w-full min-w-0 text-sm font-semibold leading-6 text-slate-900">{liveResult.summary}</p>
+                      {liveResultNote && (
+                        <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-500">{liveResultNote}</p>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getCirclePaidWalletPostureClasses(liveResult.posture)}`}>
+                        {formatCirclePaidWalletPosture(liveResult.posture)}
+                      </span>
+                      {suggestedTaskLabel && (
+                        <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                          Next {suggestedTaskLabel}
+                        </span>
+                      )}
+                      {unlockedResponse?.economy?.status && !isViewingSavedSnapshot && (
+                        <span className="inline-flex items-center rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[11px] font-medium text-green-700">
+                          Payment {String(unlockedResponse.economy.status).toLowerCase()}
+                        </span>
+                      )}
+                    </div>
+                  </div>
 
-              <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Combined matches' : 'Matches'}</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{liveResult.metrics?.matchingMarkets ?? '—'}</p>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Move gap' : 'Avg 24h move'}</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidPercent(isEventOddsCompare ? liveResult.metrics?.movementGapPct : liveResult.metrics?.averageOneDayMovePct)}</p>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Liquidity gap' : 'Avg liquidity'}</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(isEventOddsCompare ? liveResult.metrics?.liquidityGapUsd : liveResult.metrics?.averageLiquidityUsd)}</p>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">24h volume</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(liveResult.metrics?.totalVolume24hrUsd)}</p>
-                </div>
-              </div>
+                  {renderWalletSnapshotMetrics(liveResult.metrics)}
+                  {renderWalletSnapshotBalances(liveResult.balances)}
+                  {renderWalletSnapshotPositions(liveResult.positions)}
+                  {renderWalletSnapshotYesterdayPanel(liveResult.dailySummary, { showRecent: true })}
+                </>
+              ) : (
+                <>
+                  <div className="space-y-2.5">
+                    <div className="w-full min-w-0">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                        {isViewingSavedSnapshot ? 'Saved snapshot result' : 'Unlocked result'}
+                      </p>
+                      <p className="mt-1 w-full min-w-0 text-sm font-semibold leading-6 text-slate-900">{liveResult.summary}</p>
+                      {liveResultNote && (
+                        <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-500">{liveResultNote}</p>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getCirclePaidRegimeClasses(liveResult.regime)}`}>
+                        {String(liveResult.regime || 'UNKNOWN').toLowerCase()}
+                      </span>
+                      <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                        Confidence {String(liveResult.confidence || 'LOW').toLowerCase()}
+                      </span>
+                      {unlockedResponse?.economy?.status && !isViewingSavedSnapshot && (
+                        <span className="inline-flex items-center rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[11px] font-medium text-green-700">
+                          Payment {String(unlockedResponse.economy.status).toLowerCase()}
+                        </span>
+                      )}
+                    </div>
+                  </div>
 
-              {isEventOddsCompare && liveComparison && (
-                <CirclePaidComparisonPanel comparison={liveComparison} highlightSets={liveResult.highlights} />
+                  <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Combined matches' : 'Matches'}</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{liveResult.metrics?.matchingMarkets ?? '—'}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Move gap' : 'Avg 24h move'}</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidPercent(isEventOddsCompare ? liveResult.metrics?.movementGapPct : liveResult.metrics?.averageOneDayMovePct)}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{isEventOddsCompare ? 'Liquidity gap' : 'Avg liquidity'}</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(isEventOddsCompare ? liveResult.metrics?.liquidityGapUsd : liveResult.metrics?.averageLiquidityUsd)}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">24h volume</p>
+                      <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCirclePaidUsdCompact(liveResult.metrics?.totalVolume24hrUsd)}</p>
+                    </div>
+                  </div>
+
+                  {isEventOddsCompare && liveComparison && (
+                    <CirclePaidComparisonPanel comparison={liveComparison} highlightSets={liveResult.highlights} />
+                  )}
+                </>
               )}
 
               {(unlockedResponse?.savedSnapshot?.unlockedAt || unlockedResponse?.savedSnapshot?.createdAt) && (
@@ -970,7 +1380,7 @@ function CirclePaidCard({ item, agentId }) {
                 </div>
               )}
 
-              {!isEventOddsCompare && Array.isArray(liveResult.highlights) && liveResult.highlights.length > 0 && (
+              {!isWalletSnapshot && !isEventOddsCompare && Array.isArray(liveResult.highlights) && liveResult.highlights.length > 0 && (
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Matched markets</p>
                   <div className="mt-2 space-y-2">
@@ -1040,54 +1450,58 @@ function CirclePaidCard({ item, agentId }) {
                 ) : savedSnapshotCount === 0 ? (
                   <p className="text-xs text-slate-500">No paid saved snapshots yet for this card.</p>
                 ) : (
-                  savedSnapshots.map(snapshot => (
-                    <div
-                      key={snapshot.snapshotId}
-                      className={`rounded-lg border px-3 py-3 ${
-                        activeSnapshotId === snapshot.snapshotId
-                          ? 'border-indigo-200 bg-indigo-50/40'
-                          : 'border-slate-200 bg-slate-50'
-                      }`}
-                    >
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <p className="text-xs font-semibold leading-5 text-slate-800">{truncateCirclePaidText(snapshot.preview?.summary || 'Saved live market snapshot')}</p>
-                            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getCirclePaidRegimeClasses(snapshot.preview?.regime)}`}>
-                              {String(snapshot.preview?.regime || 'UNKNOWN').toLowerCase()}
-                            </span>
-                            {activeSnapshotId === snapshot.snapshotId && (
-                              <span className="inline-flex items-center rounded-full border border-indigo-200 bg-white px-2 py-0.5 text-[11px] font-medium text-indigo-700">
-                                Opened
+                  savedSnapshots.map(snapshot => {
+                    const snapshotIsWallet = isCirclePaidWalletSnapshotPayload(snapshot.preview);
+
+                    return (
+                      <div
+                        key={snapshot.snapshotId}
+                        className={`rounded-lg border px-3 py-3 ${
+                          activeSnapshotId === snapshot.snapshotId
+                            ? 'border-indigo-200 bg-indigo-50/40'
+                            : 'border-slate-200 bg-slate-50'
+                        }`}
+                      >
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="text-xs font-semibold leading-5 text-slate-800">{truncateCirclePaidText(snapshot.preview?.summary || 'Saved live market snapshot')}</p>
+                              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${snapshotIsWallet ? getCirclePaidWalletPostureClasses(snapshot.preview?.posture) : getCirclePaidRegimeClasses(snapshot.preview?.regime)}`}>
+                                {snapshotIsWallet ? formatCirclePaidWalletPosture(snapshot.preview?.posture) : String(snapshot.preview?.regime || 'UNKNOWN').toLowerCase()}
                               </span>
-                            )}
+                              {activeSnapshotId === snapshot.snapshotId && (
+                                <span className="inline-flex items-center rounded-full border border-indigo-200 bg-white px-2 py-0.5 text-[11px] font-medium text-indigo-700">
+                                  Opened
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-2 flex flex-wrap gap-1.5">
+                              {getCirclePaidSnapshotMeta(snapshot.preview, isEventOddsCompare).map(meta => (
+                                <span
+                                  key={`${snapshot.snapshotId}:${meta}`}
+                                  className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600"
+                                >
+                                  {meta}
+                                </span>
+                              ))}
+                            </div>
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              Saved {formatTimestamp(snapshot.unlockedAt || snapshot.createdAt)}
+                            </p>
                           </div>
-                          <div className="mt-2 flex flex-wrap gap-1.5">
-                            {getCirclePaidSnapshotMeta(snapshot.preview, isEventOddsCompare).map(meta => (
-                              <span
-                                key={`${snapshot.snapshotId}:${meta}`}
-                                className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600"
-                              >
-                                {meta}
-                              </span>
-                            ))}
-                          </div>
-                          <p className="mt-1 text-[11px] text-slate-500">
-                            Saved {formatTimestamp(snapshot.unlockedAt || snapshot.createdAt)}
-                          </p>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenSavedSnapshot(snapshot.snapshotId)}
+                            disabled={snapshotBusy}
+                            className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-semibold text-slate-700 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {snapshotBusy ? <Spinner size={10} /> : <ChevronDown size={10} />}
+                            {activeSnapshotId === snapshot.snapshotId ? 'Reload saved snapshot' : 'Open saved snapshot'}
+                          </button>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleOpenSavedSnapshot(snapshot.snapshotId)}
-                          disabled={snapshotBusy}
-                          className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-semibold text-slate-700 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                          {snapshotBusy ? <Spinner size={10} /> : <ChevronDown size={10} />}
-                          {activeSnapshotId === snapshot.snapshotId ? 'Reload saved snapshot' : 'Open saved snapshot'}
-                        </button>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </div>
@@ -1143,7 +1557,6 @@ function CirclePaidCard({ item, agentId }) {
       )}
     </div>
   );
-
 }
 
 function getTaskRunErrorMessage(message) {
@@ -1474,10 +1887,64 @@ function formatTimestamp(value) {
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
 }
 
+function formatTaskIdLabel(taskId, fallback = 'Task') {
+  const normalized = String(taskId || '').trim();
+  if (!normalized) return fallback;
+
+  const words = normalized
+    .replace(/^(EXEC|DAILY)_/, '')
+    .split('_')
+    .filter(Boolean)
+    .map((part) => {
+      const lower = part.toLowerCase();
+      if (TASK_ID_WORD_OVERRIDES[lower]) return TASK_ID_WORD_OVERRIDES[lower];
+      return part.charAt(0) + part.slice(1).toLowerCase();
+    });
+
+  return words.length > 0 ? words.join(' ') : fallback;
+}
+
 function formatAutomationMetric(value, digits = 2) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return '—';
   return numeric.toFixed(digits).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
+}
+
+function formatUsdAmount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '$0.00';
+  if (Math.abs(numeric) < 0.01) return '<$0.01';
+
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: numeric >= 100 ? 0 : 2,
+    maximumFractionDigits: numeric >= 100 ? 0 : 2,
+  }).format(numeric);
+}
+
+function formatUsdUnitPrice(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '$0.0000';
+  if (Math.abs(numeric) < 0.0001) return '<$0.0001';
+
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
+  }).format(numeric);
+}
+
+function humanizeAutomationAction(value, fallback = 'No action') {
+  if (!value) return fallback;
+  return String(value)
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
 }
 
 function humanizeAutomationStatus(status) {
@@ -1564,6 +2031,101 @@ function getCirbtcAutomationRuntimeSummary(state, freshness) {
     : baseSummary;
 }
 
+function getCarryLiveSummary(carry) {
+  if (!carry || typeof carry !== 'object') return '';
+
+  if (carry.carryState === 'manual_lp_conflict') {
+    return 'Auto Carry is waiting because this stable LP was added manually. Convert it once, then Auto Carry can reopen and manage the next carry position on its own.';
+  }
+
+  if (carry.carryState === 'active') {
+    return 'Auto Carry already owns the visible stable LP carry leg and is waiting for the next open, deploy, or unwind check.';
+  }
+
+  if (carry.carryState === 'debt_idle') {
+    return 'The borrow leg is already open and the borrowed stable balance is sitting in the wallet. Auto Carry will use the next carry check to deploy that balance into the stable LP, or trim it if the spread or health buffer no longer passes.';
+  }
+
+  if (carry.carryState === 'unwind') {
+    return 'Auto Carry is in unwind mode because the current spread or health buffer no longer supports the open carry leg.';
+  }
+
+  if (carry.carryState === 'inactive') {
+    return 'Auto Carry is on and watching the live spread, but it has not opened a fresh borrowed carry leg yet.';
+  }
+
+  return '';
+}
+
+function getCarryStateLabel(carryState) {
+  switch (String(carryState || '').trim().toLowerCase()) {
+    case 'manual_lp_conflict':
+      return 'Manual LP needs conversion';
+    case 'active':
+      return 'Carry is live';
+    case 'debt_idle':
+      return 'Borrow open, deploy next';
+    case 'unwind':
+      return 'Closing carry';
+    case 'inactive':
+      return 'Ready for a new carry';
+    case 'unavailable':
+      return 'Carry data unavailable';
+    default:
+      return 'Waiting';
+  }
+}
+
+function deriveCarryAutomationDisplayState(state, liveSurface, enabled) {
+  const carry = liveSurface?.carry;
+  if (!carry || typeof carry !== 'object') return state;
+
+  const staleStatus = CARRY_STALE_STATUSES.has(String(state?.lastStatus || '').trim().toLowerCase())
+    || state?.lastDecision?.reason === 'lending_surface_unavailable'
+    || !state?.lastDecision?.carryState;
+
+  const liveNetCarryApyPct = Number(carry?.selectedAsset?.netCarryApyPct ?? carry?.netCarryApyPct);
+  const nextLastDecision = {
+    ...(state?.lastDecision || {}),
+    policyId: carry.policyId || state?.lastDecision?.policyId || null,
+    carryState: carry.carryState || state?.lastDecision?.carryState || 'inactive',
+    selectedStableToken: carry.selectedAssetSymbol || state?.lastDecision?.selectedStableToken || null,
+    actionAssetSymbol: carry.selectedAssetSymbol || state?.lastDecision?.actionAssetSymbol || null,
+    netCarryApyPct: Number.isFinite(liveNetCarryApyPct)
+      ? liveNetCarryApyPct
+      : state?.lastDecision?.netCarryApyPct,
+    projectedOpenHealthFactor: Number.isFinite(Number(carry?.projectedOpenHealthFactor))
+      ? Number(carry.projectedOpenHealthFactor)
+      : state?.lastDecision?.projectedOpenHealthFactor,
+    estimatedNetUsdPerYear: Number.isFinite(Number(carry?.estimatedNetUsdPerYear))
+      ? Number(carry.estimatedNetUsdPerYear)
+      : state?.lastDecision?.estimatedNetUsdPerYear,
+    positionValueUsd: Number.isFinite(Number(carry?.positionValueUsd))
+      ? Number(carry.positionValueUsd)
+      : state?.lastDecision?.positionValueUsd,
+    availableBorrowUsd: Number.isFinite(Number(carry?.availableBorrowUsd))
+      ? Number(carry.availableBorrowUsd)
+      : state?.lastDecision?.availableBorrowUsd,
+    exclusiveMode: carry.exclusiveMode === true,
+    blockedBy: carry?.checks?.stableLpConflict?.passed === false
+      ? carry.checks.stableLpConflict.blockedBy
+      : state?.lastDecision?.blockedBy || null,
+  };
+
+  if (!nextLastDecision.summary || staleStatus) {
+    nextLastDecision.summary = getCarryLiveSummary(carry) || nextLastDecision.summary || '';
+  }
+
+  return {
+    ...(state || {}),
+    enabled: state?.enabled ?? enabled,
+    lastStatus: staleStatus
+      ? (enabled ? 'policy_hold' : 'disabled')
+      : (state?.lastStatus || (enabled ? 'idle' : 'disabled')),
+    lastDecision: nextLastDecision,
+  };
+}
+
 function getCirbtcPairStatusLabel(status) {
   const labels = {
     executed: 'Sent',
@@ -1625,6 +2187,27 @@ function getAutomationSummary(feature, state, agent) {
       }
       return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} lending protection checks ran and ${Number(state?.autoTxToday || 0)} live protection steps were sent. This card can auto-repay, top up collateral, or force LP reduction before the stable lane takes fresh risk.${triggerSummary}${bypassNote}`;
     }
+    case 'carryAutomation': {
+      const netCarryApyPct = Number(state?.lastDecision?.netCarryApyPct);
+      const projectedHealthFactor = Number(state?.lastDecision?.projectedOpenHealthFactor);
+      const spreadSummary = Number.isFinite(netCarryApyPct)
+        ? ` Latest visible estimated net yield: ${formatAutomationMetric(netCarryApyPct, 2)}%.`
+        : '';
+      const healthSummary = Number.isFinite(projectedHealthFactor)
+        ? ` Projected safety buffer after a new carry leg: ${formatAutomationMetric(projectedHealthFactor, 4)}.`
+        : '';
+      const carryHoldSummary = state?.lastDecision?.summary
+        && ['manual_lp_conflict', 'active', 'debt_idle', 'unwind', 'inactive'].includes(state?.lastDecision?.carryState)
+        ? `${state.lastDecision.summary}${spreadSummary}${healthSummary}${bypassNote}`
+        : '';
+      if (carryHoldSummary) {
+        return carryHoldSummary;
+      }
+      if (state?.lastStatus === 'dry_run') {
+        return `Practice mode is active. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} carry checks ran, and no live carry step was sent from this card. Auto Carry keeps the stable LP lane exclusive while it is enabled.${spreadSummary}${healthSummary}${bypassNote}`;
+      }
+      return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} carry checks ran and ${Number(state?.autoTxToday || 0)} live carry steps were sent. Auto Carry can open, deploy, or unwind the stable carry leg while keeping the stable LP lane exclusive.${spreadSummary}${healthSummary}${bypassNote}`;
+    }
     case 'cirbtcLp':
       if (state?.lastStatus === 'dry_run') {
         return `Practice mode is active. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} LP checks ran, and no new live LP change was required from this card.${bypassNote}`;
@@ -1637,6 +2220,76 @@ function getAutomationSummary(feature, state, agent) {
     default:
       return 'Triggered when smart-mode analysis jobs are queued for this agent.';
   }
+}
+
+function getStableOracleGuardContext(lastDecision) {
+  if (!lastDecision || lastDecision.lane !== 'oracle_strategy') {
+    return null;
+  }
+
+  const blockedBy = String(lastDecision?.blockedBy || '').trim();
+  const exitQuote = lastDecision?.exitQuote && typeof lastDecision.exitQuote === 'object'
+    ? lastDecision.exitQuote
+    : null;
+  const sameChainSellBackQuote = lastDecision?.sameChainSellBackQuote && typeof lastDecision.sameChainSellBackQuote === 'object'
+    ? lastDecision.sameChainSellBackQuote
+    : null;
+
+  if (sameChainSellBackQuote) {
+    const inputUsdc = Number(sameChainSellBackQuote.inputUsdc);
+    const expectedEurcOut = Number(sameChainSellBackQuote.expectedEurcOut);
+    const entryPriceUsdc = Number.isFinite(inputUsdc)
+      && Number.isFinite(expectedEurcOut)
+      && expectedEurcOut > 0
+      ? inputUsdc / expectedEurcOut
+      : null;
+
+    return {
+      reasonLabel: blockedBy === 'same_chain_exit_unprofitable'
+        ? 'Live Arc exit quote below round-trip floor'
+        : humanizeAutomationAction(blockedBy, 'Oracle quote check'),
+      reasonDetail: blockedBy === 'same_chain_exit_unprofitable'
+        ? 'A fresh Curve buy stays blocked until the matching live Arc EURC -> USDC quote clears the required round-trip floor.'
+        : 'Fresh Curve entries only run when the same-cycle live Arc exit quote still clears the required floor after minimum profit.',
+      title: 'Oracle Guard Check',
+      detail: 'Fresh Curve entries only run when the same-cycle live Arc exit quote still clears the required floor after minimum profit.',
+      quoteAmountLabel: `${formatAutomationMetric(expectedEurcOut, 4)} EURC`,
+      entryPriceUsdc,
+      entryPriceTracked: Number.isFinite(entryPriceUsdc) && entryPriceUsdc > 0,
+      currentExitQuoteUsdc: Number(sameChainSellBackQuote.expectedUsdcOut),
+      requiredFloorUsdc: Number(sameChainSellBackQuote.minimumExpectedUsdcOut),
+      exitRail: getExecutionRailLabel(sameChainSellBackQuote.exitExecutionRail),
+    };
+  }
+
+  if (exitQuote) {
+    const costFloorActive = exitQuote.profitBasis === 'oracle_inventory_cost_basis';
+
+    return {
+      reasonLabel: blockedBy
+        ? (costFloorActive ? 'Live Arc exit quote below cost floor' : 'Live Arc exit quote below required floor')
+        : 'Oracle quote check',
+      reasonDetail: blockedBy
+        ? (costFloorActive
+          ? 'Protected EURC inventory stays on hold until the live Arc EURC -> USDC quote clears the tracked cost-basis floor.'
+          : 'Protected EURC inventory stays on hold until the live Arc EURC -> USDC quote clears the required floor.')
+        : (costFloorActive
+          ? 'Excess EURC inventory only exits when the live Arc quote is above tracked cost basis plus the minimum profit buffer.'
+          : 'Excess EURC inventory only exits when the live Arc quote is above the current required floor.'),
+      title: costFloorActive ? 'Oracle Cost Floor Check' : 'Oracle Exit Check',
+      detail: costFloorActive
+        ? 'Excess EURC inventory only exits when the live Arc quote is above tracked cost basis plus the minimum profit buffer.'
+        : 'Excess EURC inventory only exits when the live Arc quote is above the current required floor.',
+      quoteAmountLabel: `${formatAutomationMetric(exitQuote.inputEurc, 4)} EURC`,
+      entryPriceUsdc: Number(exitQuote.averageEntryPriceUsdc),
+      entryPriceTracked: Number(exitQuote.averageEntryPriceUsdc) > 0,
+      currentExitQuoteUsdc: Number(exitQuote.expectedUsdcOut),
+      requiredFloorUsdc: Number(exitQuote.minimumExpectedUsdcOut),
+      exitRail: getExecutionRailLabel(exitQuote.exitExecutionRail),
+    };
+  }
+
+  return null;
 }
 
 function formatReputationEventType(eventType) {
@@ -1731,6 +2384,22 @@ function getArbExecutionTokens(payload) {
     fromToken: payload?.fromToken || 'USDC',
     toToken: payload?.toToken || 'EURC',
   };
+}
+
+function getArbDisplayAmountUsdc(payload) {
+  const candidates = [
+    payload?.requestedAmountIn,
+    payload?.amountIn,
+    payload?.signal?.opportunity?.amountUsdc,
+    payload?.signalModelAmountUsdc,
+  ];
+
+  for (const candidate of candidates) {
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  }
+
+  return 0;
 }
 
 function getTaskExecutionLinks(payload) {
@@ -2023,6 +2692,12 @@ function getTaskResultStatusMeta(task, payload) {
   };
 }
 
+function getTaskResultHistoryLabel(resultMeta) {
+  if (resultMeta?.buttonLabel === 'Simulated') return 'Last simulated';
+  if (resultMeta?.buttonLabel === 'Skipped') return 'Last skipped';
+  return 'Last completed';
+}
+
 function isTaskRunActive(run) {
   return ACTIVE_TASK_RUN_STATUSES.has(String(run?.status || '').toLowerCase());
 }
@@ -2063,6 +2738,24 @@ function formatTaskPercent(value) {
 
 function getTaskPayloadSummary(task, payload) {
   if (!payload || typeof payload !== 'object') return '';
+
+  if (task?.id === 'DAILY_ARB_SCAN') {
+    const arbOpportunity = payload.signal?.opportunity;
+    const referenceAmountUsdc = getArbDisplayAmountUsdc(payload);
+
+    if (arbOpportunity?.found && referenceAmountUsdc > 0) {
+      const referenceAmountLabel = formatTaskMetricAmount(referenceAmountUsdc);
+      const referenceProfitLabel = formatTaskMetricAmount(
+        arbOpportunity.expectedProfitUsdc ?? arbOpportunity.netProfitUsdc ?? 0,
+      );
+
+      return `Reference only: if you swapped about ${referenceAmountLabel} USDC on the Curve leg, the current spread suggests roughly ${referenceProfitLabel} USDC before bridge, exit and live fees.`;
+    }
+
+    if (payload.summary) return payload.summary;
+
+    return 'Simulation did not find a profitable arbitrage setup in the latest scan.';
+  }
 
   if (task?.id === 'EXEC_ARB') {
     const { fromToken, toToken } = getArbExecutionTokens(payload);
@@ -2180,6 +2873,8 @@ function getTaskExecutionFactLines(payload) {
 
   if (arbOpportunity) {
     const { fromToken, toToken } = getArbExecutionTokens(payload);
+    const arbDisplayAmountUsdc = getArbDisplayAmountUsdc(payload);
+    const hasRequestedAmount = Number(payload.requestedAmountIn || payload.amountIn) > 0;
     const hasExecutionTx = Boolean(
       payload.swapTxHash
       || payload.txHash
@@ -2189,7 +2884,9 @@ function getTaskExecutionFactLines(payload) {
     );
 
     facts.push(`Signal: ${arbOpportunity.confidence || 'LOW'} confidence · spread ${formatTaskPercent(arbOpportunity.spreadPct || 0)}%`);
-    facts.push(`Requested size: ${formatTaskMetricAmount(payload.requestedAmountIn || payload.amountIn || 0)} ${fromToken}`);
+    if (arbDisplayAmountUsdc > 0) {
+      facts.push(`${hasRequestedAmount ? 'Requested size' : 'Reference swap size'}: ${formatTaskMetricAmount(arbDisplayAmountUsdc)} ${fromToken}`);
+    }
     if (hasExecutionTx) {
       facts.push(`Executed route: ${fromToken} -> ${toToken} via Curve stable pool`);
       if (payload.amountOut || payload.swap?.amountOut) {
@@ -2200,6 +2897,8 @@ function getTaskExecutionFactLines(payload) {
     }
     if (arbOpportunity.found === false) {
       facts.push('Signal outcome: the full-route oracle model is not profitable right now.');
+    } else if (!hasExecutionTx && !hasRequestedAmount && arbDisplayAmountUsdc > 0) {
+      facts.push(`Reference scenario: swapping about ${formatTaskMetricAmount(arbDisplayAmountUsdc)} ${fromToken} would imply roughly ${formatTaskMetricAmount(arbOpportunity.expectedProfitUsdc || arbOpportunity.netProfitUsdc || 0)} USDC before bridge, exit and live fees.`);
     }
     facts.push('Execution scope: this task only covers the Curve swap leg; bridge and exit legs are not executed here.');
   }
@@ -2310,7 +3009,7 @@ function getTaskExecutionFactLines(payload) {
   }
 
   if (payload.economy?.feeUsdc) {
-    facts.push('Fee rail: x402 / Circle Gateway -> Arc revenue pool');
+    facts.push('Arc fee destination: shared Arc pool');
     facts.push(`Fee settled: ${formatTaskMetricAmount(payload.economy.feeUsdc)} USDC (${payload.economy.status || 'unknown'})`);
   }
 
@@ -2546,7 +3245,11 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
   const resultFacts = result ? getTaskExecutionFactLines(result.payload) : [];
   const resultLinks = result ? getTaskExecutionLinks(result.payload) : [];
   const resultMeta  = result ? getTaskResultStatusMeta(task, result.payload || {}) : null;
+  const resultHistoryLabel = result ? getTaskResultHistoryLabel(resultMeta) : '';
   const summaryText = result ? getTaskPayloadSummary(task, result.payload || {}) : '';
+  const arbReferenceAmountUsdc = task.id === 'DAILY_ARB_SCAN'
+    ? getArbDisplayAmountUsdc(result?.payload || {})
+    : 0;
   const operationalAlert = getTaskOperationalAlert(task);
   const errorMessage = err || (!activeRun && failedRun ? getTaskRunErrorMessage(failedRun.error || failedRun.stage_detail || failedRun.stage_label) : '');
 
@@ -2616,6 +3319,16 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
               <span className="text-sm font-semibold text-slate-800">{task.title}</span>
               <TierBadge tier={task.tier} />
               {isPaid && <FeeTag feeUsdc={task.fee_usdc} />}
+              {FREE_TASK_SIMULATION_IDS.has(task.id) && (
+                <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700">
+                  Simulation
+                </span>
+              )}
+              {result && !activeRun && (
+                <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+                  {resultHistoryLabel}
+                </span>
+              )}
               {operationalAlert && (
                 <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
                   {operationalAlert.badge}
@@ -2632,6 +3345,11 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
                 <p className="text-xs text-slate-500 mt-0.5 truncate">{task.description}</p>
                 {operationalAlert && (
                   <p className="text-[11px] text-amber-700 mt-1 truncate">{operationalAlert.title}</p>
+                )}
+                {result && !activeRun && (
+                  <p className="text-[11px] text-emerald-700 mt-1 truncate">
+                    {resultHistoryLabel} {formatTimestamp(result.created_at)}
+                  </p>
                 )}
                 {highlighted && recommendationReason && (
                   <p className="text-[11px] text-blue-700 mt-1 truncate">Why this is recommended now: {recommendationReason}</p>
@@ -2659,17 +3377,15 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
             ? <><Spinner size={11} /> Starting…</>
             : activeRun
               ? <><Spinner size={11} /> In Progress</>
-              : result
-              ? resultMeta?.buttonLabel === 'Simulated'
-                ? <><AlertTriangle size={11} /> Simulated</>
-                : resultMeta?.buttonLabel === 'Skipped'
-                  ? <><Clock size={11} /> Skipped</>
-                  : <><CheckCircle size={11} /> Done</>
               : needsParams && !expanded
                 ? 'Configure'
-              : isPaid
-                ? <><Coins size={11} /> Pay &amp; Run</>
-                : <><Play size={11} /> Run</>}
+              : result
+                ? isPaid
+                  ? <><Coins size={11} /> Pay &amp; Run Again</>
+                  : <><Play size={11} /> Run Again</>
+                : isPaid
+                  ? <><Coins size={11} /> Pay &amp; Run</>
+                  : <><Play size={11} /> Run</>}
         </button>
       </div>
 
@@ -2677,6 +3393,14 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
       {expanded && (
         <div className="px-4 pb-3 border-t border-slate-100 pt-2.5 space-y-2">
           <p className="text-xs text-slate-500">{task.description}</p>
+          {FREE_TASK_SIMULATION_IDS.has(task.id) && (
+            <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+              <p>
+                This card estimates an edge only{arbReferenceAmountUsdc > 0 ? ` using a reference ${formatTaskMetricAmount(arbReferenceAmountUsdc)} USDC Curve-leg swap.` : '.'}
+              </p>
+              <p className="mt-1">Live bridge fees, exit pricing and timing can change the outcome before any real execution.</p>
+            </div>
+          )}
           {operationalAlert && (
             <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <p className="font-semibold text-amber-900">{operationalAlert.title}</p>
@@ -3034,6 +3758,9 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
           )}
           {task.id === 'EXEC_SEPOLIA_GAS_FANOUT' && (
             <div className="space-y-1">
+              <p className="text-[11px] text-amber-700">
+                Start by funding at least 0.06 ETH on Sepolia for this agent wallet. This run then spreads 0.01 ETH each to Base Sepolia, Optimism Sepolia and Arbitrum Sepolia so later bridge actions have destination gas ready.
+              </p>
               <p className="text-[11px] text-slate-500">
                 This run waits for each destination ETH balance update before the card unlocks. If you leave this screen and return later, the latest backend stage is restored and the button remains disabled until all three destinations finish.
               </p>
@@ -3042,11 +3769,9 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
               </p>
             </div>
           )}
-          <p className="text-[11px] text-slate-400 font-mono">{task.id}</p>
           {isPaid && (
             <p className="text-xs text-amber-700/80 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-1.5">
-              Fee path: <strong>x402 / Circle Gateway</strong>{' -> '}<strong>agentic task economy</strong>{' -> '}shared Arc revenue pool.
-              The task tx and fee settlement tx appear below after confirmation.
+              A small Arc fee is charged for each paid run. The task confirmation and fee confirmation appear below after the run completes.
             </p>
           )}
         </div>
@@ -3109,7 +3834,7 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
                 </p>
               )}
               <p className="text-[11px] text-slate-400 mt-0.5">
-                {new Date(result.created_at).toLocaleTimeString()}
+                {resultHistoryLabel} {formatTimestamp(result.created_at)}
               </p>
             </div>
           </div>
@@ -3142,7 +3867,7 @@ function ResultRow({ result }) {
         className="w-full flex items-center gap-2 p-2.5 text-left hover:bg-slate-50 transition-colors"
       >
         <CheckCircle size={12} className="text-green-500 shrink-0" />
-        <span className="flex-1 text-xs text-slate-700">{result.title || result.task_id}</span>
+        <span className="flex-1 text-xs text-slate-700">{result.title || formatTaskIdLabel(result.task_id)}</span>
         <span className="text-xs text-slate-400">{ts}</span>
         {expanded
           ? <ChevronUp size={12} className="text-slate-400" />
@@ -3179,6 +3904,7 @@ export default function TasksTab() {
   const [results, setResults]         = useState([]);
   const [poolBal, setPoolBal]         = useState(null);
   const [agentStatus, setAgentStatus] = useState(null);
+  const [carryLiveSurface, setCarryLiveSurface] = useState(null);
   const [reputationOverview, setReputationOverview] = useState(null);
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState('');
@@ -3225,6 +3951,10 @@ export default function TasksTab() {
   const automationEnabledCount = AUTOMATION_FEATURES.filter(feature => agent?.features?.[feature.key]).length;
   const allAutomationEnabled = automationEnabledCount === AUTOMATION_FEATURES.length;
   const fullAutonomyBusy = automationSavingKey === 'fullAutonomous';
+  const gatewayAutoTopupEnabled = agent?.settings?.gatewayAutoTopupEnabled !== false;
+  const gatewayAutoTopupMinUsdc = Math.max(Number(agent?.settings?.gatewayAutoTopupMinUsdc || 1), 1);
+  const gatewayAutoTopupTargetUsdc = Math.max(Number(agent?.settings?.gatewayAutoTopupTargetUsdc || 3), gatewayAutoTopupMinUsdc);
+  const gatewayAutoTopupBusy = automationSavingKey === 'gatewayAutoTopup' || fullAutonomyBusy;
 
   function buildFullAutonomyPayload(nextValue) {
     return Object.fromEntries(FULL_AUTONOMY_FEATURE_KEYS.map(key => [key, nextValue]));
@@ -3233,12 +3963,15 @@ export default function TasksTab() {
   const load = useCallback(async () => {
     setLoading(true); setError('');
     try {
-      const [catRes, circlePaidRes, poolRes, statusRes, reputationRes, resultsRes, runsRes] = await Promise.all([
+      const [catRes, circlePaidRes, poolRes, statusRes, carryRes, reputationRes, resultsRes, runsRes] = await Promise.all([
         tasksApi.catalog(),
         tasksApi.circlePaidCatalog().catch(() => ({ items: [], lanes: [], economy: null })),
         tasksApi.poolBalance(),
         agent?.id
           ? agentsApi.status(agent.id).then(data => ({ data })).catch(err => ({ error: err.message }))
+          : Promise.resolve(null),
+        agent?.id && agent?.features?.carryAutomationEnabled
+          ? agentsApi.lending(agent.id).then(data => ({ data })).catch(err => ({ error: err.message }))
           : Promise.resolve(null),
         agent?.id
           ? agentsApi.reputation(agent.id, 8).then(data => ({ data })).catch(err => ({ error: err.message }))
@@ -3259,6 +3992,11 @@ export default function TasksTab() {
         setAgentStatus(statusRes.data);
       } else if (agent?.id) {
         setAgentStatus(null);
+      }
+      if (carryRes?.data) {
+        setCarryLiveSurface(carryRes.data);
+      } else {
+        setCarryLiveSurface(null);
       }
       if (reputationRes?.data) {
         setReputationOverview(reputationRes.data);
@@ -3389,7 +4127,44 @@ export default function TasksTab() {
     }
   }
 
-  const freeTasks  = catalog.filter(t => t.tier === 1);
+  async function handleGatewayAutoTopupToggle(nextValue) {
+    if (!agent?.id) return;
+
+    setAutomationSavingKey('gatewayAutoTopup');
+    setAutomationMsg('');
+
+    try {
+      await agentsApi.update(agent.id, {
+        gatewayAutoTopupEnabled: nextValue,
+        gatewayAutoTopupMinUsdc,
+        gatewayAutoTopupTargetUsdc,
+      });
+
+      setAgent(current => ({
+        ...current,
+        settings: {
+          ...(current?.settings || {}),
+          gatewayAutoTopupEnabled: nextValue,
+          gatewayAutoTopupMinUsdc,
+          gatewayAutoTopupTargetUsdc,
+        },
+      }));
+
+      setAutomationMsg(nextValue
+        ? 'Gateway warm auto-topup enabled.'
+        : 'Gateway warm auto-topup disabled.');
+      setTimeout(() => setAutomationMsg(''), 3000);
+    } catch (e) {
+      setAutomationMsg(`Error: ${e.message}`);
+    } finally {
+      setAutomationSavingKey('');
+    }
+  }
+
+  const allFreeTasks = catalog.filter(t => t.tier === 1);
+  const freeTasks  = FREE_TASK_SURFACE_TASK_IDS
+    .map(taskId => allFreeTasks.find(task => task.id === taskId))
+    .filter(Boolean);
   const paidTasks  = catalog.filter(t => t.tier === 2);
   const circlePaidItems = circlePaidCatalog.items || [];
   const circlePaidLanes = circlePaidCatalog.lanes || [];
@@ -3406,6 +4181,12 @@ export default function TasksTab() {
       latestTaskResultById.set(result.task_id, result);
     }
   }
+
+  const visibleTaskIds = new Set([
+    ...freeTasks.map(task => task.id),
+    ...paidTasks.map(task => task.id),
+  ]);
+  const visibleResults = results.filter(result => visibleTaskIds.has(result.task_id));
 
   const shownTasks = activeGroup === 'free'
     ? freeTasks
@@ -3425,7 +4206,7 @@ export default function TasksTab() {
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 flex-wrap">
-              <p className="text-sm font-semibold text-slate-800">Background Automation</p>
+              <p className="text-sm font-semibold text-slate-800">Background Controls</p>
               <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${
                 allAutomationEnabled
                   ? 'border-green-200 bg-green-50 text-green-700'
@@ -3435,10 +4216,10 @@ export default function TasksTab() {
               </span>
             </div>
             <p className="text-xs text-slate-500 mt-1">
-              Turn the background checks and automation features on or off in one action.
+              Turn the background checks and controls on or off in one action.
             </p>
             <p className="text-xs text-slate-400 mt-1">
-              The main Tasks switch stays separate. This control only manages the automation features below.
+              The main Tasks switch stays separate. This control only manages the background controls below.
             </p>
           </div>
 
@@ -3478,10 +4259,61 @@ export default function TasksTab() {
         </div>
       </div>
 
+      <div className="border border-slate-200 rounded-xl p-4 bg-white">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-sm font-semibold text-slate-800">Keep Gateway ready</p>
+              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${
+                gatewayAutoTopupEnabled
+                  ? 'border-green-200 bg-green-50 text-green-700'
+                  : 'border-slate-200 bg-slate-50 text-slate-500'
+              }`}>
+                {gatewayAutoTopupEnabled ? 'On' : 'Off'}
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">
+              Keeps a small Gateway payment balance ready so automatic work does not have to stop and refill at the last second.
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              The next incoming USDC can seed Gateway up to <strong>{gatewayAutoTopupMinUsdc} USDC</strong>. After that, if Gateway available balance falls below <strong>{gatewayAutoTopupMinUsdc} USDC</strong>, the next automation cycle refills it to <strong>{gatewayAutoTopupTargetUsdc} USDC</strong> from the wallet.
+            </p>
+
+            <div className="mt-3 grid gap-2 md:grid-cols-2">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Why it is here</p>
+                <p className="mt-1 text-sm text-slate-600">
+                  This belongs in Automation because it supports every automatic run, but it does not pick trades or change strategy. It simply keeps a small payment balance ready.
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Why leave it on</p>
+                <p className="mt-1 text-sm text-slate-600">
+                  Leave this on if you want the agent to feel hands-off. Supported payments can still refill Gateway on demand when this is off, but keeping it on avoids that extra catch-up step for the next automatic run.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <Button
+            onClick={() => handleGatewayAutoTopupToggle(!gatewayAutoTopupEnabled)}
+            disabled={gatewayAutoTopupBusy}
+            variant={gatewayAutoTopupEnabled ? 'outline' : 'primary'}
+            className="shrink-0"
+          >
+            {gatewayAutoTopupBusy ? <Spinner size={11} /> : null}
+            {gatewayAutoTopupEnabled ? 'Turn off auto-topup' : 'Keep Gateway ready automatically'}
+          </Button>
+        </div>
+      </div>
+
       {AUTOMATION_FEATURES.map(feature => {
         const enabled = agent?.features?.[feature.key] ?? false;
         const isSaving = automationSavingKey === feature.key || fullAutonomyBusy;
-        const automationState = agentStatus?.automation?.[feature.statusKey] || null;
+        const rawAutomationState = agentStatus?.automation?.[feature.statusKey] || null;
+        const automationState = feature.statusKey === 'carryAutomation'
+          ? deriveCarryAutomationDisplayState(rawAutomationState, carryLiveSurface, enabled)
+          : rawAutomationState;
         const cirbtcFreshness = feature.statusKey === 'cirbtcLp'
           ? getCirbtcAutomationFreshness(agentStatus?.automation?.defiLoop || null, automationState)
           : null;
@@ -3501,6 +4333,9 @@ export default function TasksTab() {
                 }]
               : []))
           : [];
+        const stableOracleGuardContext = feature.statusKey === 'defiLoop'
+          ? getStableOracleGuardContext(automationState?.lastDecision)
+          : null;
         const showReputationWarning = feature.statusKey === 'reputation' && agentStatus?.config?.reputationRegistryConfigured === false;
         const isReputationCard = feature.statusKey === 'reputation';
 
@@ -3520,7 +4355,7 @@ export default function TasksTab() {
                   <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getAutomationStatusClasses(lastStatus, enabled)}`}>
                     {humanizeAutomationStatus(lastStatus)}
                   </span>
-                  {automationState?.bypassDailyCap && ['oracle', 'defiLoop', 'lendingAutomation', 'cirbtcLp'].includes(feature.statusKey) && (
+                  {automationState?.bypassDailyCap && ['oracle', 'defiLoop', 'lendingAutomation', 'carryAutomation', 'cirbtcLp'].includes(feature.statusKey) && (
                     <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700">
                       Daily limit relaxed
                     </span>
@@ -3555,6 +4390,45 @@ export default function TasksTab() {
                   </div>
                 )}
 
+                {feature.statusKey === 'defiLoop' && stableOracleGuardContext && (
+                  <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 px-3 py-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">{stableOracleGuardContext.title}</p>
+                        <p className="mt-1 text-sm font-semibold text-slate-900">{stableOracleGuardContext.reasonLabel}</p>
+                        <p className="mt-1 text-xs leading-5 text-sky-800">
+                          {automationState?.lastDecision?.summary || stableOracleGuardContext.reasonDetail}
+                        </p>
+                      </div>
+                      <p className="text-[11px] leading-5 text-sky-700">
+                        {stableOracleGuardContext.quoteAmountLabel || 'Quote size unavailable'} via {stableOracleGuardContext.exitRail || 'swap route'}
+                      </p>
+                    </div>
+
+                    <div className="mt-3 grid gap-2 md:grid-cols-3">
+                      <div className="rounded-lg border border-sky-200 bg-white px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Entry Price</p>
+                        <p className="mt-1 text-sm font-medium text-slate-700">
+                          {stableOracleGuardContext.entryPriceTracked
+                            ? `${formatUsdUnitPrice(stableOracleGuardContext.entryPriceUsdc)} / EURC`
+                            : 'Not tracked yet'}
+                        </p>
+                        {!stableOracleGuardContext.entryPriceTracked && (
+                          <p className="mt-1 text-xs text-slate-500">Manual or older EURC inventory is using the standard floor right now.</p>
+                        )}
+                      </div>
+                      <div className="rounded-lg border border-sky-200 bg-white px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Current Exit Quote</p>
+                        <p className="mt-1 text-sm font-medium text-slate-700">{formatUsdAmount(stableOracleGuardContext.currentExitQuoteUsdc)}</p>
+                      </div>
+                      <div className="rounded-lg border border-sky-200 bg-white px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Required Floor</p>
+                        <p className="mt-1 text-sm font-medium text-slate-700">{formatUsdAmount(stableOracleGuardContext.requiredFloorUsdc)}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {feature.statusKey === 'lendingAutomation' && automationState?.lastDecision && (
                   <div className="mt-3 grid gap-2 md:grid-cols-3">
                     <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
@@ -3585,6 +4459,45 @@ export default function TasksTab() {
                         <p className="mt-1 text-xs text-slate-500">Visible reserve utilization is above the current cap, so lending protection is prioritizing this asset.</p>
                       </div>
                     ))}
+                  </div>
+                )}
+
+                {feature.statusKey === 'carryAutomation' && automationState?.lastDecision && (
+                  <div className="mt-3 space-y-3">
+                    <div className="grid gap-2 md:grid-cols-4">
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Carry Mode</p>
+                        <p className="mt-1 text-sm font-medium text-slate-700">{getCarryStateLabel(automationState.lastDecision.carryState)}</p>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Estimated Net Yield</p>
+                        <p className="mt-1 text-sm font-medium text-slate-700">{formatAutomationMetric(automationState.lastDecision.netCarryApyPct, 2)}%</p>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Projected Safety Buffer</p>
+                        <p className="mt-1 text-sm font-medium text-slate-700">{formatAutomationMetric(automationState.lastDecision.projectedOpenHealthFactor, 4)}</p>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Estimated Yearly Carry</p>
+                        <p className="mt-1 text-sm font-medium text-slate-700">{formatUsdAmount(automationState.lastDecision.estimatedNetUsdPerYear)}</p>
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-3">
+                      <p className="text-xs font-semibold text-sky-800">Auto Carry mode</p>
+                      <p className="mt-1 text-xs leading-5 text-sky-900">
+                        While Auto Carry is enabled, it becomes the only manager of this stable LP route so other growth actions do not compete for the same balance.
+                      </p>
+                    </div>
+
+                    {automationState.lastDecision.carryState === 'manual_lp_conflict' && (
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3">
+                        <p className="text-xs font-semibold text-amber-800">Needs carry conversion</p>
+                        <p className="mt-1 text-xs leading-5 text-amber-900">
+                          The current stable LP was opened outside Auto Carry, so this lane is intentionally waiting. Open DeFi &gt; Lending and use the carry conversion action there to remove the manual LP first. Auto Carry can then reopen and own the position on its own if the spread still passes.
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -3891,7 +4804,7 @@ export default function TasksTab() {
             <Zap size={20} className="text-[#66D121] shrink-0 mt-1" />
             <div>
               <h2 className="text-xl font-bold text-slate-900">Agent Tasks</h2>
-              <p className="text-sm text-slate-500">Run free informational jobs, paid Arc executions, Circle x402 cards and background automation from one screen.</p>
+              <p className="text-sm text-slate-500">Run free checks, paid actions, Circle Paid cards and automation controls from one screen.</p>
             </div>
           </div>
           <div className="flex items-center gap-3 lg:justify-end">
@@ -3911,7 +4824,7 @@ export default function TasksTab() {
             <div className="mt-4 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 sm:flex-row sm:items-center">
               <AlertTriangle size={16} className="text-amber-600 shrink-0" />
               <p className="flex-1 text-sm text-amber-800">
-                <strong>Tasks are disabled.</strong> Enable them to run free oracle tasks and paid execution tasks with your agent.
+                <strong>Tasks are disabled.</strong> Enable them to run free and paid actions with your agent.
               </p>
               <button
                 onClick={() => handleEnableToggle(true)}
@@ -3992,15 +4905,64 @@ export default function TasksTab() {
 
       {/* Info strip */}
       {activeGroup === 'free' && (
-        <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-500 flex items-center gap-2">
-          <Clock size={12} className="shrink-0" />
-          Free runs: up to 5 total per day for this agent. Oracle status and buyer payment flow live in the Oracle tab.
+        <div className="space-y-3">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-500 flex items-center gap-2">
+            <Clock size={12} className="shrink-0" />
+            Free runs: up to 5 total per day for this agent. This focused set keeps the live Arc checks, wallet recap and simulation cards in one place. Oracle details and payment help live in the Oracle tab.
+          </div>
+
+          <div className="rounded-xl border border-green-200 bg-green-50/70 p-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Zap size={14} className="text-green-600" />
+                  <p className="text-sm font-semibold text-slate-800">Funding Setup</p>
+                </div>
+                <p className="mt-1 text-xs text-slate-600">
+                  For a new wallet, get Sepolia ETH first so bridge gas can be fanned out later. Use the Sepolia faucet for gas, then Circle&apos;s faucet when you need test USDC for paid runs on Arc.
+                </p>
+                <div className="mt-3 space-y-1 text-[11px] text-slate-600">
+                  <p>1. Fund at least 0.06 ETH on Sepolia from a faucet or another wallet.</p>
+                  <p>2. Open Paid -&gt; Bridge Setup and run Sepolia Gas Fanout before cross-chain bridge tasks.</p>
+                  <p>3. Use the Circle faucet below when you need test USDC in this same agent wallet.</p>
+                </div>
+                <div className="mt-3 inline-flex flex-wrap items-center gap-2">
+                  <a
+                    href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center rounded-lg border border-green-200 bg-white px-3 py-1.5 text-xs font-semibold text-green-700 hover:border-green-300 hover:text-green-800"
+                  >
+                    Open Sepolia ETH Faucet
+                  </a>
+                  <a
+                    href="https://faucet.circle.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center rounded-lg border border-green-200 bg-white px-3 py-1.5 text-xs font-semibold text-green-700 hover:border-green-300 hover:text-green-800"
+                  >
+                    Open Circle Faucet
+                  </a>
+                </div>
+              </div>
+
+              {(agent?.walletAddress || agent?.wallet_address) && (
+                <div className="w-full lg:max-w-sm">
+                  <AddressBox
+                    address={agent.walletAddress || agent.wallet_address}
+                    label="Agent wallet for faucet and top-ups"
+                    compact
+                  />
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
       {activeGroup === 'automation' && (
         <div className="rounded-xl border border-blue-100 bg-blue-50/70 px-3.5 py-2.5 text-xs text-blue-700 flex items-center gap-2">
           <Brain size={12} className="shrink-0" />
-          Automation toggles only change background behavior. Use Free or Paid when you want to start a task yourself.
+          Automation controls only change automatic behavior. Use Free or Paid when you want to start a task yourself.
         </div>
       )}
       {activeGroup === 'circlePaid' && (
@@ -4012,7 +4974,7 @@ export default function TasksTab() {
       {activeGroup === 'paid' && (
         <div className="rounded-xl border border-amber-100 bg-amber-50/70 px-3.5 py-2.5 text-xs text-amber-700 flex items-center gap-2">
           <Lock size={12} className="shrink-0" />
-          Paid is the manual on-chain lane. Use it when you already know which Arc action to run.
+          Use Paid when you already know what you want this agent to do on-chain.
         </div>
       )}
 
@@ -4021,11 +4983,11 @@ export default function TasksTab() {
       {taskSection}
 
       {/* Recent results */}
-      {results.length > 0 && (
+      {visibleResults.length > 0 && (
         <Card>
           <h3 className="text-lg font-semibold text-slate-900 mb-4">Recent Executions</h3>
           <div className="space-y-1.5">
-            {results.slice(0, 10).map(r => (
+            {visibleResults.slice(0, 10).map(r => (
               <ResultRow key={r.id} result={r} />
             ))}
           </div>

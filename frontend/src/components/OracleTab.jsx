@@ -20,6 +20,31 @@ function formatUsdcBalance(value) {
   return Number.isFinite(amount) ? `${amount.toFixed(6)} USDC` : `${value} USDC`;
 }
 
+function humanizeGatewayRail(rail) {
+  const normalized = String(rail || '').trim().toLowerCase();
+
+  if (normalized === 'agentic_automation_economy') return 'Automation fees';
+  if (normalized === 'agentic_task_economy') return 'Task fees';
+  if (normalized === 'agentic_job_economy') return 'Job fees';
+  if (normalized === 'circle_paid_info_unlock') return 'Paid unlocks';
+  if (normalized === 'circle_gateway') return 'Gateway buyer payments';
+
+  return String(rail || 'Unknown rail')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function humanizeGatewayReferenceType(referenceType) {
+  const normalized = String(referenceType || '').trim().toLowerCase();
+
+  if (normalized === 'automation') return 'automation';
+  if (normalized === 'task') return 'task';
+  if (normalized === 'job') return 'job';
+  if (normalized === 'circle_paid_unlock') return 'paid unlock';
+
+  return normalized || 'payment';
+}
+
 function getOracleWarnings(oracleOverview) {
   const warnings = [];
 
@@ -125,6 +150,110 @@ const CURVE_DEPENDENT_ENDPOINTS = new Set([
   'arb-scan-multi',
 ]);
 
+const ORACLE_PRODUCT_GROUPS = [
+  {
+    key: 'execution_data',
+    title: 'Execution Data',
+    description: 'Use these before a real move on Arc. They expose live pool, peg, or reserve context that is closest to execution-time reality.',
+    tone: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+  },
+  {
+    key: 'macro_research',
+    title: 'Macro Research',
+    description: 'Use these to understand broader market or capital-allocation context. They are helpful research inputs, not direct execution routes.',
+    tone: 'border-blue-200 bg-blue-50 text-blue-800',
+  },
+  {
+    key: 'signal_estimate',
+    title: 'Signal Estimate',
+    description: 'Use these as scanners. They point at a candidate setup, but the final trade still needs a live exit route and fresh execution checks.',
+    tone: 'border-amber-200 bg-amber-50 text-amber-800',
+  },
+];
+
+const ORACLE_PRODUCT_META = {
+  'stablecoin-fx': {
+    group: 'execution_data',
+    label: 'Execution data',
+    readiness: 'Live FX + pool read',
+    bestFor: 'Checking whether the live Arc EURC lane is dislocated enough to deserve a closer look.',
+    caveat: 'Treat it as a pricing input, not as a trade instruction by itself.',
+  },
+  'pool-state': {
+    group: 'execution_data',
+    label: 'Execution data',
+    readiness: 'Live pool snapshot',
+    bestFor: 'Reading reserves, implied rate, fees, and price impact before using a lane.',
+    caveat: 'It is strongest on verified Curve lanes. Experimental venues still need manual judgment.',
+  },
+  'peg-monitor': {
+    group: 'execution_data',
+    label: 'Execution data',
+    readiness: 'Live peg monitor',
+    bestFor: 'Watching stablecoin peg health before routing stable capital.',
+    caveat: 'It tells you whether the peg looks stressed, not whether a swap route is executable.',
+  },
+  'reserve-state': {
+    group: 'execution_data',
+    label: 'Execution data',
+    readiness: 'Watchlist reserve read',
+    bestFor: 'Checking reserve APY and utilization when the deployment can read that reserve live.',
+    caveat: 'This deployment can fall back to yield hints when on-chain reserve data is unavailable.',
+  },
+  'pool-compare': {
+    group: 'execution_data',
+    label: 'Execution data',
+    readiness: 'Live venue comparison',
+    bestFor: 'Comparing multiple quoted lanes side by side before choosing where to inspect next.',
+    caveat: 'It compares quotes and liquidity states. It does not settle or simulate the full trade lifecycle.',
+  },
+  'protocol-tvl': {
+    group: 'macro_research',
+    label: 'Macro research',
+    readiness: 'Protocol watchlist',
+    bestFor: 'Comparing broad protocol size and recent direction when deciding where to do more research.',
+    caveat: 'This is a global watchlist view, not an Arc-native execution route.',
+  },
+  'yield-rank': {
+    group: 'macro_research',
+    label: 'Macro research',
+    readiness: 'Cross-market research',
+    bestFor: 'Scanning broad yield venues for research and idea generation.',
+    caveat: 'It is not limited to Arc-native routes, so treat it as research rather than an action queue.',
+  },
+  'prediction-market-check': {
+    group: 'macro_research',
+    label: 'Macro research',
+    readiness: 'Live regime overlay',
+    bestFor: 'Adding a macro risk overlay before deciding how defensive or aggressive to be.',
+    caveat: 'It is a market-regime lens, not a direct execution surface.',
+  },
+  'arb-signal': {
+    group: 'signal_estimate',
+    label: 'Signal estimate',
+    readiness: 'Cost-aware scanner',
+    bestFor: 'Spotting whether a stablecoin lane deserves a live execution review.',
+    caveat: 'The signal is now cost-aware, but a real trade still depends on the current exit route clearing its floor.',
+  },
+  'arb-scan-multi': {
+    group: 'signal_estimate',
+    label: 'Signal estimate',
+    readiness: 'Multi-lane scanner',
+    bestFor: 'Ranking several lanes quickly to decide which one deserves closer execution review.',
+    caveat: 'Use it to shortlist lanes, then confirm the final entry and exit path before sending capital.',
+  },
+};
+
+function getOracleProductMeta(endpointKey) {
+  return ORACLE_PRODUCT_META[endpointKey] || {
+    group: 'macro_research',
+    label: 'Research surface',
+    readiness: 'General read',
+    bestFor: 'Inspecting the current oracle output for this surface.',
+    caveat: 'Confirm execution details separately before trading on it.',
+  };
+}
+
 function getOracleEndpointBadges(endpointKey, { payToConfigured, curveConfigured }) {
   const paymentBadge = payToConfigured
     ? {
@@ -225,6 +354,9 @@ export default function OracleTab() {
   const [gatewayFundLoading, setGatewayFundLoading] = useState(false);
   const [gatewayFundError, setGatewayFundError] = useState('');
   const [gatewayFundResult, setGatewayFundResult] = useState(null);
+  const gatewayAutoTopupEnabled = agent?.settings?.gatewayAutoTopupEnabled !== false;
+  const gatewayAutoTopupMinUsdc = Math.max(Number(agent?.settings?.gatewayAutoTopupMinUsdc || 1), 1);
+  const gatewayAutoTopupTargetUsdc = Math.max(Number(agent?.settings?.gatewayAutoTopupTargetUsdc || 3), gatewayAutoTopupMinUsdc);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -318,6 +450,8 @@ export default function OracleTab() {
   const recentAlertDeliveries = (oracleAlerting?.recentDeliveries || []).slice(0, 3);
   const configuredAlertSinks = (oracleAlerting?.sinks || []).slice(0, 3);
   const walletAvailableForManualFund = Number(gatewayBalance?.wallet?.availableUsdc || 0);
+  const gatewayUsageSummary = Array.isArray(gatewayBalance?.usage?.summary) ? gatewayBalance.usage.summary : [];
+  const gatewayRecentUsage = Array.isArray(gatewayBalance?.usage?.recent) ? gatewayBalance.usage.recent : [];
   const canManualFundGateway = Number.isFinite(walletAvailableForManualFund)
     && walletAvailableForManualFund >= Number(MANUAL_GATEWAY_FUND_USDC);
   const statusLabel = oracleError ? 'Needs attention' : hasWarnings ? 'Warnings' : 'Live';
@@ -344,17 +478,28 @@ export default function OracleTab() {
         ? {
             tone: 'border-amber-200 bg-amber-50 text-amber-800',
             title: 'Will fund on demand',
-            body: 'The wallet has enough USDC, so the buyer helper can deposit into Gateway during the first paid request or you can pre-fund it manually below.',
+            body: gatewayAutoTopupEnabled
+              ? `The wallet has enough USDC. Supported payments can already refill Gateway on demand. Auto-topup will seed Gateway to ${gatewayAutoTopupMinUsdc} USDC on the next incoming USDC, then later refill it back to ${gatewayAutoTopupTargetUsdc} USDC whenever the available balance falls below ${gatewayAutoTopupMinUsdc} USDC.`
+              : 'The wallet has enough USDC, so the buyer helper can deposit into Gateway during the first paid request or you can pre-fund it manually below.',
           }
         : {
             tone: 'border-red-200 bg-red-50 text-red-700',
             title: 'Buyer wallet needs funds',
-            body: `The selected agent needs at least ${MANUAL_GATEWAY_FUND_USDC} USDC in the wallet before manual Gateway funding can run.`,
+            body: gatewayAutoTopupEnabled
+              ? `Auto-topup is on, but the selected agent still needs wallet USDC before it can warm Gateway back above ${gatewayAutoTopupMinUsdc} USDC.`
+              : `The selected agent needs at least ${MANUAL_GATEWAY_FUND_USDC} USDC in the wallet before manual Gateway funding can run.`,
           };
   const operatorNote = gatewayBalance?.funded
     ? 'Buyers can use the normal 402 -> pay -> retry flow. Keep an eye on fallback warnings and settlement failures.'
     : 'If this agent will buy oracle data, keep wallet USDC and ARC gas ready.';
   const curveConfigured = Boolean(oracleOverview?.config?.pools?.usdcEurcConfigured);
+  const productMatrix = useMemo(() => ORACLE_PRODUCT_GROUPS.map((group) => {
+    const endpoints = (oracleOverview?.publicEndpoints || []).filter(endpoint => getOracleProductMeta(endpoint.key).group === group.key);
+    return {
+      ...group,
+      endpoints,
+    };
+  }), [oracleOverview?.publicEndpoints]);
 
   return (
     <div className="space-y-6">
@@ -512,9 +657,40 @@ export default function OracleTab() {
               <p className="text-sm font-semibold text-slate-800">Endpoint Catalog</p>
               <span className="text-xs text-slate-400">Current public x402 products</span>
             </div>
+
+            <div className="mb-4 grid gap-3 xl:grid-cols-3">
+              {productMatrix.map((group) => (
+                <div key={group.key} className={`rounded-xl border px-4 py-3 text-xs ${group.tone}`}>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide">{group.title}</p>
+                  <p className="mt-2 text-sm font-semibold">{group.endpoints.length} endpoint{group.endpoints.length === 1 ? '' : 's'}</p>
+                  <p className="mt-1 leading-5">{group.description}</p>
+                  <p className="mt-2 text-[11px] opacity-80">
+                    {group.endpoints.length > 0
+                      ? group.endpoints.map(endpoint => endpoint.title).join(' · ')
+                      : 'No endpoints in this class on the current deployment.'}
+                  </p>
+                </div>
+              ))}
+            </div>
+
             <div className="grid gap-2 md:grid-cols-2">
               {(oracleOverview?.publicEndpoints || []).map(endpoint => (
                 <div key={endpoint.key} className="rounded-xl border border-slate-200 bg-white p-4">
+                  {(() => {
+                    const productMeta = getOracleProductMeta(endpoint.key);
+                    return (
+                      <>
+                        <div className="mb-2 flex flex-wrap gap-1.5">
+                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                            {productMeta.label}
+                          </span>
+                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-500">
+                            {productMeta.readiness}
+                          </span>
+                        </div>
+                      </>
+                    );
+                  })()}
                   <div className="mb-3 flex flex-wrap gap-1.5">
                     {getOracleEndpointBadges(endpoint.key, {
                       payToConfigured,
@@ -540,6 +716,11 @@ export default function OracleTab() {
                   <p className="mt-3 rounded-lg bg-slate-50 px-2.5 py-1.5 font-mono text-[11px] text-slate-500">
                     {endpoint.path}
                   </p>
+
+                  <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500 space-y-1.5">
+                    <p><strong className="text-slate-700">Best for:</strong> {getOracleProductMeta(endpoint.key).bestFor}</p>
+                    <p><strong className="text-slate-700">Caveat:</strong> {getOracleProductMeta(endpoint.key).caveat}</p>
+                  </div>
 
                   {Array.isArray(endpoint.supportedVenues) && endpoint.supportedVenues.length > 0 && (
                     <div className="mt-3 flex flex-wrap gap-1.5">
@@ -828,15 +1009,29 @@ export default function OracleTab() {
                   <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-800">
                     <strong>How payment works:</strong>
                     {' '}
-                    Third-party buyers following Circle's standard quickstart typically deposit USDC into Gateway before the first paid request. Arc-managed agents use our buyer helper instead, so if Gateway available balance is empty but the wallet holds USDC, the first paid request funds Gateway on demand and then completes the x402 payment flow. Optional manual pre-fund is available below for operators who want to keep a small balance warm ahead of time.
+                    Third-party buyers following Circle's standard quickstart typically deposit USDC into Gateway before the first paid request. Arc-managed agents use our buyer helper instead, so if Gateway available balance is empty but the wallet holds USDC, the next supported payment can refill Gateway on demand and then complete the flow. Auto-topup is only a warm-balance convenience layer on top of that. The same Gateway balance is shared by task fees, automation fees, job fees, and other buyer-side Gateway payments, so it can naturally go down between checks.
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="text-sm font-semibold text-slate-800">Automatic Gateway warm balance</p>
+                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${gatewayAutoTopupEnabled ? 'border-green-200 bg-green-50 text-green-700' : 'border-slate-200 bg-slate-50 text-slate-500'}`}>
+                          {gatewayAutoTopupEnabled ? 'On' : 'Off'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500">
+                        When this is on, the next incoming USDC can seed Gateway up to {gatewayAutoTopupMinUsdc} USDC for a first warm balance. After that, if Gateway available balance falls below {gatewayAutoTopupMinUsdc} USDC, the next automation cycle tops it back up to {gatewayAutoTopupTargetUsdc} USDC from the wallet. Manage this toggle from Tasks &gt; Automation.
+                      </p>
+                    </div>
                   </div>
 
                   <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div className="space-y-1">
-                        <p className="text-sm font-semibold text-slate-800">Optional manual Gateway top-up</p>
+                        <p className="text-sm font-semibold text-slate-800">Optional operator Gateway pre-fund</p>
                         <p className="text-xs text-slate-500">
-                          Adds {MANUAL_GATEWAY_FUND_USDC} USDC from the selected agent wallet into Circle Gateway. This does not disable the normal helper flow; it only pre-funds the buyer rail.
+                          Adds {MANUAL_GATEWAY_FUND_USDC} USDC from the selected agent wallet into Circle Gateway. Normal buyer flows do not require this; it only keeps a warm balance ready ahead of time.
                         </p>
                       </div>
                       <Button
@@ -868,6 +1063,53 @@ export default function OracleTab() {
                     </div>
                   </div>
 
+                  {gatewayBalance?.usage?.note && (
+                    <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600">
+                      <strong className="text-slate-800">Why this balance changes:</strong>
+                      {' '}
+                      {gatewayBalance.usage.note}
+                    </div>
+                  )}
+
+                  {gatewayUsageSummary.length > 0 && (
+                    <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 space-y-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-800">Where Gateway balance has been used</p>
+                        <p className="text-xs text-slate-500">Confirmed spend grouped by rail for this selected agent.</p>
+                      </div>
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        {gatewayUsageSummary.map((entry) => (
+                          <div key={`${entry.rail}-${entry.referenceType}`} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 space-y-1">
+                            <p className="font-semibold text-slate-800">{humanizeGatewayRail(entry.rail)}</p>
+                            <p>{formatUsdcBalance(entry.totalUsdc)} across {entry.count} {humanizeGatewayReferenceType(entry.referenceType)} payment{entry.count === 1 ? '' : 's'}.</p>
+                            <p className="text-slate-500">Last used: {formatTimestamp(entry.lastAt)}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {gatewayRecentUsage.length > 0 && (
+                    <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 space-y-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-800">Recent Gateway-backed payments</p>
+                        <p className="text-xs text-slate-500">These are the latest confirmed payments that could reduce the warm Gateway balance before the next on-demand refill.</p>
+                      </div>
+                      <div className="space-y-2">
+                        {gatewayRecentUsage.slice(0, 5).map((entry, index) => (
+                          <div key={`${entry.txHash || entry.referenceId || entry.createdAt || index}`} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-semibold text-slate-800">{humanizeGatewayRail(entry.rail)}</span>
+                              <span>{formatUsdcBalance(entry.amountUsdc)}</span>
+                            </div>
+                            <p className="mt-1">{humanizeGatewayReferenceType(entry.referenceType)} payment at {formatTimestamp(entry.createdAt)}</p>
+                            {entry.referenceId && <p className="mt-1 break-all text-slate-500">Reference: {entry.referenceId}</p>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {gatewayFundResult && (
                     <Alert type="success">
                       <div className="space-y-1">
@@ -883,8 +1125,8 @@ export default function OracleTab() {
                     <strong>{gatewayBalance.funded ? 'Gateway funded.' : 'Gateway not funded yet.'}</strong>
                     {' '}
                     {gatewayBalance.funded
-                      ? 'This agent can pay public x402 routes without an extra deposit step.'
-                      : 'The wallet holds USDC, but Circle Gateway available balance is currently empty and the buyer rail will deposit on demand.'}
+                      ? 'This agent currently has a warm Gateway balance, but that balance can still be spent by public x402 payments, task fees, automation fees, and other buyer-side Gateway flows.'
+                      : 'The wallet holds USDC, but Circle Gateway available balance is currently empty and the buyer helper can refill it on demand when the next supported payment runs.'}
                   </div>
                 </>
               )}

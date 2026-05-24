@@ -10,6 +10,9 @@ const DEFAULT_TARGET_LP_MAX_ALLOCATION_PCT = 30;
 const DEFAULT_MAX_REBALANCE_EURC = 25;
 const DEFAULT_MIN_REBALANCE_EURC = 10;
 const DEFAULT_MAX_ORACLE_DEVIATION_PCT = 2;
+const DEFAULT_MAX_FOREX_REFERENCE_OFFSET_PCT = 8;
+const DEFAULT_MAX_BALANCED_ADD_ORACLE_DEVIATION_PCT = 5;
+const DEFAULT_MAX_BALANCED_BOOTSTRAP_ORACLE_DEVIATION_PCT = 10;
 const DEFAULT_HARD_EXIT_ORACLE_DEVIATION_PCT = 12;
 const DEFAULT_MAX_PRICE_IMPACT_PCT = 0.75;
 const DEFAULT_MIN_RESERVE_PER_SIDE = 1000;
@@ -44,6 +47,40 @@ function clampFiniteNumber(value, min, max, fallback) {
 function toFiniteNumber(value) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function resolveStableAddReferenceRate(forexRateNumeric) {
+  if (!(forexRateNumeric > 0)) {
+    return {
+      referenceRate: null,
+      source: 'unavailable',
+      maxOffsetPct: DEFAULT_MAX_FOREX_REFERENCE_OFFSET_PCT,
+      clamped: false,
+    };
+  }
+
+  const parityRate = 1;
+  const maxOffsetPct = clampFiniteNumber(
+    process.env.STABLE_AUTOMATION_MAX_FOREX_REFERENCE_OFFSET_PCT,
+    0,
+    25,
+    DEFAULT_MAX_FOREX_REFERENCE_OFFSET_PCT,
+  );
+  const minReferenceRate = parityRate * (1 - (maxOffsetPct / 100));
+  const maxReferenceRate = parityRate * (1 + (maxOffsetPct / 100));
+  const referenceRate = clampFiniteNumber(
+    forexRateNumeric,
+    minReferenceRate,
+    maxReferenceRate,
+    forexRateNumeric,
+  );
+
+  return {
+    referenceRate,
+    source: referenceRate === forexRateNumeric ? 'live_forex' : 'bounded_forex_reference',
+    maxOffsetPct,
+    clamped: referenceRate !== forexRateNumeric,
+  };
 }
 
 function selectObservedPriceImpactPct(amountUsdc, priceImpact = {}) {
@@ -157,6 +194,56 @@ function resolveAllocationProfile({
   };
 }
 
+function resolveStableAddPlan({
+  deployableUsdcBalance,
+  availableEurcBalance,
+  configuredMaxLiquidityDeployUsdc,
+  targetLiquidityGapUsdc,
+  minLiquidityDeployUsdc,
+} = {}) {
+  const singleSidedUsdcCapacity = normalizeUsdcAmount(
+    Math.min(deployableUsdcBalance, configuredMaxLiquidityDeployUsdc, targetLiquidityGapUsdc),
+  );
+  const singleSidedEurcCapacity = normalizeUsdcAmount(
+    Math.min(availableEurcBalance, configuredMaxLiquidityDeployUsdc, targetLiquidityGapUsdc),
+  );
+  const preferredSingleToken = singleSidedUsdcCapacity >= singleSidedEurcCapacity ? 'USDC' : 'EURC';
+  const preferredSingleAmount = preferredSingleToken === 'USDC'
+    ? singleSidedUsdcCapacity
+    : singleSidedEurcCapacity;
+  const balancedPerSideAmount = normalizeUsdcAmount(
+    Math.min(
+      deployableUsdcBalance,
+      availableEurcBalance,
+      configuredMaxLiquidityDeployUsdc / 2,
+      targetLiquidityGapUsdc / 2,
+    ),
+  );
+  const balancedTotalAmount = normalizeUsdcAmount(balancedPerSideAmount + balancedPerSideAmount);
+  const balancedViable = balancedTotalAmount >= minLiquidityDeployUsdc;
+
+  return {
+    mode: balancedViable ? 'balanced' : 'single',
+    tokenIn: balancedViable ? null : preferredSingleToken,
+    totalAmountUsdc: balancedViable ? balancedTotalAmount : preferredSingleAmount,
+    amountUsdc: balancedViable
+      ? balancedPerSideAmount
+      : preferredSingleToken === 'USDC'
+        ? preferredSingleAmount
+        : 0,
+    amountEurc: balancedViable
+      ? balancedPerSideAmount
+      : preferredSingleToken === 'EURC'
+        ? preferredSingleAmount
+        : 0,
+    balancedViable,
+    preferredSingleToken,
+    singleSidedUsdcCapacity,
+    singleSidedEurcCapacity,
+    balancedTotalAmount,
+  };
+}
+
 function buildHoldReason({
   positionPresent,
   positionValueUsd,
@@ -167,7 +254,7 @@ function buildHoldReason({
   minLiquidityDeployUsdc,
 } = {}) {
   if (positionPresent && positionBelowTargetBand && suggestedLiquidityDeployUsdc < minLiquidityDeployUsdc) {
-    return `Stable LP manager wants to top the position back into the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band, but deployable USDC is below the minimum ${minLiquidityDeployUsdc} required for a top-up.`;
+    return `Stable LP manager wants to top the position back into the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band, but deployable stable balance is below the minimum ${minLiquidityDeployUsdc} required for a top-up.`;
   }
 
   if (positionPresent) {
@@ -178,7 +265,7 @@ function buildHoldReason({
   }
 
   if (suggestedLiquidityDeployUsdc < minLiquidityDeployUsdc) {
-    return `Stable LP manager did not open or top up the position because deployable USDC is below the minimum ${minLiquidityDeployUsdc} required to reach the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band.`;
+    return `Stable LP manager did not open or top up the position because deployable stable balance is below the minimum ${minLiquidityDeployUsdc} required to reach the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band.`;
   }
 
   return 'No stable LP management action qualified for this cycle.';
@@ -188,14 +275,17 @@ function buildSuccessReason({
   operationType,
   amount,
   assetSymbol,
+  amountLabel,
   lpAction,
   targetLpMinUsd,
   targetLpMaxUsd,
 } = {}) {
+  const normalizedAmountLabel = String(amountLabel || '').trim() || `${amount} ${assetSymbol}`.trim();
+
   if (operationType === 'add_liquidity') {
     const actionLabel = lpAction === 'top_up'
-      ? `a Curve liquidity top-up for ${amount} ${assetSymbol} to move the LP back toward the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band`
-      : `a Curve liquidity add for ${amount} ${assetSymbol}`;
+      ? `a Curve liquidity top-up using ${normalizedAmountLabel} to move the LP back toward the ${targetLpMinUsd}-${targetLpMaxUsd} USD target band`
+      : `a Curve liquidity add using ${normalizedAmountLabel}`;
     return `Stable LP manager v2 approved ${actionLabel}.`;
   }
   if (operationType === 'remove_liquidity') {
@@ -253,6 +343,11 @@ function evaluateStableAutomationPolicy({
   const oracleDeviationPct = forexRateNumeric > 0 && poolRateNumeric != null
     ? Math.abs((poolRateNumeric - forexRateNumeric) / forexRateNumeric) * 100
     : null;
+  const stableAddReference = resolveStableAddReferenceRate(forexRateNumeric);
+  const addReferenceRate = stableAddReference.referenceRate;
+  const addGuardDeviationPct = addReferenceRate > 0 && poolRateNumeric != null
+    ? Math.abs((poolRateNumeric - addReferenceRate) / addReferenceRate) * 100
+    : null;
   const walletReserveUsdc = normalizeUsdcAmount(walletReserveUsdcInput);
   const availableUsdcBalance = normalizeUsdcAmount(walletBalances?.usdc);
   const availableEurcBalance = normalizeUsdcAmount(walletBalances?.eurc);
@@ -278,9 +373,18 @@ function evaluateStableAutomationPolicy({
       ? Math.max(targetLpTargetUsd - positionValueUsd, 0)
       : targetLpTargetUsd,
   );
-  const suggestedLiquidityDeployUsdc = normalizeUsdcAmount(
-    Math.min(deployableUsdcBalance, configuredMaxLiquidityDeployUsdc, targetLiquidityGapUsdc),
-  );
+  const addPlan = resolveStableAddPlan({
+    deployableUsdcBalance,
+    availableEurcBalance,
+    configuredMaxLiquidityDeployUsdc,
+    targetLiquidityGapUsdc,
+    minLiquidityDeployUsdc,
+  });
+  const addLiquidityMode = addPlan.mode;
+  const selectedAddTokenIn = addPlan.tokenIn;
+  const selectedAddAmountUsdc = addPlan.amountUsdc;
+  const selectedAddAmountEurc = addPlan.amountEurc;
+  const suggestedLiquidityDeployUsdc = addPlan.totalAmountUsdc;
   const observedLiquidityDeployImpactPct = selectObservedPriceImpactPct(suggestedLiquidityDeployUsdc, poolState?.priceImpact);
   const exitObservedPriceImpactPct = toFiniteNumber(poolState?.priceImpact?.swap1k);
   const minReservePerSide = readPositiveNumberEnv('STABLE_AUTOMATION_MIN_RESERVE_PER_SIDE', DEFAULT_MIN_RESERVE_PER_SIDE);
@@ -288,6 +392,24 @@ function evaluateStableAutomationPolicy({
   const hardExitOracleDeviationPct = readPositiveNumberEnv(
     'STABLE_AUTOMATION_HARD_EXIT_ORACLE_DEVIATION_PCT',
     DEFAULT_HARD_EXIT_ORACLE_DEVIATION_PCT,
+  );
+  const maxBalancedAddOracleDeviationPct = clampFiniteNumber(
+    process.env.STABLE_AUTOMATION_MAX_BALANCED_ADD_ORACLE_DEVIATION_PCT,
+    maxOracleDeviationPct,
+    hardExitOracleDeviationPct,
+    Math.min(
+      Math.max(DEFAULT_MAX_BALANCED_ADD_ORACLE_DEVIATION_PCT, maxOracleDeviationPct),
+      hardExitOracleDeviationPct,
+    ),
+  );
+  const maxBalancedBootstrapOracleDeviationPct = clampFiniteNumber(
+    process.env.STABLE_AUTOMATION_MAX_BALANCED_BOOTSTRAP_ORACLE_DEVIATION_PCT,
+    maxBalancedAddOracleDeviationPct,
+    hardExitOracleDeviationPct,
+    Math.min(
+      Math.max(DEFAULT_MAX_BALANCED_BOOTSTRAP_ORACLE_DEVIATION_PCT, maxBalancedAddOracleDeviationPct),
+      hardExitOracleDeviationPct,
+    ),
   );
   const maxPriceImpactPct = readPositiveNumberEnv('STABLE_AUTOMATION_MAX_PRICE_IMPACT_PCT', DEFAULT_MAX_PRICE_IMPACT_PCT);
   const allowFallbackForex = process.env.STABLE_AUTOMATION_ALLOW_FALLBACK_FOREX === 'true';
@@ -307,6 +429,10 @@ function evaluateStableAutomationPolicy({
   const reserveDepthHealthy = Number(poolState?.reserves?.token0 || 0) >= minReservePerSide
     && Number(poolState?.reserves?.token1 || 0) >= minReservePerSide;
   const oracleDeviationWithinBand = oracleDeviationPct != null && oracleDeviationPct <= maxOracleDeviationPct;
+  const addOracleDeviationLimitPct = addLiquidityMode === 'balanced'
+    ? (!positionPresent ? maxBalancedBootstrapOracleDeviationPct : maxBalancedAddOracleDeviationPct)
+    : maxOracleDeviationPct;
+  const addOracleDeviationWithinBand = addGuardDeviationPct != null && addGuardDeviationPct <= addOracleDeviationLimitPct;
   const oracleDeviationHardBreach = oracleDeviationPct != null && oracleDeviationPct > hardExitOracleDeviationPct;
   const addLiquidityPriceImpactWithinBand = observedLiquidityDeployImpactPct != null && observedLiquidityDeployImpactPct <= maxPriceImpactPct;
   const hardExitRiskTriggered = positionPresent && (
@@ -375,11 +501,15 @@ function evaluateStableAutomationPolicy({
       ),
       addSizePositive: buildCheck(
         suggestedLiquidityDeployUsdc >= minLiquidityDeployUsdc,
-        `Deployable USDC must stay above ${minLiquidityDeployUsdc} before automation can add LP.`,
+        `Deployable stable balance must stay above ${minLiquidityDeployUsdc} before automation can add LP.`,
       ),
       oracleDeviation: buildCheck(
-        oracleDeviationWithinBand,
-        `Pool/forex deviation must stay within ${maxOracleDeviationPct}% before automation can add LP.`,
+        addOracleDeviationWithinBand,
+        addLiquidityMode === 'balanced'
+          ? (!positionPresent
+            ? `Pool/reference deviation must stay within ${addOracleDeviationLimitPct}% before automation can open dual-sided LP.`
+            : `Pool/reference deviation must stay within ${addOracleDeviationLimitPct}% before automation can top up dual-sided LP.`)
+          : `Pool/reference deviation must stay within ${addOracleDeviationLimitPct}% before automation can add single-sided LP.`,
       ),
       priceImpact: buildCheck(
         addLiquidityPriceImpactWithinBand,
@@ -421,18 +551,41 @@ function evaluateStableAutomationPolicy({
       ? suggestedLpExitAmount
       : suggestedAmountUsdc;
   const actionAssetSymbol = operationType === 'remove_liquidity'
-      ? 'LP'
+    ? 'LP'
+    : operationType === 'add_liquidity'
+      ? (addLiquidityMode === 'balanced' ? 'USDC + EURC' : selectedAddTokenIn || 'USDC')
       : 'USDC';
+  const actionAmountLabel = operationType === 'add_liquidity'
+    ? (addLiquidityMode === 'balanced'
+      ? `${selectedAddAmountUsdc} USDC + ${selectedAddAmountEurc} EURC`
+      : `${suggestedLiquidityDeployUsdc} ${selectedAddTokenIn || 'USDC'}`)
+    : null;
   const actionParams = execute
     ? (operationType === 'add_liquidity'
-      ? {
-          tokenIn: 'USDC',
-          amountIn: String(suggestedLiquidityDeployUsdc),
-          lpAction,
-          targetMinUsd: targetLpMinUsd,
-          targetUsd: targetLpTargetUsd,
-          targetMaxUsd: targetLpMaxUsd,
-        }
+      ? (addLiquidityMode === 'balanced'
+        ? {
+            mode: 'balanced',
+            fromToken: 'USDC + EURC',
+            amountIn: String(suggestedLiquidityDeployUsdc),
+            amountUsdc: String(selectedAddAmountUsdc),
+            amountEurc: String(selectedAddAmountEurc),
+            amount0: String(selectedAddAmountUsdc),
+            amount1: String(selectedAddAmountEurc),
+            lpAction,
+            targetMinUsd: targetLpMinUsd,
+            targetUsd: targetLpTargetUsd,
+            targetMaxUsd: targetLpMaxUsd,
+          }
+        : {
+            mode: 'single',
+            fromToken: selectedAddTokenIn || 'USDC',
+            tokenIn: selectedAddTokenIn || 'USDC',
+            amountIn: String(suggestedLiquidityDeployUsdc),
+            lpAction,
+            targetMinUsd: targetLpMinUsd,
+            targetUsd: targetLpTargetUsd,
+            targetMaxUsd: targetLpMaxUsd,
+          })
       : operationType === 'remove_liquidity'
         ? {
             lpAmount: suggestedLpExitAmount,
@@ -457,6 +610,7 @@ function evaluateStableAutomationPolicy({
             operationType,
             amount: actionAmount,
             assetSymbol: actionAssetSymbol,
+          amountLabel: actionAmountLabel,
             lpAction,
             targetLpMinUsd,
             targetLpMaxUsd,
@@ -509,6 +663,14 @@ function evaluateStableAutomationPolicy({
       availableUsdcBalance,
       availableEurcBalance,
       deployableUsdcBalance,
+      addLiquidityMode,
+      selectedAddTokenIn,
+      suggestedLiquidityDeployUsdcFromUsdc: selectedAddAmountUsdc,
+      suggestedLiquidityDeployUsdcFromEurc: selectedAddAmountEurc,
+      suggestedLiquidityDeployUsdcSingleSidedUsdc: addPlan.singleSidedUsdcCapacity,
+      suggestedLiquidityDeployUsdcSingleSidedEurc: addPlan.singleSidedEurcCapacity,
+      suggestedLiquidityDeployUsdcBalanced: addPlan.balancedTotalAmount,
+      balancedAddViable: addPlan.balancedViable,
       positionPresent,
       positionLpBalance,
       positionValueUsd,
@@ -520,8 +682,17 @@ function evaluateStableAutomationPolicy({
       bandTrimTriggered,
       lpAction,
       oracleDeviationPct,
+      rawForexRate: forexRateNumeric,
+      addReferenceRate,
+      addReferenceSource: stableAddReference.source,
+      addReferenceClamped: stableAddReference.clamped,
+      maxForexReferenceOffsetPct: stableAddReference.maxOffsetPct,
+      addGuardDeviationPct,
+      addOracleDeviationLimitPct,
       oracleDeviationHardBreach,
       hardExitOracleDeviationPct,
+      maxBalancedAddOracleDeviationPct,
+      maxBalancedBootstrapOracleDeviationPct,
       observedLiquidityDeployImpactPct,
       exitObservedPriceImpactPct,
       forexRate: forexRateNumeric,

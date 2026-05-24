@@ -59,10 +59,12 @@ const del  = (path)       => request('DELETE', path);
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 export const auth = {
-  startRegister:  (ownerAddress)          => post('/auth/passkey/register/start',  { ownerAddress }),
+  registerChallenge: (ownerAddress)       => post('/auth/passkey/register/challenge', { ownerAddress }),
+  startRegister:  (ownerAddress, challengeId, signature) => post('/auth/passkey/register/start',  { ownerAddress, challengeId, signature }),
   finishRegister: (ownerAddress, cred, d) => post('/auth/passkey/register/finish', { ownerAddress, credential: cred, deviceName: d }),
   startLogin:     (ownerAddress)          => post('/auth/passkey/login/start',     { ownerAddress }),
   finishLogin:    (ownerAddress, cred)    => post('/auth/passkey/login/finish',     { ownerAddress, credential: cred }),
+  logout:         ()                      => post('/auth/logout', {}),
   refresh:        ()                      => post('/auth/refresh'),
 };
 
@@ -179,6 +181,7 @@ export const oracle = {
 
 // ── Manual DeFi ─────────────────────────────────────────────────────────────
 export const defi = {
+  manualQuote: (agentId, body) => post(`/tasks/agents/${agentId}/defi/manual/quote`, body),
   manualExecute: (agentId, body) => post(`/tasks/agents/${agentId}/defi/manual/execute`, body),
 };
 

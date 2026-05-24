@@ -23,6 +23,7 @@ const gatewayAuditService = require('../services/agenticEconomy/gatewayAuditServ
 const jobEconomyService = require('../services/agenticEconomy/jobEconomyService');
 const { recordReputationEvent, EVENT_TYPES } = require('../services/reputationService');
 const { buildJobReviewPolicy, JOB_REVIEW_TIMEOUT_HOURS } = require('../services/jobRetentionService');
+const { assertAgentOperational } = require('../services/securityEventService');
 
 router.use(requireAuth);
 
@@ -45,7 +46,9 @@ const AGENTIC_COMMERCE_ABI = [
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function _getAgentForUser(agentId, userId) {
   const { rows: [agent] } = await db.query(
-    `SELECT id, wallet_address, private_key_encrypted FROM agents WHERE id = $1 AND user_id = $2`,
+    `SELECT id, wallet_address, private_key_encrypted, status, is_active,
+            security_frozen_at, security_freeze_reason
+       FROM agents WHERE id = $1 AND user_id = $2`,
     [agentId, userId],
   );
   return agent || null;
@@ -158,6 +161,7 @@ router.post('/', async (req, res, next) => {
     const agentId = req.params.id;
     const agent   = await _getAgentForUser(agentId, req.user.userId);
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
 
     const parsed = createJobSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
@@ -273,6 +277,7 @@ router.put('/:jobId/assign-provider', async (req, res, next) => {
     const { id: agentId, jobId } = req.params;
     const agent = await _getAgentForUser(agentId, req.user.userId);
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
 
     const providerAddress = String(req.body?.providerAddress || '').trim();
     if (!PROVIDER_ADDRESS_PATTERN.test(providerAddress)) {
@@ -325,6 +330,7 @@ router.put('/:jobId/deliver', async (req, res, next) => {
     const { id: agentId, jobId } = req.params;
     const agent = await _getAgentForUser(agentId, req.user.userId);
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
 
     const deliverableHash = String(req.body?.deliverableHash || '').trim();
     if (!deliverableHash) return res.status(400).json({ error: 'deliverableHash required' });
@@ -397,6 +403,7 @@ router.put('/:jobId/complete', async (req, res, next) => {
     const { id: agentId, jobId } = req.params;
     const agent = await _getAgentForUser(agentId, req.user.userId);
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
 
     const { rows: [job] } = await db.query(
       `SELECT * FROM agent_jobs WHERE id = $1 AND agent_id = $2`,
@@ -468,6 +475,7 @@ router.put('/:jobId/cancel', async (req, res, next) => {
     const { id: agentId, jobId } = req.params;
     const agent = await _getAgentForUser(agentId, req.user.userId);
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
 
     const { rows: [job] } = await db.query(
       `SELECT * FROM agent_jobs WHERE id = $1 AND agent_id = $2`,
@@ -521,6 +529,7 @@ router.put('/:jobId/reject', async (req, res, next) => {
     const { id: agentId, jobId } = req.params;
     const agent = await _getAgentForUser(agentId, req.user.userId);
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
 
     const { rows: [job] } = await db.query(
       `SELECT * FROM agent_jobs WHERE id = $1 AND agent_id = $2`,

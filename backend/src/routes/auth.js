@@ -8,19 +8,101 @@
  */
 const router   = require('express').Router();
 const { z }    = require('zod');
-const { authRateLimit } = require('../middleware/rateLimit');
-const { requireAuth, signToken } = require('../middleware/auth');
+const crypto = require('crypto');
+const { ethers } = require('ethers');
+const {
+  authStartRateLimit,
+  authFinishRateLimit,
+  authRefreshRateLimit,
+} = require('../middleware/rateLimit');
+const { requireAuth, revokeToken, signToken } = require('../middleware/auth');
 const passkeyService = require('../services/passkeyService');
+const { recordAuthFailure, recordAuthLockout } = require('../services/securityEventService');
 const db = require('../db');
 
-router.use(authRateLimit);
+const WALLET_REGISTER_CHALLENGE_PURPOSE = 'wallet_register';
+const WALLET_REGISTER_CHALLENGE_TTL_SECONDS = 5 * 60;
 
-// ── Register: Step 1 — generate challenge ─────────────────────────────────────
-router.post('/passkey/register/start', async (req, res, next) => {
+function buildPasskeyRegistrationMessage(ownerAddress, challengeId) {
+  return [
+    'Arc Machina passkey registration',
+    `Owner: ${ownerAddress}`,
+    `Nonce: ${challengeId}`,
+    'Sign this message to prove wallet ownership before creating a passkey.',
+  ].join('\n');
+}
+
+async function createWalletRegisterChallenge() {
+  const challengeId = crypto.randomUUID();
+
+  await db.query(
+    `INSERT INTO passkey_challenges (user_id, challenge, purpose, expires_at)
+     VALUES (NULL, $1, $2, NOW() + ($3 * INTERVAL '1 second'))`,
+    [challengeId, WALLET_REGISTER_CHALLENGE_PURPOSE, WALLET_REGISTER_CHALLENGE_TTL_SECONDS],
+  );
+
+  return challengeId;
+}
+
+async function consumeWalletRegisterChallenge(challengeId) {
+  const { rows } = await db.query(
+    `DELETE FROM passkey_challenges
+     WHERE user_id IS NULL
+       AND challenge = $1
+       AND purpose = $2
+       AND expires_at > NOW()
+     RETURNING challenge`,
+    [challengeId, WALLET_REGISTER_CHALLENGE_PURPOSE],
+  );
+
+  return rows.length > 0;
+}
+
+// ── Register: wallet ownership proof challenge ──────────────────────────────
+router.post('/passkey/register/challenge', authStartRateLimit, async (req, res, next) => {
   try {
     const schema = z.object({ ownerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/) });
     const { ownerAddress } = schema.parse(req.body);
     const addr = ownerAddress.toLowerCase();
+    const challengeId = await createWalletRegisterChallenge();
+
+    res.json({
+      challengeId,
+      message: buildPasskeyRegistrationMessage(addr, challengeId),
+      expiresInSeconds: WALLET_REGISTER_CHALLENGE_TTL_SECONDS,
+    });
+  } catch (err) { next(err); }
+});
+
+// ── Register: Step 1 — generate challenge ─────────────────────────────────────
+router.post('/passkey/register/start', authStartRateLimit, async (req, res, next) => {
+  try {
+    const schema = z.object({
+      ownerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+      challengeId: z.string().uuid(),
+      signature: z.string().regex(/^0x[0-9a-fA-F]+$/),
+    });
+    const { ownerAddress, challengeId, signature } = schema.parse(req.body);
+    const addr = ownerAddress.toLowerCase();
+
+    let recoveredAddress;
+    try {
+      recoveredAddress = ethers.verifyMessage(
+        buildPasskeyRegistrationMessage(addr, challengeId),
+        signature,
+      ).toLowerCase();
+    } catch {
+      return res.status(401).json({ error: 'invalid_wallet_signature' });
+    }
+
+    if (recoveredAddress !== addr) {
+      return res.status(401).json({ error: 'invalid_wallet_signature' });
+    }
+
+    const challengeConsumed = await consumeWalletRegisterChallenge(challengeId);
+    if (!challengeConsumed) {
+      return res.status(400).json({ error: 'wallet_challenge_expired' });
+    }
 
     // Upsert user row
     const { rows } = await db.query(
@@ -37,7 +119,7 @@ router.post('/passkey/register/start', async (req, res, next) => {
 });
 
 // ── Register: Step 2 — verify attestation ────────────────────────────────────
-router.post('/passkey/register/finish', async (req, res, next) => {
+router.post('/passkey/register/finish', authFinishRateLimit, async (req, res, next) => {
   try {
     const schema = z.object({
       ownerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
@@ -58,7 +140,7 @@ router.post('/passkey/register/finish', async (req, res, next) => {
 });
 
 // ── Login: Step 1 — generate challenge ───────────────────────────────────────
-router.post('/passkey/login/start', async (req, res, next) => {
+router.post('/passkey/login/start', authStartRateLimit, async (req, res, next) => {
   try {
     const schema = z.object({ ownerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/) });
     const { ownerAddress } = schema.parse(req.body);
@@ -88,7 +170,7 @@ const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_MINUTES     = 15;
 
 // ── Login: Step 2 — verify assertion ─────────────────────────────────────────
-router.post('/passkey/login/finish', async (req, res, next) => {
+router.post('/passkey/login/finish', authFinishRateLimit, async (req, res, next) => {
   try {
     const schema = z.object({
       ownerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
@@ -113,7 +195,7 @@ router.post('/passkey/login/finish', async (req, res, next) => {
       await passkeyService.verifyAuthentication(userId, credential);
     } catch (verifyErr) {
       // Increment failure counter; lock if threshold reached
-      await db.query(
+      const { rows: [updatedFailureState] } = await db.query(
         `UPDATE users
          SET failed_auth_count = failed_auth_count + 1,
              locked_until = CASE
@@ -121,9 +203,35 @@ router.post('/passkey/login/finish', async (req, res, next) => {
                THEN NOW() + INTERVAL '${LOCKOUT_MINUTES} minutes'
                ELSE locked_until
              END
+         RETURNING failed_auth_count, locked_until::text AS locked_until
          WHERE id = $2`,
         [MAX_FAILED_ATTEMPTS, userId]
       );
+
+      const auditMetadata = {
+        failedAttempts: updatedFailureState?.failed_auth_count || null,
+        userAgent: req.get('user-agent') || null,
+      };
+      recordAuthFailure({
+        userId,
+        ownerAddress: addr,
+        ipAddress: req.ip || null,
+        metadata: auditMetadata,
+      }).catch(() => {});
+
+      if (updatedFailureState?.locked_until && new Date(updatedFailureState.locked_until) > new Date()) {
+        recordAuthLockout({
+          userId,
+          ownerAddress: addr,
+          ipAddress: req.ip || null,
+          metadata: {
+            ...auditMetadata,
+            lockoutMinutes: LOCKOUT_MINUTES,
+            lockedUntil: updatedFailureState.locked_until,
+          },
+        }).catch(() => {});
+      }
+
       return res.status(401).json({ error: 'Passkey verification failed' });
     }
 
@@ -137,7 +245,22 @@ router.post('/passkey/login/finish', async (req, res, next) => {
 });
 
 // ── Refresh token ─────────────────────────────────────────────────────────────
-router.post('/refresh', requireAuth, (req, res) => {
+router.post('/logout', authRefreshRateLimit, requireAuth, async (req, res, next) => {
+  try {
+    await revokeToken({ jti: req.auth?.jti, exp: req.auth?.exp });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.message === 'token_already_expired') {
+      return res.json({ ok: true });
+    }
+    if (err.message === 'token_missing_jti') {
+      return res.status(400).json({ error: 'token_missing_jti' });
+    }
+    next(err);
+  }
+});
+
+router.post('/refresh', authRefreshRateLimit, requireAuth, (req, res) => {
   const token = signToken(req.user.userId, req.user.ownerAddress);
   res.json({ token });
 });

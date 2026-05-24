@@ -1,6 +1,7 @@
 'use strict';
 
 const { ethers } = require('ethers');
+const { sendProtectedContractTx } = require('../txSecurityService');
 
 const CONSTANT_PRODUCT_PAIR_ABI = [
   'function token0() view returns (address)',
@@ -236,13 +237,27 @@ async function executeConstantProductSwap({
   const tokenIn = new ethers.Contract(tokenInAddress, ERC20_ABI, signer);
   const pair = new ethers.Contract(pairAddress, CONSTANT_PRODUCT_PAIR_ABI, signer);
 
-  const transferTx = await tokenIn.transfer(pairAddress, amountInRaw);
-  await transferTx.wait(1);
+  await sendProtectedContractTx({
+    contract: tokenIn,
+    methodName: 'transfer',
+    args: [pairAddress, amountInRaw],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_swap_transfer_in',
+    replayFingerprint: [pairAddress, tokenInAddress, amountInRaw.toString()],
+  });
 
   const amount0Out = direction.zeroForOne ? 0n : minAmountOutRaw;
   const amount1Out = direction.zeroForOne ? minAmountOutRaw : 0n;
-  const swapTx = await pair.swap(amount0Out, amount1Out, signer.address, '0x');
-  const receipt = await swapTx.wait(1);
+  const { receipt } = await sendProtectedContractTx({
+    contract: pair,
+    methodName: 'swap',
+    args: [amount0Out, amount1Out, signer.address, '0x'],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_swap',
+    replayFingerprint: [pairAddress, amount0Out.toString(), amount1Out.toString(), amountInRaw.toString()],
+  });
 
   return {
     txHash: receipt.hash,
@@ -276,15 +291,36 @@ async function executeConstantProductAddLiquidity({
   const maxAmountBRaw = ethers.parseUnits(String(maxAmountB), decimalsB);
   const plan = resolveLiquidityPlan(pairState, tokenAAddress, tokenBAddress, maxAmountARaw, maxAmountBRaw);
 
-  const transferATx = await tokenA.transfer(pairAddress, plan.amountAUsedRaw);
-  await transferATx.wait(1);
+  await sendProtectedContractTx({
+    contract: tokenA,
+    methodName: 'transfer',
+    args: [pairAddress, plan.amountAUsedRaw],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_add_liquidity_transfer_a',
+    replayFingerprint: [pairAddress, tokenAAddress, plan.amountAUsedRaw.toString()],
+  });
 
-  const transferBTx = await tokenB.transfer(pairAddress, plan.amountBUsedRaw);
-  await transferBTx.wait(1);
+  await sendProtectedContractTx({
+    contract: tokenB,
+    methodName: 'transfer',
+    args: [pairAddress, plan.amountBUsedRaw],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_add_liquidity_transfer_b',
+    replayFingerprint: [pairAddress, tokenBAddress, plan.amountBUsedRaw.toString()],
+  });
 
   const lpAmountRaw = await pair.mint.staticCall(signer.address);
-  const mintTx = await pair.mint(signer.address);
-  const mintReceipt = await mintTx.wait(1);
+  const { receipt: mintReceipt } = await sendProtectedContractTx({
+    contract: pair,
+    methodName: 'mint',
+    args: [signer.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_add_liquidity_mint',
+    replayFingerprint: [pairAddress, lpAmountRaw.toString(), plan.amountAUsedRaw.toString(), plan.amountBUsedRaw.toString()],
+  });
 
   return {
     txHash: mintReceipt.hash,
@@ -351,13 +387,27 @@ async function executeConstantProductZapIn({
   const pair = new ethers.Contract(pairAddress, CONSTANT_PRODUCT_PAIR_ABI, signer);
 
   const tokenOutBalanceBefore = await tokenOut.balanceOf(signer.address);
-  const swapTransferTx = await tokenIn.transfer(pairAddress, swapAmountInRaw);
-  await swapTransferTx.wait(1);
+  await sendProtectedContractTx({
+    contract: tokenIn,
+    methodName: 'transfer',
+    args: [pairAddress, swapAmountInRaw],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_zap_transfer_swap_leg',
+    replayFingerprint: [pairAddress, tokenInAddress, swapAmountInRaw.toString()],
+  });
 
   const amount0Out = direction.zeroForOne ? 0n : minAmountOutRaw;
   const amount1Out = direction.zeroForOne ? minAmountOutRaw : 0n;
-  const swapTx = await pair.swap(amount0Out, amount1Out, signer.address, '0x');
-  const swapReceipt = await swapTx.wait(1);
+  const { receipt: swapReceipt } = await sendProtectedContractTx({
+    contract: pair,
+    methodName: 'swap',
+    args: [amount0Out, amount1Out, signer.address, '0x'],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_zap_swap',
+    replayFingerprint: [pairAddress, amount0Out.toString(), amount1Out.toString(), swapAmountInRaw.toString()],
+  });
 
   const tokenOutBalanceAfter = await tokenOut.balanceOf(signer.address);
   const receivedAmountOutRaw = tokenOutBalanceAfter - tokenOutBalanceBefore;
@@ -365,16 +415,37 @@ async function executeConstantProductZapIn({
     throw new Error('Zap-in swap did not return output tokens to the agent wallet');
   }
 
-  const addTokenInTx = await tokenIn.transfer(pairAddress, remainingAmountInRaw);
-  await addTokenInTx.wait(1);
+  await sendProtectedContractTx({
+    contract: tokenIn,
+    methodName: 'transfer',
+    args: [pairAddress, remainingAmountInRaw],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_zap_transfer_remaining_in',
+    replayFingerprint: [pairAddress, tokenInAddress, remainingAmountInRaw.toString()],
+  });
 
-  const addTokenOutTx = await tokenOut.transfer(pairAddress, receivedAmountOutRaw);
-  await addTokenOutTx.wait(1);
+  await sendProtectedContractTx({
+    contract: tokenOut,
+    methodName: 'transfer',
+    args: [pairAddress, receivedAmountOutRaw],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_zap_transfer_out',
+    replayFingerprint: [pairAddress, tokenOutAddress, receivedAmountOutRaw.toString()],
+  });
 
   const lpDecimals = await pair.decimals().catch(() => 18);
   const lpAmountRaw = await pair.mint.staticCall(signer.address);
-  const mintTx = await pair.mint(signer.address);
-  const mintReceipt = await mintTx.wait(1);
+  const { receipt: mintReceipt } = await sendProtectedContractTx({
+    contract: pair,
+    methodName: 'mint',
+    args: [signer.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_zap_mint',
+    replayFingerprint: [pairAddress, lpAmountRaw.toString(), totalAmountInRaw.toString()],
+  });
 
   return {
     txHash: mintReceipt.hash,
@@ -421,12 +492,26 @@ async function executeConstantProductRemoveLiquidity({
     throw new Error('Requested LP withdrawal is too small for the current balance');
   }
 
-  const transferTx = await pair.transfer(pairAddress, lpAmountRaw);
-  await transferTx.wait(1);
+  await sendProtectedContractTx({
+    contract: pair,
+    methodName: 'transfer',
+    args: [pairAddress, lpAmountRaw],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_remove_liquidity_transfer_lp',
+    replayFingerprint: [pairAddress, lpAmountRaw.toString(), normalizedWithdrawPct],
+  });
 
   const [amount0Raw, amount1Raw] = await pair.burn.staticCall(signer.address);
-  const burnTx = await pair.burn(signer.address);
-  const burnReceipt = await burnTx.wait(1);
+  const { receipt: burnReceipt } = await sendProtectedContractTx({
+    contract: pair,
+    methodName: 'burn',
+    args: [signer.address],
+    chainName: 'Arc Testnet',
+    walletAddress: signer.address,
+    operation: 'constant_product_remove_liquidity_burn',
+    replayFingerprint: [pairAddress, amount0Raw.toString(), amount1Raw.toString(), lpAmountRaw.toString()],
+  });
 
   const token0Decimals = Number(tokenDecimals[String(pairState.token0).toLowerCase()] ?? 18);
   const token1Decimals = Number(tokenDecimals[String(pairState.token1).toLowerCase()] ?? 18);

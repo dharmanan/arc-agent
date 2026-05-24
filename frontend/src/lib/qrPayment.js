@@ -3,6 +3,7 @@
  * Only Arc Testnet (Chain ID 5042002) is supported.
  */
 import QRCode from 'qrcode';
+import { getAddress } from 'ethers';
 
 const ARC_CHAIN_ID   = 5042002;
 const USDC_ADDRESS   = '0x3600000000000000000000000000000000000000';
@@ -23,10 +24,13 @@ export function buildPaymentURI(recipientAddress, amountUsdc) {
   const amount = parseFloat(amountUsdc);
   if (!amount || amount <= 0) throw new Error('Amount must be greater than zero');
 
+  const checksumRecipient = getAddress(recipientAddress);
+  const checksumUsdc = getAddress(USDC_ADDRESS);
+
   // Convert USDC to raw uint256 (6 decimals) — use BigInt to avoid float precision loss
   const amountWei = BigInt(Math.round(amount * 10 ** USDC_DECIMALS));
 
-  return `ethereum:${USDC_ADDRESS}@${ARC_CHAIN_ID}/transfer?address=${recipientAddress}&uint256=${amountWei}`;
+  return `ethereum:${checksumUsdc}@${ARC_CHAIN_ID}/transfer?address=${checksumRecipient}&uint256=${amountWei}`;
 }
 
 /**

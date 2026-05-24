@@ -4,6 +4,9 @@ const { ethers } = require('ethers');
 
 const agentService = require('./agentService');
 const nativeLending = require('./protocols/nativeLending');
+const oracle = require('./oracle');
+const positionsService = require('./positionsService');
+const { buildCarryOpportunitySnapshot } = require('./carryAutomationPolicy');
 const { getLendingPriceSnapshot } = require('./lendingOracleService');
 
 const ERC20_BALANCE_ABI = ['function balanceOf(address) view returns (uint256)'];
@@ -13,6 +16,15 @@ const DELEVERAGE_TARGET_HEALTH_FACTOR = Number(process.env.LENDING_DELEVERAGE_TA
 const COLLATERAL_TOP_UP_TRIGGER_HEALTH_FACTOR = Number(process.env.LENDING_COLLATERAL_TOP_UP_TRIGGER_HF || String(HEALTH_FACTOR_WARNING));
 const COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR = Number(process.env.LENDING_COLLATERAL_TOP_UP_TARGET_HF || String(DELEVERAGE_TARGET_HEALTH_FACTOR));
 const LIQUIDATION_ELIGIBLE_HEALTH_FACTOR = Number(process.env.LENDING_LIQUIDATION_ELIGIBLE_HF || '1');
+const BPS_SCALE = 10_000;
+const RATE_KINK_BPS = Number(process.env.ARC_LENDING_RATE_KINK_BPS || '8000');
+const BASE_BORROW_RATE_BPS = Number(process.env.ARC_LENDING_BASE_BORROW_RATE_BPS || '200');
+const SLOPE_LOW_BPS = Number(process.env.ARC_LENDING_SLOPE_LOW_BPS || '800');
+const SLOPE_HIGH_BPS = Number(process.env.ARC_LENDING_SLOPE_HIGH_BPS || '2200');
+const MIN_AUTOMATION_ACTION_USD = (() => {
+  const numeric = Number(process.env.LENDING_AUTOMATION_MIN_ACTION_USD || '1');
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 1;
+})();
 
 function _getArcRpcUrl() {
   return process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
@@ -34,6 +46,76 @@ function _normalizeAction(value) {
 
 function _normalizeAssetSymbol(value) {
   return String(value || '').trim().toUpperCase();
+}
+
+function _clamp(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(value, min), max);
+}
+
+function _aprPctFromBps(value) {
+  return _roundMetric(_toNumber(value, 0) / 100, 4) || 0;
+}
+
+function _apyPctFromAprPct(value) {
+  const aprPct = _toNumber(value, 0);
+  if (!(aprPct > 0)) return 0;
+  return _roundMetric((((1 + ((aprPct / 100) / 365)) ** 365) - 1) * 100, 4) || 0;
+}
+
+function _computeBorrowRateBps(utilizationBps) {
+  const normalizedUtilizationBps = _clamp(_toNumber(utilizationBps, 0), 0, BPS_SCALE);
+
+  if (normalizedUtilizationBps <= RATE_KINK_BPS) {
+    return BASE_BORROW_RATE_BPS + ((normalizedUtilizationBps * SLOPE_LOW_BPS) / RATE_KINK_BPS);
+  }
+
+  const aboveKinkBps = normalizedUtilizationBps - RATE_KINK_BPS;
+  const maxAboveKinkBps = Math.max(BPS_SCALE - RATE_KINK_BPS, 1);
+  return BASE_BORROW_RATE_BPS + SLOPE_LOW_BPS + ((aboveKinkBps * SLOPE_HIGH_BPS) / maxAboveKinkBps);
+}
+
+function _computeReserveRateSnapshot(reserve) {
+  const totalSupplied = _toNumber(reserve?.totalSupplied, 0);
+  const totalBorrowed = _toNumber(reserve?.totalBorrowed, 0);
+  const reserveFactorBps = _clamp(_toNumber(reserve?.reserveFactorBps, 0), 0, BPS_SCALE);
+  const utilizationBps = totalSupplied > 0
+    ? _clamp((totalBorrowed / totalSupplied) * BPS_SCALE, 0, BPS_SCALE)
+    : 0;
+  const borrowRateBps = _computeBorrowRateBps(utilizationBps);
+  const supplyRateBps = (borrowRateBps * utilizationBps * (BPS_SCALE - reserveFactorBps)) / (BPS_SCALE * BPS_SCALE);
+  const borrowAprPct = _aprPctFromBps(borrowRateBps);
+  const supplyAprPct = _aprPctFromBps(supplyRateBps);
+
+  return {
+    utilizationPct: _roundMetric((utilizationBps / BPS_SCALE) * 100, 4) || 0,
+    borrowAprPct,
+    borrowApyPct: _apyPctFromAprPct(borrowAprPct),
+    supplyAprPct,
+    supplyApyPct: _apyPctFromAprPct(supplyAprPct),
+  };
+}
+
+function _computeLendingYieldSummary(assetEntries) {
+  const totals = assetEntries.reduce((summary, assetEntry) => {
+    const suppliedUsd = _toNumber(assetEntry?.position?.suppliedUsd, 0);
+    const borrowUsd = _toNumber(assetEntry?.position?.borrowUsd, 0);
+    const supplyApyPct = _toNumber(assetEntry?.reserve?.supplyApyPct, 0);
+    const borrowApyPct = _toNumber(assetEntry?.reserve?.borrowApyPct, 0);
+
+    summary.grossSupplyUsdPerYear += suppliedUsd * (supplyApyPct / 100);
+    summary.grossBorrowCostUsdPerYear += borrowUsd * (borrowApyPct / 100);
+    return summary;
+  }, {
+    grossSupplyUsdPerYear: 0,
+    grossBorrowCostUsdPerYear: 0,
+  });
+
+  return {
+    grossSupplyUsdPerYear: _roundMetric(totals.grossSupplyUsdPerYear),
+    grossBorrowCostUsdPerYear: _roundMetric(totals.grossBorrowCostUsdPerYear),
+    netLendingUsdPerYear: _roundMetric(totals.grossSupplyUsdPerYear - totals.grossBorrowCostUsdPerYear),
+  };
 }
 
 function _getSupportedAssets() {
@@ -313,6 +395,22 @@ function evaluateEmergencyDeleverage(surface) {
   }
 
   const repayUsdNeeded = Math.max(totalBorrowUsd - (liquidationCapacityUsd / DELEVERAGE_TARGET_HEALTH_FACTOR), 0);
+  if (repayUsdNeeded > 0 && repayUsdNeeded < MIN_AUTOMATION_ACTION_USD) {
+    return {
+      execute: false,
+      status: 'dust_guarded',
+      reason: 'lending_deleverage_below_min_action_usd',
+      detail: 'Emergency deleverage is skipped because the visible repay need stays below the minimum automatic lending action size.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      targetHealthFactor: DELEVERAGE_TARGET_HEALTH_FACTOR,
+      projectedHealthFactor: surface?.risk?.healthFactor ?? null,
+      repayUsdNeeded: _roundMetric(repayUsdNeeded),
+      repayUsdPlanned: 0,
+      repayUsdShortfall: _roundMetric(repayUsdNeeded),
+      steps: [],
+    };
+  }
+
   let remainingRepayUsd = repayUsdNeeded;
   const debtAssets = (surface?.assets || [])
     .filter((assetEntry) => _toNumber(assetEntry.position.borrowUsd, 0) > 0)
@@ -329,7 +427,7 @@ function evaluateEmergencyDeleverage(surface) {
     if (!(walletUsd > 0) || !(borrowUsd > 0) || !(priceUsd > 0)) continue;
 
     const repayUsd = Math.min(walletUsd, borrowUsd, remainingRepayUsd);
-    if (!(repayUsd > 0)) continue;
+    if (!(repayUsd >= MIN_AUTOMATION_ACTION_USD)) continue;
 
     const amount = repayUsd / priceUsd;
     steps.push({
@@ -428,6 +526,22 @@ function evaluateCollateralTopUp(surface) {
     0,
   );
 
+  if (liquidationCapacityShortfallUsd > 0 && liquidationCapacityShortfallUsd < MIN_AUTOMATION_ACTION_USD) {
+    return {
+      execute: false,
+      status: 'dust_guarded',
+      reason: 'lending_collateral_topup_below_min_action_usd',
+      detail: 'Collateral top-up is skipped because the visible top-up need stays below the minimum automatic lending action size.',
+      currentHealthFactor: surface?.risk?.healthFactor ?? null,
+      targetHealthFactor: COLLATERAL_TOP_UP_TARGET_HEALTH_FACTOR,
+      projectedHealthFactor: surface?.risk?.healthFactor ?? null,
+      collateralUsdNeeded: _roundMetric(liquidationCapacityShortfallUsd),
+      collateralUsdPlanned: 0,
+      collateralUsdShortfall: _roundMetric(liquidationCapacityShortfallUsd),
+      steps: [],
+    };
+  }
+
   if (!(liquidationCapacityShortfallUsd > 0)) {
     return {
       execute: false,
@@ -479,7 +593,7 @@ function evaluateCollateralTopUp(surface) {
     const supplyAmount = supplyUsd / priceUsd;
     const liquidationCapacityAddedUsd = supplyUsd * liquidationFactor;
 
-    if (!(supplyUsd > 0) || !(supplyAmount > 0) || !(liquidationCapacityAddedUsd > 0)) {
+    if (!(supplyUsd >= MIN_AUTOMATION_ACTION_USD) || !(supplyAmount > 0) || !(liquidationCapacityAddedUsd > 0)) {
       continue;
     }
 
@@ -835,6 +949,7 @@ async function buildLendingSurfaceForWallet(walletAddress) {
     const totalBorrowed = _toNumber(reserve?.totalBorrowed, 0);
     const supplyCap = reserve?.supplyCap == null ? null : _toNumber(reserve.supplyCap, null);
     const borrowCap = reserve?.borrowCap == null ? null : _toNumber(reserve.borrowCap, null);
+    const rateSnapshot = _computeReserveRateSnapshot(reserve);
 
     return {
       symbol: asset.symbol,
@@ -867,6 +982,11 @@ async function buildLendingSurfaceForWallet(walletAddress) {
         supplyCapRemaining: supplyCap === null ? null : _roundMetric(Math.max(supplyCap - totalSupplied, 0)),
         borrowCapRemaining: borrowCap === null ? null : _roundMetric(Math.max(borrowCap - totalBorrowed, 0)),
         lastAccrualTimestamp: reserve?.lastAccrualTimestamp || null,
+        utilizationPct: rateSnapshot.utilizationPct,
+        borrowAprPct: rateSnapshot.borrowAprPct,
+        borrowApyPct: rateSnapshot.borrowApyPct,
+        supplyAprPct: rateSnapshot.supplyAprPct,
+        supplyApyPct: rateSnapshot.supplyApyPct,
       },
       position: {
         suppliedAmount: _roundMetric(suppliedAmount),
@@ -879,6 +999,7 @@ async function buildLendingSurfaceForWallet(walletAddress) {
   });
 
   const risk = _computeRiskSummary(assets, accountOverview?.liquidity || null);
+  const yieldSummary = _computeLendingYieldSummary(assets);
   const actionGuards = Object.fromEntries(assets.map((assetEntry) => [
     assetEntry.symbol,
     {
@@ -908,6 +1029,7 @@ async function buildLendingSurfaceForWallet(walletAddress) {
     },
     assets,
     risk,
+    yield: yieldSummary,
     actionGuards,
   };
 
@@ -1279,9 +1401,55 @@ async function getAgentLendingSurface(agentId, userId) {
   if (!agent) return null;
 
   const surface = await buildLendingSurfaceForWallet(agent.walletAddress);
+  let carry = null;
+
+  try {
+    const stablePool = oracle.resolveCurvePool('USDC-EURC');
+    const stablePricingPool = oracle.resolveCurvePool('EURC-USDC');
+    const [forexRate, positionSnapshot] = await Promise.all([
+      oracle.getForexRate('EURC', 'USDC'),
+      positionsService.getWalletPositions(agent.walletAddress, {
+        poolKeys: [stablePool?.key].filter(Boolean),
+      }),
+    ]);
+    const stablePosition = Array.isArray(positionSnapshot?.positions)
+      ? positionSnapshot.positions.find(
+          (item) => String(item.poolAddress || '').toLowerCase() === String(stablePool?.address || '').toLowerCase(),
+        ) || null
+      : null;
+    const stablePoolState = stablePricingPool?.address
+      ? await oracle.getCurvePoolState(stablePricingPool)
+      : oracle.getMockPoolState('EURC-USDC', forexRate.rate);
+    const assetMap = new Map((surface.assets || []).map((assetEntry) => [String(assetEntry.symbol || '').toUpperCase(), assetEntry]));
+
+    carry = buildCarryOpportunitySnapshot({
+      lendingSurface: surface,
+      stablePoolState,
+      stableCurvePosition: stablePosition,
+      walletBalances: {
+        usdc: assetMap.get('USDC')?.wallet?.amount ?? 0,
+        eurc: assetMap.get('EURC')?.wallet?.amount ?? 0,
+      },
+      maxTradeUsdc: agent.settings?.maxTradeUsdc || 0,
+      walletReserveUsdc: agent.settings?.defiWalletReserveUsdc || 0,
+    });
+  } catch (error) {
+    carry = {
+      lane: 'carry_stable_lp',
+      policyId: 'carry_stable_lp_v1',
+      carryState: 'unavailable',
+      exclusiveMode: true,
+      error: error.message,
+    };
+  }
+
   return {
     agentId: agent.id,
     ...surface,
+    carry,
+    automation: {
+      carryEnabled: agent.features?.carryAutomationEnabled === true,
+    },
   };
 }
 

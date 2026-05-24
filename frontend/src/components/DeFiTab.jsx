@@ -3,6 +3,7 @@ import { useAgent } from '../providers/AgentProvider.jsx';
 import { agents as agentsApi, oracle as oracleApi, defi as defiApi, tasks as tasksApi } from '../lib/api.js';
 import { CHAINS } from '../lib/chains.js';
 import { Alert, Card, Spinner } from './ui/index.jsx';
+import PositionAwareLpCard from './PositionAwareLpCard.jsx';
 import {
   Activity,
   ArrowRightLeft,
@@ -247,6 +248,27 @@ function createEmptyLendingSurface() {
       band: 'idle',
       label: 'No debt',
       detail: 'No active lending debt is visible yet.',
+    },
+    yield: {
+      grossSupplyUsdPerYear: 0,
+      grossBorrowCostUsdPerYear: 0,
+      netLendingUsdPerYear: 0,
+    },
+    carry: {
+      lane: 'carry_stable_lp',
+      policyId: 'carry_stable_lp_v1',
+      carryState: 'inactive',
+      exclusiveMode: true,
+      selectedAssetSymbol: null,
+      lpYield: {
+        aprPct: 0,
+        apyPct: 0,
+      },
+      estimatedNetUsdPerYear: 0,
+      checks: {},
+    },
+    automation: {
+      carryEnabled: false,
     },
     actionGuards: {},
   };
@@ -575,7 +597,9 @@ function getLendingManualActionError(actionId, params) {
   return '';
 }
 
-function LendingManualFields({ actionId, assetOptions, params, setParams }) {
+function LendingManualFields({ actionId, assetOptions, params, setParams, selectedAsset }) {
+  const visibleRepayAmount = Number(selectedAsset?.position?.borrowAmount || 0);
+
   if (actionId === 'collateral_top_up') {
     return (
       <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600">
@@ -661,7 +685,26 @@ function LendingManualFields({ actionId, assetOptions, params, setParams }) {
         </select>
       </label>
       <label>
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Amount</span>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Amount</span>
+          {actionId === 'repay' && (
+            <button
+              type="button"
+              onClick={() => setParams(current => ({
+                ...current,
+                amount: visibleRepayAmount > 0 ? String(visibleRepayAmount) : '',
+              }))}
+              disabled={visibleRepayAmount <= 0}
+              className={`text-[11px] font-semibold transition ${
+                visibleRepayAmount > 0
+                  ? 'text-arc-green hover:text-[#4ea412]'
+                  : 'cursor-not-allowed text-slate-300'
+              }`}
+            >
+              All repay
+            </button>
+          )}
+        </div>
         <input
           type="number"
           min="0"
@@ -670,6 +713,13 @@ function LendingManualFields({ actionId, assetOptions, params, setParams }) {
           onChange={(event) => setParams(current => ({ ...current, amount: event.target.value }))}
           className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#66D121]/40"
         />
+        {actionId === 'repay' && (
+          <p className="mt-1 text-[11px] text-slate-500">
+            {visibleRepayAmount > 0
+              ? `Visible debt: ${formatPositionAmount(visibleRepayAmount)} ${params.asset}. Click All repay to fill the full amount automatically.`
+              : `No visible ${params.asset} debt is available to auto-fill right now.`}
+          </p>
+        )}
       </label>
     </div>
   );
@@ -689,6 +739,10 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [trackedRun, setTrackedRun] = useState(null);
+  const selectedAsset = useMemo(() => {
+    const assets = Array.isArray(lendingSurface?.assets) ? lendingSurface.assets : [];
+    return assets.find((asset) => asset.symbol === params.asset) || null;
+  }, [lendingSurface, params.asset]);
 
   useEffect(() => {
     setParams((current) => {
@@ -874,7 +928,13 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
         </div>
 
         <div className="mt-4 space-y-2">
-          <LendingManualFields actionId={activeAction.id} assetOptions={assetOptions} params={params} setParams={setParams} />
+          <LendingManualFields
+            actionId={activeAction.id}
+            assetOptions={assetOptions}
+            params={params}
+            setParams={setParams}
+            selectedAsset={selectedAsset}
+          />
         </div>
 
         <p className="mt-3 text-xs leading-5 text-slate-500">{activeGuard.detail}</p>
@@ -938,6 +998,185 @@ function LendingManualControls({ agentId, lendingSurface, onRunQueued }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function CarryMigrationControls({ agentId, carry, carryAutomationEnabled, onRunQueued }) {
+  const lpBalance = Number(carry?.lpBalance || 0);
+  const positionValueUsd = Number(carry?.positionValueUsd || 0);
+  const shouldShow = carryAutomationEnabled && carry?.carryState === 'manual_lp_conflict' && lpBalance > 0;
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const [trackedRun, setTrackedRun] = useState(null);
+
+  useEffect(() => {
+    setMessage('');
+    setError('');
+  }, [carry?.carryState, carry?.lpBalance]);
+
+  useEffect(() => {
+    if (!agentId || !trackedRun?.id || !isPoolManualRunActive(trackedRun)) {
+      return undefined;
+    }
+
+    let active = true;
+
+    async function syncTrackedRun() {
+      try {
+        const data = await tasksApi.runs(agentId, 'recent', 20);
+        if (!active) return;
+
+        const updatedRun = Array.isArray(data?.runs)
+          ? data.runs.find(item => item.id === trackedRun.id)
+          : null;
+
+        if (!updatedRun) return;
+
+        setTrackedRun(updatedRun);
+
+        if (!isPoolManualRunActive(updatedRun)) {
+          if (updatedRun.status === 'completed') {
+            try {
+              await agentsApi.update(agentId, { carryAutomationEnabled: true });
+              setMessage('Existing stable LP was removed. Auto Carry re-check was queued and can reopen the position on its own if the spread still passes.');
+            } catch (kickoffError) {
+              setMessage(updatedRun.result_payload?.summary || 'Existing stable LP was removed.');
+              setError(kickoffError.message || 'Auto Carry re-check could not be queued automatically. Use Refresh once to reload the latest carry state.');
+            }
+            onRunQueued?.(updatedRun);
+          } else if (updatedRun.status === 'failed') {
+            setError(updatedRun.error || updatedRun.stage_detail || 'The carry conversion could not remove the current stable LP.');
+          }
+        }
+      } catch (pollError) {
+        if (!active) return;
+        setError(current => current || pollError.message || 'Failed to refresh the carry conversion status.');
+      }
+    }
+
+    syncTrackedRun();
+    const intervalId = window.setInterval(syncTrackedRun, 2500);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [agentId, onRunQueued, trackedRun]);
+
+  async function handleConvert() {
+    if (!shouldShow || !agentId) return;
+
+    const curvePool = DEFI_POOL_CONFIG.find(pool => pool.key === 'USDC-EURC');
+    if (!curvePool) {
+      setError('The verified stable Curve pool is not available for carry conversion.');
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    setMessage('');
+
+    try {
+      const response = await defiApi.manualExecute(
+        agentId,
+        buildManualActionRequest(curvePool, 'remove_dual', { lpAmount }),
+      );
+      const feeLabel = Number(response?.feeUsdc) > 0
+        ? `${Number(response.feeUsdc).toFixed(2)} USDC fee applied.`
+        : 'Fee applied on submit.';
+
+      if (response?.run) {
+        setTrackedRun(response.run);
+        setMessage(`Queued. Existing stable LP will exit into both wallet tokens first. ${feeLabel}`);
+        onRunQueued?.(response.run);
+        return;
+      }
+
+      setMessage('Submitted. Auto Carry will need a refresh to pick up the new wallet balances.');
+    } catch (runError) {
+      if (runError?.data?.run) {
+        setTrackedRun(runError.data.run);
+      }
+      setError(runError?.data?.detail || runError.message || 'Failed to start the carry conversion.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const trackedRunStatus = trackedRun ? getPoolManualRunStatusMeta(trackedRun) : null;
+  const trackedRunSummary = trackedRun ? getPoolManualRunSummary(trackedRun, 'Carry conversion') : '';
+  const trackedRunLinks = trackedRun ? getPoolManualRunLinks(trackedRun) : [];
+
+  if (!shouldShow) {
+    return null;
+  }
+
+  return (
+    <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">Carry Conversion</p>
+          <p className="mt-2 text-sm leading-6 text-amber-900">
+            This stable LP was opened outside Auto Carry, so the lane is intentionally waiting. Convert it once and Auto Carry can reopen and own the next stable LP leg by itself.
+          </p>
+          <p className="mt-2 text-xs leading-5 text-amber-800">
+            Current manual LP: {formatLpAmount(lpBalance)} LP about {formatUsdAmount(positionValueUsd)}. The conversion removes that LP into both wallet tokens first, then queues a fresh Auto Carry re-check. It does not guarantee a new borrow if the spread or health buffer has changed by then.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={handleConvert}
+          disabled={busy || !agentId}
+          className={`inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition ${
+            busy || !agentId
+              ? 'cursor-not-allowed bg-slate-200 text-slate-400'
+              : 'bg-amber-500 text-white hover:bg-amber-600'
+          }`}
+        >
+          {busy ? <Spinner size={13} /> : <RefreshCw size={15} />}
+          {busy ? 'Converting...' : 'Convert To Auto Carry'}
+        </button>
+      </div>
+
+      {error && <p className="mt-3 text-xs text-red-600">{error}</p>}
+      {message && <p className="mt-3 text-xs text-green-700">{message}</p>}
+
+      {trackedRun && (
+        <div className="mt-4 rounded-xl border border-amber-200 bg-white px-4 py-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-slate-900">Latest carry conversion</p>
+              <p className="mt-1 text-xs text-slate-500">
+                Started {formatTimestamp(trackedRun.created_at)} · Last update {formatTimestamp(trackedRun.updated_at || trackedRun.completed_at || trackedRun.created_at)}
+              </p>
+            </div>
+            {trackedRunStatus && (
+              <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${getStatusBadgeClasses(trackedRunStatus.tone)}`}>
+                {trackedRunStatus.label}
+              </span>
+            )}
+          </div>
+
+          <p className="mt-3 text-sm leading-6 text-slate-700">{trackedRunSummary}</p>
+          {trackedRunLinks.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {trackedRunLinks.map(link => (
+                <a
+                  key={`${link.label}-${link.url}`}
+                  href={link.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 hover:border-slate-300 hover:text-slate-900"
+                >
+                  {link.label}
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1125,12 +1364,46 @@ function getPoolManualRunSummary(run, fallbackLabel = 'Manual action') {
   if (!run) return '';
 
   if (run.status === 'failed') {
-    return run.error || run.stage_detail || `${fallbackLabel} failed.`;
+    return normalizeManualFailureText(run.stage_detail || run.error, `${fallbackLabel} failed.`);
   }
 
   return run.result_payload?.summary
     || run.stage_detail
     || `${fallbackLabel} ${String(run.status || 'queued').replace(/_/g, ' ')}.`;
+}
+
+function formatManualQuoteAmount(value, token = 'USDC') {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+
+  const decimals = String(token || '').toUpperCase() === 'CIRBTC' ? 6 : 4;
+  return numeric.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: decimals,
+  });
+}
+
+function normalizeManualFailureText(value, fallback = 'Manual action failed.') {
+  const text = String(value || '').trim();
+  if (!text) return fallback;
+
+  if (/ERC20:\s*transfer amount exceeds balance/i.test(text)) {
+    return 'Agent wallet balance was too low for this trade.';
+  }
+
+  if (/insufficient funds/i.test(text)) {
+    return 'Agent wallet did not have enough native gas token for this transaction.';
+  }
+
+  if (/transaction execution reverted/i.test(text) || /CALL_EXCEPTION/i.test(text)) {
+    return 'The on-chain Curve swap reverted, but the RPC node did not return a decoded contract reason.';
+  }
+
+  if (text.length > 240) {
+    return `${text.slice(0, 237)}...`;
+  }
+
+  return text;
 }
 
 function getPoolManualRunLinks(run) {
@@ -1628,6 +1901,8 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
   const ActionIcon = activeAction?.icon || PlusCircle;
   const [params, setParams] = useState(() => getDefaultManualParams(poolConfig, activeAction?.id));
   const [busy, setBusy] = useState(false);
+  const [quote, setQuote] = useState(null);
+  const [quoting, setQuoting] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [trackedRun, setTrackedRun] = useState(null);
@@ -1640,9 +1915,55 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
 
   useEffect(() => {
     setParams(getDefaultManualParams(poolConfig, activeAction?.id));
+    setQuote(null);
     setMessage('');
     setError('');
   }, [poolConfig, activeAction?.id]);
+
+  useEffect(() => {
+    if (!agentId || poolConfig.poolType !== 'curve' || activeAction?.id !== 'swap') {
+      setQuote(null);
+      setQuoting(false);
+      return undefined;
+    }
+
+    const paramError = getManualActionError(poolConfig, activeAction.id, params);
+    if (paramError) {
+      setQuote(null);
+      setQuoting(false);
+      return undefined;
+    }
+
+    let active = true;
+    const timeoutId = window.setTimeout(async () => {
+      setQuoting(true);
+      try {
+        const response = await defiApi.manualQuote(agentId, buildManualActionRequest(poolConfig, activeAction.id, params));
+        if (!active) return;
+        setQuote(response);
+      } catch (quoteError) {
+        if (!active) return;
+        setQuote({
+          amountOut: null,
+          quoteError: quoteError.message || 'Live Curve preview is unavailable right now.',
+        });
+      } finally {
+        if (active) setQuoting(false);
+      }
+    }, 350);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    activeAction?.id,
+    agentId,
+    params.amountIn,
+    params.fromToken,
+    params.toToken,
+    poolConfig,
+  ]);
 
   useEffect(() => {
     if (!agentId || !trackedRun?.id || !isPoolManualRunActive(trackedRun)) {
@@ -1670,7 +1991,7 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
             setMessage(updatedRun.result_payload?.summary || 'Manual action completed.');
             setError('');
           } else if (updatedRun.status === 'failed') {
-            setError(updatedRun.error || updatedRun.stage_detail || 'The manual pool action failed.');
+            setError(normalizeManualFailureText(updatedRun.stage_detail || updatedRun.error, 'The manual pool action failed.'));
           }
         }
       } catch (pollError) {
@@ -1719,7 +2040,7 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
       if (runError?.data?.run) {
         setTrackedRun(runError.data.run);
       }
-      setError(runError.message || 'Failed to run the manual pool action.');
+      setError(normalizeManualFailureText(runError.message, 'Failed to run the manual pool action.'));
     } finally {
       setBusy(false);
     }
@@ -1789,7 +2110,32 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
           <ManualActionFields poolConfig={poolConfig} actionId={activeAction.id} params={params} setParams={setParams} />
         </div>
 
-        {error && <p className="mt-3 text-xs text-red-500">{error}</p>}
+        {poolConfig.poolType === 'curve' && activeAction.id === 'swap' && (
+          <div className="mt-3 rounded-2xl border border-slate-200 bg-white px-3 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Estimated output</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">
+                  {quoting
+                    ? 'Checking Curve pool...'
+                    : quote?.amountOut
+                      ? `${formatManualQuoteAmount(quote.amountOut, params.toToken)} ${params.toToken}`
+                      : '—'}
+                </p>
+              </div>
+              <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-semibold text-slate-600">
+                Curve preview
+              </span>
+            </div>
+            <p className="mt-2 break-words text-xs text-slate-500">
+              {quote?.quoteError
+                ? quote.quoteError
+                : 'This is a read-only preview from the selected Curve stable pool before you submit the manual swap.'}
+            </p>
+          </div>
+        )}
+
+        {error && <p className="mt-3 break-all text-xs text-red-500">{error}</p>}
         {message && <p className="mt-3 text-xs text-green-600">{message}</p>}
 
         <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1829,7 +2175,7 @@ function PoolManualControls({ poolConfig, agentId, onRunQueued }) {
               )}
             </div>
 
-            <p className="mt-3 text-sm leading-6 text-slate-700">{trackedRunSummary}</p>
+            <p className="mt-3 whitespace-pre-wrap break-all text-sm leading-6 text-slate-700">{trackedRunSummary}</p>
 
             {trackedRunLinks.length > 0 && (
               <div className="mt-3 flex flex-wrap gap-2">
@@ -1905,84 +2251,12 @@ function PoolGlobalMetrics({ snapshot }) {
 }
 
 function PoolPositionSnapshot({ position }) {
-  if (!position) {
-    return (
-      <div className="rounded-xl border border-slate-200 bg-white px-4 py-4 text-sm text-slate-500">
-        No live LP position is currently detected for this agent on this pool.
-      </div>
-    );
-  }
-
-  const statusCards = getPositionStatusCards(position);
-
   return (
-    <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Your Current Position</p>
-          <p className="mt-1 text-xs text-slate-500">{position.lpToken?.symbol || 'LP position'} · {position.chain || 'Arc Testnet'}</p>
-        </div>
-        <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600">
-          {formatPercentAmount(position.sharePct)} share
-        </span>
-      </div>
-
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">LP Balance</p>
-          <p className="mt-1 text-sm font-semibold text-slate-900">{formatLpAmount(position.lpToken?.balance)}</p>
-          <p className="mt-1 text-[11px] text-slate-500">{position.lpToken?.symbol}</p>
-        </div>
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Position Value</p>
-          <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(position.valuation?.totalUsd)}</p>
-          <p className="mt-1 text-[11px] text-slate-500">Approximate USD spot valuation</p>
-        </div>
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Est. Fee APR / APY</p>
-          <p className="mt-1 text-sm font-semibold text-slate-900">{formatPercentAmount(position.yieldMetrics?.aprPct)} / {formatPercentAmount(position.yieldMetrics?.apyPct)}</p>
-          <p className="mt-1 text-[11px] text-slate-500">Trading fees only, not claimable rewards</p>
-        </div>
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Yield Run-Rate</p>
-          <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(position.yieldMetrics?.dailyUsd)}</p>
-          <p className="mt-1 text-[11px] text-slate-500">Weekly {formatUsdAmount(position.yieldMetrics?.weeklyUsd)}</p>
-        </div>
-      </div>
-
-      <div className="grid gap-2 sm:grid-cols-3">
-        {statusCards.map((card) => (
-          <div key={`${position.poolKey}:${card.title}`} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
-            <div className="flex items-start justify-between gap-3">
-              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{card.title}</p>
-              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(card.tone)}`}>
-                {card.label}
-              </span>
-            </div>
-            <p className="mt-2 text-[11px] leading-5 text-slate-500">{card.detail}</p>
-          </div>
-        ))}
-      </div>
-
-      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Current Redeemable Underlying</p>
-        <p className="mt-1 text-[11px] leading-5 text-slate-500">This is the live token mix your current LP share can withdraw right now, not the last amounts you originally deposited.</p>
-        <div className="mt-2 space-y-2">
-          {(position.underlying || []).map(asset => (
-            <div key={`${position.poolKey}:${asset.symbol}`} className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-sm font-medium text-slate-800">{asset.symbol}</p>
-                <p className="mt-0.5 text-[11px] text-slate-500">{formatUsdAmount(asset.usdValue)} · {formatPercentAmount(asset.exposurePct)} exposure</p>
-              </div>
-              <div className="text-right">
-                <p className="text-sm font-semibold text-slate-900">{formatPositionAmount(asset.amount)}</p>
-                <p className="mt-0.5 text-[11px] text-slate-500">Spot {formatUsdAmount(asset.usdPrice)}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
+    <PositionAwareLpCard
+      position={position}
+      title="Your Current Position"
+      emptyLabel="No live LP position is currently detected for this agent on this pool."
+    />
   );
 }
 
@@ -2025,6 +2299,39 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
     detail: 'No debt is active, so liquidation is not relevant for this account.',
     healthFactor: risk.healthFactor,
   };
+  const lendingYield = lendingSurface?.yield || createEmptyLendingSurface().yield;
+  const carry = lendingSurface?.carry || createEmptyLendingSurface().carry;
+  const carrySelectedAsset = carry?.selectedAssetSymbol || carry?.selectedAsset?.symbol || null;
+  const carryAutomationEnabled = lendingSurface?.automation?.carryEnabled === true;
+  const carryNetApyPct = Number(carry?.selectedAsset?.netCarryApyPct ?? carry?.netCarryApyPct);
+  const carryBorrowApyPct = Number(carry?.selectedAsset?.borrowApyPct ?? carry?.borrowApyPct);
+  const carryLpApyPct = Number(carry?.lpYield?.apyPct);
+  const carryProjectedDeltaUsd = Number(carry?.estimatedNetUsdPerYear);
+  const carryTone = carry?.carryState === 'active'
+    ? 'green'
+    : carry?.carryState === 'unwind' || carry?.carryState === 'manual_lp_conflict' || carry?.carryState === 'unavailable'
+      ? 'amber'
+      : Number.isFinite(carryNetApyPct) && carryNetApyPct > 0
+        ? 'green'
+        : 'slate';
+  const carryLabel = carry?.carryState === 'active'
+    ? 'Active'
+    : carry?.carryState === 'debt_idle'
+      ? 'Borrow opened'
+      : carry?.carryState === 'unwind'
+        ? 'Unwind'
+        : carry?.carryState === 'manual_lp_conflict'
+          ? 'Manual LP detected'
+          : carry?.carryState === 'unavailable'
+            ? 'Unavailable'
+            : carryAutomationEnabled
+              ? 'Watching'
+              : 'Off';
+  const carryDetail = carry?.error
+    ? `Carry snapshot is temporarily unavailable: ${carry.error}`
+    : carry?.carryState === 'debt_idle'
+      ? `${carryAutomationEnabled ? 'Auto Carry is enabled.' : 'Auto Carry is off.'} The borrow leg is already open, and the borrowed ${carrySelectedAsset || 'stable balance'} is now sitting in the wallet. If the spread and health buffer still pass, the next automatic carry cycle will deploy that borrowed balance into the stable LP. LP fee APY ${formatPercentAmount(carryLpApyPct)} · borrow APY ${formatPercentAmount(carryBorrowApyPct)} · estimated net yield ${formatPercentAmount(carryNetApyPct)} · estimated yearly carry ${formatUsdAmount(carryProjectedDeltaUsd)}.`
+    : `${carryAutomationEnabled ? 'Auto Carry is enabled.' : 'Auto Carry is off.'} ${carry?.exclusiveMode ? 'When it is on, it controls this stable LP carry route.' : ''} ${carrySelectedAsset ? `Watching ${carrySelectedAsset} on the borrow side.` : ''} LP fee APY ${formatPercentAmount(carryLpApyPct)} · borrow APY ${formatPercentAmount(carryBorrowApyPct)} · estimated net yield ${formatPercentAmount(carryNetApyPct)} · estimated yearly carry ${formatUsdAmount(carryProjectedDeltaUsd)}.`;
   const recoveryTone = recovery.execute
     ? recovery.status === 'partial' ? 'amber' : 'green'
     : recovery.status === 'needs_funding' ? 'amber' : 'slate';
@@ -2091,6 +2398,12 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
       tone: priceCard.tone,
       label: priceCard.label,
       detail: priceCard.detail,
+    },
+    {
+      title: 'Carry Mode',
+      tone: carryTone,
+      label: carryLabel,
+      detail: carryDetail,
     },
     {
       title: 'Recovery',
@@ -2218,6 +2531,71 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
       <Card>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="flex items-start gap-3">
+            <Coins size={18} className="text-slate-400 shrink-0 mt-1" />
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">Carry Readiness</h3>
+              <p className="mt-1 text-sm text-slate-500">Read-only carry view from the live lending surface plus the stable LP fee estimate. This shows where yield comes from and what it costs.</p>
+            </div>
+          </div>
+          <p className="text-xs text-slate-400">Watched borrow side {carrySelectedAsset || '—'}</p>
+        </div>
+
+        <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Base Lending Yield</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(lendingYield.grossSupplyUsdPerYear)}</p>
+            <p className="mt-1 text-xs text-slate-500">Yearly estimate from current supplied balances.</p>
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Borrow Cost</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(lendingYield.grossBorrowCostUsdPerYear)}</p>
+            <p className="mt-1 text-xs text-slate-500">Yearly estimate from current borrow APY on visible debt.</p>
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Stable LP Fee APY</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{formatPercentAmount(carryLpApyPct)}</p>
+            <p className="mt-1 text-xs text-slate-500">Fee-only LP estimate from live pool depth and fee tier.</p>
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Estimated Net Yield</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{formatPercentAmount(carryNetApyPct)}</p>
+            <p className="mt-1 text-xs text-slate-500">Stable LP fee APY minus the selected borrow APY.</p>
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Estimated Yearly Carry</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(carryProjectedDeltaUsd)}</p>
+            <p className="mt-1 text-xs text-slate-500">Estimated yearly net carry on the currently tracked carry size.</p>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 lg:grid-cols-2">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">How To Read This</p>
+            <p className="mt-2 text-sm leading-6 text-slate-600">
+              Lending can earn on its own. Carry only adds a borrowed LP leg when the extra LP fee estimate still stays above the visible borrow cost on the watched stable asset.
+            </p>
+          </div>
+          <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-4">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">Auto Carry Mode</p>
+            <p className="mt-2 text-sm leading-6 text-sky-800">
+              {carryAutomationEnabled
+                ? 'Auto Carry is enabled. It becomes the only manager of this stable LP carry route while it is active.'
+                : 'Auto Carry is currently off. This panel still shows whether the live spread is strong enough to support an active carry decision.'}
+            </p>
+          </div>
+        </div>
+
+        <CarryMigrationControls
+          agentId={agentId}
+          carry={carry}
+          carryAutomationEnabled={carryAutomationEnabled}
+          onRunQueued={onRunQueued}
+        />
+      </Card>
+
+      <Card>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-start gap-3">
             <BarChart3 size={18} className="text-slate-400 shrink-0 mt-1" />
             <div>
               <h3 className="text-lg font-semibold text-slate-900">Reserve Readiness Watch</h3>
@@ -2237,7 +2615,7 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
           <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-4">
             <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">What It Can Unlock Later</p>
             <p className="mt-2 text-sm leading-6 text-sky-800">
-              As the reserve model matures, these cards can feed utilization-aware guardrails, market depth checks, and safer lending size limits. Today they are informative, not an execution switch.
+              As the reserve model matures, these cards can feed utilization-aware guardrails, market depth checks, and safer lending size limits. Today they are informative, not an execution switch. Auto Carry uses the connected lending surface and stable LP fee model above instead of this watch panel.
             </p>
           </div>
         </div>

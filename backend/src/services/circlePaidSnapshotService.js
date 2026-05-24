@@ -46,6 +46,54 @@ function isPreviewExpired(snapshot) {
 
 function buildPredictionMarketPreviewPayload(fullPayload = {}) {
   const liveResult = normalizeJsonObject(fullPayload);
+
+  if (liveResult.walletAddress && Array.isArray(liveResult.balances)) {
+    return {
+      provider: 'arc_wallet_snapshot',
+      summary: liveResult.summary || 'Wallet snapshot preview is ready.',
+      status: liveResult.status || 'preview_ready',
+      walletAddress: liveResult.walletAddress || null,
+      posture: liveResult.posture || null,
+      recommendedTaskId: liveResult.recommendedTaskId || null,
+      metrics: {
+        liquidUsd: liveResult.metrics?.liquidUsd ?? null,
+        positionUsd: liveResult.metrics?.positionUsd ?? null,
+        totalWalletUsd: liveResult.metrics?.totalWalletUsd ?? null,
+        positionCount: liveResult.metrics?.positionCount ?? null,
+        warningCount: liveResult.metrics?.warningCount ?? null,
+      },
+      balances: liveResult.balances.slice(0, 3).map((balance) => ({
+        symbol: balance.symbol,
+        amount: balance.amount ?? null,
+        usdValue: balance.usdValue ?? null,
+        exposurePct: balance.exposurePct ?? null,
+      })),
+      positions: Array.isArray(liveResult.positions)
+        ? liveResult.positions.slice(0, 3).map((position) => ({
+            poolKey: position.poolKey,
+            protocol: position.protocol,
+            totalUsd: position.totalUsd ?? null,
+            sharePct: position.sharePct ?? null,
+          }))
+        : [],
+      dailySummary: liveResult.dailySummary
+        ? {
+            status: liveResult.dailySummary.status || 'unknown',
+            summary: liveResult.dailySummary.summary || null,
+            counts: {
+              lpAdds: liveResult.dailySummary.counts?.lpAdds ?? null,
+              lpRemoves: liveResult.dailySummary.counts?.lpRemoves ?? null,
+              swaps: liveResult.dailySummary.counts?.swaps ?? null,
+              rebalances: liveResult.dailySummary.counts?.rebalances ?? null,
+              lendingBorrows: liveResult.dailySummary.counts?.lendingBorrows ?? null,
+              arbSignalsFound: liveResult.dailySummary.counts?.arbSignalsFound ?? null,
+            },
+          }
+        : null,
+      fetchedAt: liveResult.fetchedAt || new Date().toISOString(),
+    };
+  }
+
   const metrics = normalizeJsonObject(liveResult.metrics);
   const comparison = normalizeJsonObject(liveResult.comparison, null);
   const primaryComparison = normalizeJsonObject(comparison?.primary, null);

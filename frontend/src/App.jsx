@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { useAccount, useSwitchChain } from 'wagmi';
-import { arcTestnet, SUPPORTED_CHAINS } from './lib/web3.js';
-import { AgentProvider, useAgent } from './providers/AgentProvider.jsx';
+import { SUPPORTED_CHAINS } from './lib/web3.js';
+import { AgentProvider } from './providers/AgentProvider.jsx';
 import DashboardTab from './components/DashboardTab.jsx';
 import AgentTab from './components/AgentTab.jsx';
 import BridgeTab from './components/BridgeTab.jsx';
@@ -11,18 +11,20 @@ import JobsTab from './components/JobsTab.jsx';
 import TasksTab from './components/TasksTab.jsx';
 import DeFiTab from './components/DeFiTab.jsx';
 import OracleTab from './components/OracleTab.jsx';
+import TradeTab from './components/TradeTab.jsx';
 import LandingPage from './components/LandingPage.jsx';
-import { LayoutDashboard, ArrowLeftRight, Repeat2, Bot, Briefcase, Zap, ChevronDown, Brain, Droplets } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
 
 const TABS = [
-  { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
-  { id: 'bridge',    label: 'Bridge',    Icon: ArrowLeftRight  },
-  { id: 'swap',      label: 'Swap',      Icon: Repeat2         },
-  { id: 'agent',     label: 'Agent',     Icon: Bot             },
-  { id: 'jobs',      label: 'Jobs',      Icon: Briefcase       },
-  { id: 'tasks',     label: 'Tasks',     Icon: Zap             },
-  { id: 'defi',      label: 'DeFi',      Icon: Droplets        },
-  { id: 'oracle',    label: 'Oracle',    Icon: Brain           },
+  { id: 'dashboard', label: 'Dashboard', compactLabel: 'Dash' },
+  { id: 'bridge',    label: 'Bridge' },
+  { id: 'swap',      label: 'Swap' },
+  { id: 'agent',     label: 'Agent' },
+  { id: 'jobs',      label: 'Jobs' },
+  { id: 'tasks',     label: 'Tasks' },
+  { id: 'oracle',    label: 'Oracle' },
+  { id: 'trade',     label: 'Trade' },
+  { id: 'defi',      label: 'DeFi' },
 ];
 
 function NetworkSwitcher() {
@@ -31,16 +33,19 @@ function NetworkSwitcher() {
   const [open, setOpen] = useState(false);
 
   const current = SUPPORTED_CHAINS.find(c => c.id === chain?.id);
+  const currentLabel = current?.name ?? chain?.name ?? 'Switch Network';
+  const mobileLabel = currentLabel;
 
   return (
     <div className="relative">
       <button
         onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-[#66D121]/40 hover:bg-arc-greenBg hover:text-arc-green"
+        className="flex max-w-full items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-[13px] font-medium text-slate-700 transition hover:border-[#66D121]/40 hover:bg-arc-greenBg hover:text-arc-green sm:gap-2 sm:px-3 sm:text-sm"
       >
         <span className="h-2 w-2 rounded-full bg-arc-green" />
-        {current?.name ?? chain?.name ?? 'Switch Network'}
-        <ChevronDown size={14} />
+        <span className="hidden sm:inline">{currentLabel}</span>
+        <span className="sm:hidden">{mobileLabel}</span>
+        <ChevronDown size={13} />
       </button>
       {open && (
         <>
@@ -70,42 +75,51 @@ function NetworkSwitcher() {
 function Header({ activeTab, setTab, onOpenLanding }) {
   const { isConnected } = useAccount();
   return (
-    <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/80 backdrop-blur-md">
-      <div className="mx-auto flex max-w-6xl items-center gap-4 px-4 py-3 sm:px-6 lg:px-8">
+    <header className="sticky top-0 z-30 overflow-x-hidden border-b border-slate-200 bg-white/80 backdrop-blur-md">
+      <div className="mx-auto flex max-w-6xl min-w-0 items-center justify-between gap-2 px-3 py-3 sm:gap-3 sm:px-6 lg:gap-4 lg:px-8">
         {/* Logo */}
         <button
           type="button"
           onClick={onOpenLanding}
-          className="mr-2 flex items-center gap-2.5 rounded-xl px-1 py-1 transition hover:bg-slate-100"
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-1 py-1 transition hover:bg-slate-100 md:flex-none"
         >
           <img
             src="/arc-logo-icon.png"
             alt=""
-            className="h-11 w-auto object-contain"
+            className="h-8 w-auto shrink-0 object-contain sm:h-10 xl:h-11"
           />
-          <span className="font-extrabold tracking-tight text-slate-900">Arc Machina</span>
+          <span className="flex min-w-0 flex-col text-left font-extrabold leading-none tracking-tight text-slate-900 md:hidden">
+            <span className="text-[0.76rem]">Arc</span>
+            <span className="text-[0.76rem]">Machina</span>
+          </span>
+          <span className="hidden text-left font-extrabold tracking-tight text-slate-900 whitespace-nowrap lg:inline xl:hidden">Arc</span>
+          <span className="hidden text-left font-extrabold tracking-tight text-slate-900 whitespace-nowrap xl:inline">Arc Machina</span>
         </button>
 
         {/* Tab navigation */}
-        <nav className="hidden md:flex items-center gap-1 flex-1">
-          {TABS.map(({ id, label, Icon }) => (
+        <nav className="hidden flex-1 items-center gap-1 pl-1 md:flex lg:gap-1.5">
+          {TABS.map(({ id, label, compactLabel }) => (
             <button
               key={id}
               onClick={() => setTab(id)}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold transition ${
+              className={`rounded-lg whitespace-nowrap ${id === 'dashboard' ? 'px-2.5' : 'px-3'} py-2 text-sm font-semibold transition ${
                 activeTab === id
                   ? 'border border-[#66D121]/40 bg-arc-greenBg text-arc-green shadow-sm'
                   : 'border border-transparent text-slate-600 hover:text-arc-green hover:bg-arc-greenBg/60'
               }`}
             >
-              <Icon size={15} />
-              {label}
+              {compactLabel ? (
+                <>
+                  <span className="xl:hidden">{compactLabel}</span>
+                  <span className="hidden xl:inline">{label}</span>
+                </>
+              ) : label}
             </button>
           ))}
         </nav>
 
         {/* Right: network switcher + connect */}
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1.5 sm:gap-2">
           {isConnected && <NetworkSwitcher />}
           <ConnectButton
             accountStatus="avatar"
@@ -116,21 +130,22 @@ function Header({ activeTab, setTab, onOpenLanding }) {
       </div>
 
       {/* Mobile tabs */}
-      <div className="flex md:hidden overflow-x-auto gap-1 px-4 pb-2">
-        {TABS.map(({ id, label, Icon }) => (
-          <button
-            key={id}
-            onClick={() => setTab(id)}
-            className={`flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-              activeTab === id
-                ? 'border border-[#66D121]/40 bg-arc-greenBg text-arc-green'
-                : 'border border-transparent text-slate-600'
-            }`}
-          >
-            <Icon size={13} />
-            {label}
-          </button>
-        ))}
+      <div className="overflow-x-auto px-3 pb-3 md:hidden [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <div className="flex min-w-max items-center gap-1.5">
+          {TABS.map(({ id, label }) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              className={`shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                activeTab === id
+                  ? 'border border-[#66D121]/40 bg-arc-greenBg text-arc-green'
+                  : 'border border-transparent text-slate-600'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
     </header>
   );
@@ -153,17 +168,18 @@ function AppContent() {
   }
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen overflow-x-hidden">
       <Header activeTab={tab} setTab={setTab} onOpenLanding={() => setShowLanding(true)} />
-      <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
+      <main className="mx-auto max-w-6xl overflow-x-hidden px-3 py-6 sm:px-6 sm:py-8 lg:px-8">
         {tab === 'dashboard' && <DashboardTab onNavigate={navigate} />}
         {tab === 'bridge' && <BridgeTab onBack={back} />}
         {tab === 'swap' && <SwapTab onBack={back} />}
         {tab === 'agent' && <AgentTab />}
         {tab === 'jobs' && <JobsTab />}
         {tab === 'tasks' && <TasksTab />}
-        {tab === 'defi' && <DeFiTab />}
         {tab === 'oracle' && <OracleTab />}
+        {tab === 'trade' && <TradeTab />}
+        {tab === 'defi' && <DeFiTab />}
       </main>
     </div>
   );

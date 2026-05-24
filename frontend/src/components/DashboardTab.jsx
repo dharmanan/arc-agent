@@ -6,7 +6,7 @@ import { authenticatePasskey } from '../lib/passkey.js';
 import { fetchAgentPortfolio } from '../lib/agentBalances.js';
 import { Card, Badge, Button, AddressBox, Alert, Spinner } from './ui/index.jsx';
 import PaymentModal from './PaymentModal.jsx';
-import { Wallet, Activity, ArrowRight, ArrowUpRight, ArrowDownLeft, Repeat2, Zap, LogIn, ExternalLink, RefreshCw, QrCode, Send } from 'lucide-react';
+import { Wallet, Activity, ArrowRight, ArrowUpRight, ArrowDownLeft, Repeat2, Zap, LogIn, ExternalLink, RefreshCw, QrCode, Send, Coins } from 'lucide-react';
 import { CHAINS } from '../lib/chains.js';
 
 const AUTOMATION_SNAPSHOT_TOLERANCE_MS = 60 * 1000;
@@ -110,9 +110,26 @@ function getExecutionRailLabel(executionRail) {
   }
 }
 
+function normalizeActivitySummary(summary) {
+  const raw = String(summary || '').trim();
+  if (!raw) return null;
+  return raw.replace(/\s+/g, ' ').trim();
+}
+
+function isMachineLikeActivitySummary(summary) {
+  const compact = normalizeActivitySummary(summary);
+  if (!compact) return false;
+
+  return /CALL_EXCEPTION|REPLACEMENT_UNDERPRICED|replacement fee too low|transaction=|invocation=|revert=|code=-?\d+|version=|info=\{|error=\{|0x[0-9a-f]{48,}/i.test(compact);
+}
+
 function summarizeActivityError(error) {
   const raw = String(error || '').trim();
   if (!raw) return null;
+
+  if (/replacement fee too low|replacement transaction underpriced|REPLACEMENT_UNDERPRICED/i.test(raw)) {
+    return 'The network rejected the retry because its gas fee was not high enough to replace the pending transaction.';
+  }
 
   if (/nonce too low|nonce has already been used|NONCE_EXPIRED/i.test(raw)) {
     return 'Another transaction already used this wallet nonce before this swap was submitted.';
@@ -120,6 +137,10 @@ function summarizeActivityError(error) {
 
   if (/ERC20:\s*transfer amount exceeds balance/i.test(raw)) {
     return 'Agent wallet balance was too low for this trade.';
+  }
+
+  if (/insufficient funds for (gas|intrinsic transaction cost)/i.test(raw)) {
+    return 'The wallet did not have enough native gas to submit this transaction.';
   }
 
   if ((/transaction execution reverted/i.test(raw) || /CALL_EXCEPTION/i.test(raw)) && /reason=null/i.test(raw)) {
@@ -134,11 +155,51 @@ function summarizeActivityError(error) {
     return 'Daily spend limit blocked this autonomous trade.';
   }
 
-  const compact = raw.replace(/\s+/g, ' ').trim();
+  const compact = normalizeActivitySummary(raw);
   const quotedReason = compact.match(/reason[=:]\s*["']([^"']+)["']/i)?.[1];
   const primary = quotedReason || compact.split(' (action=')[0] || compact;
 
   return primary.length > 180 ? `${primary.slice(0, 177)}...` : primary;
+}
+
+function summarizeActivityFailureReason(meta, actionLabel) {
+  const reason = String(meta?.reason || '').trim();
+  if (!reason) return null;
+
+  if (reason === 'position_guard_unavailable') {
+    return `${actionLabel} failed: The app could not verify the current LP position, so it skipped the exit before sending a transaction.`;
+  }
+
+  if (reason === 'lp_position_not_found') {
+    return `${actionLabel} failed: No active LP position was available to exit.`;
+  }
+
+  if (reason === 'insufficient_lp_position') {
+    return `${actionLabel} failed: The requested LP exit size was larger than the current LP balance.`;
+  }
+
+  return null;
+}
+
+function getUserFacingFailedActivityPhase(meta, actionLabel, fallbackLabel) {
+  const structuredReason = summarizeActivityFailureReason(meta, actionLabel);
+  if (structuredReason) {
+    return structuredReason;
+  }
+
+  const summary = normalizeActivitySummary(meta.summary);
+  const machineLikeSummary = isMachineLikeActivitySummary(summary);
+  const summarizedError = summarizeActivityError(meta.error || (machineLikeSummary ? summary : ''));
+
+  if (summarizedError) {
+    return `${actionLabel} failed: ${summarizedError}`;
+  }
+
+  if (summary && !machineLikeSummary) {
+    return summary;
+  }
+
+  return fallbackLabel;
 }
 
 function getOracleStrategyFailureContext(meta, inputToken) {
@@ -207,6 +268,20 @@ function formatUsdAmount(amount) {
     currency: 'USD',
     minimumFractionDigits: numeric >= 100 ? 0 : 2,
     maximumFractionDigits: numeric >= 100 ? 0 : 2,
+  }).format(numeric);
+}
+
+function formatUsdUnitPrice(amount) {
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '$0.0000';
+  if (Math.abs(numeric) < 0.0001) return '<$0.0001';
+
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
   }).format(numeric);
 }
 
@@ -315,75 +390,111 @@ function getPositionStatusCards(position) {
   ];
 }
 
-function getRewardProgramStatus(program, summary) {
-  if (!program) {
-    return {
-      tone: 'slate',
-      label: 'No program',
-      detail: 'No reward program is configured for this agent yet.',
-    };
-  }
-
-  if (summary?.claimableRewardsEnabled) {
-    return {
-      tone: 'green',
-      label: 'Claimable',
-      detail: 'Funded reward emissions or unclaimed accruals are available.',
-    };
-  }
-
-  if (program.status === 'live') {
-    return {
-      tone: 'green',
-      label: 'Live',
-      detail: 'The reward program is active, but this agent has not accrued claimable balance yet.',
-    };
-  }
-
-  if (program.status === 'scheduled') {
-    return {
-      tone: 'amber',
-      label: 'Scheduled',
-      detail: 'The reward program is configured, but its funded live window has not started yet.',
-    };
-  }
-
-  return {
-    tone: 'slate',
-    label: 'Seeded paused',
-    detail: 'The reward ledger exists, but live reward emissions are intentionally off. This card is bookkeeping only right now.',
-  };
+function formatHealthFactor(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric === 0) return '0';
+  return numeric.toFixed(numeric >= 10 ? 2 : 3).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
 }
 
-function getRewardSnapshotStatus(snapshot) {
-  if (!snapshot) {
-    return {
-      tone: 'slate',
-      label: 'No snapshot',
-      detail: 'No epoch snapshot has been written yet.',
-    };
-  }
+function getLendingExecutionStatus(surface) {
+  const execution = surface?.execution || {};
 
-  if (snapshot.status === 'finalized') {
-    return {
-      tone: 'green',
-      label: 'Finalized',
-      detail: 'This epoch snapshot is finalized and can feed accruals when the program is live.',
-    };
-  }
-
-  if (snapshot.status === 'cancelled') {
+  if (execution.globalPaused) {
     return {
       tone: 'red',
-      label: 'Cancelled',
-      detail: 'This epoch is no longer eligible for new reward accruals.',
+      label: 'Paused',
+      detail: 'Lending actions are paused right now.',
+    };
+  }
+
+  if (execution.ready) {
+    return {
+      tone: 'green',
+      label: 'Ready',
+      detail: 'Stable lending actions are available from the DeFi tab.',
+    };
+  }
+
+  if (execution.contractAddress && execution.buildState === 'scaffold_only') {
+    return {
+      tone: 'amber',
+      label: 'Limited',
+      detail: 'A lending contract is connected, but the current setup still blocks full live writes.',
     };
   }
 
   return {
     tone: 'amber',
-    label: 'Pending',
-    detail: 'This snapshot is only a ledger write. Claimable LP rewards are not active yet, so nothing can be claimed from it.',
+    label: 'Coming soon',
+    detail: 'This lending surface is wired, but a live contract is not connected yet.',
+  };
+}
+
+function getLendingPriceStatus(surface) {
+  const priceAssets = Array.isArray(surface?.prices?.assets) ? surface.prices.assets : [];
+  const fallbackAssets = priceAssets.filter((asset) => asset?.isFallback);
+
+  if (priceAssets.length === 0) {
+    return {
+      tone: 'slate',
+      label: 'Waiting',
+      detail: 'Price data has not loaded yet.',
+    };
+  }
+
+  if (fallbackAssets.length > 0) {
+    return {
+      tone: 'amber',
+      label: 'Backup in use',
+      detail: `${fallbackAssets.map((asset) => asset.symbol).join(', ')} is currently using backup price data.`,
+    };
+  }
+
+  return {
+    tone: 'green',
+    label: 'Live prices',
+    detail: 'This summary is using the current stable price feed.',
+  };
+}
+
+function getLendingRiskStatus(risk) {
+  if (!risk) {
+    return {
+      tone: 'slate',
+      label: 'Waiting',
+      detail: 'Lending risk has not loaded yet.',
+    };
+  }
+
+  if (risk.band === 'healthy') {
+    return {
+      tone: 'green',
+      label: risk.label || 'Buffered',
+      detail: `${risk.detail} Health factor ${formatHealthFactor(risk.healthFactor)}.`,
+    };
+  }
+
+  if (risk.band === 'warning') {
+    return {
+      tone: 'amber',
+      label: risk.label || 'Watch closely',
+      detail: `${risk.detail} Health factor ${formatHealthFactor(risk.healthFactor)}.`,
+    };
+  }
+
+  if (risk.band === 'critical') {
+    return {
+      tone: 'red',
+      label: risk.label || 'Critical',
+      detail: `${risk.detail} Health factor ${formatHealthFactor(risk.healthFactor)}.`,
+    };
+  }
+
+  return {
+    tone: 'slate',
+    label: risk.label || 'No debt',
+    detail: risk.detail || 'No active lending debt is visible yet.',
   };
 }
 
@@ -580,6 +691,74 @@ function getStableAutomationStatus(defiLoopState, lastDecision) {
   };
 }
 
+function getStableOracleGuardContext(lastDecision) {
+  if (!lastDecision || lastDecision.lane !== 'oracle_strategy') {
+    return null;
+  }
+
+  const blockedBy = String(lastDecision?.blockedBy || '').trim();
+  const exitQuote = lastDecision?.exitQuote && typeof lastDecision.exitQuote === 'object'
+    ? lastDecision.exitQuote
+    : null;
+  const sameChainSellBackQuote = lastDecision?.sameChainSellBackQuote && typeof lastDecision.sameChainSellBackQuote === 'object'
+    ? lastDecision.sameChainSellBackQuote
+    : null;
+
+  if (sameChainSellBackQuote) {
+    const inputUsdc = Number(sameChainSellBackQuote.inputUsdc);
+    const expectedEurcOut = Number(sameChainSellBackQuote.expectedEurcOut);
+    const entryPriceUsdc = Number.isFinite(inputUsdc)
+      && Number.isFinite(expectedEurcOut)
+      && expectedEurcOut > 0
+      ? inputUsdc / expectedEurcOut
+      : null;
+
+    return {
+      reasonLabel: blockedBy === 'same_chain_exit_unprofitable'
+        ? 'Live Arc exit quote below round-trip floor'
+        : null,
+      reasonDetail: blockedBy === 'same_chain_exit_unprofitable'
+        ? 'A fresh Curve buy stays blocked until the matching live Arc EURC -> USDC quote clears the required round-trip floor.'
+        : null,
+      title: 'Oracle Guard Check',
+      detail: 'Fresh Curve entries only run when the same-cycle live Arc exit quote still clears the required floor after minimum profit.',
+      quoteAmountLabel: formatRewardAmount(expectedEurcOut, 'EURC'),
+      entryPriceUsdc,
+      entryPriceTracked: Number.isFinite(entryPriceUsdc) && entryPriceUsdc > 0,
+      currentExitQuoteUsdc: Number(sameChainSellBackQuote.expectedUsdcOut),
+      requiredFloorUsdc: Number(sameChainSellBackQuote.minimumExpectedUsdcOut),
+      exitRail: getExecutionRailLabel(sameChainSellBackQuote.exitExecutionRail),
+    };
+  }
+
+  if (exitQuote) {
+    const costFloorActive = exitQuote.profitBasis === 'oracle_inventory_cost_basis';
+
+    return {
+      reasonLabel: blockedBy
+        ? (costFloorActive ? 'Live Arc exit quote below cost floor' : 'Live Arc exit quote below required floor')
+        : null,
+      reasonDetail: blockedBy
+        ? (costFloorActive
+          ? 'Protected EURC inventory stays on hold until the live Arc EURC -> USDC quote clears the tracked cost-basis floor.'
+          : 'Protected EURC inventory stays on hold until the live Arc EURC -> USDC quote clears the required floor.')
+        : null,
+      title: costFloorActive ? 'Oracle Cost Floor Check' : 'Oracle Exit Check',
+      detail: costFloorActive
+        ? 'Excess EURC inventory only exits when the live Arc quote is above tracked cost basis plus the minimum profit buffer.'
+        : 'Excess EURC inventory only exits when the live Arc quote is above the current required floor.',
+      quoteAmountLabel: formatRewardAmount(exitQuote.inputEurc, 'EURC'),
+      entryPriceUsdc: Number(exitQuote.averageEntryPriceUsdc),
+      entryPriceTracked: Number(exitQuote.averageEntryPriceUsdc) > 0,
+      currentExitQuoteUsdc: Number(exitQuote.expectedUsdcOut),
+      requiredFloorUsdc: Number(exitQuote.minimumExpectedUsdcOut),
+      exitRail: getExecutionRailLabel(exitQuote.exitExecutionRail),
+    };
+  }
+
+  return null;
+}
+
 function getCirbtcAutomationStatus(cirbtcLoopState, lastDecision) {
   if (!cirbtcLoopState?.enabled) {
     return {
@@ -761,8 +940,25 @@ function formatPositionVenue(position) {
   return `${chain} · ${venueLabel}`;
 }
 
+function normalizeExplorerChainName(chainName) {
+  const normalized = String(chainName || '').trim().toLowerCase();
+
+  if (!normalized) return 'Arc Testnet';
+  if (normalized === 'arc-testnet' || normalized === 'arc testnet') return 'Arc Testnet';
+  if (normalized === 'sepolia') return 'Sepolia';
+  if (normalized === 'base-sepolia' || normalized === 'base sepolia') return 'Base Sepolia';
+  if (normalized === 'optimism-sepolia' || normalized === 'optimism sepolia') return 'Optimism Sepolia';
+  if (normalized === 'arbitrum-sepolia' || normalized === 'arbitrum sepolia') return 'Arbitrum Sepolia';
+
+  return chainName;
+}
+
+function formatActivityChainLabel(chainName) {
+  return normalizeExplorerChainName(chainName || 'Arc Testnet');
+}
+
 function getExplorerTxUrl(chainName, txHash) {
-  const explorerBase = CHAINS[chainName]?.explorerUrl;
+  const explorerBase = CHAINS[normalizeExplorerChainName(chainName)]?.explorerUrl;
   if (!explorerBase || !isRealHash(txHash)) return null;
   return `${explorerBase}/tx/${txHash}`;
 }
@@ -1003,14 +1199,17 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const outputAmountLabel = formatTokenAmount(meta.amountOut, toToken);
     const swapTxHash = tx.tx_hash || tx.txHash || null;
     const swapUrl = getExplorerTxUrl('Arc Testnet', swapTxHash);
+    const failedSwapPhase = getUserFacingFailedActivityPhase(meta, 'This swap', 'This swap failed before confirmation.');
 
     return {
       title: 'swap',
       routeLabel: `Arc Testnet · ${fromToken} → ${toToken}`,
       amountLabel: inputAmountLabel,
-      phase: outputAmountLabel
-        ? `${tx.status === 'confirmed' ? 'Received' : 'Estimated out'}: ${outputAmountLabel}`
-        : (tx.status === 'executing' ? 'Awaiting on-chain confirmation' : null),
+      phase: tx.status === 'failed'
+        ? failedSwapPhase
+        : outputAmountLabel
+          ? `${tx.status === 'confirmed' ? 'Received' : 'Estimated out'}: ${outputAmountLabel}`
+          : (tx.status === 'executing' ? 'Awaiting on-chain confirmation' : null),
       links: swapUrl
         ? [{
             key: `${tx.id}-swap`,
@@ -1040,14 +1239,17 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const primaryHash = meta.mintTxHash || tx.tx_hash || null;
     const swapUrl = getExplorerTxUrl('Arc Testnet', meta.swapTxHash);
     const mintUrl = getExplorerTxUrl('Arc Testnet', primaryHash);
+    const failedLpAddPhase = getUserFacingFailedActivityPhase(meta, 'This LP add', 'This LP add failed before confirmation.');
 
     return {
       title: 'direct pair lp add',
       routeLabel: `Arc Testnet · ${stableToken}/${volatileToken} direct pair`,
       amountLabel: amountInLabel,
-      phase: swappedLabel
-        ? `Swap leg ${swappedLabel}${meta.swapRouteStrategy ? ` via ${meta.swapRouteStrategy}` : ''}. ${lpUsedLabel || lpMintedLabel || 'LP minted.'}${leftoverParts.length > 0 ? ` Wallet kept ${leftoverParts.join(' + ')} unmatched to the pair ratio.` : ''}`
-        : (meta.summary || lpMintedLabel || 'Direct-pair LP minted on-chain'),
+      phase: tx.status === 'failed'
+        ? failedLpAddPhase
+        : swappedLabel
+          ? `Swap leg ${swappedLabel}${meta.swapRouteStrategy ? ` via ${meta.swapRouteStrategy}` : ''}. ${lpUsedLabel || lpMintedLabel || 'LP minted.'}${leftoverParts.length > 0 ? ` Wallet kept ${leftoverParts.join(' + ')} unmatched to the pair ratio.` : ''}`
+          : (meta.summary || lpMintedLabel || 'Direct-pair LP minted on-chain'),
       links: [
         swapUrl ? {
           key: `${tx.id}-direct-lp-add-swap`,
@@ -1080,16 +1282,19 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
       : meta.token1Symbol === volatileToken
         ? formatTokenAmount(meta.token1Amount, volatileToken)
         : null;
+    const failedLpExitPhase = getUserFacingFailedActivityPhase(meta, 'This LP exit', 'This LP exit failed before confirmation.');
 
     return {
       title: 'direct pair lp exit',
       routeLabel: `Arc Testnet · ${stableToken}/${volatileToken} direct pair`,
       amountLabel: meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP burned` : null,
-      phase: [
-        Number(meta.withdrawPct) > 0 ? `Withdrew ${Number(meta.withdrawPct).toFixed(0)}% of the position.` : null,
-        returnedStable ? `Returned ${returnedStable}` : null,
-        returnedVolatile ? `Returned ${returnedVolatile}` : null,
-      ].filter(Boolean).join(' '),
+      phase: tx.status === 'failed'
+        ? failedLpExitPhase
+        : [
+            Number(meta.withdrawPct) > 0 ? `Withdrew ${Number(meta.withdrawPct).toFixed(0)}% of the position.` : null,
+            returnedStable ? `Returned ${returnedStable}` : null,
+            returnedVolatile ? `Returned ${returnedVolatile}` : null,
+          ].filter(Boolean).join(' '),
       links: burnUrl ? [{
         key: `${tx.id}-direct-lp-remove-burn`,
         label: 'Burn tx',
@@ -1105,6 +1310,7 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const lpMintedLabel = meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP minted` : null;
     const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
     const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+    const failedCurveAddPhase = getUserFacingFailedActivityPhase(meta, 'This Curve LP add', 'This Curve LP add failed before confirmation.');
 
     return {
       title: 'curve liquidity add',
@@ -1114,6 +1320,8 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
         ? 'Simulation only. No on-chain liquidity add was submitted.'
         : tx.status === 'skipped'
           ? ([meta.summary, activityPolicyBadge?.note].filter(Boolean).join(' ')) || 'No on-chain liquidity add was submitted.'
+          : tx.status === 'failed'
+            ? ([failedCurveAddPhase, activityPolicyBadge?.note].filter(Boolean).join(' '))
           : meta.minLpAmount
             ? `${lpMintedLabel || 'LP minted.'} Minimum protected LP: ${formatLpAmount(meta.minLpAmount)}.`
             : ([lpMintedLabel || meta.summary || 'Curve liquidity added on-chain', activityPolicyBadge?.note].filter(Boolean).join(' ')),
@@ -1140,9 +1348,9 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
       meta.token0Symbol && meta.token0Amount ? formatTokenAmount(meta.token0Amount, meta.token0Symbol) : null,
       meta.token1Symbol && meta.token1Amount ? formatTokenAmount(meta.token1Amount, meta.token1Symbol) : null,
     ].filter(Boolean);
-    const summarizedError = summarizeActivityError(meta.error);
     const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
     const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+    const failedCurveExitPhase = getUserFacingFailedActivityPhase(meta, 'This Curve LP exit', 'This Curve LP exit failed before confirmation.');
 
     return {
       title: 'curve liquidity remove',
@@ -1155,7 +1363,7 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
         : tx.status === 'skipped'
           ? ([meta.summary, activityPolicyBadge?.note].filter(Boolean).join(' ')) || 'No on-chain liquidity removal was submitted.'
           : tx.status === 'failed'
-            ? ([meta.summary || (summarizedError ? `Failed before confirmation: ${summarizedError}` : 'Curve liquidity removal failed before confirmation.'), activityPolicyBadge?.note].filter(Boolean).join(' '))
+            ? ([failedCurveExitPhase, activityPolicyBadge?.note].filter(Boolean).join(' '))
           : [
               burnLabel,
               isDualCurveExit && returnedBothTokens.length > 0 ? `Returned ${returnedBothTokens.join(' + ')}` : null,
@@ -1187,6 +1395,7 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const sellBackTxUrl = getExplorerTxUrl('Arc Testnet', sellBackTxHash);
     const finalUsdcAmountLabel = formatTokenAmount(meta.finalAmountOutUsdc, 'USDC');
     const entryEurcAmountLabel = formatTokenAmount(meta.entryAmountOutEurc || meta.amountOut, 'EURC');
+    const failedSignalTradePhase = getUserFacingFailedActivityPhase(meta, 'This signal trade', 'This signal trade failed before confirmation.');
 
     let phase = meta.summary || null;
     if (tx.status === 'confirmed') {
@@ -1201,6 +1410,8 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
           ? `Executed the Curve entry leg and received ${outputAmountLabel}.`
           : 'Executed the Curve entry leg on-chain.';
       }
+    } else if (tx.status === 'failed') {
+      phase = failedSignalTradePhase;
     } else if (tx.status === 'dry_run') {
       phase = 'Simulation only. No on-chain trade was submitted.';
     }
@@ -1240,6 +1451,7 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const outputAmountLabel = formatTokenAmount(meta.amountOut, toToken);
     const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
     const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
+    const failedRebalancePhase = getUserFacingFailedActivityPhase(meta, 'This rebalance', 'This rebalance failed before confirmation.');
 
     return {
       title: 'rebalance',
@@ -1249,6 +1461,8 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
         ? 'Simulation only. No on-chain rebalance was submitted.'
         : tx.status === 'skipped'
           ? ([meta.summary, activityPolicyBadge?.note].filter(Boolean).join(' ')) || 'No on-chain rebalance was submitted.'
+          : tx.status === 'failed'
+            ? ([failedRebalancePhase, activityPolicyBadge?.note].filter(Boolean).join(' '))
           : outputAmountLabel
             ? `Received ${outputAmountLabel}${meta.executionRail ? ` via ${getExecutionRailLabel(meta.executionRail)}` : ''}`
             : ([meta.summary || 'Portfolio rebalanced on-chain', activityPolicyBadge?.note].filter(Boolean).join(' ')),
@@ -1262,6 +1476,56 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
         : [],
       tagLabel: activityPolicyBadge?.label || null,
       tagVariant: activityPolicyBadge?.variant || 'slate',
+    };
+  }
+
+  if (tx.type === 'carry_automation') {
+    const actionLabel = humanizeAutomationAction(meta.operationType || meta.action || 'carry_automation');
+    const stableToken = meta.stableToken || meta.actionAssetSymbol || meta.tokenIn || tx.token || 'USDC';
+    const amountInLabel = formatTokenAmount(meta.amountIn ?? tx.amount_usdc, stableToken);
+    const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
+    const txUrl = getExplorerTxUrl(tx.from_chain || meta.sourceChain || 'Arc Testnet', txHash);
+
+    return {
+      title: 'Auto Carry',
+      routeLabel: `${formatActivityChainLabel(tx.from_chain || meta.sourceChain || 'Arc Testnet')} · ${actionLabel}`,
+      amountLabel: amountInLabel,
+      phase: meta.summary || meta.reason || 'Carry automation submitted an on-chain action.',
+      links: txUrl
+        ? [{
+            key: `${tx.id}-carry-automation`,
+            label: 'Tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
+    };
+  }
+
+  if (['lending_supply', 'lending_withdraw', 'lending_borrow', 'lending_repay'].includes(tx.type)) {
+    const token = meta.toToken || meta.fromToken || tx.token || 'USDC';
+    const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
+    const txUrl = getExplorerTxUrl(tx.from_chain || meta.sourceChain || 'Arc Testnet', txHash);
+    const titleMap = {
+      lending_supply: 'Lending Supply',
+      lending_withdraw: 'Lending Withdraw',
+      lending_borrow: 'Lending Borrow',
+      lending_repay: 'Lending Repay',
+    };
+
+    return {
+      title: titleMap[tx.type] || 'Lending Action',
+      routeLabel: `${formatActivityChainLabel(tx.from_chain || meta.sourceChain || 'Arc Testnet')} · Native lending · ${token}`,
+      amountLabel: formatTokenAmount(tx.amount_usdc ?? meta.amountIn ?? meta.amountOut, token),
+      phase: meta.summary || 'Executed on the Arc-native lending lane.',
+      links: txUrl
+        ? [{
+            key: `${tx.id}-lending-action`,
+            label: 'Tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
     };
   }
 
@@ -1313,9 +1577,11 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     ? (amountValue ? `${parseFloat(amountValue).toFixed(4)} ETH` : null)
     : formatTokenAmount(amountValue, token);
 
-  const routeLabel = fromChain && toChain && fromChain !== toChain
-    ? `${fromChain} → ${toChain}`
-    : fromChain || toChain || null;
+  const formattedFromChain = fromChain ? formatActivityChainLabel(fromChain) : null;
+  const formattedToChain = toChain ? formatActivityChainLabel(toChain) : null;
+  const routeLabel = formattedFromChain && formattedToChain && formattedFromChain !== formattedToChain
+    ? `${formattedFromChain} → ${formattedToChain}`
+    : formattedFromChain || formattedToChain || null;
   const sourceLabel = `${isNativeBridge ? 'Source tx' : 'Burn tx'}${fromChain ? ` (${fromChain})` : ''}`;
   const destinationLabel = `${isNativeBridge ? 'Destination tx' : 'Mint tx'}${toChain ? ` (${toChain})` : ''}`;
 
@@ -1376,9 +1642,9 @@ export default function DashboardTab({ onNavigate }) {
   const [loadingPositions, setLoadingPositions] = useState(false);
   const [positionsError, setPositionsError] = useState('');
   const [positionWarnings, setPositionWarnings] = useState([]);
-  const [rewardOverview, setRewardOverview] = useState(null);
-  const [loadingRewards, setLoadingRewards] = useState(false);
-  const [rewardsError, setRewardsError] = useState('');
+  const [lendingOverview, setLendingOverview] = useState(null);
+  const [loadingLending, setLoadingLending] = useState(false);
+  const [lendingError, setLendingError] = useState('');
   const [txs, setTxs]             = useState([]);
   const [loadingTxs, setLoadingTxs] = useState(false);
   const [txError, setTxError]     = useState('');
@@ -1390,10 +1656,13 @@ export default function DashboardTab({ onNavigate }) {
 
   const arcPortfolio = portfolio.find(entry => entry.chainName === 'Arc Testnet');
   const sepoliaPortfolio = portfolio.find(entry => entry.chainName === 'Sepolia');
-  const primaryRewardProgram = rewardOverview?.programs?.[0] || null;
-  const latestRewardSnapshot = rewardOverview?.snapshots?.[0] || null;
-  const rewardProgramStatus = getRewardProgramStatus(primaryRewardProgram, rewardOverview?.summary);
-  const rewardSnapshotStatus = getRewardSnapshotStatus(latestRewardSnapshot);
+  const lendingExecutionStatus = getLendingExecutionStatus(lendingOverview);
+  const lendingPriceStatus = getLendingPriceStatus(lendingOverview);
+  const lendingRiskStatus = getLendingRiskStatus(lendingOverview?.risk || null);
+  const lendingActiveAssets = Array.isArray(lendingOverview?.assets)
+    ? lendingOverview.assets.filter((entry) => Number(entry?.position?.suppliedAmount || 0) > 0 || Number(entry?.position?.borrowAmount || 0) > 0)
+    : [];
+  const lendingExecutionNotes = Array.isArray(lendingOverview?.execution?.notes) ? lendingOverview.execution.notes : [];
   const marketAnalysisState = agentStatus?.automation?.marketAnalysis || null;
   const lastMarketAnalysisDecision = marketAnalysisState?.lastDecision || null;
   const marketAnalysisStatus = getMarketAnalysisStatus(marketAnalysisState, lastMarketAnalysisDecision);
@@ -1423,6 +1692,7 @@ export default function DashboardTab({ onNavigate }) {
   const stableAutomationPositionValue = Number.isFinite(Number(lastStableDecision?.positionValueUsd))
     ? formatUsdAmount(lastStableDecision?.positionValueUsd)
     : '—';
+  const stableOracleGuardContext = getStableOracleGuardContext(lastStableDecision);
   const stableManualCooldownUntil = defiLoopState?.manualCooldownUntil || lastStableDecision?.manualCooldownUntil || null;
   const stableManualCooldownActive = Number.isFinite(Date.parse(stableManualCooldownUntil || '')) && Date.parse(stableManualCooldownUntil) > Date.now();
   const cirbtcStatusMissingFromBackend = Boolean(agentStatus?.automation && !agentStatus?.automation?.cirbtcLp);
@@ -1490,6 +1760,7 @@ export default function DashboardTab({ onNavigate }) {
       ? 'The latest confirmed cirBTC LP transaction is recorded on-chain.'
       : 'No confirmed cirBTC LP transaction has been saved yet.';
   const visibleTxs = getVisibleRecentActivity(txs, agentStatus);
+  const recentActivityItems = visibleTxs.slice(0, 20);
 
   function getGasLabel(entry) {
     const symbol = entry?.nativeSymbol || 'ETH';
@@ -1500,6 +1771,17 @@ export default function DashboardTab({ onNavigate }) {
     return entry?.chainName !== 'Arc Testnet';
   }
 
+  async function loadFirstAgentWithDetails() {
+    const list = await agents.list();
+    if (!list.length) return null;
+
+    try {
+      return await agents.get(list[0].id);
+    } catch {
+      return list[0];
+    }
+  }
+
   async function handleReconnect() {
     if (!ownerAddress) return;
     setConnectError('');
@@ -1507,8 +1789,8 @@ export default function DashboardTab({ onNavigate }) {
     try {
       const result = await authenticatePasskey(ownerAddress);
       setJwt(result.token);
-      const list = await agents.list();
-      if (list.length > 0) setAgent(list[0]);
+      const fullAgent = await loadFirstAgentWithDetails();
+      if (fullAgent) setAgent(fullAgent);
     } catch (e) {
       setConnectError(e.message);
     } finally {
@@ -1551,26 +1833,22 @@ export default function DashboardTab({ onNavigate }) {
     }
   }, [agent?.id, isAuthenticated]);
 
-  const loadRewards = useCallback(async ({ silent = false } = {}) => {
+  const loadLending = useCallback(async ({ silent = false } = {}) => {
     if (!agent?.id || !isAuthenticated) {
-      setRewardOverview(null);
+      setLendingOverview(null);
+      setLendingError('');
       return;
     }
 
-    if (!silent) setLoadingRewards(true);
-    setRewardsError('');
+    if (!silent) setLoadingLending(true);
+    setLendingError('');
     try {
-      const data = await agents.rewards(agent.id, {
-        programLimit: 3,
-        snapshotLimit: 3,
-        accrualLimit: 3,
-        claimLimit: 3,
-      });
-      setRewardOverview(data || null);
+      const data = await agents.lending(agent.id);
+      setLendingOverview(data || null);
     } catch (e) {
-      setRewardsError(e.message || 'Failed to load LP rewards ledger');
+      setLendingError(e.message || 'Failed to load lending summary');
     } finally {
-      if (!silent) setLoadingRewards(false);
+      if (!silent) setLoadingLending(false);
     }
   }, [agent?.id, isAuthenticated]);
 
@@ -1584,7 +1862,7 @@ export default function DashboardTab({ onNavigate }) {
     setTxError('');
     try {
       const data = await transactions.list(agent.id);
-      setTxs(Array.isArray(data) ? data.slice(0, 20) : []);
+      setTxs(Array.isArray(data) ? data.slice(0, 50) : []);
     } catch (e) {
       setTxError(e.message || 'Failed to load recent activity');
     } finally {
@@ -1615,8 +1893,8 @@ export default function DashboardTab({ onNavigate }) {
   }, [loadPositions]);
 
   useEffect(() => {
-    loadRewards();
-  }, [loadRewards]);
+    loadLending();
+  }, [loadLending]);
 
   useEffect(() => {
     if (!agentWalletAddress) return;
@@ -1642,11 +1920,11 @@ export default function DashboardTab({ onNavigate }) {
     if (!agent?.id || !isAuthenticated) return undefined;
 
     const intervalId = setInterval(() => {
-      loadRewards({ silent: true });
+      loadLending({ silent: true });
     }, 30_000);
 
     return () => clearInterval(intervalId);
-  }, [agent?.id, isAuthenticated, loadRewards]);
+  }, [agent?.id, isAuthenticated, loadLending]);
 
   useEffect(() => {
     loadTransactions();
@@ -1665,7 +1943,6 @@ export default function DashboardTab({ onNavigate }) {
 
     return () => clearInterval(intervalId);
   }, [agent?.id, isAuthenticated, loadTransactions]);
-
   useEffect(() => {
     if (!agent?.id || !isAuthenticated) return undefined;
 
@@ -1780,8 +2057,9 @@ export default function DashboardTab({ onNavigate }) {
             </Button>
           </div>
         </div>
-        <div className="mt-4">
+        <div className="mt-4 grid gap-3 lg:grid-cols-2">
           <AddressBox address={agent.walletAddress} label="Agent Wallet Address" compact />
+          <AddressBox address={ownerAddress} label="Owner Wallet (MetaMask)" compact />
         </div>
         <div className="mt-4">
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -2022,9 +2300,11 @@ export default function DashboardTab({ onNavigate }) {
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
                   <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Blocked By</p>
                   <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {lastStableDecision?.blockedBy ? humanizeAutomationAction(lastStableDecision.blockedBy) : 'None'}
+                    {stableOracleGuardContext?.reasonLabel || (lastStableDecision?.blockedBy ? humanizeAutomationAction(lastStableDecision.blockedBy) : 'None')}
                   </p>
-                  <p className="mt-1 text-[11px] text-slate-500">Hold reason appears here when the policy refuses execution.</p>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    {stableOracleGuardContext?.reasonDetail || 'Hold reason appears here when the policy refuses execution.'}
+                  </p>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
                   <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Wallet Inventory</p>
@@ -2047,6 +2327,42 @@ export default function DashboardTab({ onNavigate }) {
                   </p>
                 </div>
               </div>
+
+              {stableOracleGuardContext && (
+                <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 px-3 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">{stableOracleGuardContext.title}</p>
+                      <p className="mt-1 text-[11px] leading-5 text-sky-800">{stableOracleGuardContext.detail}</p>
+                    </div>
+                    <p className="text-[11px] leading-5 text-sky-700">
+                      {stableOracleGuardContext.quoteAmountLabel || 'Quote size unavailable'} via {stableOracleGuardContext.exitRail || 'swap route'}
+                    </p>
+                  </div>
+
+                  <div className="mt-3 grid gap-2 md:grid-cols-3">
+                    <div className="rounded-xl border border-sky-200 bg-white px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Entry Price</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">
+                        {stableOracleGuardContext.entryPriceTracked
+                          ? `${formatUsdUnitPrice(stableOracleGuardContext.entryPriceUsdc)} / EURC`
+                          : 'Not tracked yet'}
+                      </p>
+                      {!stableOracleGuardContext.entryPriceTracked && (
+                        <p className="mt-1 text-xs text-slate-500">Manual or older EURC inventory is using the standard floor right now.</p>
+                      )}
+                    </div>
+                    <div className="rounded-xl border border-sky-200 bg-white px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Current Exit Quote</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(stableOracleGuardContext.currentExitQuoteUsdc)}</p>
+                    </div>
+                    <div className="rounded-xl border border-sky-200 bg-white px-3 py-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Required Floor</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(stableOracleGuardContext.requiredFloorUsdc)}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -2191,14 +2507,23 @@ export default function DashboardTab({ onNavigate }) {
               <p className="text-xs text-slate-500">Live DeFi LP positions currently held by the agent wallet.</p>
             </div>
           </div>
-          <Button
-            variant="outline"
-            className="px-3 py-2 text-xs"
-            onClick={() => loadPositions()}
-            loading={loadingPositions}
-          >
-            <RefreshCw size={13} /> Refresh
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              className="px-3 py-2 text-xs"
+              onClick={() => onNavigate?.('defi')}
+            >
+              Open DeFi <ArrowRight size={13} />
+            </Button>
+            <Button
+              variant="outline"
+              className="px-3 py-2 text-xs"
+              onClick={() => loadPositions()}
+              loading={loadingPositions}
+            >
+              <RefreshCw size={13} /> Refresh
+            </Button>
+          </div>
         </div>
 
         {positionsError && <Alert type="error">{positionsError}</Alert>}
@@ -2224,7 +2549,7 @@ export default function DashboardTab({ onNavigate }) {
                     <p className="text-sm font-semibold text-slate-900">{position.poolKey}</p>
                     <p className="mt-1 text-xs text-slate-500">{formatPositionVenue(position)}</p>
                   </div>
-                  <Badge variant="slate">{position.sharePct}% share</Badge>
+                  <Badge variant="slate">{formatPercentAmount(position.sharePct)} share</Badge>
                 </div>
 
                 <div className="mt-4 grid gap-2 sm:grid-cols-2">
@@ -2329,179 +2654,183 @@ export default function DashboardTab({ onNavigate }) {
       <Card>
         <div className="mb-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <Zap size={16} className="text-slate-400" />
+            <Coins size={16} className="text-slate-400" />
             <div>
-              <h3 className="font-semibold text-slate-800">LP Rewards Ledger</h3>
-              <p className="text-xs text-slate-500">This card tracks a separate rewards program, not normal LP fee yield. It can stay populated while rewards are still disabled.</p>
+              <h3 className="font-semibold text-slate-800">Lending Summary</h3>
+              <p className="text-xs text-slate-500">Stable supply and borrow state for this agent wallet. Open DeFi for the full lending controls.</p>
             </div>
           </div>
-          <Button
-            variant="outline"
-            className="px-3 py-2 text-xs"
-            onClick={() => loadRewards()}
-            loading={loadingRewards}
-          >
-            <RefreshCw size={13} /> Refresh
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              className="px-3 py-2 text-xs"
+              onClick={() => onNavigate?.('defi')}
+            >
+              Open DeFi <ArrowRight size={13} />
+            </Button>
+            <Button
+              variant="outline"
+              className="px-3 py-2 text-xs"
+              onClick={() => loadLending()}
+              loading={loadingLending}
+            >
+              <RefreshCw size={13} /> Refresh
+            </Button>
+          </div>
         </div>
 
-        {rewardsError && <Alert type="error">{rewardsError}</Alert>}
+        {lendingError && <Alert type="error">{lendingError}</Alert>}
 
-        {loadingRewards ? (
+        {loadingLending ? (
           <div className="flex justify-center py-8"><Spinner /></div>
-        ) : !rewardOverview ? (
+        ) : !lendingOverview ? (
           <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
-            No LP rewards ledger is available for this agent yet.
+            No lending summary is available for this agent yet.
           </div>
         ) : (
           <div className="space-y-3">
             <div className="grid gap-2 md:grid-cols-3">
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                 <div className="flex items-start justify-between gap-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Program Status</p>
-                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(rewardProgramStatus.tone)}`}>
-                    {rewardProgramStatus.label}
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Execution Status</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(lendingExecutionStatus.tone)}`}>
+                    {lendingExecutionStatus.label}
                   </span>
                 </div>
                 <p className="mt-2 text-sm font-semibold text-slate-900">
-                  {primaryRewardProgram?.metadata?.displayName || primaryRewardProgram?.poolKey || 'No configured program'}
+                  {lendingOverview.execution?.contractAddress ? formatAddress(lendingOverview.execution.contractAddress) : 'No contract connected'}
                 </p>
-                <p className="mt-1 text-[11px] leading-5 text-slate-500">{rewardProgramStatus.detail}</p>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Claimable Balance</p>
-                <p className="mt-2 text-sm font-semibold text-slate-900">
-                  {formatRewardAmount(rewardOverview.summary?.totalUnclaimed, primaryRewardProgram?.rewardToken || 'USDC')}
-                </p>
-                <p className="mt-1 text-[11px] leading-5 text-slate-500">
-                  {rewardOverview.summary?.claimableRewardsEnabled
-                    ? 'Unclaimed reward balance is available separately from LP fee APR.'
-                    : 'No funded claimable reward balance has accrued yet.'}
-                </p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{lendingExecutionStatus.detail}</p>
               </div>
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                 <div className="flex items-start justify-between gap-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Latest Snapshot</p>
-                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(rewardSnapshotStatus.tone)}`}>
-                    {rewardSnapshotStatus.label}
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Price Guard</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(lendingPriceStatus.tone)}`}>
+                    {lendingPriceStatus.label}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm font-semibold text-slate-900">Updated {formatDateTime(lendingOverview.prices?.fetchedAt)}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{lendingPriceStatus.detail}</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Account Risk</p>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(lendingRiskStatus.tone)}`}>
+                    {lendingRiskStatus.label}
                   </span>
                 </div>
                 <p className="mt-2 text-sm font-semibold text-slate-900">
-                  {formatDateTime(rewardOverview.summary?.latestSnapshotAt)}
+                  HF {formatHealthFactor(lendingOverview.risk?.healthFactor)} · LTV {formatPercentAmount(lendingOverview.risk?.ltvPct)}
                 </p>
-                <p className="mt-1 text-[11px] leading-5 text-slate-500">{rewardSnapshotStatus.detail}</p>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">{lendingRiskStatus.detail}</p>
               </div>
             </div>
 
-            {primaryRewardProgram && (
-              <div className="grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_minmax(0,0.75fr)]">
-                <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-semibold text-slate-900">{primaryRewardProgram.poolKey}</p>
-                      <p className="mt-1 text-xs text-slate-500">
-                        {String(primaryRewardProgram.rewardSourceType || 'program').replace(/_/g, ' ')} · {primaryRewardProgram.rewardToken}
-                      </p>
-                    </div>
-                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(rewardProgramStatus.tone)}`}>
-                      {primaryRewardProgram.status}
-                    </span>
-                  </div>
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Total Supplied</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(lendingOverview.risk?.totalSuppliedUsd)}</p>
+                <p className="mt-1 text-[11px] text-slate-500">Current supplied collateral value</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Total Borrowed</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(lendingOverview.risk?.totalBorrowUsd)}</p>
+                <p className="mt-1 text-[11px] text-slate-500">Current outstanding stable debt</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Available Borrow</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">{formatUsdAmount(lendingOverview.risk?.availableBorrowUsd)}</p>
+                <p className="mt-1 text-[11px] text-slate-500">Headroom before the next borrow</p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-white px-3 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Health Factor</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">{formatHealthFactor(lendingOverview.risk?.healthFactor)}</p>
+                <p className="mt-1 text-[11px] text-slate-500">Liquidation buffer snapshot</p>
+              </div>
+            </div>
 
-                  <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Epoch Budget</p>
-                      <p className="mt-1 text-sm font-semibold text-slate-900">
-                        {formatRewardAmount(primaryRewardProgram.latestRewardBudget, primaryRewardProgram.rewardToken)}
-                      </p>
-                      <p className="mt-1 text-[11px] text-slate-500">Current configured reward budget</p>
-                    </div>
-                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Snapshots</p>
-                      <p className="mt-1 text-sm font-semibold text-slate-900">{primaryRewardProgram.snapshotCount}</p>
-                      <p className="mt-1 text-[11px] text-slate-500">
-                        {primaryRewardProgram.latestSnapshotStatus
-                          ? `Latest ${primaryRewardProgram.latestSnapshotStatus}`
-                          : 'No epoch snapshot yet'}
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Earned</p>
-                      <p className="mt-1 text-sm font-semibold text-slate-900">
-                        {formatRewardAmount(primaryRewardProgram.totalEarned, primaryRewardProgram.rewardToken)}
-                      </p>
-                      <p className="mt-1 text-[11px] text-slate-500">Agent accruals recorded so far</p>
-                    </div>
-                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Unclaimed</p>
-                      <p className="mt-1 text-sm font-semibold text-slate-900">
-                        {formatRewardAmount(primaryRewardProgram.totalUnclaimed, primaryRewardProgram.rewardToken)}
-                      </p>
-                      <p className="mt-1 text-[11px] text-slate-500">Still separate from LP fee APR shown above</p>
-                    </div>
+            <div className="grid gap-3 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
+              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">Active Lending Assets</p>
+                    <p className="mt-1 text-xs text-slate-500">Assets with current supplied or borrowed balances.</p>
                   </div>
-
-                  <p className="mt-3 text-[11px] leading-5 text-slate-500">
-                    {primaryRewardProgram.metadata?.fundingNote || rewardOverview.summary?.note}
-                  </p>
+                  <span className="text-xs font-medium text-slate-400">{lendingActiveAssets.length} rows</span>
                 </div>
 
-                <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-semibold text-slate-900">Recent Epoch Snapshots</p>
-                      <p className="mt-1 text-xs text-slate-500">Latest ledger writes for reward accounting.</p>
-                    </div>
-                    <span className="text-xs font-medium text-slate-400">{rewardOverview.snapshots?.length || 0} rows</span>
-                  </div>
-
-                  {rewardOverview.snapshots?.length ? (
-                    <div className="mt-3 space-y-2">
-                      {rewardOverview.snapshots.map((snapshot) => {
-                        const snapshotStatus = getRewardSnapshotStatus(snapshot);
-                        return (
-                          <div key={snapshot.id} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                            <div className="flex items-start justify-between gap-3">
-                              <div>
-                                <p className="text-sm font-semibold text-slate-900">{formatDateTime(snapshot.epochEnd)}</p>
-                                <p className="mt-1 text-[11px] text-slate-500">
-                                  {snapshot.poolKey} · Budget {formatRewardAmount(snapshot.rewardBudget, snapshot.rewardToken)}
-                                </p>
-                              </div>
-                              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${getStatusBadgeClasses(snapshotStatus.tone)}`}>
-                                {snapshotStatus.label}
-                              </span>
-                            </div>
-                            <p className="mt-2 text-[11px] leading-5 text-slate-500">{snapshotStatus.detail}</p>
+                {lendingActiveAssets.length ? (
+                  <div className="mt-3 space-y-2">
+                    {lendingActiveAssets.map((asset) => (
+                      <div key={asset.symbol} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900">{asset.symbol}</p>
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              {asset.position?.useAsCollateral ? 'Used as collateral' : 'Not used as collateral'}
+                            </p>
                           </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div className="mt-3 rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
-                      No snapshot rows are available yet.
-                    </div>
-                  )}
+                          <div className="text-right text-[11px] text-slate-500">
+                            <p>Wallet {formatPositionAmount(asset.wallet?.amount || 0)}</p>
+                            <p>Available {formatUsdAmount(asset.wallet?.amountUsd)}</p>
+                          </div>
+                        </div>
+
+                        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                          <div className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Supplied</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-900">{formatPositionAmount(asset.position?.suppliedAmount || 0)}</p>
+                            <p className="mt-1 text-[11px] text-slate-500">{formatUsdAmount(asset.position?.suppliedUsd)}</p>
+                          </div>
+                          <div className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Borrowed</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-900">{formatPositionAmount(asset.position?.borrowAmount || 0)}</p>
+                            <p className="mt-1 text-[11px] text-slate-500">{formatUsdAmount(asset.position?.borrowUsd)}</p>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="mt-3 rounded-xl border border-slate-100 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                    No active lending position is visible yet. Open DeFi to review balances and available lending actions.
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Connection Snapshot</p>
+                  <p className="mt-1 text-xs text-slate-500">Quick status of the lending surface currently wired into the dashboard.</p>
+                </div>
+
+                <div className="mt-4 space-y-2">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Build State</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">{String(lendingOverview.execution?.buildState || 'scaffold_only').replace(/_/g, ' ')}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">Source {lendingOverview.execution?.source || 'arc_native_scaffold'}</p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Contract</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">{lendingOverview.execution?.contractAddress ? formatAddress(lendingOverview.execution.contractAddress) : 'Not connected'}</p>
+                    <p className="mt-1 text-[11px] text-slate-500">Updated {formatDateTime(lendingOverview.prices?.fetchedAt)}</p>
+                  </div>
+                </div>
+
+                {lendingExecutionNotes.length > 0 && (
+                  <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Notes</p>
+                    <p className="mt-2 text-[11px] leading-5 text-slate-500">{lendingExecutionNotes[0]}</p>
+                  </div>
+                )}
+
+                <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-[11px] leading-5 text-sky-800">
+                  Use the DeFi tab for reserve watch, asset-level guards, and live lending actions. This dashboard card stays focused on the top-level account snapshot.
                 </div>
               </div>
-            )}
-
-            {latestRewardSnapshot?.snapshotPayload?.note && (
-              <p className="text-[11px] leading-5 text-slate-500">{latestRewardSnapshot.snapshotPayload.note}</p>
-            )}
+            </div>
           </div>
         )}
-      </Card>
-
-      {/* Owner wallet */}
-      <Card>
-        <div className="flex items-center gap-3">
-          <Wallet size={18} className="text-slate-400" />
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Owner Wallet (MetaMask)</p>
-            <p className="font-mono text-sm text-slate-700">{formatAddress(ownerAddress)}</p>
-          </div>
-        </div>
       </Card>
 
       {/* Recent activity */}
@@ -2524,11 +2853,11 @@ export default function DashboardTab({ onNavigate }) {
           <div className="flex justify-center py-8"><Spinner /></div>
         ) : txError ? (
           <Alert type="error">{txError}</Alert>
-        ) : visibleTxs.length === 0 ? (
+        ) : recentActivityItems.length === 0 ? (
           <div className="py-8 text-center text-sm text-slate-400">No transactions yet. Your agent activity will appear here.</div>
         ) : (
-          <div className="space-y-2">
-            {visibleTxs.map(tx => {
+          <div className="max-h-[36rem] space-y-2 overflow-y-auto overscroll-contain pr-1">
+            {recentActivityItems.map(tx => {
               const { title, routeLabel, amountLabel, phase, links, tagLabel, tagVariant } = getTxDisplay(tx, { allTxs: txs, agentStatus });
               const isReceive = tx.type === 'receive';
               const isSend    = tx.type === 'send' || tx.type === 'nano_payment';
@@ -2613,7 +2942,7 @@ export default function DashboardTab({ onNavigate }) {
                         {counterpart.slice(0, 8)}…{counterpart.slice(-5)}
                       </span>
                     )}
-                    {phase && <span className="min-w-0 break-all">{phase}</span>}
+                    {phase && <span className="min-w-0 break-words leading-5">{phase}</span>}
                     {links.map(link => (
                       <a key={link.key} href={link.url} target="_blank" rel="noopener noreferrer"
                         className="flex items-center gap-1 text-arc-green hover:underline font-mono">

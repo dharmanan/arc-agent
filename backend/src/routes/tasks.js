@@ -11,10 +11,13 @@ const { requireAuth } = require('../middleware/auth');
 const db              = require('../db');
 const queue           = require('../queue/agentQueue');
 const { ethers }      = require('ethers');
+const oracle          = require('../services/oracle');
+const protocols       = require('../services/protocols');
 const { isDailyLimitBypassed } = require('../services/dailyLimitBypass');
 const taskRunService = require('../services/taskRunService');
 const nativeLendingRiskService = require('../services/nativeLendingRiskService');
 const { getAgentWithKey } = require('../services/agentService');
+const { assertAgentOperational } = require('../services/securityEventService');
 const {
   buildCirclePaidHandoff,
   getCirclePaidCatalog,
@@ -32,6 +35,7 @@ const {
   listCirclePaidSnapshots,
   unlockCirclePaidSnapshot,
 } = require('../services/circlePaidSnapshotService');
+const { getWalletAssetSnapshot } = require('../services/walletSnapshotService');
 
 // ── Minimal ABI for ArcRevenuePool.getPoolBalance() ──────────────────────────
 const _POOL_VIEW_ABI = ['function getPoolBalance() external view returns (uint256)'];
@@ -98,12 +102,21 @@ const CCTP_CHAIN_NAMES = new Set([
   'Arbitrum Sepolia',
 ]);
 const REBALANCE_TOKENS = new Set(['USDC', 'EURC']);
+const WALLET_ASSET_SNAPSHOT_ITEM_ID = 'ARC_WALLET_ASSET_SNAPSHOT';
 const PREDICTION_MARKET_CHECK_ITEM_ID = 'ARC_PREDICTION_MARKET_CHECK';
 const EVENT_ODDS_COMPARE_ITEM_ID = 'ARC_EVENT_ODDS_COMPARE';
 
 function _isPositiveNumber(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0;
+}
+
+function _sendPermissionBlocked(res, permissionGuard) {
+  return res.status(403).json({
+    error: permissionGuard?.error || permissionGuard?.reason || 'permission_blocked',
+    permission: permissionGuard?.permission || null,
+    detail: permissionGuard?.stageDetail || permissionGuard?.errorSummary || 'Task is blocked by the current strategy preference.',
+  });
 }
 
 function _isBinaryIndex(value) {
@@ -268,7 +281,7 @@ function _resolveManualDefiExecution(body) {
         action,
         params: {
           tokenOut,
-          lpAmount: Number(params.lpAmount),
+          lpAmount: String(params.lpAmount).trim(),
         },
       };
     }
@@ -281,7 +294,7 @@ function _resolveManualDefiExecution(body) {
         poolKey,
         action,
         params: {
-          lpAmount: Number(params.lpAmount),
+          lpAmount: String(params.lpAmount).trim(),
         },
       };
     }
@@ -370,6 +383,40 @@ function _resolveManualDefiExecution(body) {
   }
 
   return { error: 'manual_defi_direct_pair_action_invalid' };
+}
+
+function _resolveManualDefiQuote(body) {
+  const poolKey = String(body?.poolKey || body?.pool || '').trim().toUpperCase();
+  const venue = String(body?.venue || '').trim().toLowerCase();
+  const action = String(body?.action || '').trim().toLowerCase();
+  const params = _normalizeManualDefiParams(body?.params);
+
+  if (!poolKey) return { error: 'manual_defi_pool_required' };
+  if (!action) return { error: 'manual_defi_action_required' };
+
+  if (MANUAL_DEFI_CURVE_POOLS.has(poolKey)) {
+    if (venue && venue !== 'curve') return { error: 'manual_defi_curve_venue_invalid' };
+    if (action !== 'swap') return { error: 'manual_defi_quote_unsupported' };
+
+    const route = _resolveCurveSwapRoute(params);
+    if (!route) return { error: 'curve_swap_direction_required' };
+    if (!_isPositiveNumber(params.amountIn)) return { error: 'curve_swap_amount_required' };
+
+    return {
+      lane: 'curve',
+      poolKey,
+      action,
+      params: {
+        amountIn: Number(params.amountIn),
+        fromToken: route.fromToken,
+        toToken: route.toToken,
+        indexIn: route.indexIn,
+        indexOut: route.indexOut,
+      },
+    };
+  }
+
+  return { error: 'manual_defi_quote_unsupported' };
 }
 
 function _validateExecutionParams(taskId, params) {
@@ -531,8 +578,12 @@ function _normalizeCirclePaidPreviewId(value) {
   return String(value || '').trim();
 }
 
-async function _getCirclePaidLiveResult(itemId, params = {}) {
+async function _getCirclePaidLiveResult(itemId, params = {}, context = {}) {
   switch (itemId) {
+    case WALLET_ASSET_SNAPSHOT_ITEM_ID:
+      return getWalletAssetSnapshot({
+        walletAddress: params.walletAddress || context.agent?.wallet_address || context.agent?.walletAddress,
+      });
     case PREDICTION_MARKET_CHECK_ITEM_ID:
       return getPredictionMarketPulse({
         topic: params.topic,
@@ -677,7 +728,7 @@ async function _handleCirclePaidPreview(req, res, next, { legacyAlias = false } 
       return res.json(handoff);
     }
 
-    const liveResult = await _getCirclePaidLiveResult(item.id, params);
+    const liveResult = await _getCirclePaidLiveResult(item.id, params, { agent: context.agent });
     if (!liveResult) {
       return res.json(handoff);
     }
@@ -910,16 +961,23 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
     // Verify ownership
     const { rows: [agent] } = await db.query(
       `SELECT id, daily_tasks_enabled, daily_free_task_count, daily_paid_task_count,
-              daily_limit_reset_at, wallet_address
+              daily_limit_reset_at, wallet_address, status, is_active,
+              security_frozen_at, security_freeze_reason
        FROM agents WHERE id = $1 AND user_id = $2`,
       [agentId, req.user.userId],
     );
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
 
     const isBypass = isDailyLimitBypassed(agent);
 
     if (!isBypass && !agent.daily_tasks_enabled)
       return res.status(403).json({ error: 'daily_tasks_disabled' });
+
+    const permissionGuard = await queue.guardTaskPermission(taskId, agentId);
+    if (!permissionGuard.ok) {
+      return _sendPermissionBlocked(res, permissionGuard);
+    }
 
     if (!isBypass && task.tier === 1) {
       // Daily reset check
@@ -1002,6 +1060,67 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
 
 // ── POST /api/tasks/agents/:id/defi/manual/execute ──────────────────────────
 // Queues a manual DeFi pool action without depending on the Tasks switch or the public paid task catalog.
+router.post('/agents/:id/defi/manual/quote', requireAuth, async (req, res, next) => {
+  try {
+    const agentId = req.params.id;
+    const resolution = _resolveManualDefiQuote(req.body || {});
+    if (resolution.error) {
+      return res.status(400).json({ error: resolution.error });
+    }
+
+    const { rows: [agent] } = await db.query(
+      `SELECT id FROM agents WHERE id = $1 AND user_id = $2`,
+      [agentId, req.user.userId],
+    );
+    if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+
+    const curvePool = oracle.resolveCurvePool(resolution.poolKey);
+    if (!curvePool?.address) {
+      return res.status(409).json({
+        amountOut: null,
+        quoteError: 'The selected Curve pool is not configured right now.',
+      });
+    }
+
+    try {
+      const quote = await protocols.getCurveQuote(
+        curvePool.address,
+        resolution.params.indexIn,
+        resolution.params.indexOut,
+        String(resolution.params.amountIn),
+        curvePool.baseToken?.decimals || 6,
+        curvePool.quoteToken?.decimals || 6,
+      );
+
+      return res.json({
+        amountIn: String(resolution.params.amountIn),
+        amountOut: quote.amountOut,
+        quoteError: null,
+        venue: 'curve',
+        executionRail: 'curve_pool_quote',
+        poolKey: resolution.poolKey,
+        poolAddress: curvePool.address,
+        poolSource: curvePool.source || 'verified_default',
+        fromToken: resolution.params.fromToken,
+        toToken: resolution.params.toToken,
+      });
+    } catch (_quoteError) {
+      return res.json({
+        amountIn: String(resolution.params.amountIn),
+        amountOut: null,
+        quoteError: 'Live Curve preview is unavailable right now.',
+        venue: 'curve',
+        executionRail: 'curve_pool_quote',
+        poolKey: resolution.poolKey,
+        poolAddress: curvePool.address,
+        poolSource: curvePool.source || 'verified_default',
+        fromToken: resolution.params.fromToken,
+        toToken: resolution.params.toToken,
+      });
+    }
+  } catch (err) { next(err); }
+});
+
 router.post('/agents/:id/defi/manual/execute', requireAuth, async (req, res, next) => {
   try {
     const agentId = req.params.id;
@@ -1011,10 +1130,17 @@ router.post('/agents/:id/defi/manual/execute', requireAuth, async (req, res, nex
     }
 
     const { rows: [agent] } = await db.query(
-      `SELECT id, wallet_address FROM agents WHERE id = $1 AND user_id = $2`,
+      `SELECT id, wallet_address, status, is_active, security_frozen_at, security_freeze_reason
+         FROM agents WHERE id = $1 AND user_id = $2`,
       [agentId, req.user.userId],
     );
     if (!agent) return res.status(404).json({ error: 'agent_not_found' });
+    assertAgentOperational(agent);
+
+    const permissionGuard = await queue.guardTaskPermission(resolution.taskId, agentId);
+    if (!permissionGuard.ok) {
+      return _sendPermissionBlocked(res, permissionGuard);
+    }
 
     if (resolution.lane === 'lending') {
       let validation;

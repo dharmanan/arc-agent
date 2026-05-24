@@ -7,7 +7,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const FRONTEND_PROJECT_FILE = path.join(ROOT_DIR, 'frontend', '.vercel', 'project.json');
 const FRONTEND_VERCEL_CONFIG = path.join(ROOT_DIR, 'frontend', 'vercel.json');
 
-const FRONTEND_URL = process.env.PROD_FRONTEND_URL || 'https://arcmachina.vercel.app';
+const FRONTEND_URL = process.env.PROD_FRONTEND_URL || 'https://arcmachina.xyz';
 const BACKEND_HEALTH_URL = process.env.PROD_BACKEND_HEALTH_URL || 'https://backend-production-597c.up.railway.app/health';
 const PUBLIC_ORACLE_URL = `${FRONTEND_URL}/api/oracle/public/pool-state?pool=USDC-EURC`;
 
@@ -100,11 +100,11 @@ async function main() {
     if (response.status !== 200) {
       throw new Error(`Expected bundle status 200, got ${response.status}`);
     }
-    if (!text.includes('LP Rewards Ledger')) {
-      throw new Error('LP Rewards Ledger string not found in the live bundle');
+    if (!text.includes('Run free checks, paid actions, Circle Paid cards and automation controls from one screen.')) {
+      throw new Error('Tasks hub marker string not found in the live bundle');
     }
 
-    return `${assetPath} contains LP Rewards Ledger`;
+    return `${assetPath} contains the tasks hub marker`;
   })) && allPassed;
 
   allPassed = (await runCheck('Backend Health', async () => {

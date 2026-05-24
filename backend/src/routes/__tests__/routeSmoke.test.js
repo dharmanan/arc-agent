@@ -27,7 +27,10 @@ function loadTasksHarness() {
   process.env.JWT_SECRET = TEST_JWT_SECRET;
 
   const db = { query: jest.fn() };
-  const queue = { queueManualTask: jest.fn().mockResolvedValue(undefined) };
+  const queue = {
+    queueManualTask: jest.fn().mockResolvedValue(undefined),
+    guardTaskPermission: jest.fn().mockResolvedValue({ ok: true }),
+  };
   const taskRunService = {
     findActiveTaskRun: jest.fn().mockResolvedValue(null),
     createTaskRun: jest.fn().mockResolvedValue({ id: 'run-1' }),
@@ -48,6 +51,9 @@ function loadTasksHarness() {
   jest.doMock('../../services/predictionMarketService', () => ({
     getEventOddsCompare: jest.fn(),
     getPredictionMarketPulse: jest.fn(),
+  }));
+  jest.doMock('../../services/walletSnapshotService', () => ({
+    getWalletAssetSnapshot: jest.fn(),
   }));
   jest.doMock('../../services/circlePaidSnapshotService', () => ({
     buildCirclePaidPricingSnapshot: jest.fn(),
@@ -238,6 +244,8 @@ function loadOracleHarness() {
     getOracleObservabilitySummary: jest.fn(() => ({})),
     getYieldOpportunities: jest.fn().mockResolvedValue([]),
   }));
+  jest.doMock('../../services/protocols', () => ({}));
+  jest.doMock('../../services/agentWalletService', () => ({}));
   jest.doMock('../../services/agentService', () => ({}));
   jest.doMock('../../services/predictionMarketService', () => ({
     getPredictionMarketPulse: jest.fn(),
@@ -342,6 +350,79 @@ describe('tasks route smoke', () => {
 
     expect(response.status).toBe(400);
     expect(response.body.error).toBe('rebalance_amount_required');
+  });
+
+  test('blocks queued task runs when the required strategy permission is disabled', async () => {
+    const { app, db, queue, taskRunService, signToken } = loadTasksHarness();
+    const token = signToken(TEST_USER_ID, TEST_OWNER_ADDRESS.toLowerCase());
+
+    db.query
+      .mockResolvedValueOnce({
+        rows: [{ id: 'DAILY_ARB_SCAN', tier: 1, fee_usdc: '0.00' }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{
+          id: TEST_AGENT_ID,
+          daily_tasks_enabled: true,
+          daily_free_task_count: 0,
+          daily_paid_task_count: 0,
+          daily_limit_reset_at: '2026-05-24T00:00:00.000Z',
+          wallet_address: TEST_OWNER_ADDRESS,
+        }],
+      });
+    queue.guardTaskPermission.mockResolvedValueOnce({
+      ok: false,
+      error: 'permission_blocked',
+      reason: 'permission_blocked',
+      permission: 'defi_scan',
+      stageDetail: 'Task DAILY_ARB_SCAN is blocked because DeFi Protocol Scanner is disabled for this agent.',
+    });
+
+    const response = await request(app)
+      .post(`/api/tasks/agents/${TEST_AGENT_ID}/tasks/run`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ taskId: 'DAILY_ARB_SCAN', params: {} });
+
+    expect(response.status).toBe(403);
+    expect(response.body.error).toBe('permission_blocked');
+    expect(response.body.permission).toBe('defi_scan');
+    expect(queue.queueManualTask).not.toHaveBeenCalled();
+    expect(taskRunService.createTaskRun).not.toHaveBeenCalled();
+  });
+
+  test('rejects task runs for security-frozen agents', async () => {
+    const { app, db, queue, taskRunService, signToken } = loadTasksHarness();
+    const token = signToken(TEST_USER_ID, TEST_OWNER_ADDRESS.toLowerCase());
+
+    db.query
+      .mockResolvedValueOnce({
+        rows: [{ id: 'DAILY_ARB_SCAN', tier: 1, fee_usdc: '0.00' }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{
+          id: TEST_AGENT_ID,
+          daily_tasks_enabled: true,
+          daily_free_task_count: 0,
+          daily_paid_task_count: 0,
+          daily_limit_reset_at: '2026-05-24T00:00:00.000Z',
+          wallet_address: TEST_OWNER_ADDRESS,
+          status: 'locked',
+          is_active: false,
+          security_frozen_at: '2026-05-24T19:00:00.000Z',
+          security_freeze_reason: 'suspicious_agent_activity',
+        }],
+      });
+
+    const response = await request(app)
+      .post(`/api/tasks/agents/${TEST_AGENT_ID}/tasks/run`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ taskId: 'DAILY_ARB_SCAN', params: {} });
+
+    expect(response.status).toBe(423);
+    expect(response.body.error).toBe('Agent is frozen pending a security review.');
+    expect(queue.guardTaskPermission).not.toHaveBeenCalled();
+    expect(queue.queueManualTask).not.toHaveBeenCalled();
+    expect(taskRunService.createTaskRun).not.toHaveBeenCalled();
   });
 });
 
