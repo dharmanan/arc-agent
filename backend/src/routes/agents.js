@@ -213,6 +213,18 @@ router.get('/:id/reputation', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── Reputation on-chain proof ────────────────────────────────────────────────
+router.get('/:id/reputation/proof', async (req, res, next) => {
+  try {
+    const proof = await reputationService.getReputationProof(
+      req.params.id,
+      req.user.userId,
+    );
+    if (!proof) return res.status(404).json({ error: 'Agent not found' });
+    res.json(proof);
+  } catch (err) { next(err); }
+});
+
 // ── Live protocol positions ──────────────────────────────────────────────────
 router.get('/:id/positions', async (req, res, next) => {
   try {

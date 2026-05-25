@@ -18,26 +18,29 @@ const REPUTATION_REGISTRY_ADDRESS = process.env.REPUTATION_REGISTRY_ADDRESS || n
 const REPUTATION_REGISTRY_ABI = [
   'function recordEvent(uint256 tokenId, string eventType, int256 scoreDelta) returns (bool)',
   'function getScore(uint256 tokenId) view returns (uint256)',
+  'function totalEvents(uint256 tokenId) view returns (uint256)',
   'event ReputationRecorded(uint256 indexed tokenId, string eventType, int256 scoreDelta, uint256 newScore)',
 ];
 
 // Event types — mirrors Arc reputation standard
 const EVENT_TYPES = {
-  TX_COMPLETED:   'TRANSACTION_COMPLETED',
-  ARB_EXECUTED:   'ARB_EXECUTED',
-  DEFI_LOOP:      'DEFI_LOOP_COMPLETED',
-  ORACLE_QUERY:   'ORACLE_QUERY_COMPLETED',
-  DAILY_TASK:     'DAILY_TASK_COMPLETED',
+  TX_COMPLETED:       'TRANSACTION_COMPLETED',
+  ARB_EXECUTED:       'ARB_EXECUTED',
+  DEFI_LOOP:          'DEFI_LOOP_COMPLETED',
+  ORACLE_QUERY:       'ORACLE_QUERY_COMPLETED',
+  DAILY_TASK:         'DAILY_TASK_COMPLETED',
+  PAID_TASK:          'PAID_TASK_COMPLETED',
   JOB_REVIEW_TIMEOUT: 'JOB_REVIEW_TIMEOUT',
 };
 
 // Score deltas per event type
 const SCORE_DELTAS = {
-  [EVENT_TYPES.TX_COMPLETED]:  1,
-  [EVENT_TYPES.ARB_EXECUTED]:  2,
-  [EVENT_TYPES.DEFI_LOOP]:     1,
-  [EVENT_TYPES.ORACLE_QUERY]:  1,
-  [EVENT_TYPES.DAILY_TASK]:    1,
+  [EVENT_TYPES.TX_COMPLETED]:       1,
+  [EVENT_TYPES.ARB_EXECUTED]:       2,
+  [EVENT_TYPES.DEFI_LOOP]:          1,
+  [EVENT_TYPES.ORACLE_QUERY]:       1,
+  [EVENT_TYPES.DAILY_TASK]:         1,
+  [EVENT_TYPES.PAID_TASK]:          2,
   [EVENT_TYPES.JOB_REVIEW_TIMEOUT]: -2,
 };
 
@@ -218,4 +221,96 @@ async function getReputationOverview(agentId, userId, limit = 10) {
   };
 }
 
-module.exports = { recordReputationEvent, getReputationOverview, EVENT_TYPES };
+/**
+ * Fetch on-chain ReputationRecorded event history for a given agent.
+ * Phase 1 (fast): getScore + totalEvents via view call.
+ * Phase 2 (best-effort): paginated event log scan — errors here do NOT
+ *   downgrade the status; they just result in fewer visible events.
+ *
+ * SCAN_DEPTH is kept small (50 000 blocks) so the endpoint completes
+ * well inside the 30-second Railway response timeout.
+ *
+ * @returns {{ score, totalEvents, events, eventsStatus, contractAddress, tokenId, status }}
+ */
+async function getReputationProof(agentId, userId) {
+  const { rows: [agent] } = await db.query(
+    `SELECT id, erc8004_status, erc8004_token_id
+     FROM agents
+     WHERE id = $1 AND user_id = $2`,
+    [agentId, userId],
+  );
+
+  if (!agent) return null;
+
+  const result = {
+    contractAddress: REPUTATION_REGISTRY_ADDRESS,
+    tokenId: agent.erc8004_token_id || null,
+    score: null,
+    totalEvents: null,
+    events: [],
+    eventsStatus: 'not_scanned',
+    status: 'not_configured',
+  };
+
+  if (!REPUTATION_REGISTRY_ADDRESS || agent.erc8004_status !== 'registered' || !result.tokenId) {
+    result.status = agent.erc8004_status !== 'registered' ? 'identity_required' : 'not_configured';
+    return result;
+  }
+
+  const rpc      = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
+  const provider = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
+  const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
+
+  // ── Phase 1: score read (fast view calls) ────────────────────────────────
+  let blockNumber;
+  try {
+    const [scoreRaw, totalRaw, bn] = await Promise.all([
+      registry.getScore(BigInt(result.tokenId)),
+      registry.totalEvents(BigInt(result.tokenId)),
+      provider.getBlockNumber(),
+    ]);
+    result.score       = Number(scoreRaw);
+    result.totalEvents = Number(totalRaw);
+    result.status      = 'live';
+    blockNumber        = bn;
+  } catch (err) {
+    console.error(`[REPUTATION] proof score read error agent=${agentId}:`, err.message);
+    result.status = 'read_error';
+    return result;   // return early — still has contractAddress + tokenId for display
+  }
+
+  // ── Phase 2: event log scan (best-effort, non-fatal) ─────────────────────
+  try {
+    const CHUNK      = 9999;
+    const SCAN_DEPTH = 50000; // ~last 12 hours on Arc Testnet, fits well within timeout
+    const scanFrom   = Math.max(0, blockNumber - SCAN_DEPTH);
+    const filter     = registry.filters.ReputationRecorded(BigInt(result.tokenId));
+    let logs         = [];
+    let chunkEnd     = blockNumber;
+
+    while (chunkEnd >= scanFrom) {
+      const chunkStart = Math.max(scanFrom, chunkEnd - CHUNK + 1);
+      try {
+        const chunk = await registry.queryFilter(filter, chunkStart, chunkEnd);
+        logs = [...chunk, ...logs];
+      } catch (_) { /* skip erroring chunk, keep going */ }
+      chunkEnd = chunkStart - 1;
+    }
+
+    result.events = logs.map(ev => ({
+      blockNumber: ev.blockNumber,
+      txHash:      ev.transactionHash,
+      eventType:   ev.args.eventType,
+      scoreDelta:  Number(ev.args.scoreDelta),
+      newScore:    Number(ev.args.newScore),
+    }));
+    result.eventsStatus = 'ok';
+  } catch (err) {
+    console.error(`[REPUTATION] proof event scan error agent=${agentId}:`, err.message);
+    result.eventsStatus = 'error';
+  }
+
+  return result;
+}
+
+module.exports = { recordReputationEvent, getReputationOverview, getReputationProof, EVENT_TYPES };

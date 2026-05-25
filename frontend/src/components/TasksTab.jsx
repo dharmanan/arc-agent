@@ -11,6 +11,7 @@ import {
   ShieldCheck, ExternalLink,
 } from 'lucide-react';
 import { CHAINS } from '../lib/chains.js';
+import ReputationProofModal from './ReputationProofModal.jsx';
 
 const AUTOMATION_SNAPSHOT_TOLERANCE_MS = 60 * 1000;
 const CARRY_STALE_STATUSES = new Set(['fetch_error', 'decision_error']);
@@ -135,6 +136,7 @@ const REPUTATION_EVENT_LABELS = {
   DEFI_LOOP_COMPLETED: 'DeFi Loop',
   ORACLE_QUERY_COMPLETED: 'Oracle Query',
   DAILY_TASK_COMPLETED: 'Daily Task',
+  PAID_TASK_COMPLETED: 'Paid Task',
 };
 const REPUTATION_IMPORTANCE_ITEMS = [
   {
@@ -170,6 +172,12 @@ const REPUTATION_SCORE_RULES = [
     description: 'Awarded for successful manual or queued task activity.',
   },
   {
+    eventType: 'PAID_TASK_COMPLETED',
+    label: 'Paid Task',
+    delta: 2,
+    description: 'Awarded for completing a paid task; weighted higher to reflect USDC cost.',
+  },
+  {
     eventType: 'ORACLE_QUERY_COMPLETED',
     label: 'Oracle Query',
     delta: 1,
@@ -189,6 +197,12 @@ const PAID_TASK_GROUPS = [
     title: 'Bridge Setup',
     description: 'Start here on a new wallet. Fund at least 0.06 ETH on Sepolia first, then spread gas to the three supported Sepolia L2 testnets before running other bridge actions.',
     taskIds: ['EXEC_SEPOLIA_GAS_FANOUT'],
+  },
+  {
+    key: 'auto_carry',
+    title: 'Auto Carry Products',
+    description: 'No-input carry products that only trigger or stop the autonomous stable carry lane. The live lending and LP state is read automatically before each run.',
+    taskIds: ['EXEC_AUTO_CARRY_START', 'EXEC_AUTO_CARRY_STOP'],
   },
   {
     key: 'stable_curve',
@@ -216,6 +230,7 @@ const PAID_TASK_GROUPS = [
   },
 ];
 const PAID_TASK_GROUP_TASK_IDS = new Set(PAID_TASK_GROUPS.flatMap(group => group.taskIds));
+const AUTO_CARRY_TASK_IDS = new Set(['EXEC_AUTO_CARRY_START', 'EXEC_AUTO_CARRY_STOP']);
 const TASK_ID_WORD_OVERRIDES = {
   arb: 'Arbitrage',
   cirbtc: 'cirBTC',
@@ -230,6 +245,20 @@ const TASK_ID_WORD_OVERRIDES = {
 
 function getTaskOperationalAlert(task) {
   switch (task?.id) {
+    case 'EXEC_AUTO_CARRY_START':
+      return {
+        badge: 'Autonomous',
+        title: 'Triggers the same carry lane the background loop uses',
+        body: 'This product does not ask for an amount. It reads the live carry lane, removes a blocking manual stable LP when needed, then hands the route back to Auto Carry.',
+      };
+
+    case 'EXEC_AUTO_CARRY_STOP':
+      return {
+        badge: 'Exit lane',
+        title: 'Turns Auto Carry off before any unwind step runs',
+        body: 'This product first switches the carry lane off, then unwinds the visible autonomous carry leg only when the current LP and debt state makes that possible.',
+      };
+
     case 'EXEC_SEPOLIA_GAS_FANOUT':
       return {
         badge: 'Start here',
@@ -310,6 +339,412 @@ function getTaskOperationalAlert(task) {
     default:
       return null;
   }
+}
+
+function getAutoCarryTaskToneClasses(tone) {
+  switch (tone) {
+    case 'amber':
+      return {
+        card: 'border-amber-200 bg-amber-50',
+        eyebrow: 'text-amber-700',
+        body: 'text-amber-900',
+        note: 'text-amber-800',
+        badge: 'border-amber-200 bg-white text-amber-700',
+      };
+    case 'rose':
+      return {
+        card: 'border-rose-200 bg-rose-50',
+        eyebrow: 'text-rose-700',
+        body: 'text-rose-900',
+        note: 'text-rose-800',
+        badge: 'border-rose-200 bg-white text-rose-700',
+      };
+    default:
+      return {
+        card: 'border-sky-200 bg-sky-50',
+        eyebrow: 'text-sky-700',
+        body: 'text-sky-900',
+        note: 'text-sky-800',
+        badge: 'border-sky-200 bg-white text-sky-700',
+      };
+  }
+}
+
+const AUTO_CARRY_PRACTICAL_SUPPLY_FLOOR_USDC = 100;
+
+function getAutoCarryBlockedReasonLabel(blockedBy, assetSymbol = 'USDC') {
+  switch (String(blockedBy || '').trim().toLowerCase()) {
+    case 'borrow_capacity_too_small':
+      return 'Fresh starts still need more supplied collateral and visible borrow room.';
+    case 'manual_stable_lp_conflict':
+      return 'A manual stable LP is still blocking the autonomous lane.';
+    case 'stable_pool_unavailable':
+      return 'The stable LP lane is not ready for a live deploy yet.';
+    case 'negative_net_carry':
+      return 'The live LP yield is still not clearing borrow cost.';
+    case 'health_factor_buffer_too_thin':
+      return 'The projected health buffer is still too thin for a fresh leg.';
+    case 'wallet_balance_too_small':
+      return `The wallet still needs idle ${assetSymbol} ready for the deploy or repay step.`;
+    case 'execution_not_ready':
+      return 'The lending lane is not ready for live execution yet.';
+    default:
+      return humanizeAutomationAction(blockedBy, 'The live carry checks are still waiting on another condition.');
+  }
+}
+
+function getAutoCarryExplainer(taskId, assetSymbol) {
+  if (taskId === 'EXEC_AUTO_CARRY_STOP') {
+    return `Auto Carry unwinds the same lending plus stable LP lane in reverse: turn the lane off, pull liquidity back, then repay visible ${assetSymbol} debt when the live state allows it.`;
+  }
+
+  return `Auto Carry uses supplied collateral to borrow ${assetSymbol}, then moves that borrowed balance into the stable LP only when the live spread stays positive and the safety checks still pass.`;
+}
+
+function getAutoCarryRequirementLines({ taskId, carryState, blockedBy, assetSymbol }) {
+  const waitReason = blockedBy ? `Current live hold reason: ${getAutoCarryBlockedReasonLabel(blockedBy, assetSymbol)}` : null;
+
+  if (taskId === 'EXEC_AUTO_CARRY_STOP') {
+    if (carryState === 'manual_lp_conflict') {
+      return [
+        'No amount entry is needed. This card only turns Auto Carry off from the current manual LP state.',
+        'The manual stable LP stays untouched until a separate manual exit or conversion is requested.',
+      ];
+    }
+
+    if (carryState === 'debt_idle') {
+      return [
+        'No amount entry is needed. The card reads the live debt and wallet balance on its own.',
+        `The lane repays visible idle ${assetSymbol} debt only if enough matching wallet balance is already sitting idle.`,
+        'If the wallet is still short, Auto Carry still turns off and leaves the remaining repay choice for later.',
+      ];
+    }
+
+    if (carryState === 'active' || carryState === 'unwind') {
+      return [
+        'No amount entry is needed. The card reads the live LP and debt state before it sends anything.',
+        'If carry is live, the stable LP must be removable and the visible debt must be unwindable from the same live flow.',
+        'If the unwind cannot finish safely, the card surfaces the failure instead of hiding it.',
+      ];
+    }
+
+    return [
+      'No amount entry is needed.',
+      'When there is no live carry leg, this only keeps the lane turned off.',
+    ];
+  }
+
+  if (carryState === 'manual_lp_conflict') {
+    return [
+      'A manual USDC/EURC LP is still open, so this product has to convert that position before Auto Carry can own the lane.',
+      `With the current setup, about ${AUTO_CARRY_PRACTICAL_SUPPLY_FLOOR_USDC} USDC already supplied in lending is the practical threshold for a fresh carry start.`,
+      'The spread must stay positive after borrow cost and the projected health buffer must still clear the safety floor.',
+      ...(waitReason ? [waitReason] : []),
+    ];
+  }
+
+  if (carryState === 'debt_idle') {
+    return [
+      'The borrow leg is already open, so this trigger mainly needs the LP handoff to finish.',
+      `The borrowed ${assetSymbol} has to stay visible in the wallet until the follow-up deploy runs.`,
+      'If the spread or safety checks fail on the next review, Auto Carry holds instead of forcing the LP add.',
+      ...(waitReason ? [waitReason] : []),
+    ];
+  }
+
+  if (carryState === 'active') {
+    return [
+      'The lane already has both debt and LP exposure live.',
+      'This refresh mostly rechecks spread, LP coverage, and the health buffer before it decides to keep holding or unwind.',
+      'It does not ask you for a manual size while Auto Carry already owns the lane.',
+      ...(waitReason ? [waitReason] : []),
+    ];
+  }
+
+  return [
+    'Auto Carry reads live lending and stable LP conditions before it does anything.',
+    `With the current setup, about ${AUTO_CARRY_PRACTICAL_SUPPLY_FLOOR_USDC} USDC already supplied in lending is the practical threshold for a fresh carry start.`,
+    'The spread must stay positive after borrow cost, the stable LP lane must be live, and the projected health buffer must clear the safety floor.',
+    ...(waitReason ? [waitReason] : []),
+  ];
+}
+
+function getAutoCarryPhaseLines({ taskId, carryState, assetSymbol }) {
+  if (taskId === 'EXEC_AUTO_CARRY_STOP') {
+    if (carryState === 'manual_lp_conflict') {
+      return [
+        'Turn Auto Carry off.',
+        'Leave the manual stable LP untouched.',
+        'Keep the lane closed until you reopen or convert it later.',
+      ];
+    }
+
+    if (carryState === 'debt_idle') {
+      return [
+        'Turn Auto Carry off first.',
+        `Read the visible ${assetSymbol} debt and the idle ${assetSymbol} balance already sitting in the wallet.`,
+        'Repay immediately only if enough idle balance is already available.',
+        'Leave the lane off after that repay decision.',
+      ];
+    }
+
+    if (carryState === 'active' || carryState === 'unwind') {
+      return [
+        'Turn Auto Carry off first.',
+        'Remove the active stable LP leg.',
+        `Use the recovered ${assetSymbol} flow to repay visible debt.`,
+        'Leave the lane off after the unwind finishes.',
+      ];
+    }
+
+    return [
+      'Turn Auto Carry off.',
+      'Make no LP or lending move because nothing is live to unwind.',
+      'Leave the lane closed until you trigger Start again.',
+    ];
+  }
+
+  if (carryState === 'manual_lp_conflict') {
+    return [
+      'Convert the blocking manual stable LP back into wallet tokens.',
+      'Turn Auto Carry on and run the first live review right away.',
+      `If the checks pass, borrow ${assetSymbol} first.`,
+      'Queue a follow-up carry review about 30 seconds later.',
+      `On the follow-up pass, move the borrowed ${assetSymbol} into the stable LP.`,
+      'After that, keep monitoring and only hold or unwind when the next live checks require it.',
+    ];
+  }
+
+  if (carryState === 'debt_idle') {
+    return [
+      'Keep the lane on and refresh the live review immediately.',
+      `Read the borrowed ${assetSymbol} already sitting idle in the wallet.`,
+      `Deploy that idle ${assetSymbol} into the stable LP on the follow-up pass if the checks still pass.`,
+      'Return to monitoring once the LP and debt are aligned again.',
+    ];
+  }
+
+  if (carryState === 'active') {
+    return [
+      'Refresh the live carry snapshot.',
+      'Recheck borrow cost, LP yield, LP coverage, and the health buffer.',
+      'Keep holding the active lane if those checks still pass.',
+      'Switch to hold or unwind instead if the spread weakens or the position becomes unsafe.',
+    ];
+  }
+
+  return [
+    'Turn Auto Carry on and queue the first live carry review immediately.',
+    'Read supplied collateral, visible borrow room, LP yield, and borrow cost.',
+    `If the checks pass, borrow ${assetSymbol} first.`,
+    'Queue a follow-up carry review about 30 seconds later.',
+    `On that follow-up pass, deploy the borrowed ${assetSymbol} into the stable LP.`,
+    'After the handoff, keep monitoring and only hold or unwind when the next checks say so.',
+  ];
+}
+
+function getAutoCarryProductDetails(taskId, carryContext) {
+  const decision = carryContext?.lastDecision || {};
+  const carryState = String(decision.carryState || 'inactive');
+  const liveManagedAssetSymbol = decision.actionAssetSymbol || decision.selectedAssetSymbol || null;
+  const selectedAssetSymbol = taskId === 'EXEC_AUTO_CARRY_START'
+    && !['active', 'debt_idle', 'unwind'].includes(carryState)
+      ? decision.preferredOpenAssetSymbol || 'USDC'
+      : liveManagedAssetSymbol || decision.preferredOpenAssetSymbol || 'USDC';
+  const lpBalance = Number(decision.lpBalance || 0);
+  const positionValueUsd = Number(decision.positionValueUsd || 0);
+  const netCarryApyPct = Number(decision.netCarryApyPct || 0);
+  const projectedOpenHealthFactor = Number(decision.projectedOpenHealthFactor || 0);
+  const availableBorrowUsd = Number(decision.availableBorrowUsd || 0);
+  const blockedBy = decision.blockedBy || null;
+  const explainer = getAutoCarryExplainer(taskId, selectedAssetSymbol);
+  const requirements = getAutoCarryRequirementLines({
+    taskId,
+    carryState,
+    blockedBy,
+    assetSymbol: selectedAssetSymbol,
+  });
+  const phases = getAutoCarryPhaseLines({
+    taskId,
+    carryState,
+    assetSymbol: selectedAssetSymbol,
+  });
+
+  if (taskId === 'EXEC_AUTO_CARRY_START') {
+    if (carryState === 'manual_lp_conflict') {
+      return {
+        tone: 'amber',
+        title: 'Manual LP will be converted first',
+        body: 'This product removes the blocking manual stable LP into both wallet tokens, then enables Auto Carry and queues the same autonomous carry review. No amount entry is required.',
+        note: lpBalance > 0 || positionValueUsd > 0
+          ? `Current manual LP: ${formatTaskMetricAmount(lpBalance)} LP about ${formatUsdAmount(positionValueUsd)}.`
+          : 'The live LP size is waiting for the next carry refresh.',
+        carryState,
+        selectedAssetSymbol,
+        lpBalance,
+        positionValueUsd,
+        netCarryApyPct,
+        projectedOpenHealthFactor,
+        availableBorrowUsd,
+        blockedBy,
+        explainer,
+        requirements,
+        phases,
+      };
+    }
+
+    if (carryState === 'debt_idle') {
+      return {
+        tone: 'sky',
+        title: 'Borrow is already open and waiting for the next LP step',
+        body: 'This product re-queues the autonomous carry review immediately so the idle borrowed balance can continue into the stable LP lane without waiting for the long scheduler interval.',
+        note: 'No manual amount entry is needed because the current carry lane is read live before the trigger is queued.',
+        carryState,
+        selectedAssetSymbol,
+        lpBalance,
+        positionValueUsd,
+        netCarryApyPct,
+        projectedOpenHealthFactor,
+        availableBorrowUsd,
+        blockedBy,
+        explainer,
+        requirements,
+        phases,
+      };
+    }
+
+    if (carryState === 'active') {
+      return {
+        tone: 'sky',
+        title: 'Carry is already live',
+        body: 'Running this product again does not ask for a size. It only refreshes the same autonomous carry lane and keeps Auto Carry in control of the stable route.',
+        note: 'Use the stop product below if the goal is to unwind and switch the lane off.',
+        carryState,
+        selectedAssetSymbol,
+        lpBalance,
+        positionValueUsd,
+        netCarryApyPct,
+        projectedOpenHealthFactor,
+        availableBorrowUsd,
+        blockedBy,
+        explainer,
+        requirements,
+        phases,
+      };
+    }
+
+    return {
+      tone: 'sky',
+      title: 'Queues the autonomous carry lane with no amount input',
+      body: 'This product enables Auto Carry and queues the same live carry review that the background loop uses. If the spread is not ready yet, the lane stays on and keeps waiting automatically.',
+      note: blockedBy
+        ? `Current wait reason: ${getAutoCarryBlockedReasonLabel(blockedBy, selectedAssetSymbol)}`
+        : 'The carry lane chooses the borrow size on its own from the live lending and LP surface.',
+      carryState,
+      selectedAssetSymbol,
+      lpBalance,
+      positionValueUsd,
+      netCarryApyPct,
+      projectedOpenHealthFactor,
+      availableBorrowUsd,
+      blockedBy,
+      explainer,
+      requirements,
+      phases,
+    };
+  }
+
+  if (carryState === 'manual_lp_conflict') {
+    return {
+      tone: 'rose',
+      title: 'Turns Auto Carry off without taking over the manual LP',
+      body: 'Because the current stable LP is manual, this stop product only turns Auto Carry off. The manual LP stays untouched until a separate manual exit is requested.',
+      note: lpBalance > 0 || positionValueUsd > 0
+        ? `Current manual LP: ${formatTaskMetricAmount(lpBalance)} LP about ${formatUsdAmount(positionValueUsd)}.`
+        : 'No autonomous LP unwind is planned from this state.',
+      carryState,
+      selectedAssetSymbol,
+      lpBalance,
+      positionValueUsd,
+      netCarryApyPct,
+      projectedOpenHealthFactor,
+      availableBorrowUsd,
+      blockedBy,
+      explainer,
+      requirements,
+      phases,
+    };
+  }
+
+  if (carryState === 'debt_idle') {
+    return {
+      tone: 'rose',
+      title: 'Repays idle carry debt before the lane stays off',
+      body: 'This product first turns Auto Carry off, then uses any visible idle wallet balance in the carry asset to repay the current debt leg when that repay is immediately possible.',
+      note: 'If the wallet does not hold enough of the debt asset yet, the lane still turns off and waits for a later manual or automated repay decision.',
+      carryState,
+      selectedAssetSymbol,
+      lpBalance,
+      positionValueUsd,
+      netCarryApyPct,
+      projectedOpenHealthFactor,
+      availableBorrowUsd,
+      blockedBy,
+      explainer,
+      requirements,
+      phases,
+    };
+  }
+
+  if (carryState === 'active' || carryState === 'unwind') {
+    return {
+      tone: 'rose',
+      title: 'Unwinds the live autonomous carry leg',
+      body: 'This product turns Auto Carry off first, then removes the current stable LP and repays visible debt from the same carry asset when the live position can be unwound immediately.',
+      note: 'No manual notional is required because the current LP and debt are read from the live carry state.',
+      carryState,
+      selectedAssetSymbol,
+      lpBalance,
+      positionValueUsd,
+      netCarryApyPct,
+      projectedOpenHealthFactor,
+      availableBorrowUsd,
+      blockedBy,
+      explainer,
+      requirements,
+      phases,
+    };
+  }
+
+  return {
+    tone: 'rose',
+    title: 'Keeps the carry lane closed',
+    body: 'This product simply turns Auto Carry off when there is no active autonomous carry leg to unwind right now.',
+    note: 'Use the start product when the goal is to hand the stable route back to autonomous carry management.',
+    carryState,
+    selectedAssetSymbol,
+    lpBalance,
+    positionValueUsd,
+    netCarryApyPct,
+    projectedOpenHealthFactor,
+    availableBorrowUsd,
+    blockedBy,
+    explainer,
+    requirements,
+    phases,
+  };
+}
+
+function getAutoCarryTaskButtonCopy(taskId, hasResult) {
+  if (taskId === 'EXEC_AUTO_CARRY_START') {
+    return hasResult ? 'Pay & Trigger Again' : 'Pay & Trigger';
+  }
+
+  if (taskId === 'EXEC_AUTO_CARRY_STOP') {
+    return hasResult ? 'Pay & Stop Again' : 'Pay & Stop';
+  }
+
+  return hasResult ? 'Pay & Run Again' : 'Pay & Run';
 }
 
 // ── Tier badge (light mode) ───────────────────────────────────────────────────
@@ -1559,7 +1994,10 @@ function CirclePaidCard({ item, agentId }) {
   );
 }
 
-function getTaskRunErrorMessage(message) {
+function getTaskRunErrorMessage(message, taskId = null) {
+  const normalized = String(message || '').trim();
+  const lower = normalized.toLowerCase();
+
   switch (message) {
     case 'daily_tasks_disabled':
       return 'Enable tasks for this agent before running tasks.';
@@ -1679,6 +2117,12 @@ function getTaskRunErrorMessage(message) {
       return 'The requested liquidation amount is above the visible repayable debt.';
     case 'lending_liquidation_health_unknown':
       return 'Liquidation status cannot be determined until a valid borrower health factor is available.';
+    case 'carry_context_unavailable':
+      return 'The live carry snapshot could not be loaded right now. Retry after the lending and LP surface refreshes.';
+    case 'carry_manual_lp_balance_unavailable':
+      return 'The current manual stable LP balance is not visible yet. Refresh the carry surface, then retry this Auto Carry start product.';
+    case 'lending_surface_unavailable':
+      return 'The live lending surface could not be read right now, so Auto Carry could not continue. Refresh the lending data and retry in a moment.';
     case 'swap_not_configured':
       return 'No direct execution rail is configured for this task on this deployment.';
     case 'direct_pair_not_configured':
@@ -1691,6 +2135,10 @@ function getTaskRunErrorMessage(message) {
     case 'native_lending_liquidation_error':
     case 'native_lending_safe_exit_error':
       return 'The lending worker started but the live on-chain step did not complete successfully.';
+    case 'execution_error':
+      return AUTO_CARRY_TASK_IDS.has(taskId)
+        ? 'Auto Carry reached the live chain step, but the wallet was still busy finishing another on-chain action. Wait a short moment, then try this card again.'
+        : 'The live on-chain step did not finish successfully. Wait a short moment, then try again.';
     case 'wallet_not_configured':
       return 'This agent wallet is not ready for live protocol position checks yet.';
     case 'task_not_found':
@@ -1701,9 +2149,41 @@ function getTaskRunErrorMessage(message) {
       return 'This task is already running. Wait for the current run to finish before starting it again.';
     case 'manual_task_queue_unavailable':
       return 'The task worker is not ready right now. Retry in a moment.';
+    case 'bridge_params_required':
+      return 'Choose the source chain, destination chain and bridge amount before starting this bridge.';
+    case 'stale_task_run_closed':
+      return taskId === 'EXEC_SEPOLIA_GAS_FANOUT'
+        ? 'The previous gas fanout run stopped before the final bridge status was saved. Check Sepolia and destination gas balances, then retry if needed.'
+        : 'The previous task run stopped before the final status was saved. Review balances and retry if needed.';
     case 'bridge_native_topup_error':
       return 'The native gas bridge did not complete successfully.';
     default:
+      if (/insufficient funds/i.test(normalized)) {
+        if (taskId === 'EXEC_SEPOLIA_GAS_FANOUT') {
+          return 'This wallet does not have enough Sepolia ETH to fan out gas to the destination testnets. Fund Sepolia first, then retry this setup task.';
+        }
+
+        if (taskId === 'EXEC_CCTP_BRIDGE') {
+          return 'This bridge could not continue because the wallet does not have enough balance to cover the next on-chain step.';
+        }
+
+        return 'This task could not continue because the wallet did not have enough balance for the required on-chain step.';
+      }
+
+      if (/another transaction is already executing/i.test(lower)) {
+        return AUTO_CARRY_TASK_IDS.has(taskId)
+          ? 'Auto Carry is still waiting for the previous on-chain step to settle. Give it a short moment, then run this card again.'
+          : 'The wallet is still finishing a previous on-chain step. Give it a short moment, then retry.';
+      }
+
+      if (lower === 'worker_interrupted') {
+        return 'The previous worker stopped before this task finished. Review the latest stage and retry if needed.';
+      }
+
+      if (/missing revert data|call_exception/i.test(lower)) {
+        return 'The live on-chain check did not return a usable response. Retry after the lending and LP surface refresh.';
+      }
+
       return message || 'Failed to run task';
   }
 }
@@ -2031,8 +2511,12 @@ function getCirbtcAutomationRuntimeSummary(state, freshness) {
     : baseSummary;
 }
 
-function getCarryLiveSummary(carry) {
+function getCarryLiveSummary(carry, enabled = true) {
   if (!carry || typeof carry !== 'object') return '';
+
+  if (!enabled) {
+    return 'Auto Carry is off. Use Start when you want the stable carry lane to review the live lending and LP state again.';
+  }
 
   if (carry.carryState === 'manual_lp_conflict') {
     return 'Auto Carry is waiting because this stable LP was added manually. Convert it once, then Auto Carry can reopen and manage the next carry position on its own.';
@@ -2079,6 +2563,7 @@ function getCarryStateLabel(carryState) {
 function deriveCarryAutomationDisplayState(state, liveSurface, enabled) {
   const carry = liveSurface?.carry;
   if (!carry || typeof carry !== 'object') return state;
+  const carryEnabled = Boolean(state?.enabled ?? enabled);
 
   const staleStatus = CARRY_STALE_STATUSES.has(String(state?.lastStatus || '').trim().toLowerCase())
     || state?.lastDecision?.reason === 'lending_surface_unavailable'
@@ -2091,6 +2576,7 @@ function deriveCarryAutomationDisplayState(state, liveSurface, enabled) {
     carryState: carry.carryState || state?.lastDecision?.carryState || 'inactive',
     selectedStableToken: carry.selectedAssetSymbol || state?.lastDecision?.selectedStableToken || null,
     actionAssetSymbol: carry.selectedAssetSymbol || state?.lastDecision?.actionAssetSymbol || null,
+    lpBalance: carry?.lpBalance || state?.lastDecision?.lpBalance || null,
     netCarryApyPct: Number.isFinite(liveNetCarryApyPct)
       ? liveNetCarryApyPct
       : state?.lastDecision?.netCarryApyPct,
@@ -2112,13 +2598,28 @@ function deriveCarryAutomationDisplayState(state, liveSurface, enabled) {
       : state?.lastDecision?.blockedBy || null,
   };
 
+  if (!carryEnabled) {
+    nextLastDecision.action = 'auto_carry_stop';
+    nextLastDecision.carryAutomationEnabled = false;
+    nextLastDecision.carryState = 'inactive';
+    nextLastDecision.blockedBy = null;
+    nextLastDecision.summary = getCarryLiveSummary(carry, false);
+
+    return {
+      ...(state || {}),
+      enabled: false,
+      lastStatus: 'disabled',
+      lastDecision: nextLastDecision,
+    };
+  }
+
   if (!nextLastDecision.summary || staleStatus) {
-    nextLastDecision.summary = getCarryLiveSummary(carry) || nextLastDecision.summary || '';
+    nextLastDecision.summary = getCarryLiveSummary(carry, carryEnabled) || nextLastDecision.summary || '';
   }
 
   return {
     ...(state || {}),
-    enabled: state?.enabled ?? enabled,
+    enabled: carryEnabled,
     lastStatus: staleStatus
       ? (enabled ? 'policy_hold' : 'disabled')
       : (state?.lastStatus || (enabled ? 'idle' : 'disabled')),
@@ -2470,10 +2971,19 @@ function getTaskExecutionLinks(payload) {
 
   if (Array.isArray(payload.targets)) {
     payload.targets.forEach((target) => {
+      const destinationTxHash = target.destinationTxHash || null;
+      const sourceTxHash = target.sourceTxHash || target.topUpTxHash || null;
+
       pushTaskExecutionLink(links, {
-        label: `${target.toChain} tx`,
+        label: `${target.toChain} destination tx`,
         chainName: target.toChain,
-        hash: target.topUpTxHash,
+        hash: destinationTxHash,
+      });
+
+      pushTaskExecutionLink(links, {
+        label: `${target.toChain} source tx`,
+        chainName: target.fromChain || payload.fromChain || 'Sepolia',
+        hash: sourceTxHash,
       });
     });
   }
@@ -2681,6 +3191,23 @@ function getTaskResultStatusMeta(task, payload) {
     };
   }
 
+  if (payload?.ok === false) {
+    const failureSummary = getTaskRunErrorMessage(
+      payload?.errorSummary || payload?.error || payload?.summary || payload?.reason || 'task_execution_failed',
+      task?.id,
+    );
+
+    return {
+      label: 'Failed',
+      buttonLabel: 'Failed',
+      panelClasses: 'bg-rose-50/80',
+      iconClasses: 'text-rose-600',
+      titleClasses: 'text-rose-800',
+      detailClasses: 'text-rose-700',
+      summary: failureSummary,
+    };
+  }
+
   return {
     label: getCompletedTaskLabel(task, payload),
     buttonLabel: 'Done',
@@ -2702,7 +3229,7 @@ function isTaskRunActive(run) {
   return ACTIVE_TASK_RUN_STATUSES.has(String(run?.status || '').toLowerCase());
 }
 
-function buildTaskRunResult(task, run) {
+function buildTaskRunResult(task, run, agent = null) {
   if (!run || run.status !== 'completed') return null;
 
   const payload = run.result_payload || {};
@@ -2716,7 +3243,7 @@ function buildTaskRunResult(task, run) {
     created_at: run.completed_at || run.updated_at || run.created_at,
     payload: {
       ...payload,
-      summary: getTaskPayloadSummary(task, payload) || meta.summary,
+      summary: getTaskPayloadSummary(task, payload, agent) || meta.summary,
     },
   };
 }
@@ -2736,8 +3263,54 @@ function formatTaskPercent(value) {
   return numeric.toFixed(2).replace(/\.00$/, '');
 }
 
-function getTaskPayloadSummary(task, payload) {
+function getTaskPayloadSummary(task, payload, agent = null) {
   if (!payload || typeof payload !== 'object') return '';
+
+  if (payload.ok === false) {
+    return getTaskRunErrorMessage(
+      payload.errorSummary || payload.error || payload.summary || payload.reason || 'task_execution_failed',
+      task?.id,
+    );
+  }
+
+  const getLegacyArbSkipSummary = () => {
+    const rawSummary = String(payload.summary || '').trim();
+    if (task?.id !== 'EXEC_ARB') return null;
+    if (!/Stable LP manager/i.test(rawSummary)) return null;
+
+    const blockedBy = String(payload?.stablePolicy?.verdict?.blockedBy || '').trim();
+    if (blockedBy === 'addSizePositive') {
+      return 'No on-chain trade was sent. This task only executes the USDC -> EURC Curve entry leg, and the deployable stable balance available to this task stayed below the minimum actionable entry size.';
+    }
+
+    return 'No on-chain trade was sent. This task only executes the USDC -> EURC Curve entry leg, and the current oracle safety policy did not approve opening a fresh entry at the requested size.';
+  };
+
+  const getInventoryCapSummary = () => {
+    if (task?.id !== 'EXEC_ARB') return null;
+    const blockedBy = String(payload?.oracleStrategyPolicy?.verdict?.blockedBy || '').trim();
+    if (blockedBy !== 'inventoryCap') return null;
+
+    const currentEurcBalance = Number(
+      payload?.oracleInventory?.currentEurcBalance
+      ?? payload?.oracleStrategyPolicy?.metrics?.availableEurcBalance,
+    );
+    const agentInventoryCap = Number(agent?.settings?.oracleMaxEurcInventory || 0);
+    const fallbackAgentCap = Number(agent?.settings?.maxTradeUsdc || agent?.maxTradeUsdc || 0);
+    const payloadInventoryCap = Number(
+      payload?.oracleInventory?.eurcCap
+      ?? payload?.oracleStrategyPolicy?.metrics?.maxEurcInventoryEurc,
+    );
+    const eurcInventoryCap = agentInventoryCap > 0
+      ? agentInventoryCap
+      : (fallbackAgentCap > 0 ? fallbackAgentCap : payloadInventoryCap);
+
+    if (!(Number.isFinite(currentEurcBalance) && Number.isFinite(eurcInventoryCap) && eurcInventoryCap > 0)) {
+      return null;
+    }
+
+    return `No on-chain trade was sent. This task only opens a fresh USDC -> EURC Curve entry, and the agent already holds ${formatTaskMetricAmount(currentEurcBalance)} EURC against a ${formatTaskMetricAmount(eurcInventoryCap)} EURC inventory cap. A new entry stays paused until some EURC rotates back into USDC.`;
+  };
 
   if (task?.id === 'DAILY_ARB_SCAN') {
     const arbOpportunity = payload.signal?.opportunity;
@@ -2775,6 +3348,12 @@ function getTaskPayloadSummary(task, payload) {
     if (hasExecutionTx) {
       return `Executed a signal-driven Curve swap from ${requestedAmount} ${fromToken} to ${toToken}. This task does not complete the bridge or exit leg, so no realized arbitrage profit is claimed here.`;
     }
+
+    const inventoryCapSummary = getInventoryCapSummary();
+    if (inventoryCapSummary) return inventoryCapSummary;
+
+    const legacyArbSkipSummary = getLegacyArbSkipSummary();
+    if (legacyArbSkipSummary) return legacyArbSkipSummary;
 
     if (payload.summary) return payload.summary;
 
@@ -2894,6 +3473,21 @@ function getTaskExecutionFactLines(payload) {
       }
     } else if (payload.direction) {
       facts.push(`Current signal direction: ${payload.direction === 'buy_eurc' ? 'USDC -> EURC' : 'EURC -> USDC'}`);
+    }
+    const currentEurcInventory = Number(payload?.oracleInventory?.currentEurcBalance);
+    const eurcInventoryCap = Number(payload?.oracleInventory?.eurcCap);
+    if (Number.isFinite(currentEurcInventory) && Number.isFinite(eurcInventoryCap) && eurcInventoryCap > 0) {
+      facts.push(`Current EURC inventory: ${formatTaskMetricAmount(currentEurcInventory)} / ${formatTaskMetricAmount(eurcInventoryCap)} cap`);
+      if (payload?.oracleStrategyPolicy?.verdict?.blockedBy === 'inventoryCap') {
+        const capSource = String(payload?.oracleInventory?.capSource || '').trim();
+        if (capSource === 'agent_setting') {
+          facts.push('Inventory rule source: your agent Oracle EURC inventory setting.');
+        } else if (capSource === 'environment_setting') {
+          facts.push('Inventory rule source: the shared Oracle environment cap.');
+        } else if (capSource === 'trade_size_fallback') {
+          facts.push('Inventory rule source: fallback to the Oracle trade-size cap.');
+        }
+      }
     }
     if (arbOpportunity.found === false) {
       facts.push('Signal outcome: the full-route oracle model is not profitable right now.');
@@ -3077,7 +3671,8 @@ function getReputationSetupItems(reputationOverview) {
   ];
 }
 
-function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking }) {
+function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking, agentId }) {
+  const [proofOpen, setProofOpen] = useState(false);
   const setupItems = getReputationSetupItems(reputationOverview);
   const onchain = reputationOverview?.onchain || {};
   const modeLabel = reputationOverview?.mode === 'hybrid' ? 'Local + On-Chain' : 'Local Only';
@@ -3087,6 +3682,7 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
     : null;
 
   return (
+    <>
     <Card className="space-y-4 border-blue-100 bg-[radial-gradient(circle_at_top_left,rgba(219,234,254,0.9),rgba(236,253,245,0.9),rgba(255,255,255,1))]">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div className="max-w-3xl">
@@ -3150,6 +3746,16 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
             {onchain.status === 'live' ? Number(onchain.score || 0) : '—'}
           </p>
           <p className="text-xs text-slate-500">{getOnchainReputationMessage(onchain)}</p>
+          {onchain.status === 'live' && agentId && (
+            <button
+              type="button"
+              onClick={() => setProofOpen(true)}
+              className="mt-2 inline-flex items-center gap-1 text-[11px] font-medium text-blue-600 hover:text-blue-800 transition"
+            >
+              <ShieldCheck size={11} />
+              View on-chain proof
+            </button>
+          )}
         </div>
         <div className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Identity Link</p>
@@ -3224,11 +3830,15 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
         <AddressBox address={onchain.contractAddress} label="Reputation Registry Contract" compact />
       )}
     </Card>
-  );
+
+    {proofOpen && agentId && (
+      <ReputationProofModal agentId={agentId} onClose={() => setProofOpen(false)} />
+    )}
+  </>);
 }
 
 // ── Task Card with persistent run status ──────────────────────────────────────
-function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQueued, highlighted, recommendationReason }) {
+function TaskCard({ task, agent, agentId, tasksEnabled, latestRun, latestResult, onRunQueued, highlighted, recommendationReason, carryContext = null, sharedActiveRun = null }) {
   const [busy, setBusy]         = useState(false);
   const [err, setErr]           = useState('');
   const [expanded, setExpanded] = useState(false);
@@ -3237,28 +3847,72 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
   const isPaid      = task.tier === 2;
   const isBlocked   = !tasksEnabled;
   const needsParams = isExecutionTask(task.id);
-  const activeRun   = isTaskRunActive(latestRun) ? latestRun : null;
+  const isAutoCarryTask = AUTO_CARRY_TASK_IDS.has(task.id);
+  const ownActiveRun = isTaskRunActive(latestRun) ? latestRun : null;
+  const blockingPeerRun = isAutoCarryTask
+    && sharedActiveRun
+    && isTaskRunActive(sharedActiveRun)
+    && sharedActiveRun.id !== latestRun?.id
+      ? sharedActiveRun
+      : null;
+  const activeRun   = ownActiveRun;
   const failedRun   = latestRun?.status === 'failed' ? latestRun : null;
   const result      = activeRun
     ? null
-    : buildTaskRunResult(task, latestRun) || latestResult || null;
+    : buildTaskRunResult(task, latestRun, agent) || latestResult || null;
   const resultFacts = result ? getTaskExecutionFactLines(result.payload) : [];
   const resultLinks = result ? getTaskExecutionLinks(result.payload) : [];
   const resultMeta  = result ? getTaskResultStatusMeta(task, result.payload || {}) : null;
   const resultHistoryLabel = result ? getTaskResultHistoryLabel(resultMeta) : '';
-  const summaryText = result ? getTaskPayloadSummary(task, result.payload || {}) : '';
+  const summaryText = result ? getTaskPayloadSummary(task, result.payload || {}, agent) : '';
   const arbReferenceAmountUsdc = task.id === 'DAILY_ARB_SCAN'
     ? getArbDisplayAmountUsdc(result?.payload || {})
     : 0;
+  const taskDescription = task.id === 'EXEC_ARB'
+    ? 'Manual signal entry on the Curve leg only. This task does not bridge out or sell back into USDC.'
+    : task.description;
   const operationalAlert = getTaskOperationalAlert(task);
-  const errorMessage = err || (!activeRun && failedRun ? getTaskRunErrorMessage(failedRun.error || failedRun.stage_detail || failedRun.stage_label) : '');
+  const autoCarryDetails = AUTO_CARRY_TASK_IDS.has(task.id)
+    ? getAutoCarryProductDetails(task.id, carryContext)
+    : null;
+  const autoCarryTone = autoCarryDetails ? getAutoCarryTaskToneClasses(autoCarryDetails.tone) : null;
+  const paidButtonLabel = getAutoCarryTaskButtonCopy(task.id, Boolean(result));
+  const errorMessage = err || '';
+  const failedRunMessage = !activeRun && failedRun
+    ? getTaskRunErrorMessage(
+      failedRun.result_payload?.errorSummary
+        || failedRun.result_payload?.error
+        || failedRun.stage_detail
+        || failedRun.result_payload?.summary
+        || failedRun.result_payload?.reason
+        || failedRun.error
+        || failedRun.stage_key
+        || failedRun.stage_label,
+      task.id,
+    )
+    : '';
+  const peerLockTaskLabel = blockingPeerRun?.task_id === 'EXEC_AUTO_CARRY_START'
+    ? 'Auto Carry Start'
+    : blockingPeerRun?.task_id === 'EXEC_AUTO_CARRY_STOP'
+      ? 'Auto Carry Stop'
+      : 'another Auto Carry product';
 
   useEffect(() => {
     setParams(getInitialTaskParams(task.id));
   }, [task.id]);
 
+  useEffect(() => {
+    setErr('');
+  }, [agentId, task.id, latestRun?.id, latestRun?.status]);
+
+  useEffect(() => {
+    if (isAutoCarryTask && (activeRun || blockingPeerRun || failedRun)) {
+      setExpanded(true);
+    }
+  }, [isAutoCarryTask, activeRun, blockingPeerRun, failedRun]);
+
   async function handleRun() {
-    if (!agentId || isBlocked || activeRun) return;
+    if (!agentId || isBlocked || activeRun || blockingPeerRun) return;
     if (needsParams && !expanded) {
       setExpanded(true);
       return;
@@ -3300,7 +3954,7 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
         onRunQueued?.(e.data.run);
         setExpanded(true);
       }
-      setErr(getTaskRunErrorMessage(e.message));
+      setErr(getTaskRunErrorMessage(e.message, task.id));
     } finally {
       setBusy(false);
     }
@@ -3329,6 +3983,11 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
                   {resultHistoryLabel}
                 </span>
               )}
+              {failedRun && !activeRun && !result && (
+                <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700">
+                  Last failed
+                </span>
+              )}
               {operationalAlert && (
                 <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
                   {operationalAlert.badge}
@@ -3342,13 +4001,18 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
             </div>
             {!expanded && (
               <>
-                <p className="text-xs text-slate-500 mt-0.5 truncate">{task.description}</p>
+                <p className="text-xs text-slate-500 mt-0.5 truncate">{taskDescription}</p>
                 {operationalAlert && (
                   <p className="text-[11px] text-amber-700 mt-1 truncate">{operationalAlert.title}</p>
                 )}
                 {result && !activeRun && (
                   <p className="text-[11px] text-emerald-700 mt-1 truncate">
                     {resultHistoryLabel} {formatTimestamp(result.created_at)}
+                  </p>
+                )}
+                {failedRun && !activeRun && !result && (
+                  <p className="text-[11px] text-rose-700 mt-1 truncate">
+                    Last failed {formatTimestamp(failedRun.updated_at || failedRun.created_at)}
                   </p>
                 )}
                 {highlighted && recommendationReason && (
@@ -3364,7 +4028,7 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
 
         <button
           onClick={handleRun}
-          disabled={busy || !agentId || Boolean(activeRun) || isBlocked}
+          disabled={busy || !agentId || Boolean(activeRun) || Boolean(blockingPeerRun) || isBlocked}
           className={`shrink-0 flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition
             ${isBlocked
               ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
@@ -3377,14 +4041,16 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
             ? <><Spinner size={11} /> Starting…</>
             : activeRun
               ? <><Spinner size={11} /> In Progress</>
+              : blockingPeerRun
+                ? <><Lock size={11} /> Locked</>
               : needsParams && !expanded
                 ? 'Configure'
               : result
                 ? isPaid
-                  ? <><Coins size={11} /> Pay &amp; Run Again</>
+                  ? <><Coins size={11} /> {paidButtonLabel}</>
                   : <><Play size={11} /> Run Again</>
                 : isPaid
-                  ? <><Coins size={11} /> Pay &amp; Run</>
+                  ? <><Coins size={11} /> {paidButtonLabel}</>
                   : <><Play size={11} /> Run</>}
         </button>
       </div>
@@ -3392,7 +4058,13 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
       {/* Expanded detail */}
       {expanded && (
         <div className="px-4 pb-3 border-t border-slate-100 pt-2.5 space-y-2">
-          <p className="text-xs text-slate-500">{task.description}</p>
+          <p className="text-xs text-slate-500">{taskDescription}</p>
+          {task.id === 'EXEC_ARB' && (
+            <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+              <p className="font-semibold text-sky-900">This is not a full arbitrage round trip</p>
+              <p className="mt-1">The paid task only executes the Curve entry leg when EURC looks cheap on Arc. It does not bridge out, it does not force an immediate sell-back into USDC, and it does not claim realized arbitrage profit by itself. Full round-trip behavior belongs to the autonomous oracle lane when the live exit route is strong enough.</p>
+            </div>
+          )}
           {FREE_TASK_SIMULATION_IDS.has(task.id) && (
             <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
               <p>
@@ -3405,6 +4077,77 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
             <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <p className="font-semibold text-amber-900">{operationalAlert.title}</p>
               <p className="mt-1">{operationalAlert.body}</p>
+            </div>
+          )}
+          {autoCarryDetails && autoCarryTone && (
+            <div className={`rounded-lg border px-3 py-3 ${autoCarryTone.card}`}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <p className={`text-[11px] font-semibold uppercase tracking-wide ${autoCarryTone.eyebrow}`}>{autoCarryDetails.title}</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">Current lane: {getCarryStateLabel(autoCarryDetails.carryState)}</p>
+                  <p className="mt-2 text-xs leading-5 text-slate-700">{autoCarryDetails.explainer}</p>
+                  <p className={`mt-1 text-xs leading-5 ${autoCarryTone.body}`}>{autoCarryDetails.body}</p>
+                  {autoCarryDetails.note && (
+                    <p className={`mt-2 text-xs leading-5 ${autoCarryTone.note}`}>{autoCarryDetails.note}</p>
+                  )}
+                </div>
+                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${autoCarryTone.badge}`}>
+                  {autoCarryDetails.selectedAssetSymbol}
+                </span>
+              </div>
+
+              <div className="mt-3 grid gap-2 md:grid-cols-2">
+                <div className="rounded-lg border border-white/70 bg-white px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">When it will act</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-5 text-slate-600">
+                    {autoCarryDetails.requirements.map((line) => (
+                      <li key={line}>{line}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="rounded-lg border border-white/70 bg-white px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">How the flow works</p>
+                  <ol className="mt-2 list-decimal space-y-1 pl-4 text-xs leading-5 text-slate-600">
+                    {autoCarryDetails.phases.map((line) => (
+                      <li key={line}>{line}</li>
+                    ))}
+                  </ol>
+                </div>
+              </div>
+
+              <div className={`mt-3 grid gap-2 ${Number.isFinite(autoCarryDetails.availableBorrowUsd) && autoCarryDetails.availableBorrowUsd > 0 ? 'md:grid-cols-4' : 'md:grid-cols-3'}`}>
+                {Number.isFinite(autoCarryDetails.availableBorrowUsd) && autoCarryDetails.availableBorrowUsd > 0 && (
+                  <div className="rounded-lg border border-white/70 bg-white px-3 py-2">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Visible Borrow</p>
+                    <p className="mt-1 text-sm font-medium text-slate-700">{formatUsdAmount(autoCarryDetails.availableBorrowUsd)}</p>
+                  </div>
+                )}
+                <div className="rounded-lg border border-white/70 bg-white px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Visible LP</p>
+                  <p className="mt-1 text-sm font-medium text-slate-700">{formatTaskMetricAmount(autoCarryDetails.lpBalance)}</p>
+                </div>
+                <div className="rounded-lg border border-white/70 bg-white px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">LP Value</p>
+                  <p className="mt-1 text-sm font-medium text-slate-700">{formatUsdAmount(autoCarryDetails.positionValueUsd)}</p>
+                </div>
+                <div className="rounded-lg border border-white/70 bg-white px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Projected Safety</p>
+                  <p className="mt-1 text-sm font-medium text-slate-700">{formatAutomationMetric(autoCarryDetails.projectedOpenHealthFactor, 4)}</p>
+                </div>
+              </div>
+
+              {Number.isFinite(autoCarryDetails.netCarryApyPct) && autoCarryDetails.netCarryApyPct !== 0 && (
+                <p className="mt-2 text-xs text-slate-600">Latest estimated net carry: {formatAutomationMetric(autoCarryDetails.netCarryApyPct, 2)}% yearly.</p>
+              )}
+            </div>
+          )}
+          {failedRunMessage && (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+              <p className="font-semibold text-rose-900">Last failed run</p>
+              <p className="mt-1">{failedRunMessage}</p>
+              <p className="mt-1 text-[11px] text-rose-700/80">
+                {formatTimestamp(failedRun.updated_at || failedRun.created_at)}
+              </p>
             </div>
           )}
           {needsParams && (
@@ -3777,6 +4520,21 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
         </div>
       )}
 
+      {blockingPeerRun && (
+        <div className="px-4 pb-3 border-t border-slate-100 pt-2.5 bg-amber-50/70">
+          <div className="flex items-start gap-2">
+            <Lock size={13} className="text-amber-600 shrink-0 mt-0.5" />
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-semibold text-amber-800">Locked by {peerLockTaskLabel}</p>
+              <p className="text-xs mt-0.5 text-amber-700">Another Auto Carry product is already running. This card stays locked until that run finishes or fails.</p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Started {formatTimestamp(blockingPeerRun.created_at)} · Last update {formatTimestamp(blockingPeerRun.updated_at || blockingPeerRun.created_at)}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Active run panel */}
       {activeRun && (
         <div className="px-4 pb-3 border-t border-slate-100 pt-2.5 bg-blue-50/70">
@@ -3852,12 +4610,12 @@ function TaskCard({ task, agentId, tasksEnabled, latestRun, latestResult, onRunQ
 }
 
 // ── Recent result row (light mode) ────────────────────────────────────────────
-function ResultRow({ result }) {
+function ResultRow({ result, agent = null }) {
   const [expanded, setExpanded] = useState(false);
   const ts = new Date(result.created_at).toLocaleTimeString();
   const factLines = getTaskExecutionFactLines(result.payload);
   const executionLinks = getTaskExecutionLinks(result.payload);
-  const summaryText = getTaskPayloadSummary({ id: result.task_id, title: result.title }, result.payload || {});
+  const summaryText = getTaskPayloadSummary({ id: result.task_id, title: result.title }, result.payload || {}, agent);
   const hasRenderableContent = Boolean(summaryText) || factLines.length > 0 || executionLinks.length > 0;
 
   return (
@@ -3970,7 +4728,7 @@ export default function TasksTab() {
         agent?.id
           ? agentsApi.status(agent.id).then(data => ({ data })).catch(err => ({ error: err.message }))
           : Promise.resolve(null),
-        agent?.id && agent?.features?.carryAutomationEnabled
+        agent?.id
           ? agentsApi.lending(agent.id).then(data => ({ data })).catch(err => ({ error: err.message }))
           : Promise.resolve(null),
         agent?.id
@@ -4045,6 +4803,23 @@ export default function TasksTab() {
       clearInterval(interval);
     };
   }, [agent?.id, hasActiveTaskRun, load]);
+
+  useEffect(() => {
+    const latestAutoCarryResult = results.find(result => AUTO_CARRY_TASK_IDS.has(result.task_id));
+    const nextEnabled = latestAutoCarryResult?.payload?.carryAutomationEnabled;
+
+    if (typeof nextEnabled !== 'boolean') return;
+
+    setAgent((current) => (current
+      ? {
+          ...current,
+          features: {
+            ...(current.features || {}),
+            carryAutomationEnabled: nextEnabled,
+          },
+        }
+      : current));
+  }, [results, setAgent]);
 
   async function handleEnableToggle(newVal) {
     if (!agent?.id) return;
@@ -4181,6 +4956,7 @@ export default function TasksTab() {
       latestTaskResultById.set(result.task_id, result);
     }
   }
+  const activeCarryProductRun = taskRuns.find(run => AUTO_CARRY_TASK_IDS.has(run.task_id) && isTaskRunActive(run)) || null;
 
   const visibleTaskIds = new Set([
     ...freeTasks.map(task => task.id),
@@ -4193,6 +4969,11 @@ export default function TasksTab() {
     : activeGroup === 'paid'
       ? paidTasks
       : [];
+  const paidCarryAutomationState = deriveCarryAutomationDisplayState(
+    agentStatus?.automation?.carryAutomation || null,
+    carryLiveSurface,
+    agent?.features?.carryAutomationEnabled ?? false,
+  );
   const paidTaskGroups = PAID_TASK_GROUPS
     .map(group => ({
       ...group,
@@ -4314,6 +5095,13 @@ export default function TasksTab() {
         const automationState = feature.statusKey === 'carryAutomation'
           ? deriveCarryAutomationDisplayState(rawAutomationState, carryLiveSurface, enabled)
           : rawAutomationState;
+        const liveCarry = feature.statusKey === 'carryAutomation' ? carryLiveSurface?.carry || null : null;
+        const carryLpBalance = feature.statusKey === 'carryAutomation'
+          ? Number(automationState?.lastDecision?.lpBalance ?? liveCarry?.lpBalance ?? 0)
+          : 0;
+        const carryPositionValueUsd = feature.statusKey === 'carryAutomation'
+          ? Number(automationState?.lastDecision?.positionValueUsd ?? liveCarry?.positionValueUsd ?? 0)
+          : 0;
         const cirbtcFreshness = feature.statusKey === 'cirbtcLp'
           ? getCirbtcAutomationFreshness(agentStatus?.automation?.defiLoop || null, automationState)
           : null;
@@ -4492,10 +5280,15 @@ export default function TasksTab() {
 
                     {automationState.lastDecision.carryState === 'manual_lp_conflict' && (
                       <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3">
-                        <p className="text-xs font-semibold text-amber-800">Needs carry conversion</p>
+                        <p className="text-xs font-semibold text-amber-800">Manual LP is blocking Auto Carry</p>
                         <p className="mt-1 text-xs leading-5 text-amber-900">
-                          The current stable LP was opened outside Auto Carry, so this lane is intentionally waiting. Open DeFi &gt; Lending and use the carry conversion action there to remove the manual LP first. Auto Carry can then reopen and own the position on its own if the spread still passes.
+                          This lane is intentionally waiting because the current stable LP was opened outside Auto Carry. Use Paid &gt; Auto Carry Products &gt; Auto Carry Start to convert that LP into wallet balances first, then hand the route back to the autonomous carry lane without entering an amount.
                         </p>
+                        {(carryLpBalance > 0 || carryPositionValueUsd > 0) && (
+                          <p className="mt-2 text-xs leading-5 text-amber-800">
+                            Current manual LP: {formatTaskMetricAmount(carryLpBalance)} LP about {formatUsdAmount(carryPositionValueUsd)}.
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>
@@ -4717,8 +5510,11 @@ export default function TasksTab() {
               <TaskCard
                 key={task.id}
                 task={task}
+                agent={agent}
                 agentId={agent?.id}
                 tasksEnabled={tasksEnabled}
+                carryContext={paidCarryAutomationState}
+                sharedActiveRun={activeCarryProductRun}
                 latestRun={latestTaskRunById.get(task.id) || null}
                 latestResult={latestTaskResultById.get(task.id) || null}
                 onRunQueued={(run) => {
@@ -4749,8 +5545,11 @@ export default function TasksTab() {
               <TaskCard
                 key={task.id}
                 task={task}
+                agent={agent}
                 agentId={agent?.id}
                 tasksEnabled={tasksEnabled}
+                carryContext={paidCarryAutomationState}
+                sharedActiveRun={activeCarryProductRun}
                 latestRun={latestTaskRunById.get(task.id) || null}
                 latestResult={latestTaskResultById.get(task.id) || null}
                 onRunQueued={(run) => {
@@ -4769,8 +5568,11 @@ export default function TasksTab() {
         <TaskCard
           key={task.id}
           task={task}
+          agent={agent}
           agentId={agent?.id}
           tasksEnabled={tasksEnabled}
+          carryContext={paidCarryAutomationState}
+          sharedActiveRun={activeCarryProductRun}
           latestRun={latestTaskRunById.get(task.id) || null}
           latestResult={latestTaskResultById.get(task.id) || null}
           onRunQueued={(run) => {
@@ -4796,6 +5598,7 @@ export default function TasksTab() {
         reputationOverview={reputationOverview}
         trackingBusy={automationSavingKey === 'reputationEnabled'}
         onToggleTracking={(nextValue) => handleAutomationToggle('reputationEnabled', nextValue)}
+        agentId={agent?.id}
       />
 
       <Card>
@@ -4988,7 +5791,7 @@ export default function TasksTab() {
           <h3 className="text-lg font-semibold text-slate-900 mb-4">Recent Executions</h3>
           <div className="space-y-1.5">
             {visibleResults.slice(0, 10).map(r => (
-              <ResultRow key={r.id} result={r} />
+              <ResultRow key={r.id} result={r} agent={agent} />
             ))}
           </div>
         </Card>

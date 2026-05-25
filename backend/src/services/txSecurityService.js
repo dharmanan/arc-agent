@@ -8,6 +8,7 @@ const { recordSecurityEvent, recordSuspiciousAgentActivity } = require('./securi
 const DEFAULT_TX_RATE_LIMIT_WINDOW_SEC = readPositiveIntegerEnv('AGENT_TX_RATE_LIMIT_WINDOW_SEC', 60);
 const DEFAULT_TX_RATE_LIMIT_MAX = readPositiveIntegerEnv('AGENT_TX_RATE_LIMIT_MAX', 12);
 const DEFAULT_CHAIN_LOCK_TTL_SEC = readPositiveIntegerEnv('AGENT_TX_CHAIN_LOCK_TTL_SEC', 120);
+const DEFAULT_CHAIN_LOCK_WAIT_MS = readNonNegativeIntegerEnv('AGENT_TX_CHAIN_LOCK_WAIT_MS', 45000);
 const DEFAULT_REPLAY_TTL_SEC = readPositiveIntegerEnv('AGENT_TX_REPLAY_TTL_SEC', 45);
 const DEFAULT_GAS_MARGIN_BPS = readPositiveBigIntEnv('AGENT_TX_GAS_MARGIN_BPS', 12500n);
 
@@ -18,6 +19,11 @@ const memoryCounters = new Map();
 function readPositiveIntegerEnv(name, fallback) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function readNonNegativeIntegerEnv(name, fallback) {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function readPositiveBigIntEnv(name, fallback) {
@@ -61,10 +67,10 @@ function normalizeWalletAddress(walletAddress) {
 }
 
 function resolveAgentKey({ agentId, walletAddress }) {
-  if (agentId) return `agent:${String(agentId).trim()}`;
-
   const normalizedWallet = normalizeWalletAddress(walletAddress);
   if (normalizedWallet) return `wallet:${normalizedWallet}`;
+
+  if (agentId) return `agent:${String(agentId).trim()}`;
 
   throw Object.assign(new Error('Missing agent identity for protected transaction execution'), {
     status: 500,
@@ -138,6 +144,10 @@ async function getRedisClient() {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function pruneMemoryMap(map) {
   const now = Date.now();
   for (const [key, value] of map.entries()) {
@@ -147,16 +157,14 @@ function pruneMemoryMap(map) {
   }
 }
 
-async function acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec }) {
+async function tryAcquireChainLock({ agentKey, chainKey, lockTtlSec }) {
   const client = await getRedisClient();
   const key = buildLockKey(agentKey, chainKey);
   const token = crypto.randomUUID();
 
   if (client) {
     const result = await client.set(key, token, 'NX', 'EX', lockTtlSec).catch(() => null);
-    if (result !== 'OK') {
-      throw buildBusyError(chainName);
-    }
+    if (result !== 'OK') return null;
 
     return async () => {
       const releaseScript = `
@@ -172,7 +180,7 @@ async function acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec }) {
   pruneMemoryMap(memoryLocks);
   const existing = memoryLocks.get(key);
   if (existing && existing.expiresAt > Date.now()) {
-    throw buildBusyError(chainName);
+    return null;
   }
 
   memoryLocks.set(key, { token, expiresAt: Date.now() + (lockTtlSec * 1000) });
@@ -182,6 +190,22 @@ async function acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec }) {
       memoryLocks.delete(key);
     }
   };
+}
+
+async function acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec, waitForLockMs = DEFAULT_CHAIN_LOCK_WAIT_MS }) {
+  const timeoutMs = Math.max(Number(waitForLockMs) || 0, 0);
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    const releaseLock = await tryAcquireChainLock({ agentKey, chainKey, lockTtlSec });
+    if (releaseLock) return releaseLock;
+
+    if (Date.now() >= deadline) {
+      throw buildBusyError(chainName);
+    }
+
+    await sleep(Math.min(250, Math.max(deadline - Date.now(), 1)));
+  }
 }
 
 async function assertReplayNotSeen(replayKey) {
@@ -340,6 +364,7 @@ async function sendProtectedContractTx({
   rateLimitMax = DEFAULT_TX_RATE_LIMIT_MAX,
   windowSec = DEFAULT_TX_RATE_LIMIT_WINDOW_SEC,
   lockTtlSec = DEFAULT_CHAIN_LOCK_TTL_SEC,
+  waitForLockMs = DEFAULT_CHAIN_LOCK_WAIT_MS,
   gasMarginBps = DEFAULT_GAS_MARGIN_BPS,
   waitConfirmations = 1,
 }) {
@@ -348,7 +373,7 @@ async function sendProtectedContractTx({
   const agentKey = resolveAgentKey({ agentId, walletAddress: signerAddress });
   const chainKey = normalizeChainName(chainName);
   const replayKey = buildReplayKey(agentKey, chainKey, operation, resolveReplayFingerprint({ replayFingerprint, methodName, args }));
-  const releaseLock = await acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec });
+  const releaseLock = await acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec, waitForLockMs });
 
   try {
     await assertReplayNotSeen(replayKey);
@@ -404,11 +429,12 @@ async function runProtectedWrite({
   rateLimitMax = DEFAULT_TX_RATE_LIMIT_MAX,
   windowSec = DEFAULT_TX_RATE_LIMIT_WINDOW_SEC,
   lockTtlSec = DEFAULT_CHAIN_LOCK_TTL_SEC,
+  waitForLockMs = DEFAULT_CHAIN_LOCK_WAIT_MS,
 }, execute) {
   const agentKey = resolveAgentKey({ agentId, walletAddress });
   const chainKey = normalizeChainName(chainName);
   const replayKey = buildReplayKey(agentKey, chainKey, operation, replayFingerprint);
-  const releaseLock = await acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec });
+  const releaseLock = await acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec, waitForLockMs });
 
   try {
     await assertReplayNotSeen(replayKey);

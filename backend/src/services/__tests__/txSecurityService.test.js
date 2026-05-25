@@ -7,6 +7,7 @@ const SECOND_TX_HASH = `0x${'2'.repeat(64)}`;
 function loadHarness() {
   jest.resetModules();
   process.env.NODE_ENV = 'test';
+  process.env.AGENT_TX_CHAIN_LOCK_WAIT_MS = '0';
 
   let service;
   jest.isolateModules(() => {
@@ -66,6 +67,45 @@ describe('txSecurityService', () => {
 
     await expect(service.runProtectedWrite({
       chainName: 'Arc Testnet',
+      walletAddress: TEST_WALLET_ADDRESS,
+      operation: 'agent_send',
+      replayFingerprint: ['second-send'],
+    }, async () => ({ txHash: SECOND_TX_HASH }))).rejects.toMatchObject({
+      code: 'AGENT_TX_BUSY',
+      status: 409,
+    });
+
+    unblockFirstWrite();
+    await firstWrite;
+  });
+
+  test('uses wallet address as the shared lock identity when agent id is also present', async () => {
+    const service = loadHarness();
+
+    let unblockFirstWrite;
+    let markStarted;
+    const started = new Promise((resolve) => {
+      markStarted = resolve;
+    });
+
+    const firstWrite = service.runProtectedWrite({
+      chainName: 'Arc Testnet',
+      agentId: 'agent-a',
+      walletAddress: TEST_WALLET_ADDRESS,
+      operation: 'agent_send',
+      replayFingerprint: ['first-send'],
+    }, async () => {
+      markStarted();
+      return new Promise((resolve) => {
+        unblockFirstWrite = () => resolve({ txHash: TEST_TX_HASH });
+      });
+    });
+
+    await started;
+
+    await expect(service.runProtectedWrite({
+      chainName: 'Arc Testnet',
+      agentId: 'agent-b',
       walletAddress: TEST_WALLET_ADDRESS,
       operation: 'agent_send',
       replayFingerprint: ['second-send'],

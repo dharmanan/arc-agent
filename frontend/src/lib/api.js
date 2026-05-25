@@ -89,6 +89,7 @@ export const agents = {
     return get(`/agents/${id}/rewards${suffix}`);
   },
   reputation:        (id, limit) => get(`/agents/${id}/reputation${limit ? `?limit=${limit}` : ''}`),
+  reputationProof:   (id)        => get(`/agents/${id}/reputation/proof`),
   delete:            (id)        => del(`/agents/${id}`),
   retryIdentity:     (id)        => post(`/agents/${id}/register-identity`),
 };

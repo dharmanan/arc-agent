@@ -549,6 +549,14 @@ function getMarketAnalysisStatus(marketAnalysisState, lastDecision) {
     };
   }
 
+  if (status === 'cap_reached') {
+    return {
+      tone: 'amber',
+      label: humanizeAutomationStatus(status),
+      detail: lastDecision?.action || "Market analysis is paused until this agent's daily DeFi automation cap resets.",
+    };
+  }
+
   if (['permission_blocked', 'disabled'].includes(status)) {
     return {
       tone: 'amber',
@@ -1002,6 +1010,40 @@ function getOracleSignalFollowUp(tx, allTxs) {
   }) || null;
 }
 
+function getRecentActivityStatus(tx) {
+  const meta = getTxMeta(tx);
+
+  if (tx?.type === 'oracle_signal') {
+    return {
+      label: 'snapshot',
+      variant: 'slate',
+    };
+  }
+
+  if (meta.executionState === 'daily_cap_reached') {
+    return {
+      label: 'limit reached',
+      variant: 'yellow',
+    };
+  }
+
+  if (meta.executionState === 'insufficient_balance') {
+    return {
+      label: 'balance hold',
+      variant: 'yellow',
+    };
+  }
+
+  return {
+    label: tx?.status || 'pending',
+    variant: tx?.status === 'confirmed'
+      ? 'green'
+      : tx?.status === 'failed'
+        ? 'red'
+        : 'yellow',
+  };
+}
+
 function getVisibleRecentActivity(allTxs = [], agentStatus = null) {
   const visible = [];
   const seenOracleSnapshots = new Set();
@@ -1144,12 +1186,13 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const tradableBalanceLabel = formatTokenAmountWithZero(meta.availableToTradeUsdc, inputToken);
     const reservedBalanceLabel = formatTokenAmountWithZero(meta.walletReserveUsdc, inputToken);
     const summarizedError = summarizeActivityError(meta.error);
+    const dailyCapSummary = normalizeActivitySummary(meta.summary);
     const txHash = tx.tx_hash || tx.txHash || null;
     const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
 
     let phase = null;
     if (meta.executionState === 'daily_cap_reached') {
-      phase = `Autonomous execution did not run because this agent already used ${Number(meta.dailyCapCount || 0)}/${Number(meta.dailyCap || 10)} daily DeFi loop runs. No on-chain trade was submitted.`;
+      phase = `Autonomous execution did not run because this agent already used ${Number(meta.dailyCapCount || 0)}/${Number(meta.dailyCap || 10)} daily DeFi loop runs. ${dailyCapSummary || 'The next oracle strategy review was skipped before pricing, so no trade quote or transaction draft was created.'}`;
     } else if (meta.executionState === 'insufficient_balance') {
       phase = tradableBalanceLabel && reservedBalanceLabel && Number(meta.walletReserveUsdc) > 0
         ? `Skipped before execution. Requested ${requestedAmountLabel || inputAmountLabel || `1 ${inputToken}`}, the wallet held ${availableBalanceLabel || `0 ${inputToken}`}, but ${reservedBalanceLabel} was kept reserved, leaving ${tradableBalanceLabel} available for autonomous trading. No on-chain trade was submitted.`
@@ -1542,13 +1585,17 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
         ? 'Simulation only. No on-chain gas top-ups were submitted.'
         : `Confirmed native gas top-ups for ${targetChains.join(', ')}.`,
       links: meta.targets.map((target, index) => {
-        const url = getExplorerTxUrl(target.toChain, target.topUpTxHash);
+        const destinationTxHash = target.destinationTxHash || null;
+        const sourceTxHash = target.sourceTxHash || target.topUpTxHash || null;
+        const linkHash = destinationTxHash || sourceTxHash;
+        const linkChain = destinationTxHash ? target.toChain : (target.fromChain || sourceChain);
+        const url = getExplorerTxUrl(linkChain, linkHash);
         if (!url) return null;
 
         return {
           key: `${tx.id}-gas-fanout-${index}`,
-          label: `${target.toChain} tx`,
-          hash: target.topUpTxHash,
+          label: destinationTxHash ? `${target.toChain} destination tx` : `${target.toChain} source tx`,
+          hash: linkHash,
           url,
         };
       }).filter(Boolean),
@@ -1697,6 +1744,31 @@ export default function DashboardTab({ onNavigate }) {
   const stableManualCooldownActive = Number.isFinite(Date.parse(stableManualCooldownUntil || '')) && Date.parse(stableManualCooldownUntil) > Date.now();
   const cirbtcStatusMissingFromBackend = Boolean(agentStatus?.automation && !agentStatus?.automation?.cirbtcLp);
   const cirbtcLoopState = agentStatus?.automation?.cirbtcLp || null;
+  const sharedDefiDailyCapReached = Boolean(
+    defiLoopState
+    && !defiLoopState?.bypassDailyCap
+    && Number(defiLoopState?.dailyCap || 0) > 0
+    && Number(defiLoopState?.todayCount || 0) >= Number(defiLoopState?.dailyCap || 0),
+  );
+  const sharedDefiDailyCapResetsAt = defiLoopState?.dailyCapResetsAt
+    || cirbtcLoopState?.dailyCapResetsAt
+    || marketAnalysisState?.dailyCapResetsAt
+    || agentStatus?.automation?.oracle?.dailyCapResetsAt
+    || null;
+  const suspendScanJobsWhenDefiCapReached = agentStatus?.config?.suspendScanJobsWhenDefiCapReached === true;
+  const sharedDefiCapResetLabel = sharedDefiDailyCapResetsAt
+    ? `${formatDateTime(sharedDefiDailyCapResetsAt)} UTC`
+    : 'the next daily reset window';
+  const sharedDefiTodayCount = Number(defiLoopState?.todayCount || 0);
+  const sharedDefiDailyCap = Number(defiLoopState?.dailyCap || 0);
+  const sharedDefiCapWarning = sharedDefiDailyCapReached
+    ? suspendScanJobsWhenDefiCapReached
+      ? `This agent's daily DeFi automation cap is full. Advisory scans and oracle snapshots are paused until ${sharedDefiCapResetLabel}.`
+      : `This agent's daily DeFi automation cap is full. Autonomous execution is paused until ${sharedDefiCapResetLabel}, but advisory scans may still continue.`
+    : null;
+  const sharedDefiCapNotice = sharedDefiDailyCap > 0
+    ? `Automation budget today: ${sharedDefiTodayCount}/${sharedDefiDailyCap} checks used. Resets at ${sharedDefiCapResetLabel}.`
+    : null;
   const lastCirbtcDecision = cirbtcLoopState?.lastDecision || null;
   const cirbtcAutomationFreshness = getCirbtcAutomationFreshness(defiLoopState, cirbtcLoopState, lastCirbtcDecision);
   const cirbtcAutomationBaseStatus = getCirbtcAutomationStatus(cirbtcLoopState, lastCirbtcDecision);
@@ -1733,6 +1805,23 @@ export default function DashboardTab({ onNavigate }) {
           ? `Uses ${lastCirbtcDecision.selectedStableToken} for the latest cirBTC LP review.`
           : 'The next cirBTC check will choose the supported pair.',
       }];
+  const liveArcUsdcBalance = Number(arcPortfolio?.usdcBalance);
+  const hasLiveArcUsdcBalance = arcPortfolio?.usdcBalance !== null
+    && arcPortfolio?.usdcBalance !== undefined
+    && Number.isFinite(liveArcUsdcBalance);
+  const cirbtcUsdcPairSummary = cirbtcAutomationPairSummaries.find(
+    (pairSummary) => String(pairSummary?.stableToken || '').toUpperCase() === 'USDC',
+  ) || null;
+  const cirbtcUsdcMinBootstrap = Number(cirbtcUsdcPairSummary?.minBootstrapAmount || 0);
+  const cirbtcSnapshotNeedsUsdc = String(lastCirbtcDecision?.blockedBy || '').toLowerCase() === 'sizepositive'
+    || String(cirbtcUsdcPairSummary?.blockedBy || '').toLowerCase() === 'sizepositive';
+  const cirbtcLiveUsdcEnoughForBootstrap = hasLiveArcUsdcBalance
+    && cirbtcUsdcMinBootstrap > 0
+    && liveArcUsdcBalance >= cirbtcUsdcMinBootstrap;
+  const cirbtcShowUsdcFaucetWarning = hasLiveArcUsdcBalance
+    && cirbtcUsdcMinBootstrap > 0
+    && liveArcUsdcBalance < cirbtcUsdcMinBootstrap;
+  const cirbtcShowSnapshotLagNotice = cirbtcSnapshotNeedsUsdc && cirbtcLiveUsdcEnoughForBootstrap;
   const cirbtcAutomationPrimarySummary = lastCirbtcDecision?.summary || cirbtcAutomationBaseStatus.detail;
   const cirbtcAutomationPreviousSnapshotSummary = cirbtcAutomationFreshness.hasNewerDefiLoop
     ? cirbtcAutomationFreshness.detail
@@ -2147,6 +2236,14 @@ export default function DashboardTab({ onNavigate }) {
           </div>
         ) : (
           <div className="space-y-3">
+            {sharedDefiCapNotice && (
+              <Alert type={sharedDefiDailyCapReached ? 'warning' : 'info'}>
+                {sharedDefiDailyCapReached
+                  ? sharedDefiCapWarning
+                  : `${sharedDefiCapNotice} When this agent reaches the daily cap, new DeFi checks pause until the reset window.`}
+              </Alert>
+            )}
+
             <div className="grid gap-2 md:grid-cols-4">
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                 <div className="flex items-start justify-between gap-3">
@@ -2253,12 +2350,12 @@ export default function DashboardTab({ onNavigate }) {
                 <p className="mt-1 text-[11px] leading-5 text-slate-500">{stableAutomationAllocationPctLabel} of stable capital via {stableAutomationAllocationSourceLabel}</p>
               </div>
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Today</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Daily Budget</p>
                 <p className="mt-2 text-sm font-semibold text-slate-900">
                   {Number(defiLoopState?.todayCount || 0)}/{Number(defiLoopState?.dailyCap || 10)} checks
                 </p>
                 <p className="mt-1 text-[11px] leading-5 text-slate-500">
-                  {Number(defiLoopState?.autoTxToday || 0)} real auto tx sent{defiLoopState?.bypassDailyCap ? ' · daily cap bypass active' : ''}
+                  Resets at {sharedDefiCapResetLabel}. {Number(defiLoopState?.autoTxToday || 0)} real auto tx sent{defiLoopState?.bypassDailyCap ? ' · daily cap bypass active' : ''}
                 </p>
               </div>
             </div>
@@ -2454,6 +2551,41 @@ export default function DashboardTab({ onNavigate }) {
               <p className="mt-3 text-sm leading-6 text-slate-700">
                 {cirbtcAutomationPrimarySummary}
               </p>
+
+              <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Live Arc USDC</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">
+                      {hasLiveArcUsdcBalance ? formatRewardAmount(liveArcUsdcBalance, 'USDC') : 'Loading…'}
+                    </p>
+                  </div>
+                  {cirbtcUsdcMinBootstrap > 0 && (
+                    <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-slate-500">
+                      Min {formatRewardAmount(cirbtcUsdcMinBootstrap, 'USDC')}
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                  cirBTC bootstrap on this route depends on the wallet's current Arc USDC balance.
+                </p>
+              </div>
+
+              {cirbtcShowUsdcFaucetWarning && (
+                <div className="mt-3">
+                  <Alert type="warning">
+                    Live Arc USDC is still below the minimum needed for the next cirBTC bootstrap. Current wallet balance: <strong>{formatRewardAmount(liveArcUsdcBalance, 'USDC')}</strong>. Minimum needed: <strong>{formatRewardAmount(cirbtcUsdcMinBootstrap, 'USDC')}</strong>. If this wallet was just funded, wait for the next portfolio refresh. Otherwise use the <a href="https://faucet.circle.com" target="_blank" rel="noopener noreferrer" className="font-semibold underline">Circle faucet</a> and refresh again.
+                  </Alert>
+                </div>
+              )}
+
+              {cirbtcShowSnapshotLagNotice && (
+                <div className="mt-3">
+                  <Alert type="info">
+                    The last saved cirBTC snapshot still says insufficient balance, but the live Arc wallet now holds <strong>{formatRewardAmount(liveArcUsdcBalance, 'USDC')}</strong>. This card will clear after the next cirBTC review saves a fresh snapshot.
+                  </Alert>
+                </div>
+              )}
 
               {cirbtcAutomationPreviousSnapshotSummary && (
                 <p className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
@@ -2901,14 +3033,7 @@ export default function DashboardTab({ onNavigate }) {
                 : isRebalance ? 'Rebalance'
                 : title;
 
-              const statusLabel = isOracleSignal ? 'snapshot' : tx.status;
-              const statusVariant = isOracleSignal
-                ? 'slate'
-                : tx.status === 'confirmed'
-                  ? 'green'
-                  : tx.status === 'failed'
-                    ? 'red'
-                    : 'yellow';
+              const activityStatus = getRecentActivityStatus(tx);
 
               const meta = getTxMeta(tx);
               const counterpart = isReceive
@@ -2930,8 +3055,8 @@ export default function DashboardTab({ onNavigate }) {
                         {tagLabel}
                       </Badge>
                     )}
-                    <Badge variant={statusVariant} className="ml-auto">
-                      {statusLabel}
+                    <Badge variant={activityStatus.variant} className="ml-auto">
+                      {activityStatus.label}
                     </Badge>
                   </div>
                   <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 pl-[23px] text-xs text-slate-500">

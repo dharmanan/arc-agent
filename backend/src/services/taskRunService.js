@@ -3,11 +3,93 @@
 const db = require('../db');
 
 const ACTIVE_TASK_RUN_STATUSES = ['queued', 'running'];
+const TASK_RUN_STALE_TIMEOUT_MINUTES = (() => {
+  const parsed = Number.parseInt(process.env.TASK_RUN_STALE_TIMEOUT_MINUTES || '20', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 20;
+})();
 
 function normalizeLimit(limit, fallback = 20) {
   const parsed = Number.parseInt(limit, 10);
   if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, 100);
+}
+
+function _isActiveStatus(status) {
+  return ACTIVE_TASK_RUN_STATUSES.includes(String(status || '').toLowerCase());
+}
+
+function _isTaskRunStale(row) {
+  if (!row || !_isActiveStatus(row.status)) return false;
+  const updatedAtMs = new Date(row.updated_at || row.created_at || 0).getTime();
+  if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) return false;
+  return (Date.now() - updatedAtMs) >= TASK_RUN_STALE_TIMEOUT_MINUTES * 60_000;
+}
+
+function _buildStaleTaskRunDetail(row) {
+  const taskId = String(row?.task_id || '').trim().toUpperCase();
+  if (taskId === 'EXEC_SEPOLIA_GAS_FANOUT' || taskId === 'EXEC_CCTP_BRIDGE') {
+    return 'The previous worker stopped before saving the final bridge status. Destination funds may already have arrived, so review balances before retrying this task.';
+  }
+
+  return 'The previous worker stopped before writing a final result. This stale task run was closed so you can retry it safely.';
+}
+
+async function _recoverTaskRunRow(row) {
+  if (!row || !_isTaskRunStale(row)) return row || null;
+
+  const { rows: [latestResult] } = await db.query(
+    `SELECT payload, created_at
+       FROM agent_task_results
+      WHERE agent_id = $1
+        AND task_id = $2
+        AND created_at >= $3
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [row.agent_id, row.task_id, row.created_at],
+  );
+
+  if (latestResult?.payload) {
+    return completeTaskRun(row.id, {
+      resultPayload: latestResult.payload,
+      stageKey: 'recovered_completed',
+      stageLabel: 'Completed',
+      stageDetail: latestResult.payload.summary || 'Recovered a completed task result after a worker restart.',
+    });
+  }
+
+  return failTaskRun(row.id, {
+    error: 'stale_task_run_closed',
+    stageKey: 'worker_interrupted',
+    stageLabel: 'Worker Interrupted',
+    stageDetail: _buildStaleTaskRunDetail(row),
+    resultPayload: {
+      staleRunClosed: true,
+      recoveredFrom: 'active_timeout',
+      lastKnownStageKey: row.stage_key || null,
+      lastKnownStageLabel: row.stage_label || null,
+    },
+  });
+}
+
+async function _recoverStaleTaskRuns(agentId, { taskId = null } = {}) {
+  const params = [agentId, ACTIVE_TASK_RUN_STATUSES];
+  const taskFilter = taskId ? 'AND r.task_id = $3' : '';
+  if (taskId) params.push(taskId);
+
+  const { rows } = await db.query(
+    `SELECT r.*, t.title, t.description
+       FROM agent_task_runs r
+       JOIN task_catalog t ON t.id = r.task_id
+      WHERE r.agent_id = $1
+        AND r.status = ANY($2::text[])
+        ${taskFilter}
+      ORDER BY r.created_at DESC`,
+    params,
+  );
+
+  for (const row of rows) {
+    await _recoverTaskRunRow(row);
+  }
 }
 
 async function createTaskRun({
@@ -36,6 +118,8 @@ async function createTaskRun({
 }
 
 async function findActiveTaskRun(agentId, taskId) {
+  await _recoverStaleTaskRuns(agentId, { taskId });
+
   const { rows: [row] } = await db.query(
     `SELECT r.*, t.title, t.description
        FROM agent_task_runs r
@@ -51,7 +135,35 @@ async function findActiveTaskRun(agentId, taskId) {
   return row || null;
 }
 
+async function findActiveTaskRunForTaskIds(agentId, taskIds = []) {
+  const normalizedTaskIds = Array.from(new Set(
+    (Array.isArray(taskIds) ? taskIds : [])
+      .map(taskId => String(taskId || '').trim().toUpperCase())
+      .filter(Boolean),
+  ));
+
+  if (normalizedTaskIds.length === 0) return null;
+
+  await _recoverStaleTaskRuns(agentId);
+
+  const { rows: [row] } = await db.query(
+    `SELECT r.*, t.title, t.description
+       FROM agent_task_runs r
+       JOIN task_catalog t ON t.id = r.task_id
+      WHERE r.agent_id = $1
+        AND r.task_id = ANY($2::text[])
+        AND r.status = ANY($3::text[])
+      ORDER BY r.created_at DESC
+      LIMIT 1`,
+    [agentId, normalizedTaskIds, ACTIVE_TASK_RUN_STATUSES],
+  );
+
+  return row || null;
+}
+
 async function listTaskRuns(agentId, { status = 'recent', limit = 20 } = {}) {
+  await _recoverStaleTaskRuns(agentId);
+
   const normalizedLimit = normalizeLimit(limit);
 
   if (status === 'active') {
@@ -92,6 +204,10 @@ async function getTaskRun(agentId, runId) {
       LIMIT 1`,
     [agentId, runId],
   );
+
+  if (_isTaskRunStale(row)) {
+    return _recoverTaskRunRow(row);
+  }
 
   return row || null;
 }
@@ -185,6 +301,7 @@ module.exports = {
   createTaskRun,
   failTaskRun,
   findActiveTaskRun,
+  findActiveTaskRunForTaskIds,
   getTaskRun,
   listTaskRuns,
   markTaskRunRunning,

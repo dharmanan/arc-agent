@@ -607,6 +607,9 @@ export default function AgentTab() {
           <p>
             When the same-run round trip is profitable enough, the bot can also buy EURC on Curve and sell it back into USDC in the same cycle instead of keeping the EURC inventory.
           </p>
+          <p>
+            Testnet reminder: keep this agent wallet topped up with Sepolia gas and Arc test USDC. If automation starts skipping for low balance, refill gas from a Sepolia faucet and use the <a href="https://faucet.circle.com" target="_blank" rel="noopener noreferrer" className="font-medium text-arc-green underline">Circle faucet</a> for fresh test USDC.
+          </p>
         </div>
         <p className="mt-3 text-xs text-slate-400 flex items-center gap-1">
           <Zap size={11} /> Transactions below the auto-approve limit are signed automatically by the agent without prompting.

@@ -25,6 +25,8 @@ const ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES = Math.max(
 const DEFAULT_STABLE_TARGET_LP_ALLOCATION_PCT = 25;
 const DEFAULT_STABLE_TARGET_LP_MIN_ALLOCATION_PCT = 20;
 const DEFAULT_STABLE_TARGET_LP_MAX_ALLOCATION_PCT = 30;
+const DAILY_ORACLE_CAP = Math.max(Number.parseInt(process.env.DAILY_ORACLE_CAP || '48', 10) || 48, 1);
+const DAILY_DEFI_LOOP_CAP = Math.max(Number.parseInt(process.env.DAILY_DEFI_LOOP_CAP || '24', 10) || 24, 1);
 
 function parseTimestampMs(value) {
   const timestamp = Date.parse(value || '');
@@ -551,7 +553,7 @@ async function updatePermissions(agentId, userId, permsMap) {
 async function getAgentStatus(agentId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
-            a.llm_model, a.wallet_address, a.last_reset_day,
+            a.llm_model, a.wallet_address, a.last_reset_day, a.daily_limit_reset_at,
           a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.lending_automation_enabled, a.carry_automation_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
             a.daily_market_analysis_count, a.daily_defi_loop_count, a.daily_auto_tx_count,
             a.market_analysis_last_run_at, a.market_analysis_last_status, a.market_analysis_last_decision,
@@ -581,6 +583,13 @@ async function getAgentStatus(agentId, userId) {
   }
 
   const dailyLimitBypass = getDailyLimitBypass(a);
+  const suspendScanJobsWhenDefiCapReached = String(process.env.SUSPEND_CAP_REACHED_SCAN_JOBS || '').trim().toLowerCase() === 'true';
+  const dailyCapResetAtMs = a.daily_limit_reset_at
+    ? new Date(a.daily_limit_reset_at).getTime() + 86_400_000
+    : Number.NaN;
+  const dailyCapResetsAt = Number.isFinite(dailyCapResetAtMs)
+    ? new Date(dailyCapResetAtMs).toISOString()
+    : null;
   const marketAnalysisLastDecision = a.market_analysis_last_decision
     && typeof a.market_analysis_last_decision === 'object'
     && Object.keys(a.market_analysis_last_decision).length > 0
@@ -626,6 +635,7 @@ async function getAgentStatus(agentId, userId) {
     config: {
       reputationRegistryConfigured: Boolean(process.env.REPUTATION_REGISTRY_ADDRESS),
       swapConfigured: Boolean(process.env.CIRCLE_KIT_KEY || process.env.KIT_KEY),
+      suspendScanJobsWhenDefiCapReached,
     },
     automation: {
       marketAnalysis: {
@@ -633,6 +643,7 @@ async function getAgentStatus(agentId, userId) {
         lastRunAt: a.market_analysis_last_run_at,
         lastStatus: a.market_analysis_last_status || 'idle',
         lastDecision: marketAnalysisLastDecision,
+        dailyCapResetsAt,
       },
       oracle: {
         enabled: a.oracle_enabled ?? false,
@@ -640,7 +651,8 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: a.oracle_last_status || 'idle',
         entryCooldown: oracleEntryCooldown,
         todayCount: a.daily_market_analysis_count ?? 0,
-        dailyCap: 48,
+        dailyCap: DAILY_ORACLE_CAP,
+        dailyCapResetsAt,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
       defiLoop: {
@@ -650,7 +662,8 @@ async function getAgentStatus(agentId, userId) {
         lastDecision: stableLoopState.lastDecision,
         manualCooldownUntil: a.stable_manual_cooldown_until,
         todayCount: a.daily_defi_loop_count ?? 0,
-        dailyCap: 10,
+        dailyCap: DAILY_DEFI_LOOP_CAP,
+        dailyCapResetsAt,
         autoTxToday: a.daily_auto_tx_count ?? 0,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
@@ -660,7 +673,8 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: a.lending_automation_last_status || 'idle',
         lastDecision: lendingAutomationLastDecision,
         todayCount: a.daily_defi_loop_count ?? 0,
-        dailyCap: 10,
+        dailyCap: DAILY_DEFI_LOOP_CAP,
+        dailyCapResetsAt,
         autoTxToday: a.daily_auto_tx_count ?? 0,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
@@ -670,7 +684,8 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: a.carry_automation_last_status || 'idle',
         lastDecision: carryAutomationLastDecision,
         todayCount: a.daily_defi_loop_count ?? 0,
-        dailyCap: 10,
+        dailyCap: DAILY_DEFI_LOOP_CAP,
+        dailyCapResetsAt,
         autoTxToday: a.daily_auto_tx_count ?? 0,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
@@ -680,7 +695,8 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: a.cirbtc_lp_last_status || 'idle',
         lastDecision: cirbtcLpLastDecision,
         todayCount: a.daily_defi_loop_count ?? 0,
-        dailyCap: 10,
+        dailyCap: DAILY_DEFI_LOOP_CAP,
+        dailyCapResetsAt,
         autoTxToday: a.daily_auto_tx_count ?? 0,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
@@ -784,6 +800,7 @@ module.exports = {
   updateAgent,
   updatePermissions,
   getAgentStatus,
+  readOracleEntryCooldown,
   deactivateAgent,
   retryErc8004Registration,
 };

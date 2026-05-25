@@ -833,7 +833,13 @@ async function cctpBurn({ agent, fromChain, toChain, amountUsdc }) {
  * sourceTxHash (primary) ve messageHash (fallback) ile attestation'ı bekle.
  * Returns: { attestation } (0x... hex string)
  */
-async function cctpPollAttestation({ fromChain, toChain, sourceTxHash, messageHash, maxWaitMs = 10 * 60 * 1000 }) {
+async function cctpPollAttestation({
+  fromChain,
+  toChain,
+  sourceTxHash,
+  messageHash,
+  maxWaitMs = parseInt(process.env.CCTP_ATTESTATION_MAX_WAIT_MS || `${30 * 60 * 1000}`, 10),
+}) {
   const srcCfg  = CCTP_CHAINS[fromChain];
   const dstCfg  = toChain ? CCTP_CHAINS[toChain] : null;
   if (!srcCfg) throw new Error(`CCTP desteklemiyor: ${fromChain}`);
@@ -868,7 +874,7 @@ async function cctpPollAttestation({ fromChain, toChain, sourceTxHash, messageHa
     await sleep(POLL_MS);
   }
 
-  throw new Error('Attestation zaman aşımına uğradı (10 dakika)');
+  throw new Error('Attestation zaman aşımına uğradı (30 dakika)');
 }
 
 /**
@@ -1016,18 +1022,14 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 
   if (token === 'USDC') {
     console.log(`[AGENT-NANO] ${agent.wallet_address} → ${toAddress}: ${amountUsdc} ${token} via Gateway`);
-    const result = await runProtectedWrite({
-      chainName: 'Arc Testnet',
-      ...getAgentIdentity(agent),
-      operation: 'gateway_nano_payment',
-      replayFingerprint: [toAddress, String(amountUsdc), token],
-    }, () => gatewayBuyerService.executeGatewayTransfer({
+    const result = await gatewayBuyerService.executeGatewayTransfer({
       agent,
       amountUsdc,
       recipient: toAddress,
       fromChain: 'Arc Testnet',
       toChain: 'Arc Testnet',
-    }));
+      replayFingerprint: ['gateway_nano_payment', toAddress, String(amountUsdc), token],
+    });
     console.log(`[AGENT-NANO] ✓ ${result.transferResult?.mintTxHash || 'gateway-transfer-confirmed'}`);
     return result.transferResult?.mintTxHash || null;
   }

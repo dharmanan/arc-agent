@@ -1605,14 +1605,19 @@ router.post('/gateway/fund', requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'agent_signer_not_found' });
     }
 
+    const walletAddress = String(agent.walletAddress || rawAgent.wallet_address || '').toLowerCase();
     const client = createGatewayClientForAgent(rawAgent, { chainName });
-    const funding = await depositGatewayBalance(client, amountUsdc);
+    const funding = await depositGatewayBalance(client, amountUsdc, {
+      chainName,
+      walletAddress,
+      operation: 'manual_gateway_fund',
+    });
 
     res.json({
       agentId,
       chainName,
       amountUsdc: funding.amountUsdc,
-      walletAddress: String(agent.walletAddress || rawAgent.wallet_address || '').toLowerCase(),
+      walletAddress,
       wallet: {
         availableUsdc: funding.balancesAfter.wallet.formattedAvailable,
         totalUsdc: funding.balancesAfter.wallet.formattedTotal,

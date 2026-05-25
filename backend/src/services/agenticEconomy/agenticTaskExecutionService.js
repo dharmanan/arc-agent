@@ -7,11 +7,14 @@ const agentWalletService = require('../agentWalletService');
 const positionsService = require('../positionsService');
 const { decrypt } = require('../cryptoService');
 const nativeLendingRiskService = require('../nativeLendingRiskService');
+const { readOracleEntryCooldown } = require('../agentService');
 const { resolveDirectSwapFallbackPool } = require('../oracle/pools');
-const { evaluateStableAutomationPolicy } = require('../stableAutomationPolicy');
+const { evaluateOracleStrategyPolicy } = require('../oracleStrategyPolicy');
 
 const DEFAULT_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000';
 const DEFAULT_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
+const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
+const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
 const SEPOLIA_GAS_FANOUT_AMOUNT_ETH = String(process.env.SEPOLIA_GAS_FANOUT_AMOUNT_ETH || '0.01');
 const SEPOLIA_GAS_FANOUT_CHAINS = ['Optimism Sepolia', 'Base Sepolia', 'Arbitrum Sepolia'];
 const NATIVE_TOPUP_POLL_MS = parseInt(process.env.NATIVE_TOPUP_POLL_MS || '5000', 10);
@@ -30,6 +33,32 @@ const DIRECT_PAIR_ZAP_LIMIT_DEFAULTS = {
     maxSwapAmountIn: '8',
   },
 };
+
+let _arcProvider = null;
+
+function _getArcProvider() {
+  if (!_arcProvider) {
+    _arcProvider = new ethers.JsonRpcProvider(ARC_RPC_URL);
+  }
+
+  return _arcProvider;
+}
+
+async function _getArcTokenBalance(walletAddress, tokenAddress, decimals = 6) {
+  if (!walletAddress || !tokenAddress) return 0;
+  const contract = new ethers.Contract(tokenAddress, ERC20_BALANCE_ABI, _getArcProvider());
+  const rawBalance = await contract.balanceOf(walletAddress);
+  return Number(ethers.formatUnits(rawBalance, decimals));
+}
+
+async function _getArbTaskWalletBalances(walletAddress) {
+  const [usdc, eurc] = await Promise.all([
+    _getArcTokenBalance(walletAddress, DEFAULT_USDC_ADDRESS, 6),
+    _getArcTokenBalance(walletAddress, DEFAULT_EURC_ADDRESS, 6),
+  ]);
+
+  return { usdc, eurc };
+}
 
 function _readPositiveNumberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -1090,6 +1119,7 @@ async function executeSepoliaGasFanoutTask({ agent, dryRun = false, onStep }) {
 
     for (const toChain of SEPOLIA_GAS_FANOUT_CHAINS) {
       const balanceBeforeWei = await agentWalletService.getNativeBalance(toChain, recipient);
+      const destinationStartBlock = await agentWalletService.getCurrentBlockNumber(toChain).catch(() => null);
 
       await report('bridging', { toChain, amountEth });
       const result = await agentWalletService.bridgeNativeGasTopUp({
@@ -1110,16 +1140,28 @@ async function executeSepoliaGasFanoutTask({ agent, dryRun = false, onStep }) {
         balanceBeforeWei,
       });
 
+      const destinationReceipt = await agentWalletService.findRecentIncomingNativeTransfer({
+        chainName: toChain,
+        recipient,
+        amountWei: result.amountWei,
+        startBlock: destinationStartBlock,
+      }).catch(() => null);
+
       await report('arrived', {
         toChain,
+        fromChain: result.fromChain || 'Sepolia',
         amountEth,
         topUpTxHash: result.topUpTxHash,
+        destinationTxHash: destinationReceipt?.hash || null,
       });
 
       targets.push({
+        fromChain: result.fromChain || 'Sepolia',
         toChain,
         amountEth,
         topUpTxHash: result.topUpTxHash,
+        sourceTxHash: result.topUpTxHash,
+        destinationTxHash: destinationReceipt?.hash || null,
         bridgeKind: result.bridgeKind,
         bridgeAddress: result.bridgeAddress,
         balanceBeforeWei: balanceBeforeWei.toString(),
@@ -1759,16 +1801,39 @@ async function executeArbTask({ agent, params = {}, dryRun = false, pricingPool,
     expectedProfitUsdc,
     netProfitUsdc,
   });
-  const stablePolicy = evaluateStableAutomationPolicy({
+  const walletBalances = await _getArbTaskWalletBalances(agent?.wallet_address);
+  const oracleEntryCooldown = await readOracleEntryCooldown(agent?.id);
+  const oracleStrategyPolicy = evaluateOracleStrategyPolicy({
     agent,
     forexRate,
     poolState,
     signal,
+    executionGate: {
+      verdict: {
+        execute: true,
+        suggestedAmount: inputAmountNumeric,
+      },
+    },
     pricingPool: pricingTarget,
     swapPool: swapTarget,
     requestedAmountUsdc: inputAmountNumeric,
+    walletBalances,
+    walletReserveUsdc: 0,
+    exitQuote: null,
+    entryCooldown: oracleEntryCooldown,
   });
-  payload.stablePolicy = stablePolicy;
+  const explicitOracleInventoryCap = Number(agent?.oracle_max_eurc_inventory || 0);
+  const configuredOracleInventoryCap = Number(process.env.ORACLE_STRATEGY_MAX_EURC_INVENTORY || 0);
+  payload.oracleInventory = {
+    currentEurcBalance: oracleStrategyPolicy.metrics?.availableEurcBalance ?? walletBalances.eurc,
+    eurcCap: oracleStrategyPolicy.metrics?.maxEurcInventoryEurc ?? null,
+    remainingHeadroomEurc: oracleStrategyPolicy.metrics?.remainingEurcInventoryHeadroom ?? null,
+    protectedReserveEurc: oracleStrategyPolicy.metrics?.minEurcReserveEurc ?? 0,
+    capSource: explicitOracleInventoryCap > 0
+      ? 'agent_setting'
+      : (configuredOracleInventoryCap > 0 ? 'environment_setting' : 'trade_size_fallback'),
+  };
+  payload.oracleStrategyPolicy = oracleStrategyPolicy;
 
   if (!poolAddress) {
     payload.skipped = true;
@@ -1794,21 +1859,29 @@ async function executeArbTask({ agent, params = {}, dryRun = false, pricingPool,
     return { ok: true, payload };
   }
 
-  if (stablePolicy.metrics?.sizeClamped) {
+  if (oracleStrategyPolicy.metrics?.sizeClamped) {
     payload.skipped = true;
-    payload.summary = `No on-chain trade was sent. The requested ${requestedSizeLabel} exceeds the current stable-lane safety cap of ${stablePolicy.metrics.effectiveMaxTradeUsdc} USDC for this route.`;
+    payload.summary = `No on-chain trade was sent. The requested ${requestedSizeLabel} exceeds the current oracle strategy safety cap of ${oracleStrategyPolicy.metrics.effectiveMaxTradeUsdc} USDC for this route.`;
     return { ok: true, payload };
   }
 
-  if (stablePolicy.verdict?.execute !== true) {
+  if (oracleStrategyPolicy.verdict?.execute !== true) {
     payload.skipped = true;
-    payload.summary = `No on-chain trade was sent. ${stablePolicy.verdict?.reason || 'Stable automation policy v1 blocked this Curve entry leg.'}`;
+    if (oracleStrategyPolicy.verdict?.blockedBy === 'inventoryCap') {
+      const currentEurcBalance = payload.oracleInventory?.currentEurcBalance;
+      const eurcCap = payload.oracleInventory?.eurcCap;
+      payload.summary = Number.isFinite(Number(currentEurcBalance)) && Number.isFinite(Number(eurcCap))
+        ? `No on-chain trade was sent. This task only opens a fresh USDC -> EURC Curve entry, and the agent already holds ${formatMetric(currentEurcBalance, 6)} EURC against a ${formatMetric(eurcCap, 6)} EURC inventory cap. A new entry stays paused until some EURC rotates back into USDC.`
+        : `No on-chain trade was sent. ${oracleStrategyPolicy.verdict?.reason || 'Oracle strategy policy v1 blocked this Curve entry leg.'}`;
+    } else {
+      payload.summary = `No on-chain trade was sent. ${oracleStrategyPolicy.verdict?.reason || 'Oracle strategy policy v1 blocked this Curve entry leg.'}`;
+    }
     return { ok: true, payload };
   }
 
   if (dryRun) {
     payload.dryRun = true;
-    payload.summary = `Simulation only. The requested ${requestedSizeLabel} Curve entry leg clears the current stable-lane policy checks, but this task does not execute the bridge or exit leg.`;
+    payload.summary = `Simulation only. The requested ${requestedSizeLabel} Curve entry leg clears the current oracle strategy policy checks, but this task does not execute the bridge or exit leg.`;
     return { ok: true, payload };
   }
 

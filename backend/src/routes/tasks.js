@@ -49,7 +49,7 @@ function _getPoolContract() {
   return new ethers.Contract(addr, _POOL_VIEW_ABI, provider);
 }
 
-const DAILY_PAID_TASK_CAP = parseInt(process.env.DAILY_PAID_TASK_CAP || '5', 10);
+const DAILY_PAID_TASK_CAP = parseInt(process.env.DAILY_PAID_TASK_CAP || '10', 10);
 const DAILY_FREE_TASK_CAP = parseInt(process.env.DAILY_FREE_TASK_CAP || '5', 10);
 const EXECUTION_TASK_IDS = new Set([
   'EXEC_CURVE_SWAP',
@@ -71,6 +71,36 @@ const EXECUTION_TASK_IDS = new Set([
   'EXEC_ARB',
   'EXEC_REBALANCE',
 ]);
+const AUTO_CARRY_TASK_IDS = new Set(['EXEC_AUTO_CARRY_START', 'EXEC_AUTO_CARRY_STOP']);
+
+async function acquireAutoCarryTaskRunLock(agentId) {
+  const client = await db.getClient();
+  let released = false;
+
+  const release = async (mode = 'rollback') => {
+    if (released) return;
+    released = true;
+
+    try {
+      if (mode === 'commit') await client.query('COMMIT');
+      else await client.query('ROLLBACK');
+    } finally {
+      client.release();
+    }
+  };
+
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+      ['auto_carry_task_run', String(agentId || '')],
+    );
+    return { client, release };
+  } catch (error) {
+    await release('rollback').catch(() => {});
+    throw error;
+  }
+}
 const CURVE_POOL_TOKENS = new Set(['USDC', 'EURC']);
 const DIRECT_PAIR_ZAP_LIMITS = {
   EXEC_CIRBTC_USDC_ZAP_IN: 20,
@@ -939,12 +969,18 @@ router.get('/pool-balance', async (_req, res, next) => {
 // ── POST /api/agents/:id/tasks/run ────────────────────────────────────────────
 // Queues a Tier-1 (free) or Tier-2 (paid) task for the agent.
 router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
+  let autoCarryLock = null;
+
   try {
     const agentId = req.params.id;
     const taskId  = String(req.body?.taskId || '').trim().toUpperCase();
     const params  = req.body?.params || {};  // optional task-specific params
 
     if (!taskId) return res.status(400).json({ error: 'taskId required' });
+
+    if (AUTO_CARRY_TASK_IDS.has(taskId)) {
+      autoCarryLock = await acquireAutoCarryTaskRunLock(agentId);
+    }
 
     // Verify task exists
     const { rows: [task] } = await db.query(
@@ -1015,8 +1051,14 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
       }
     }
 
-    const existingRun = await taskRunService.findActiveTaskRun(agentId, taskId);
+    const existingRun = AUTO_CARRY_TASK_IDS.has(taskId)
+      ? await taskRunService.findActiveTaskRunForTaskIds(agentId, Array.from(AUTO_CARRY_TASK_IDS))
+      : await taskRunService.findActiveTaskRun(agentId, taskId);
     if (existingRun) {
+      if (autoCarryLock) {
+        await autoCarryLock.release('rollback');
+        autoCarryLock = null;
+      }
       return res.status(409).json({
         error: 'task_already_running',
         run: existingRun,
@@ -1031,6 +1073,11 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
       stageLabel: 'Queued',
       stageDetail: 'Task request accepted. This card will stay locked until the worker finishes or fails.',
     });
+
+    if (autoCarryLock) {
+      await autoCarryLock.release('commit');
+      autoCarryLock = null;
+    }
 
     try {
       await queue.queueManualTask(taskId, { agentId, params, taskRunId: run.id });
@@ -1055,7 +1102,12 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
       feeUsdc: task.tier === 2 ? Number(task.fee_usdc) : 0,
       run,
     });
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (autoCarryLock) {
+      await autoCarryLock.release('rollback').catch(() => {});
+    }
+    next(err);
+  }
 });
 
 // ── POST /api/tasks/agents/:id/defi/manual/execute ──────────────────────────

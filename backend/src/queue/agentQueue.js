@@ -32,13 +32,16 @@ const { evaluateLendingAutomationPolicy } = require('../services/lendingAutomati
 const { evaluateCarryAutomationPolicy } = require('../services/carryAutomationPolicy');
 const { evaluateOracleStrategyPolicy } = require('../services/oracleStrategyPolicy');
 const { evaluateCirbtcLpAutomationPolicy } = require('../services/cirbtcLpAutomationPolicy');
+const bridgeActivityService = require('../services/bridgeActivityService');
 const taskRunService = require('../services/taskRunService');
 const { ensureGatewayWarmBalance } = require('../services/agenticEconomy/gatewayBuyer');
+const { shouldTrackAutoCarryStartHandoff } = require('../services/autoCarryTaskRunPolicy');
 
 const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
 const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
 const ARC_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || process.env.EURC_ADDRESS || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
 const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
+const PAID_GAS_FANOUT_AMOUNT_ETH = String(process.env.SEPOLIA_GAS_FANOUT_AMOUNT_ETH || '0.01');
 const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC = 1;
 const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC = 3;
 
@@ -747,7 +750,7 @@ async function executeLendingAutomationTask({ agent, automationPolicy, dryRunEna
   return { ok: false, reason: 'lending_automation_operation_unsupported' };
 }
 
-async function executeCarryAutomationTask({ agent, automationPolicy, dryRunEnabled }) {
+async function executeCarryAutomationTask({ agent, automationPolicy, dryRunEnabled, taskRunId = null, sourceTaskId = null }) {
   const operationType = String(automationPolicy?.verdict?.operationType || '').trim().toLowerCase();
   const actionParams = automationPolicy?.verdict?.actionParams && typeof automationPolicy.verdict.actionParams === 'object'
     ? automationPolicy.verdict.actionParams
@@ -820,6 +823,21 @@ async function executeCarryAutomationTask({ agent, automationPolicy, dryRunEnabl
 
     if (!borrowResult.ok) return borrowResult;
 
+    const followup = !dryRunEnabled
+      ? await queueDefiLoopForAgent(agent?.id, {
+          reason: 'carry-open-followup',
+          delayMs: CARRY_AUTOMATION_FOLLOWUP_DELAY_MS,
+          taskRunId,
+          sourceTaskId,
+          carryFollowupPhase: 'followup',
+        }).catch((error) => ({
+          queued: false,
+          jobId: null,
+          delayMs: CARRY_AUTOMATION_FOLLOWUP_DELAY_MS,
+          error: error.message,
+        }))
+      : null;
+
     return {
       ok: true,
       payload: {
@@ -838,9 +856,15 @@ async function executeCarryAutomationTask({ agent, automationPolicy, dryRunEnabl
             txHash: borrowResult?.payload?.txHash || null,
           },
         ],
+        followupQueued: Boolean(followup?.queued),
+        followupJobId: followup?.jobId || null,
+        followupDelayMs: followup?.delayMs || null,
+        followupQueueError: followup?.error || null,
         summary: dryRunEnabled
-          ? `Would borrow ${actionParams.borrowAmount} ${stableToken}. The next carry cycle would deploy the borrowed balance into the stable LP lane.`
-          : `Borrowed ${actionParams.borrowAmount} ${stableToken}. The next carry cycle will deploy the borrowed balance into the stable LP lane.`,
+          ? `Would borrow ${actionParams.borrowAmount} ${stableToken}. A follow-up carry cycle would then deploy the borrowed balance into the stable LP lane.`
+          : followup?.queued
+            ? `Borrowed ${actionParams.borrowAmount} ${stableToken}. A follow-up carry cycle is already queued${formatCarryFollowupDelayForSummary(followup.delayMs)} to deploy the borrowed balance into the stable LP lane.`
+            : `Borrowed ${actionParams.borrowAmount} ${stableToken}. The next carry cycle will deploy the borrowed balance into the stable LP lane.`,
       },
     };
   }
@@ -957,6 +981,393 @@ async function executeCarryAutomationTask({ agent, automationPolicy, dryRunEnabl
   }
 
   return { ok: false, reason: 'unsupported_carry_operation' };
+}
+
+function normalizeDefiLoopReason(reason) {
+  return String(reason || 'manual')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'manual';
+}
+
+const DEFI_LOOP_PRIORITY_CARRY_TASK = 1;
+const DEFI_LOOP_PRIORITY_RECOVERY = 2;
+const DEFI_LOOP_PRIORITY_MARKET = 10;
+const DEFI_LOOP_PRIORITY_SCHEDULED = 20;
+
+function resolveDefiLoopJobPriority(reason, options = {}) {
+  const explicitPriority = Number(options.priority);
+  if (Number.isFinite(explicitPriority) && explicitPriority > 0) {
+    return Math.floor(explicitPriority);
+  }
+
+  const normalizedReason = normalizeDefiLoopReason(reason);
+  const sourceTaskId = String(options.sourceTaskId || '').trim().toUpperCase();
+  if (sourceTaskId === 'EXEC_AUTO_CARRY_START' || normalizedReason.startsWith('carry-')) {
+    return DEFI_LOOP_PRIORITY_CARRY_TASK;
+  }
+  if (normalizedReason.includes('recovery') || Number(options.orphanRecoveryCount || 0) > 0) {
+    return DEFI_LOOP_PRIORITY_RECOVERY;
+  }
+  if (normalizedReason === 'market-analysis') {
+    return DEFI_LOOP_PRIORITY_MARKET;
+  }
+
+  return DEFI_LOOP_PRIORITY_SCHEDULED;
+}
+
+async function queueDefiLoopForAgent(agentId, options = {}) {
+  if (!agentId) return { queued: false, jobId: null, delayMs: 0 };
+
+  const delayMs = Math.max(Number(options.delayMs) || 0, 0);
+  const reason = normalizeDefiLoopReason(options.reason);
+  const jobId = `defi-${agentId}-${reason}-${Date.now()}`;
+  const priority = resolveDefiLoopJobPriority(reason, options);
+  const jobData = { agentId };
+
+  if (options.taskRunId) jobData.taskRunId = options.taskRunId;
+  if (options.sourceTaskId) jobData.sourceTaskId = options.sourceTaskId;
+  if (options.carryFollowupPhase) jobData.carryFollowupPhase = options.carryFollowupPhase;
+  if (Number.isFinite(Number(options.orphanRecoveryCount)) && Number(options.orphanRecoveryCount) > 0) {
+    jobData.orphanRecoveryCount = Number(options.orphanRecoveryCount);
+  }
+
+  const jobOptions = { jobId, priority };
+  if (delayMs > 0) jobOptions.delay = delayMs;
+
+  const job = await queue.add('DEFI_LOOP', jobData, jobOptions);
+  const confirmedJob = await queue.getJob(job?.id || jobId);
+  if (!confirmedJob) {
+    throw new Error(`DEFI_LOOP job ${jobId} was not persisted after queue.add`);
+  }
+
+  return {
+    queued: true,
+    jobId: job?.id || jobId,
+    delayMs,
+    priority,
+  };
+}
+
+async function setCarryAutomationEnabled(agentId, enabled) {
+  if (!agentId) return;
+  await db.query(
+    `UPDATE agents SET carry_automation_enabled = $2 WHERE id = $1`,
+    [agentId, Boolean(enabled)],
+  );
+}
+
+async function buildCarryAutomationTaskContext(agent) {
+  try {
+    const walletAddress = agent?.wallet_address || agent?.walletAddress || null;
+    if (!walletAddress) {
+      return { ok: false, reason: 'wallet_not_configured' };
+    }
+
+    const walletReserveUsdc = normalizeUsdcAmount(Math.max(Number(agent?.defi_wallet_reserve_usdc || 0), 0));
+    const [forexRate, lendingSurface, positionContext, usdcBalance, eurcBalance] = await Promise.all([
+      oracle.getForexRate('EURC', 'USDC'),
+      nativeLendingRiskService.buildLendingSurfaceForWallet(walletAddress),
+      readStableCurvePositionContext(walletAddress),
+      getArcUsdcBalance(walletAddress).catch(() => 0),
+      getArcEurcBalance(walletAddress).catch(() => 0),
+    ]);
+    const stablePoolState = await _getOracleStablePoolState(forexRate);
+    const stableCurvePosition = positionContext?.ok === true ? positionContext.position || null : null;
+    const carryPolicy = evaluateCarryAutomationPolicy({
+      lendingSurface,
+      stablePoolState,
+      stableCurvePosition,
+      walletBalances: {
+        usdc: usdcBalance,
+        eurc: eurcBalance,
+      },
+      maxTradeUsdc: Number(agent?.max_trade_usdc || 0),
+      walletReserveUsdc,
+    });
+
+    return {
+      ok: true,
+      carryPolicy,
+      snapshot: carryPolicy?.metrics || {},
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'carry_context_unavailable',
+      error: error.message,
+    };
+  }
+}
+
+async function executeAutoCarryStartTask({ agent, dryRun, taskRunId }) {
+  await _reportTaskRunStage(taskRunId, {
+    stageKey: 'carry_start_review',
+    stageLabel: 'Carry Start Review',
+    stageDetail: 'Reviewing the live carry lane before Auto Carry is enabled.',
+  });
+
+  const context = await buildCarryAutomationTaskContext(agent);
+  if (!context.ok) return context;
+
+  const snapshot = context.snapshot || {};
+  const selectedAsset = snapshot.selectedAsset || null;
+  const stableToken = String(
+    context.carryPolicy?.verdict?.actionAssetSymbol
+    || snapshot.selectedAssetSymbol
+    || selectedAsset?.symbol
+    || 'USDC',
+  ).trim().toUpperCase();
+  const carryState = String(snapshot.carryState || 'inactive');
+  const lpAmount = normalizeUsdcAmount(Number(snapshot.lpBalance || 0));
+  let conversionResult = null;
+
+  if (carryState === 'manual_lp_conflict') {
+    if (!(lpAmount > 0)) {
+      return {
+        ok: false,
+        reason: 'carry_manual_lp_balance_unavailable',
+        error: 'The live manual stable LP balance could not be resolved.',
+      };
+    }
+
+    await _reportTaskRunStage(taskRunId, {
+      stageKey: 'carry_start_convert_manual_lp',
+      stageLabel: 'Manual LP Conversion',
+      stageDetail: 'Removing the blocking manual stable LP before Auto Carry takes over.',
+    });
+
+    conversionResult = await agenticTaskExecutionService.executeCurveLiquidityRemoveBalancedTask({
+      agent,
+      params: {
+        lpAmount: snapshot.lpBalance,
+      },
+      dryRun,
+    });
+
+    if (!conversionResult.ok) return conversionResult;
+  }
+
+  await _reportTaskRunStage(taskRunId, {
+    stageKey: 'carry_start_enable',
+    stageLabel: 'Enabling Auto Carry',
+    stageDetail: 'Saving Auto Carry mode and queueing the next carry review.',
+  });
+
+  if (!dryRun) {
+    await setCarryAutomationEnabled(agent.id, true);
+    agent.carry_automation_enabled = true;
+  }
+
+  const shouldTrackKickoffHandoff = shouldTrackAutoCarryStartHandoff({
+    dryRun,
+    taskRunId,
+    carryState,
+    carryVerdictExecute: context.carryPolicy?.verdict?.execute === true,
+  });
+
+  const kickoff = dryRun
+    ? { queued: false, jobId: null, delayMs: 0 }
+    : await queueDefiLoopForAgent(agent.id, {
+        reason: 'carry-start-task',
+        taskRunId: shouldTrackKickoffHandoff ? taskRunId : null,
+        sourceTaskId: shouldTrackKickoffHandoff ? 'EXEC_AUTO_CARRY_START' : null,
+        carryFollowupPhase: shouldTrackKickoffHandoff ? 'initial' : null,
+      }).catch((error) => ({
+        queued: false,
+        jobId: null,
+        delayMs: 0,
+        error: error.message,
+      }));
+
+  let summary;
+  if (carryState === 'manual_lp_conflict') {
+    summary = dryRun
+      ? 'Would remove the manual stable LP, enable Auto Carry, and queue the next carry review.'
+      : 'Removed the manual stable LP, enabled Auto Carry, and queued the next carry review.';
+  } else if (carryState === 'debt_idle') {
+    summary = dryRun
+      ? 'Would enable Auto Carry and queue the next carry review so the idle borrowed balance can continue into the LP lane.'
+      : 'Enabled Auto Carry and queued the next carry review so the idle borrowed balance can continue into the LP lane.';
+  } else if (carryState === 'active') {
+    summary = dryRun
+      ? `Would keep Auto Carry enabled and queue a fresh review for the current ${stableToken} carry lane.`
+      : `Auto Carry is enabled and a fresh review was queued for the current ${stableToken} carry lane.`;
+  } else if (context.carryPolicy?.verdict?.execute === false && context.carryPolicy?.verdict?.reason) {
+    summary = dryRun
+      ? `Would enable Auto Carry, but the live lane is currently waiting: ${context.carryPolicy.verdict.reason}`
+      : `Enabled Auto Carry. The live lane is currently waiting: ${context.carryPolicy.verdict.reason}`;
+  } else {
+    summary = dryRun
+      ? 'Would enable Auto Carry and queue the next carry review.'
+      : 'Enabled Auto Carry and queued the next carry review.';
+  }
+
+  return {
+    ok: true,
+    deferTaskRunCompletion: Boolean(kickoff.queued && shouldTrackKickoffHandoff),
+    taskRunStage: kickoff.queued && shouldTrackKickoffHandoff
+      ? {
+          stageKey: 'carry_handoff_queued',
+          stageLabel: 'Auto Carry Handoff',
+          stageDetail: 'The paid trigger is locked while the autonomous carry review and any queued follow-up finish.',
+        }
+      : null,
+    payload: {
+      action: 'auto_carry_start',
+      executionRail: 'carry_automation_trigger',
+      stableToken,
+      carryStateBefore: carryState,
+      carryAutomationEnabled: true,
+      manualLpConverted: Boolean(conversionResult?.ok),
+      manualLpBalance: snapshot.lpBalance || null,
+      positionValueUsd: snapshot.positionValueUsd || 0,
+      blockedBy: context.carryPolicy?.verdict?.blockedBy || null,
+      triggerQueued: kickoff.queued,
+      triggerJobId: kickoff.jobId || null,
+      triggerQueueError: kickoff.error || null,
+      conversionTxHash: conversionResult?.payload?.txHash || null,
+      conversionSummary: conversionResult?.payload?.summary || null,
+      dryRun: Boolean(dryRun),
+      summary,
+      executedAt: new Date().toISOString(),
+    },
+  };
+}
+
+async function executeAutoCarryStopTask({ agent, dryRun, taskRunId }) {
+  await _reportTaskRunStage(taskRunId, {
+    stageKey: 'carry_stop_review',
+    stageLabel: 'Carry Stop Review',
+    stageDetail: 'Reviewing the live carry lane before Auto Carry is turned off.',
+  });
+
+  const context = await buildCarryAutomationTaskContext(agent);
+  if (!context.ok) return context;
+
+  const snapshot = context.snapshot || {};
+  const selectedAsset = snapshot.selectedAsset || null;
+  const stableToken = String(
+    selectedAsset?.symbol
+    || snapshot.selectedAssetSymbol
+    || context.carryPolicy?.verdict?.actionAssetSymbol
+    || 'USDC',
+  ).trim().toUpperCase();
+  const carryState = String(snapshot.carryState || 'inactive');
+  const debtAmount = normalizeUsdcAmount(Number(selectedAsset?.borrowAmount || 0));
+  const walletRepayAmount = normalizeUsdcAmount(
+    Number(selectedAsset?.priceUsd || 0) > 0
+      ? Math.min(
+          Number(selectedAsset?.walletDeployableUsd || 0),
+          Number(selectedAsset?.borrowUsd || 0),
+        ) / Number(selectedAsset.priceUsd)
+      : 0,
+  );
+  let unwindResult = null;
+
+  await _reportTaskRunStage(taskRunId, {
+    stageKey: 'carry_stop_disable',
+    stageLabel: 'Turning Off Auto Carry',
+    stageDetail: 'Saving the carry mode switch-off before any unwind step runs.',
+  });
+
+  if (!dryRun) {
+    await setCarryAutomationEnabled(agent.id, false);
+    agent.carry_automation_enabled = false;
+  }
+
+  if (snapshot.currentCarryModeActive && Number(snapshot.lpBalance || 0) > 0) {
+    await _reportTaskRunStage(taskRunId, {
+      stageKey: 'carry_stop_unwind_lp',
+      stageLabel: 'Unwinding Carry LP',
+      stageDetail: 'Removing the stable LP and repaying visible debt for the active carry lane.',
+    });
+
+    unwindResult = await executeCarryAutomationTask({
+      agent,
+      automationPolicy: {
+        verdict: {
+          operationType: 'close_carry',
+          actionAssetSymbol: stableToken,
+          actionParams: {
+            stableToken,
+            lpAmount: snapshot.lpBalance,
+            debtAmount,
+            tokenOut: stableToken,
+          },
+        },
+      },
+      dryRunEnabled: dryRun,
+    });
+
+    if (!unwindResult.ok) return unwindResult;
+  } else if (snapshot.currentDebtIdle && debtAmount > 0 && walletRepayAmount > 0) {
+    await _reportTaskRunStage(taskRunId, {
+      stageKey: 'carry_stop_repay_idle_debt',
+      stageLabel: 'Repaying Idle Debt',
+      stageDetail: 'Repaying the visible carry debt from idle wallet balance before stopping.',
+    });
+
+    unwindResult = await executeCarryAutomationTask({
+      agent,
+      automationPolicy: {
+        verdict: {
+          operationType: 'repay_wallet_balance',
+          actionAssetSymbol: stableToken,
+          actionParams: {
+            asset: stableToken,
+            amount: String(walletRepayAmount),
+          },
+        },
+      },
+      dryRunEnabled: dryRun,
+    });
+
+    if (!unwindResult.ok) return unwindResult;
+  }
+
+  let summary;
+  if (unwindResult?.payload?.summary) {
+    summary = dryRun
+      ? `${unwindResult.payload.summary} Auto Carry would then stay off.`
+      : `${unwindResult.payload.summary} Auto Carry is now off.`;
+  } else if (carryState === 'manual_lp_conflict') {
+    summary = dryRun
+      ? 'Would turn Auto Carry off without touching the existing manual stable LP.'
+      : 'Turned Auto Carry off without touching the existing manual stable LP.';
+  } else if (snapshot.currentDebtIdle && debtAmount > 0 && !(walletRepayAmount > 0)) {
+    summary = dryRun
+      ? `Would turn Auto Carry off. The visible ${stableToken} debt cannot be repaid immediately because the wallet does not hold enough idle balance yet.`
+      : `Turned Auto Carry off. The visible ${stableToken} debt cannot be repaid immediately because the wallet does not hold enough idle balance yet.`;
+  } else {
+    summary = dryRun
+      ? 'Would turn Auto Carry off. No active carry leg needs to unwind right now.'
+      : 'Turned Auto Carry off. No active carry leg needed to unwind right now.';
+  }
+
+  const payload = {
+    ...(unwindResult?.payload || {}),
+    action: 'auto_carry_stop',
+    executionRail: 'carry_automation_trigger',
+    stableToken,
+    carryState: 'inactive',
+    carryStateBefore: carryState,
+    carryAutomationEnabled: false,
+    blockedBy: null,
+    positionValueUsd: 0,
+    debtAmount,
+    dryRun: Boolean(dryRun),
+    summary,
+    executedAt: new Date().toISOString(),
+  };
+
+  if (!dryRun) {
+    await _setAutomationState(agent.id, 'carryAutomation', 'disabled');
+    await _setAutomationDecision(agent.id, 'carryAutomation', payload);
+  }
+
+  return { ok: true, payload };
 }
 
 function getErrorText(value) {
@@ -1134,6 +1545,8 @@ const PAID_TASK_ACTIVITY_SUPPORTED_IDS = new Set([
   'EXEC_LENDING_SAFE_EXIT',
   'EXEC_LENDING_DELEVERAGE',
   'EXEC_LENDING_LIQUIDATE',
+  'EXEC_AUTO_CARRY_START',
+  'EXEC_AUTO_CARRY_STOP',
   'EXEC_MANUAL_LENDING_SUPPLY',
   'EXEC_MANUAL_LENDING_WITHDRAW',
   'EXEC_MANUAL_LENDING_BORROW',
@@ -1146,6 +1559,10 @@ const PAID_TASK_ACTIVITY_SUPPORTED_IDS = new Set([
   'EXEC_SEPOLIA_GAS_FANOUT',
   'EXEC_ARB',
   'EXEC_REBALANCE',
+]);
+const PAID_TASK_RUNTIME_ACTIVITY_IDS = new Set([
+  'EXEC_CCTP_BRIDGE',
+  'EXEC_SEPOLIA_GAS_FANOUT',
 ]);
 const MANUAL_TASK_READY_TIMEOUT_MS = parseInt(process.env.MANUAL_TASK_READY_TIMEOUT_MS || '1200', 10);
 const STABLE_MANUAL_ADD_COOLDOWN_TASK_IDS = new Set([
@@ -1314,6 +1731,14 @@ function registerTaskProcessor(name, concurrency, handler) {
             error: failureMessage,
             stageDetail: result.errorSummary || result.stageDetail || result.error || result.reason || null,
             resultPayload: result.payload || null,
+          }).catch(() => {});
+        } else if (result?.deferTaskRunCompletion === true) {
+          const deferredStage = result.taskRunStage || {};
+          await taskRunService.updateTaskRunStage(taskRunId, {
+            status: 'running',
+            stageKey: deferredStage.stageKey || 'awaiting_followup',
+            stageLabel: deferredStage.stageLabel || 'Awaiting Follow-Up',
+            stageDetail: deferredStage.stageDetail || result?.payload?.summary || 'Task handed off to a follow-up automation run.',
           }).catch(() => {});
         } else {
           if (agentId && STABLE_MANUAL_ADD_COOLDOWN_TASK_IDS.has(name) && result?.payload?.dryRun !== true) {
@@ -1907,6 +2332,7 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
   const { rows: [agent] } = await db.query(
     `SELECT llm_model, llm_api_key_encrypted,
             defi_loop_enabled, cirbtc_lp_enabled,
+            wallet_address, daily_defi_loop_count, daily_limit_reset_at,
             defi_loop_last_run_at, cirbtc_lp_last_run_at
        FROM agents
       WHERE id = $1
@@ -1926,6 +2352,38 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
       action: 'hold',
       reason: 'permission_blocked',
       permission: 'defi_scan',
+    };
+  }
+
+  if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
+    const decisionSnapshot = {
+      recordedAt: new Date().toISOString(),
+      status: 'cap_reached',
+      chain,
+      token,
+      engine: 'system',
+      opportunity: "Market analysis paused because this agent's daily DeFi automation cap is already full.",
+      risk: 'low',
+      action: 'Wait for the next daily cap reset before refreshing another advisory signal.',
+      signal: {
+        lane: 'stable_curve',
+        shouldReviewDefi: false,
+        stableLpMinAllocationPct: null,
+        stableLpTargetAllocationPct: null,
+        stableLpMaxAllocationPct: null,
+        confidence: 'low',
+      },
+      queuedDefiReview: false,
+      rawDecision: null,
+      pausedBy: 'shared_defi_daily_cap',
+    };
+
+    await _setAutomationState(agentId, 'marketAnalysis', 'cap_reached');
+    await _setAutomationDecision(agentId, 'marketAnalysis', decisionSnapshot);
+    return {
+      ok: true,
+      action: 'hold',
+      reason: 'shared_defi_daily_cap_reached',
     };
   }
 
@@ -1951,6 +2409,7 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
           trigger: 'market_analysis',
         }, {
           jobId: `defi-market-analysis-${agentId}-${Date.now()}`,
+          priority: DEFI_LOOP_PRIORITY_MARKET,
         });
         queuedDefiReview = true;
       } catch (queueErr) {
@@ -1985,9 +2444,669 @@ const CURVE_USDC_EURC_POOL    = process.env.CURVE_USDC_EURC_POOL || null;
 const DEFI_LOOP_INTERVAL_MS   = parseInt(process.env.DEFI_LOOP_INTERVAL_MS   || '3600000',  10); // default 1h
 const DEFI_LOOP_STARTUP_DELAY_MS = parseInt(process.env.DEFI_LOOP_STARTUP_DELAY_MS || '60000', 10);
 const DEFI_LOOP_ORPHAN_JOB_AGE_MS = parseInt(process.env.DEFI_LOOP_ORPHAN_JOB_AGE_MS || '120000', 10);
-const DAILY_DEFI_LOOP_CAP     = 10;
+const DEFI_LOOP_TRACKED_CARRY_ORPHAN_JOB_AGE_MS = Math.max(
+  parseInt(process.env.DEFI_LOOP_TRACKED_CARRY_ORPHAN_JOB_AGE_MS || '45000', 10) || 45000,
+  15000,
+);
+const DEFI_LOOP_ACTIVE_NO_LOCK_GRACE_MS = Math.max(
+  parseInt(process.env.DEFI_LOOP_ACTIVE_NO_LOCK_GRACE_MS || '5000', 10) || 5000,
+  1000,
+);
+const DEFI_LOOP_ORPHAN_SWEEP_INTERVAL_MS = Math.max(parseInt(process.env.DEFI_LOOP_ORPHAN_SWEEP_INTERVAL_MS || '60000', 10) || 60000, 30000);
+const DEFI_LOOP_ORPHAN_RECOVERY_MAX_REQUEUES = Math.max(
+  parseInt(process.env.DEFI_LOOP_ORPHAN_RECOVERY_MAX_REQUEUES || '2', 10) || 2,
+  1,
+);
+const DAILY_DEFI_LOOP_CAP     = Math.max(parseInt(process.env.DAILY_DEFI_LOOP_CAP || '24', 10) || 24, 1);
+const DAILY_ORACLE_CAP        = Math.max(parseInt(process.env.DAILY_ORACLE_CAP || '48', 10) || 48, 1);
+const SUSPEND_CAP_REACHED_SCAN_JOBS = String(process.env.SUSPEND_CAP_REACHED_SCAN_JOBS || '').trim().toLowerCase() === 'true';
 const GLOBAL_DRY_RUN          = process.env.DRY_RUN === 'true';
 const DEFAULT_ORACLE_SAME_CHAIN_MIN_PROFIT_USDC = 0.01;
+
+function getDefiLoopOrphanJobAgeMs(job) {
+  const sourceTaskId = String(job?.data?.sourceTaskId || '').trim().toUpperCase();
+  const taskRunId = String(job?.data?.taskRunId || '').trim();
+  return taskRunId && sourceTaskId === 'EXEC_AUTO_CARRY_START'
+    ? DEFI_LOOP_TRACKED_CARRY_ORPHAN_JOB_AGE_MS
+    : DEFI_LOOP_ORPHAN_JOB_AGE_MS;
+}
+
+function buildDefiLoopOrphanRecovery(job) {
+  const agentId = String(job?.data?.agentId || '').trim();
+  if (!agentId) return null;
+
+  const carryFollowupPhase = String(job?.data?.carryFollowupPhase || '').trim().toLowerCase();
+  const sourceTaskId = String(job?.data?.sourceTaskId || '').trim().toUpperCase();
+  const taskRunId = String(job?.data?.taskRunId || '').trim() || null;
+  const orphanRecoveryCount = Math.max(Number.parseInt(job?.data?.orphanRecoveryCount || '0', 10) || 0, 0);
+  const isTrackedCarryStart = Boolean(taskRunId && sourceTaskId === 'EXEC_AUTO_CARRY_START');
+  const isCarryFollowup = carryFollowupPhase === 'followup';
+
+  if (!isTrackedCarryStart) {
+    return {
+      agentId,
+      taskRunId: null,
+      sourceTaskId: null,
+      carryFollowupPhase: carryFollowupPhase || null,
+      orphanRecoveryCount,
+      shouldRequeue: false,
+      reason: 'orphan-recovery',
+    };
+  }
+
+  return {
+    agentId,
+    taskRunId: isTrackedCarryStart ? taskRunId : null,
+    sourceTaskId: isTrackedCarryStart ? sourceTaskId : null,
+    carryFollowupPhase: isCarryFollowup ? 'followup' : 'initial',
+    orphanRecoveryCount,
+    shouldRequeue: orphanRecoveryCount < DEFI_LOOP_ORPHAN_RECOVERY_MAX_REQUEUES,
+    reason: isCarryFollowup ? 'carry-open-followup' : 'carry-start-task',
+  };
+}
+
+function resolveBullQueueKey(key) {
+  return typeof queue?.toKey === 'function' ? queue.toKey(key) : `bull:agent-jobs:${key}`;
+}
+
+function resolveBullJobLockKey(job) {
+  const jobKey = typeof job?.queue?.toKey === 'function'
+    ? job.queue.toKey(job.id)
+    : resolveBullQueueKey(job?.id);
+  return `${jobKey}:lock`;
+}
+
+async function readBullJobLock(job) {
+  try {
+    const client = job?.queue?.client || queue.client;
+    if (!client || !job?.id) return null;
+    return client.get(resolveBullJobLockKey(job));
+  } catch (_) {
+    return null;
+  }
+}
+
+function getDefiLoopNoLockGraceMs(job) {
+  const processedOn = Number(job?.processedOn || 0);
+  return processedOn > 0
+    ? getDefiLoopOrphanJobAgeMs(job)
+    : DEFI_LOOP_ACTIVE_NO_LOCK_GRACE_MS;
+}
+
+function getDefiLoopActiveReferenceMs(job) {
+  const processedOn = Number(job?.processedOn || 0);
+  if (Number.isFinite(processedOn) && processedOn > 0) return processedOn;
+  const queuedAt = Number(job?.timestamp || 0);
+  return Number.isFinite(queuedAt) && queuedAt > 0 ? queuedAt : 0;
+}
+
+async function isLiveDefiLoopJob(job, now = Date.now()) {
+  if (!job || job.name !== 'DEFI_LOOP') return false;
+
+  const state = typeof job.getState === 'function'
+    ? await job.getState().catch(() => null)
+    : null;
+
+  if (state && state !== 'active') {
+    return state === 'waiting' || state === 'delayed' || state === 'paused';
+  }
+
+  const lock = await readBullJobLock(job);
+  if (lock) return true;
+
+  const referenceMs = getDefiLoopActiveReferenceMs(job);
+  if (!referenceMs) return false;
+  return (now - referenceMs) < getDefiLoopNoLockGraceMs(job);
+}
+
+async function removeMalformedDefiLoopJobReferences(job, reason = 'malformed-active') {
+  if (!job?.id) return false;
+
+  const id = String(job.id);
+  const client = job?.queue?.client || queue.client;
+  const jobKey = typeof job?.queue?.toKey === 'function'
+    ? job.queue.toKey(id)
+    : resolveBullQueueKey(id);
+
+  try {
+    await job.remove();
+    return true;
+  } catch (_) {
+    // Active jobs without a Bull lock may fail job.remove(); clean stale refs directly.
+  }
+
+  try {
+    await Promise.all([
+      client.lrem(resolveBullQueueKey('active'), 0, id),
+      client.lrem(resolveBullQueueKey('wait'), 0, id),
+      client.zrem(resolveBullQueueKey('priority'), id),
+      client.zrem(resolveBullQueueKey('delayed'), id),
+      client.zrem(resolveBullQueueKey('failed'), id),
+      client.zrem(resolveBullQueueKey('completed'), id),
+      client.srem(resolveBullQueueKey('stalled'), id),
+      client.del(jobKey),
+      client.del(`${jobKey}:lock`),
+    ]);
+    logQueueVerbose(`[DEFI_LOOP] Removed stale job references id=${id} reason=${reason}`);
+    return true;
+  } catch (err) {
+    console.error(`[DEFI_LOOP] Could not remove stale job references ${id}:`, err.message);
+    return false;
+  }
+}
+
+async function cleanupMalformedActiveDefiLoopJobs({ agentId = null, limit = 200 } = {}) {
+  const activeJobs = await queue.getJobs(['active'], 0, limit, true);
+  const now = Date.now();
+  const targetAgentId = agentId ? String(agentId).trim() : null;
+  let removedCount = 0;
+  let requeuedCount = 0;
+
+  for (const job of activeJobs) {
+    if (job?.name !== 'DEFI_LOOP') continue;
+
+    const queuedAgentId = String(job?.data?.agentId || '').trim();
+    if (!queuedAgentId) continue;
+    if (targetAgentId && queuedAgentId !== targetAgentId) continue;
+
+    const lock = await readBullJobLock(job);
+    if (lock) continue;
+
+    const referenceMs = getDefiLoopActiveReferenceMs(job);
+    if (!referenceMs) continue;
+    if ((now - referenceMs) < getDefiLoopNoLockGraceMs(job)) continue;
+
+    const recovery = buildDefiLoopOrphanRecovery(job);
+
+    const removed = await removeMalformedDefiLoopJobReferences(job, 'active-no-lock');
+    if (!removed) continue;
+    removedCount += 1;
+
+    if (!recovery?.shouldRequeue) continue;
+
+    const requeueResult = await queueDefiLoopForAgent(recovery.agentId, {
+      reason: recovery.reason,
+      taskRunId: recovery.taskRunId,
+      sourceTaskId: recovery.sourceTaskId,
+      carryFollowupPhase: recovery.carryFollowupPhase,
+      orphanRecoveryCount: recovery.orphanRecoveryCount + 1,
+    }).catch((error) => ({
+      queued: false,
+      error: error.message,
+    }));
+
+    if (!requeueResult.queued) {
+      console.error(
+        `[DEFI_LOOP] Could not requeue malformed active job ${job.id}:`,
+        requeueResult.error || 'unknown error',
+      );
+      continue;
+    }
+
+    requeuedCount += 1;
+
+    if (recovery.taskRunId && recovery.sourceTaskId === 'EXEC_AUTO_CARRY_START') {
+      await taskRunService.updateTaskRunStage(recovery.taskRunId, {
+        status: 'running',
+        stageKey: recovery.carryFollowupPhase === 'followup'
+          ? 'carry_waiting_followup'
+          : 'carry_handoff_queued',
+        stageLabel: recovery.carryFollowupPhase === 'followup'
+          ? 'Waiting For Follow-Up'
+          : 'Auto Carry Handoff',
+        stageDetail: recovery.carryFollowupPhase === 'followup'
+          ? 'Recovered the queued follow-up after a worker interruption. The autonomous carry handoff is continuing.'
+          : 'Recovered the queued Auto Carry review after a worker interruption. The autonomous carry handoff is continuing.',
+      }).catch(() => {});
+    }
+  }
+
+  if (removedCount > 0) {
+    logQueueVerbose(
+      `[DEFI_LOOP] Cleaned up ${removedCount} malformed active job(s)`
+      + (requeuedCount > 0 ? ` and requeued ${requeuedCount} recovery job(s)` : ''),
+    );
+  }
+
+  return {
+    removedCount,
+    requeuedCount,
+  };
+}
+
+function normalizeCarryAutomationAction(payload = {}) {
+  return String(payload?.action || payload?.operationType || '').trim().toLowerCase();
+}
+
+async function findLiveDefiLoopJobForTaskRun(taskRunId) {
+  const normalizedTaskRunId = String(taskRunId || '').trim();
+  if (!normalizedTaskRunId) return null;
+
+  const jobs = await queue.getJobs(['waiting', 'active', 'delayed', 'paused'], 0, 500, true);
+  const now = Date.now();
+
+  for (const job of jobs) {
+    if (job?.name !== 'DEFI_LOOP') continue;
+    if (String(job?.data?.taskRunId || '').trim() !== normalizedTaskRunId) continue;
+
+    if (await isLiveDefiLoopJob(job, now)) return job;
+    await removeMalformedDefiLoopJobReferences(job, 'task-run-live-check');
+  }
+
+  return null;
+}
+
+async function readLatestCarryAutomationTransactionForRun(run) {
+  if (!run?.agent_id || !run?.created_at) return null;
+
+  const { rows: [row] } = await db.query(
+    `SELECT tx_hash,
+            amount_usdc::text AS amount_usdc,
+            token,
+            status,
+            meta,
+            created_at
+       FROM transactions
+      WHERE agent_id = $1
+        AND status = 'confirmed'
+        AND meta->>'executionSource' = $2
+        AND created_at >= $3
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [run.agent_id, getCarryAutomationExecutionSource(), run.created_at],
+  );
+
+  return row || null;
+}
+
+async function loadAgentForAutoCarryHandoffRecovery(agentId) {
+  const { rows: [agent] } = await db.query(
+    `SELECT id, llm_model, llm_api_key_encrypted,
+            defi_loop_enabled, lending_automation_enabled, carry_automation_enabled, cirbtc_lp_enabled, oracle_enabled,
+            daily_defi_loop_count, daily_limit_reset_at,
+            daily_limit_usdc, max_trade_usdc, defi_wallet_reserve_usdc,
+            oracle_max_eurc_inventory, oracle_min_eurc_reserve, slippage_percent,
+            gateway_auto_topup_enabled, gateway_auto_topup_min_usdc, gateway_auto_topup_target_usdc,
+            wallet_address, private_key_encrypted,
+            market_analysis_last_decision,
+            stable_manual_cooldown_until
+       FROM agents
+      WHERE id = $1`,
+    [agentId],
+  );
+
+  return agent || null;
+}
+
+function resolveRecoveredCarryAmountUsdc({ automationPolicy = null, payload = null, latestTx = null } = {}) {
+  const actionParams = automationPolicy?.verdict?.actionParams && typeof automationPolicy.verdict.actionParams === 'object'
+    ? automationPolicy.verdict.actionParams
+    : {};
+  const candidates = [
+    payload?.amountUsdc,
+    payload?.amountIn,
+    actionParams.amountIn,
+    actionParams.borrowAmount,
+    actionParams.amount,
+    latestTx?.amount_usdc,
+  ];
+
+  for (const candidate of candidates) {
+    const value = normalizeUsdcAmount(Number(candidate));
+    if (value > 0) return value;
+  }
+
+  return 0;
+}
+
+async function persistRecoveredAutoCarryExecution({ run, automationPolicy = null, payload = {}, latestTx = null, carryFollowupPhase = 'initial' }) {
+  const action = normalizeCarryAutomationAction(payload);
+  const stableToken = String(
+    payload?.stableToken
+    || getCarryAutomationTransactionToken(automationPolicy?.verdict?.actionParams || {}, automationPolicy)
+    || 'USDC',
+  ).trim().toUpperCase();
+  const amountUsdc = resolveRecoveredCarryAmountUsdc({ automationPolicy, payload, latestTx });
+  const resultPayload = {
+    ...(payload || {}),
+    ok: payload?.ok !== false,
+    action: action || payload?.action || payload?.operationType || null,
+    amountUsdc,
+    stableToken,
+    carryTriggerTaskId: 'EXEC_AUTO_CARRY_START',
+    carryFollowupPhase,
+    finalAutomationStatus: 'executed',
+    recoveredFromMissingFollowup: true,
+    recoveredInlineFromHandoff: true,
+  };
+
+  await _setAutomationState(run.agent_id, 'carryAutomation', 'executed');
+  await _setAutomationDecision(run.agent_id, 'carryAutomation', resultPayload);
+
+  if (resultPayload.txHash) {
+    await db.query(
+      `INSERT INTO transactions
+         (agent_id, type, from_chain, to_chain, token, amount_usdc, status, tx_hash, meta)
+       VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, 'confirmed', $5, $6::jsonb)`,
+      [
+        run.agent_id,
+        getCarryAutomationTransactionType(),
+        stableToken,
+        amountUsdc,
+        resultPayload.txHash,
+        JSON.stringify({
+          automationPolicy,
+          ...resultPayload,
+          executionState: 'executed',
+          executionSource: getCarryAutomationExecutionSource(),
+        }),
+      ],
+    );
+  }
+
+  if (AUTO_CARRY_HANDOFF_TERMINAL_ACTIONS.has(action)) {
+    await _saveResultOnly(run.agent_id, 'EXEC_AUTO_CARRY_START', resultPayload).catch(() => {});
+    await taskRunService.completeTaskRun(run.id, {
+      resultPayload,
+      stageKey: 'carry_handoff_completed',
+      stageLabel: 'Completed',
+      stageDetail: resultPayload.summary || 'The Auto Carry handoff completed.',
+    });
+    return { completed: true, action, payload: resultPayload };
+  }
+
+  if (action === 'open_carry') {
+    await taskRunService.updateTaskRunStage(run.id, {
+      status: 'running',
+      stageKey: 'carry_waiting_followup',
+      stageLabel: 'Waiting For Follow-Up',
+      stageDetail: 'Borrow opened. The recovered follow-up will deploy the borrowed balance into the stable LP lane.',
+    }).catch(() => {});
+    return { completed: false, action, payload: resultPayload };
+  }
+
+  return { completed: false, action, payload: resultPayload };
+}
+
+async function executeRecoveredAutoCarryInitialRun(run) {
+  const agent = await loadAgentForAutoCarryHandoffRecovery(run.agent_id);
+  if (!agent) throw new Error('agent_not_found');
+
+  await taskRunService.updateTaskRunStage(run.id, {
+    status: 'running',
+    stageKey: 'carry_initial_review',
+    stageLabel: 'Carry Review',
+    stageDetail: 'Recovering the missing Auto Carry review without waiting for another queue handoff.',
+  }).catch(() => {});
+
+  const context = await buildCarryAutomationTaskContext(agent);
+  if (!context.ok) throw new Error(context.error || context.reason || 'carry_context_unavailable');
+
+  if (context.carryPolicy?.verdict?.execute !== true) {
+    const resultPayload = {
+      ok: true,
+      action: 'hold',
+      reason: context.carryPolicy?.verdict?.reason || 'carry_policy_hold',
+      summary: context.carryPolicy?.verdict?.reason || 'Auto Carry is enabled, but the live carry lane is waiting.',
+      carryTriggerTaskId: 'EXEC_AUTO_CARRY_START',
+      carryFollowupPhase: 'initial',
+      finalAutomationStatus: 'policy_hold',
+      recoveredInlineFromHandoff: true,
+    };
+
+    await _setAutomationState(run.agent_id, 'carryAutomation', 'policy_hold');
+    await _setAutomationDecision(run.agent_id, 'carryAutomation', resultPayload);
+    await _saveResultOnly(run.agent_id, 'EXEC_AUTO_CARRY_START', resultPayload).catch(() => {});
+    await taskRunService.completeTaskRun(run.id, {
+      resultPayload,
+      stageKey: 'carry_handoff_completed',
+      stageLabel: 'Completed',
+      stageDetail: resultPayload.summary,
+    });
+
+    return { completed: true, action: 'hold', payload: resultPayload };
+  }
+
+  const execution = await executeCarryAutomationTask({
+    agent,
+    automationPolicy: context.carryPolicy,
+    dryRunEnabled: false,
+    taskRunId: run.id,
+    sourceTaskId: 'EXEC_AUTO_CARRY_START',
+  });
+
+  if (!execution.ok) throw new Error(execution.error || execution.reason || 'carry_execution_failed');
+
+  return persistRecoveredAutoCarryExecution({
+    run,
+    automationPolicy: context.carryPolicy,
+    payload: execution.payload || {},
+    carryFollowupPhase: 'initial',
+  });
+}
+
+async function executeRecoveredAutoCarryFollowupRun(run, latestTx) {
+  const agent = await loadAgentForAutoCarryHandoffRecovery(run.agent_id);
+  if (!agent) throw new Error('agent_not_found');
+
+  await taskRunService.updateTaskRunStage(run.id, {
+    status: 'running',
+    stageKey: 'carry_followup_running',
+    stageLabel: 'Carry Follow-Up',
+    stageDetail: 'Recovering the stuck follow-up and deploying the borrowed balance into the stable LP lane.',
+  }).catch(() => {});
+
+  const walletUsdc = await getArcUsdcBalance(agent.wallet_address).catch(() => 0);
+  const latestAmount = normalizeUsdcAmount(Number(latestTx?.amount_usdc || 0));
+  const amountIn = normalizeUsdcAmount(Math.min(latestAmount, walletUsdc));
+  if (!(amountIn > 0.01)) throw new Error('carry_followup_wallet_balance_unavailable');
+
+  const automationPolicy = {
+    policyId: getCarryAutomationExecutionSource(),
+    verdict: {
+      execute: true,
+      operationType: 'deploy_wallet_balance',
+      actionAssetSymbol: 'USDC',
+      actionParams: {
+        stableToken: 'USDC',
+        amountIn,
+      },
+    },
+  };
+
+  const execution = await executeCarryAutomationTask({
+    agent,
+    automationPolicy,
+    dryRunEnabled: false,
+    taskRunId: run.id,
+    sourceTaskId: 'EXEC_AUTO_CARRY_START',
+  });
+
+  if (!execution.ok) throw new Error(execution.error || execution.reason || 'carry_followup_execution_failed');
+
+  return persistRecoveredAutoCarryExecution({
+    run,
+    automationPolicy,
+    payload: execution.payload || {},
+    latestTx,
+    carryFollowupPhase: 'followup',
+  });
+}
+
+async function executeRecoveredAutoCarryHandoffRun(run, latestTx, plan) {
+  if (plan?.carryFollowupPhase === 'followup') {
+    return executeRecoveredAutoCarryFollowupRun(run, latestTx);
+  }
+
+  return executeRecoveredAutoCarryInitialRun(run);
+}
+
+async function completeAutoCarryStartRunFromCarryTransaction(run, txRow) {
+  const meta = txRow?.meta && typeof txRow.meta === 'object' ? txRow.meta : {};
+  const action = normalizeCarryAutomationAction(meta);
+  if (!AUTO_CARRY_HANDOFF_TERMINAL_ACTIONS.has(action)) return false;
+
+  const resultPayload = {
+    ...meta,
+    ok: meta.ok !== false,
+    action: action || meta.action || meta.operationType || null,
+    txHash: txRow?.tx_hash || meta.txHash || null,
+    amountUsdc: txRow?.amount_usdc || meta.amountUsdc || null,
+    token: txRow?.token || meta.stableToken || meta.token || 'USDC',
+    carryTriggerTaskId: 'EXEC_AUTO_CARRY_START',
+    carryFollowupPhase: 'followup',
+    finalAutomationStatus: 'executed',
+    recoveredFromMissingFollowup: true,
+  };
+
+  await _saveResultOnly(run.agent_id, 'EXEC_AUTO_CARRY_START', resultPayload).catch(() => {});
+  await taskRunService.completeTaskRun(run.id, {
+    resultPayload,
+    stageKey: 'carry_handoff_completed',
+    stageLabel: 'Completed',
+    stageDetail: meta.summary || 'The Auto Carry handoff completed.',
+  });
+
+  return true;
+}
+
+function resolveAutoCarryHandoffRecoveryPlan(run, latestTx) {
+  const stageKey = String(run?.stage_key || '').trim().toLowerCase();
+  const meta = latestTx?.meta && typeof latestTx.meta === 'object' ? latestTx.meta : {};
+  const latestAction = normalizeCarryAutomationAction(meta);
+
+  if (AUTO_CARRY_HANDOFF_TERMINAL_ACTIONS.has(latestAction)) {
+    return { completeFromTransaction: true };
+  }
+
+  if (stageKey === 'carry_handoff_queued' && latestAction !== 'open_carry') {
+    return {
+      reason: 'carry-start-task-recovery',
+      carryFollowupPhase: 'initial',
+      stageKey: 'carry_handoff_queued',
+      stageLabel: 'Auto Carry Handoff',
+      stageDetail: 'Recovered a missing queued Auto Carry review. The autonomous carry handoff is continuing.',
+    };
+  }
+
+  return {
+    reason: 'carry-open-followup-recovery',
+    carryFollowupPhase: 'followup',
+    stageKey: 'carry_waiting_followup',
+    stageLabel: 'Waiting For Follow-Up',
+    stageDetail: 'Recovered a missing queued follow-up. The autonomous carry handoff is continuing.',
+  };
+}
+
+async function recoverMissingAutoCarryHandoffRuns({ agentId = null, limit = CARRY_AUTOMATION_HANDOFF_RECOVERY_BATCH_SIZE } = {}) {
+  const targetAgentId = agentId ? String(agentId).trim() : null;
+  const staleBefore = new Date(Date.now() - CARRY_AUTOMATION_HANDOFF_RECOVERY_AGE_MS).toISOString();
+  const params = [
+    taskRunService.ACTIVE_TASK_RUN_STATUSES,
+    AUTO_CARRY_HANDOFF_RECOVERY_STAGE_KEYS,
+    staleBefore,
+    Math.max(Math.min(Number.parseInt(limit, 10) || CARRY_AUTOMATION_HANDOFF_RECOVERY_BATCH_SIZE, 100), 1),
+  ];
+  let agentFilter = '';
+  if (targetAgentId) {
+    params.push(targetAgentId);
+    agentFilter = `AND r.agent_id = $${params.length}`;
+  }
+
+  const { rows } = await db.query(
+    `SELECT r.id,
+            r.agent_id,
+            r.task_id,
+            r.status,
+            r.stage_key,
+            r.stage_label,
+            r.stage_detail,
+            r.created_at,
+            r.updated_at
+       FROM agent_task_runs r
+      WHERE r.task_id = 'EXEC_AUTO_CARRY_START'
+        AND r.status = ANY($1::text[])
+        AND r.stage_key = ANY($2::text[])
+        AND r.updated_at <= $3
+        ${agentFilter}
+      ORDER BY r.updated_at ASC
+      LIMIT $4`,
+    params,
+  );
+
+  let completedCount = 0;
+  let requeuedCount = 0;
+  let inlineCount = 0;
+  let skippedCount = 0;
+
+  for (const run of rows) {
+    const liveJob = await findLiveDefiLoopJobForTaskRun(run.id).catch(() => null);
+    if (liveJob) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const latestTx = await readLatestCarryAutomationTransactionForRun(run).catch(() => null);
+    const plan = resolveAutoCarryHandoffRecoveryPlan(run, latestTx);
+
+    if (plan.completeFromTransaction) {
+      const completed = await completeAutoCarryStartRunFromCarryTransaction(run, latestTx).catch((error) => {
+        console.error(`[DEFI_LOOP] Could not complete recovered Auto Carry run ${run.id}:`, error.message);
+        return false;
+      });
+      if (completed) completedCount += 1;
+      continue;
+    }
+
+    const inlineRecovery = await executeRecoveredAutoCarryHandoffRun(run, latestTx, plan).catch((error) => ({
+      completed: false,
+      action: null,
+      error: error.message,
+    }));
+
+    if (inlineRecovery.error) {
+      console.error(`[DEFI_LOOP] Could not recover Auto Carry handoff inline for run ${run.id}:`, inlineRecovery.error);
+      continue;
+    }
+
+    inlineCount += 1;
+    if (inlineRecovery.completed) completedCount += 1;
+  }
+
+  if (completedCount > 0 || requeuedCount > 0 || inlineCount > 0) {
+    console.log(
+      `[DEFI_LOOP] Auto Carry handoff recovery completed=${completedCount} inline=${inlineCount} requeued=${requeuedCount}`
+      + (skippedCount > 0 ? ` skipped=${skippedCount}` : ''),
+    );
+  }
+
+  return {
+    completedCount,
+    requeuedCount,
+    inlineCount,
+    skippedCount,
+  };
+}
+
+function hasDailyResetWindowElapsed(resetAtValue, nowMs = Date.now()) {
+  const resetAtMs = resetAtValue
+    ? new Date(resetAtValue).getTime()
+    : Number.NaN;
+
+  if (!Number.isFinite(resetAtMs)) return false;
+  return (nowMs - resetAtMs) >= 86_400_000;
+}
+
+function hasReachedSharedDefiDailyCap(agent, nowMs = Date.now()) {
+  if (!agent) return false;
+  if (isDailyLimitBypassed(agent)) return false;
+  if (hasDailyResetWindowElapsed(agent.daily_limit_reset_at, nowMs)) return false;
+  return Number(agent.daily_defi_loop_count || 0) >= DAILY_DEFI_LOOP_CAP;
+}
+
+function shouldSuspendScanJobsWhenDefiCapReached(agent, nowMs = Date.now()) {
+  return SUSPEND_CAP_REACHED_SCAN_JOBS && hasReachedSharedDefiDailyCap(agent, nowMs);
+}
 const DEFAULT_ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES = 60;
 
 function readPositiveNumberEnv(name, fallback) {
@@ -2559,11 +3678,20 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
     agent.daily_market_analysis_count = 0;
   }
 
-  // Daily cap: max 48 oracle queries per agent (every 30 min × 24h)
-  const DAILY_ORACLE_CAP = 48;
+  // Daily cap: max 48 oracle queries per agent by default (every 30 min x 24h)
   if (!isDailyLimitBypassed(agent) && agent.daily_market_analysis_count >= DAILY_ORACLE_CAP) {
     console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} daily cap reached`);
     return finishOracle('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_market_analysis_count });
+  }
+
+  if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
+    console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} paused because this agent's daily DeFi cap is full`);
+    return finishOracle('cap_reached', {
+      ok: false,
+      reason: 'shared_defi_daily_cap_reached',
+      count: agent.daily_defi_loop_count,
+      summary: "Oracle snapshots are paused because this agent's daily DeFi automation cap is already full.",
+    });
   }
 
   await maybeWarmAgentGatewayBalance(agent, 'oracle_query');
@@ -2677,15 +3805,26 @@ async function scheduleOracleLoop() {
   setInterval(async () => {
     try {
       const { rows } = await db.query(
-        `SELECT id FROM agents
+        `SELECT id, wallet_address, daily_defi_loop_count, daily_limit_reset_at FROM agents
          WHERE oracle_enabled = TRUE
            AND status NOT IN ('locked', 'inactive')`,
       );
-      for (const { id } of rows) {
+      let queuedCount = 0;
+      let suspendedCount = 0;
+      for (const agent of rows) {
+        if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
+          suspendedCount += 1;
+          continue;
+        }
+        const { id } = agent;
         await queue.add('ORACLE_QUERY', { agentId: id }, { jobId: `oracle-${id}-${Date.now()}` });
+        queuedCount += 1;
       }
-      if (rows.length > 0) {
-        console.log(`[ORACLE_LOOP] Queued ${rows.length} oracle job(s)`);
+      if (queuedCount > 0) {
+        console.log(`[ORACLE_LOOP] Queued ${queuedCount} oracle job(s)`);
+      }
+      if (suspendedCount > 0) {
+        console.log(`[ORACLE_LOOP] Skipped ${suspendedCount} oracle job(s) because the shared daily DeFi cap is already full`);
       }
     } catch (err) {
       console.error('[ORACLE_LOOP] Schedule error:', err.message);
@@ -2701,20 +3840,31 @@ async function scheduleMarketAnalysisLoop() {
   setInterval(async () => {
     try {
       const { rows } = await db.query(
-        `SELECT id FROM agents
+        `SELECT id, wallet_address, daily_defi_loop_count, daily_limit_reset_at FROM agents
          WHERE market_analysis_enabled = TRUE
            AND is_smart_mode = TRUE
            AND status NOT IN ('locked', 'inactive')`,
       );
-      for (const { id } of rows) {
+      let queuedCount = 0;
+      let suspendedCount = 0;
+      for (const agent of rows) {
+        if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
+          suspendedCount += 1;
+          continue;
+        }
+        const { id } = agent;
         await queue.add(
           'MARKET_ANALYSIS',
           { agentId: id, chain: 'arc-testnet', token: 'USDC' },
           { jobId: `market-analysis-${id}-${Date.now()}` },
         );
+        queuedCount += 1;
       }
-      if (rows.length > 0) {
-        console.log(`[MARKET_ANALYSIS_LOOP] Queued ${rows.length} market analysis job(s)`);
+      if (queuedCount > 0) {
+        console.log(`[MARKET_ANALYSIS_LOOP] Queued ${queuedCount} market analysis job(s)`);
+      }
+      if (suspendedCount > 0) {
+        console.log(`[MARKET_ANALYSIS_LOOP] Skipped ${suspendedCount} market analysis job(s) because the shared daily DeFi cap is already full`);
       }
     } catch (err) {
       console.error('[MARKET_ANALYSIS_LOOP] Schedule error:', err.message);
@@ -2731,6 +3881,12 @@ async function scheduleMarketAnalysisLoop() {
 
 queue.process('DEFI_LOOP', 1, async (job) => {
   const { agentId } = job.data;
+  const carryTaskRunId = job?.data?.taskRunId || null;
+  const carrySourceTaskId = String(job?.data?.sourceTaskId || '').trim().toUpperCase();
+  const carryFollowupPhase = String(job?.data?.carryFollowupPhase || 'initial').trim().toLowerCase();
+  const shouldTrackAutoCarryTaskRun = Boolean(carryTaskRunId && carrySourceTaskId === 'EXEC_AUTO_CARRY_START');
+  let recoveredPendingAutoCarryTaskRun = null;
+  let pendingAutoCarryTaskRunResolved = false;
 
   let latestStablePolicy = null;
   let latestStableLanePolicy = null;
@@ -2782,10 +3938,128 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     }
   };
 
+  const resolveTrackedOrRecoveredAutoCarryTaskRun = async (status, payload) => {
+    if (shouldTrackAutoCarryTaskRun) {
+      return {
+        taskRunId: carryTaskRunId,
+        sourceTaskId: carrySourceTaskId,
+        carryFollowupPhase,
+        adopted: false,
+      };
+    }
+
+    if (activeAutomationKey !== 'carryAutomation') return null;
+    if (payload?.ok === false) return null;
+
+    const carryAction = String(payload?.action || '').trim().toLowerCase();
+    const carryState = String(latestCarryPolicy?.metrics?.carryState || '').trim().toLowerCase();
+    const canRecoverFromGenericCarryAction = (
+      carryAction === 'open_carry'
+      || carryAction === 'deploy_wallet_balance'
+      || carryAction === 'close_carry'
+      || carryAction === 'repay_wallet_balance'
+    );
+    const canRecoverFromCarryHold = status === 'policy_hold' && carryState === 'active';
+
+    if (!canRecoverFromGenericCarryAction && !canRecoverFromCarryHold) return null;
+    if (pendingAutoCarryTaskRunResolved) return recoveredPendingAutoCarryTaskRun;
+
+    pendingAutoCarryTaskRunResolved = true;
+    const pendingRun = await taskRunService.findActiveTaskRun(agentId, 'EXEC_AUTO_CARRY_START').catch(() => null);
+    if (!pendingRun) {
+      recoveredPendingAutoCarryTaskRun = null;
+      return null;
+    }
+
+    const pendingStageKey = String(pendingRun.stage_key || '').trim().toLowerCase();
+    const inferredFollowupPhase = (
+      carryAction === 'deploy_wallet_balance'
+      || carryAction === 'repay_wallet_balance'
+      || carryAction === 'close_carry'
+      || carryState === 'active'
+      || pendingStageKey === 'carry_waiting_followup'
+      || pendingStageKey === 'carry_followup_running'
+    )
+      ? 'followup'
+      : 'initial';
+
+    recoveredPendingAutoCarryTaskRun = {
+      taskRunId: pendingRun.id,
+      sourceTaskId: 'EXEC_AUTO_CARRY_START',
+      carryFollowupPhase: inferredFollowupPhase,
+      adopted: true,
+    };
+
+    return recoveredPendingAutoCarryTaskRun;
+  };
+
   const finishDefi = async (status, payload) => {
     await persistAutomationSnapshot(activeAutomationKey, status, payload);
+
+    const trackedAutoCarryTaskRun = await resolveTrackedOrRecoveredAutoCarryTaskRun(status, payload);
+
+    if (trackedAutoCarryTaskRun) {
+      const trackedTaskRunId = trackedAutoCarryTaskRun.taskRunId;
+      const trackedSourceTaskId = trackedAutoCarryTaskRun.sourceTaskId;
+      const trackedCarryFollowupPhase = trackedAutoCarryTaskRun.carryFollowupPhase;
+      const resultPayload = {
+        ...(payload || {}),
+        ok: payload?.ok !== false,
+        carryTriggerTaskId: trackedSourceTaskId,
+        carryFollowupPhase: trackedCarryFollowupPhase,
+        finalAutomationStatus: status,
+        recoveredFromGenericDefiLoop: trackedAutoCarryTaskRun.adopted === true,
+      };
+
+      if (payload?.ok === false) {
+        await _saveResultOnly(agentId, trackedSourceTaskId, {
+          ...resultPayload,
+          ok: false,
+          skipped: false,
+          summary: payload?.summary || payload?.error || payload?.reason || 'Auto Carry handoff failed.',
+        }).catch(() => {});
+        await taskRunService.failTaskRun(trackedTaskRunId, {
+          error: payload?.error || payload?.summary || payload?.reason || 'auto_carry_handoff_failed',
+          stageKey: 'carry_handoff_failed',
+          stageLabel: 'Auto Carry Failed',
+          stageDetail: payload?.summary || payload?.error || payload?.reason || 'Auto Carry handoff failed.',
+          resultPayload,
+        }).catch(() => {});
+      } else if (payload?.action === 'open_carry' && payload?.followupQueued) {
+        const delaySeconds = Math.round(Number(payload.followupDelayMs || CARRY_AUTOMATION_FOLLOWUP_DELAY_MS) / 1000);
+        await taskRunService.updateTaskRunStage(trackedTaskRunId, {
+          status: 'running',
+          stageKey: 'carry_waiting_followup',
+          stageLabel: 'Waiting For Follow-Up',
+          stageDetail: delaySeconds > 0
+            ? `Borrow opened. The queued ${delaySeconds}-second follow-up is still finishing the autonomous carry handoff.`
+            : 'Borrow opened. The queued follow-up is finishing the autonomous carry handoff.',
+        }).catch(() => {});
+      } else {
+        await _saveResultOnly(agentId, trackedSourceTaskId, resultPayload).catch(() => {});
+        await taskRunService.completeTaskRun(trackedTaskRunId, {
+          resultPayload,
+          stageKey: 'carry_handoff_completed',
+          stageLabel: 'Completed',
+          stageDetail: payload?.summary || (trackedCarryFollowupPhase === 'followup'
+            ? 'The follow-up carry cycle completed.'
+            : 'The Auto Carry handoff completed.'),
+        }).catch(() => {});
+      }
+    }
+
     return payload;
   };
+
+  if (shouldTrackAutoCarryTaskRun) {
+    await _reportTaskRunStage(carryTaskRunId, {
+      stageKey: carryFollowupPhase === 'followup' ? 'carry_followup_running' : 'carry_initial_review',
+      stageLabel: carryFollowupPhase === 'followup' ? 'Carry Follow-Up' : 'Carry Review',
+      stageDetail: carryFollowupPhase === 'followup'
+        ? 'The queued follow-up carry cycle is finishing the autonomous handoff.'
+        : 'Auto Carry is running the first live review after the paid trigger.',
+    });
+  }
 
   // Reload agent — verify flag still on + fetch encrypted key
   const { rows: [agent] } = await db.query(
@@ -2888,13 +4162,17 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     await db.query(
       `INSERT INTO transactions
          (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
-       VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'failed', $2::jsonb)`,
+       VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'skipped', $2::jsonb)`,
       [agentId, JSON.stringify({
         executionState: 'daily_cap_reached',
         executionSource: 'oracle_strategy',
         reason: 'daily_cap_reached',
+        summary: 'Skipped before the next EURC/USDC oracle strategy review could start because the daily DeFi loop cap was already reached.',
         dailyCap: DAILY_DEFI_LOOP_CAP,
         dailyCapCount: agent.daily_defi_loop_count,
+        signal: {
+          strategy: 'stablecoin_fx',
+        },
         fromToken: 'USDC',
         toToken: 'EURC',
       })],
@@ -3679,6 +4957,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         agent,
         automationPolicy,
         dryRunEnabled: true,
+        taskRunId: shouldTrackAutoCarryTaskRun ? carryTaskRunId : null,
+        sourceTaskId: shouldTrackAutoCarryTaskRun ? carrySourceTaskId : null,
       });
       if (!dryRunResult.ok) {
         return finishDefi('dry_run_failed', {
@@ -3931,6 +5211,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         agent,
         automationPolicy,
         dryRunEnabled: false,
+        taskRunId: shouldTrackAutoCarryTaskRun ? carryTaskRunId : null,
+        sourceTaskId: shouldTrackAutoCarryTaskRun ? carrySourceTaskId : null,
       });
       if (!executionResult.ok) {
         await db.query(
@@ -4189,6 +5471,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     return finishDefi('executed', {
       ok: true,
       action: operationType,
+      ...executionPayload,
       txHash: txResult.txHash,
       amountOut: txResult.amountOut,
       summary: executionPayload.summary || automationPolicy?.verdict?.reason || null,
@@ -4242,34 +5525,8 @@ queue.process('DEFI_LOOP', 1, async (job) => {
 async function scheduleDefiLoop() {
   if (!DEFI_LOOP_INTERVAL_MS || DEFI_LOOP_INTERVAL_MS < 60_000) return;
 
-  const cleanupMalformedActiveDefiLoopJobs = async () => {
-    const activeJobs = await queue.getJobs(['active'], 0, 200, true);
-    const now = Date.now();
-    let removedCount = 0;
-
-    for (const job of activeJobs) {
-      if (job?.name !== 'DEFI_LOOP') continue;
-      if (job?.processedOn) continue;
-
-      const queuedAt = Number(job?.timestamp || 0);
-      if (!Number.isFinite(queuedAt) || queuedAt <= 0) continue;
-      if ((now - queuedAt) < DEFI_LOOP_ORPHAN_JOB_AGE_MS) continue;
-
-      try {
-        await job.remove();
-        removedCount += 1;
-      } catch (err) {
-        console.error(`[DEFI_LOOP] Could not remove malformed active job ${job.id}:`, err.message);
-      }
-    }
-
-    if (removedCount > 0) {
-      logQueueVerbose(`[DEFI_LOOP] Cleaned up ${removedCount} malformed active job(s) before scheduling the next sweep`);
-    }
-  };
-
   const getQueuedOrActiveDefiLoopAgentIds = async () => {
-    const jobs = await queue.getJobs(['waiting', 'active'], 0, 500, true);
+    const jobs = await queue.getJobs(['waiting', 'active', 'delayed'], 0, 500, true);
     return new Set(
       jobs
         .filter((job) => job?.name === 'DEFI_LOOP' && job?.data?.agentId)
@@ -4282,21 +5539,38 @@ async function scheduleDefiLoop() {
       await cleanupMalformedActiveDefiLoopJobs();
 
       const { rows } = await db.query(
-        `SELECT id FROM agents
-         WHERE (defi_loop_enabled = TRUE OR lending_automation_enabled = TRUE OR cirbtc_lp_enabled = TRUE)
+        `SELECT id, wallet_address, daily_defi_loop_count, daily_limit_reset_at FROM agents
+         WHERE (defi_loop_enabled = TRUE OR lending_automation_enabled = TRUE OR carry_automation_enabled = TRUE OR cirbtc_lp_enabled = TRUE)
            AND status NOT IN ('locked', 'inactive')`,
       );
 
       const queuedOrActiveAgentIds = await getQueuedOrActiveDefiLoopAgentIds();
       let queuedCount = 0;
+      let cappedCount = 0;
+      const nowUtc = Date.now();
 
-      for (const { id } of rows) {
+      for (const agent of rows) {
+        const { id } = agent;
         if (queuedOrActiveAgentIds.has(String(id))) continue;
-        await queue.add('DEFI_LOOP', { agentId: id }, { jobId: `defi-${id}-${Date.now()}` });
+
+        const dailyCapReached = hasReachedSharedDefiDailyCap(agent, nowUtc);
+
+        if (dailyCapReached) {
+          cappedCount += 1;
+          continue;
+        }
+
+        await queue.add('DEFI_LOOP', { agentId: id }, {
+          jobId: `defi-${id}-${Date.now()}`,
+          priority: DEFI_LOOP_PRIORITY_SCHEDULED,
+        });
         queuedCount += 1;
       }
       if (queuedCount > 0) {
         console.log(`[DEFI_LOOP] Queued ${queuedCount} defi loop job(s)`);
+      }
+      if (cappedCount > 0) {
+        console.log(`[DEFI_LOOP] Skipped ${cappedCount} agent(s) because their daily DeFi loop cap is already full`);
       }
     } catch (err) {
       console.error('[DEFI_LOOP] Schedule error:', err.message);
@@ -4304,14 +5578,25 @@ async function scheduleDefiLoop() {
   };
 
   await cleanupMalformedActiveDefiLoopJobs();
+  await recoverMissingAutoCarryHandoffRuns();
   setTimeout(() => {
     queueEligibleDefiLoops().catch((err) => {
       console.error('[DEFI_LOOP] Startup schedule error:', err.message);
     });
   }, Math.max(DEFI_LOOP_STARTUP_DELAY_MS, 0));
+  setInterval(() => {
+    cleanupMalformedActiveDefiLoopJobs().catch((err) => {
+      console.error('[DEFI_LOOP] Orphan cleanup error:', err.message);
+    });
+  }, DEFI_LOOP_ORPHAN_SWEEP_INTERVAL_MS);
+  setInterval(() => {
+    recoverMissingAutoCarryHandoffRuns().catch((err) => {
+      console.error('[DEFI_LOOP] Auto Carry handoff recovery error:', err.message);
+    });
+  }, CARRY_AUTOMATION_HANDOFF_RECOVERY_INTERVAL_MS);
   setInterval(queueEligibleDefiLoops, DEFI_LOOP_INTERVAL_MS);
 
-  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, startup delay ${Math.max(DEFI_LOOP_STARTUP_DELAY_MS, 0) / 1000}s, GLOBAL_DRY_RUN=${GLOBAL_DRY_RUN}`);
+  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, startup delay ${Math.max(DEFI_LOOP_STARTUP_DELAY_MS, 0) / 1000}s, orphan sweep ${DEFI_LOOP_ORPHAN_SWEEP_INTERVAL_MS / 1000}s, carry handoff recovery ${CARRY_AUTOMATION_HANDOFF_RECOVERY_INTERVAL_MS / 1000}s, GLOBAL_DRY_RUN=${GLOBAL_DRY_RUN}`);
 }
 
 // ── DAILY FREE TASKS (Tier 1) ──────────────────────────────────────────────────
@@ -4384,10 +5669,47 @@ const GAS_FANOUT_TASK_FEE_USDC = parseFloat(process.env.GAS_FANOUT_TASK_FEE_USDC
 const AUTOMATION_EXECUTION_FEE_USDC = parseFloat(
   process.env.AUTOMATION_EXECUTION_FEE_USDC || String(PAID_TASK_FEE_USDC),
 );
+const CARRY_AUTOMATION_FOLLOWUP_DELAY_MS = Math.max(
+  parseInt(process.env.CARRY_AUTOMATION_FOLLOWUP_DELAY_MS || '0', 10) || 0,
+  0,
+);
+const CARRY_AUTOMATION_HANDOFF_RECOVERY_AGE_MS = Math.max(
+  parseInt(
+    process.env.CARRY_AUTOMATION_HANDOFF_RECOVERY_AGE_MS
+      || String(Math.max(CARRY_AUTOMATION_FOLLOWUP_DELAY_MS + 10000, 12000)),
+    10,
+  ) || Math.max(CARRY_AUTOMATION_FOLLOWUP_DELAY_MS + 10000, 12000),
+  5000,
+);
+const CARRY_AUTOMATION_HANDOFF_RECOVERY_INTERVAL_MS = Math.max(
+  parseInt(process.env.CARRY_AUTOMATION_HANDOFF_RECOVERY_INTERVAL_MS || '15000', 10) || 15000,
+  5000,
+);
+const CARRY_AUTOMATION_HANDOFF_RECOVERY_BATCH_SIZE = Math.max(
+  Math.min(parseInt(process.env.CARRY_AUTOMATION_HANDOFF_RECOVERY_BATCH_SIZE || '25', 10) || 25, 100),
+  1,
+);
+const AUTO_CARRY_HANDOFF_RECOVERY_STAGE_KEYS = [
+  'carry_handoff_queued',
+  'carry_waiting_followup',
+  'carry_followup_running',
+];
+const AUTO_CARRY_HANDOFF_TERMINAL_ACTIONS = new Set([
+  'deploy_wallet_balance',
+  'repay_wallet_balance',
+  'close_carry',
+  'auto_carry_stop',
+]);
 const MANUAL_DEFI_PAID_TASK_OPTIONS = {
   guard: null,
   incrementDailyPaidCount: false,
 };
+
+function formatCarryFollowupDelayForSummary(delayMs = CARRY_AUTOMATION_FOLLOWUP_DELAY_MS) {
+  const normalizedDelayMs = Math.max(Number(delayMs) || 0, 0);
+  if (normalizedDelayMs <= 0) return '';
+  return ` in ${Math.round(normalizedDelayMs / 1000)} seconds`;
+}
 
 // ── TIER-2 PAID TASK CATALOG ───────────────────────────────────────────────────
 const BUILTIN_TIER2_TASKS = [
@@ -4565,6 +5887,20 @@ const BUILTIN_TIER2_TASKS = [
     id:          'EXEC_LENDING_LIQUIDATE',
     title:       'Lending Liquidate',
     description: 'Liquidate an unhealthy Arc-native lending account using a selected debt and collateral pair',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_AUTO_CARRY_START',
+    title:       'Auto Carry Start',
+    description: 'Trigger the autonomous carry lane without entering an amount. If a manual stable LP is blocking the lane, this task unwinds it first and then hands the route back to Auto Carry.',
+    tier:        2,
+    fee_usdc:    PAID_TASK_FEE_USDC,
+  },
+  {
+    id:          'EXEC_AUTO_CARRY_STOP',
+    title:       'Auto Carry Stop',
+    description: 'Turn Auto Carry off and unwind the current autonomous carry leg back toward wallet balances when the live lane state allows it.',
     tier:        2,
     fee_usdc:    PAID_TASK_FEE_USDC,
   },
@@ -4763,13 +6099,15 @@ async function _saveTaskResult(agentId, taskId, payload) {
 
 // ── TIER-2 PAID TASK HELPERS ──────────────────────────────────────────────────
 
-const DAILY_PAID_TASK_CAP  = parseInt(process.env.DAILY_PAID_TASK_CAP || '5', 10);
+const DAILY_PAID_TASK_CAP  = parseInt(process.env.DAILY_PAID_TASK_CAP || '10', 10);
 
 // Check daily paid cap; reset if a new UTC day has started
 async function _paidTaskGuard(agentId) {
   const { rows: [agent] } = await db.query(
     `SELECT id, daily_tasks_enabled, daily_paid_task_count, daily_limit_reset_at,
-            wallet_address, private_key_encrypted
+            wallet_address, private_key_encrypted,
+            max_trade_usdc, oracle_max_eurc_inventory, oracle_min_eurc_reserve,
+            carry_automation_enabled, defi_wallet_reserve_usdc
      FROM agents WHERE id = $1`,
     [agentId],
   );
@@ -4805,13 +6143,20 @@ async function _manualPaidDefiGuard(agentId) {
   return { ok: true, agent };
 }
 
-// Write result only — no cap increment, no fee deposit (used for free execution tasks)
-async function _saveResultOnly(agentId, taskId, payload) {
+// Write result only — no cap increment, no fee deposit, no implicit reputation side effect.
+async function _saveResultOnly(agentId, taskId, payload, options = {}) {
   await db.query(
     `INSERT INTO agent_task_results (agent_id, task_id, payload) VALUES ($1, $2, $3::jsonb)`,
     [agentId, taskId, JSON.stringify(payload)],
   );
-  recordReputationEvent(agentId, EVENT_TYPES.DAILY_TASK).catch(() => {});
+
+  const reputationEventType = typeof options.reputationEventType === 'string'
+    ? options.reputationEventType
+    : null;
+
+  if (reputationEventType) {
+    recordReputationEvent(agentId, reputationEventType).catch(() => {});
+  }
 }
 
 // Guard for free execution tasks (no daily cap check, only tasks_enabled flag)
@@ -4839,17 +6184,89 @@ function _getCurveStableTaskToken(index) {
   return Number(index) === 1 ? 'EURC' : 'USDC';
 }
 
-function _getPaidTaskActivityStatus(payload) {
+function _getPaidTaskActivityStatus(payload, executionMeta = {}) {
+  if (executionMeta?.forceStatus) return executionMeta.forceStatus;
+  if (payload?.failed) return 'failed';
   if (payload?.dryRun) return 'dry_run';
   if (payload?.skipped) return 'skipped';
   return 'confirmed';
 }
 
+function _buildFailedPaidTaskPayload(taskId, params = {}, failure) {
+  const message = _resolveTaskActivityFailureMessage(failure);
+  const payload = {
+    ...params,
+    failed: true,
+    reason: failure?.reason || failure?.code || 'task_execution_failed',
+    error: message,
+    summary: message,
+  };
+
+  if (taskId === 'EXEC_CIRBTC_USDC_ZAP_IN') payload.stableToken = payload.stableToken || 'USDC';
+  if (taskId === 'EXEC_CIRBTC_EURC_ZAP_IN') payload.stableToken = payload.stableToken || 'EURC';
+  if (taskId === 'EXEC_CIRBTC_USDC_LP_REMOVE') {
+    payload.stableToken = payload.stableToken || 'USDC';
+    payload.targetToken = payload.targetToken || 'USDC';
+  }
+  if (taskId === 'EXEC_CIRBTC_EURC_LP_REMOVE') {
+    payload.stableToken = payload.stableToken || 'EURC';
+    payload.targetToken = payload.targetToken || 'EURC';
+  }
+
+  return payload;
+}
+
+async function _recordFailedPaidTaskActivity(agentId, taskId, params = {}, failure, executionMeta = {}) {
+  if (!agentId || !PAID_TASK_ACTIVITY_SUPPORTED_IDS.has(taskId)) return;
+  if (PAID_TASK_RUNTIME_ACTIVITY_IDS.has(taskId)) return;
+
+  await _recordPaidTaskActivity(
+    agentId,
+    taskId,
+    _buildFailedPaidTaskPayload(taskId, params, failure),
+    {
+      ...executionMeta,
+      forceStatus: 'failed',
+      failureReason: failure?.reason || failure?.code || null,
+      lastError: _resolveTaskActivityFailureMessage(failure),
+    },
+  );
+}
+
 async function _insertTaskActivityRecord(agentId, record) {
-  await db.query(
+  if (record?.txId) {
+    await db.query(
+      `UPDATE transactions
+          SET type = COALESCE($2, type),
+              from_chain = COALESCE($3, from_chain),
+              to_chain = COALESCE($4, to_chain),
+              token = COALESCE($5, token),
+              amount_usdc = COALESCE($6, amount_usdc),
+              tx_hash = COALESCE($7, tx_hash),
+              status = COALESCE($8, status),
+              confirmed_at = CASE WHEN COALESCE($8, status) = 'confirmed' THEN COALESCE(confirmed_at, NOW()) ELSE confirmed_at END,
+              meta = COALESCE(meta, '{}'::jsonb) || $9::jsonb
+        WHERE id = $1`,
+      [
+        record.txId,
+        record.type || null,
+        record.fromChain || null,
+        record.toChain || null,
+        record.token || null,
+        record.amount == null ? null : _toTaskTxAmount(record.amount),
+        record.txHash || null,
+        record.status || null,
+        JSON.stringify(record.meta || {}),
+      ],
+    );
+    return record.txId;
+  }
+
+  const { rows: [row] } = await db.query(
     `INSERT INTO transactions
        (agent_id, type, from_chain, to_chain, token, amount_usdc, tx_hash, status, meta)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+     RETURNING id`,
     [
       agentId,
       record.type,
@@ -4862,10 +6279,362 @@ async function _insertTaskActivityRecord(agentId, record) {
       JSON.stringify(record.meta || {}),
     ],
   );
+
+  return row?.id || null;
+}
+
+function _resolveTaskActivityFailureMessage(failure) {
+  if (!failure) return 'Task execution failed.';
+  if (typeof failure === 'string') return failure;
+
+  return failure.errorSummary
+    || failure.stageDetail
+    || failure.error
+    || failure.reason
+    || failure.message
+    || 'Task execution failed.';
+}
+
+function _isAttestationPendingFailure(failure) {
+  return /attestation.*(timeout|zaman aşımı)/i.test(_resolveTaskActivityFailureMessage(failure));
+}
+
+function _getPaidBridgeActivityStatus(step) {
+  switch (step) {
+    case 'approving':
+      return bridgeActivityService.STATUS.AWAITING_APPROVE;
+    case 'approved':
+    case 'burning':
+      return bridgeActivityService.STATUS.AWAITING_BURN;
+    case 'burned':
+    case 'attesting':
+      return bridgeActivityService.STATUS.PENDING_ATTESTATION;
+    case 'attested':
+    case 'minting':
+      return bridgeActivityService.STATUS.READY_TO_MINT;
+    case 'complete':
+      return bridgeActivityService.STATUS.MINTED;
+    default:
+      return bridgeActivityService.STATUS.AWAITING_APPROVE;
+  }
+}
+
+function _buildPaidBridgeTxMeta(taskRunId, step, data = {}) {
+  const meta = {
+    taskId: 'EXEC_CCTP_BRIDGE',
+    taskRunId,
+    bridgeType: 'cctp',
+    bridgeStep: step,
+    lastUpdated: new Date().toISOString(),
+    ...data,
+  };
+
+  if (step === 'complete') {
+    meta.bridgeCompletionStatus = 'complete';
+  } else if (['burned', 'attesting', 'attested', 'minting'].includes(step)) {
+    meta.bridgeCompletionStatus = 'destination_pending';
+  } else {
+    meta.bridgeCompletionStatus = 'source_submitted';
+  }
+
+  return meta;
+}
+
+async function _createPaidBridgeRuntimeTracking(agent, params = {}, taskRunId = null) {
+  const txId = await _insertTaskActivityRecord(agent.id, {
+    type: 'bridge',
+    fromChain: params.fromChain || 'Arc Testnet',
+    toChain: params.toChain || 'Arc Testnet',
+    token: 'USDC',
+    amount: params.amountUsdc || 0,
+    status: 'executing',
+    meta: _buildPaidBridgeTxMeta(taskRunId, 'approving'),
+  });
+
+  const activity = {
+    id: txId,
+    txId,
+    agentId: agent.id,
+    walletAddress: agent.wallet_address || agent.walletAddress,
+    fromChain: params.fromChain || 'Arc Testnet',
+    toChain: params.toChain || 'Arc Testnet',
+    amount: params.amountUsdc || 0,
+    token: 'USDC',
+    mode: 'auto',
+    status: bridgeActivityService.STATUS.AWAITING_APPROVE,
+    startedAt: Date.now(),
+  };
+
+  await bridgeActivityService.upsertActivity(activity).catch(() => {});
+  return { txId, activity, taskRunId, agentId: agent.id };
+}
+
+async function _updatePaidBridgeRuntimeTracking(tracking, params = {}, step, data = {}) {
+  if (!tracking?.txId) return;
+
+  const txHash = data.mintTxHash || data.burnTxHash || data.approveTxHash || null;
+
+  await _insertTaskActivityRecord(tracking.agentId, {
+    txId: tracking.txId,
+    type: 'bridge',
+    fromChain: params.fromChain || 'Arc Testnet',
+    toChain: params.toChain || 'Arc Testnet',
+    token: 'USDC',
+    amount: params.amountUsdc || 0,
+    txHash,
+    status: step === 'complete' ? 'confirmed' : 'executing',
+    meta: _buildPaidBridgeTxMeta(tracking.taskRunId, step, data),
+  });
+
+  const current = await bridgeActivityService.getActivity(tracking.activity.id).catch(() => tracking.activity);
+  const next = {
+    ...(current || tracking.activity),
+    status: _getPaidBridgeActivityStatus(step),
+  };
+
+  if (data.approveTxHash) next.approveTxHash = data.approveTxHash;
+  if (data.burnTxHash) next.sourceTxHash = data.burnTxHash;
+  if (data.messageHash) next.messageHash = data.messageHash;
+  if (data.mintTxHash) next.mintTxHash = data.mintTxHash;
+
+  await bridgeActivityService.upsertActivity(next).catch(() => {});
+}
+
+async function _failPaidBridgeRuntimeTracking(tracking, params = {}, failure) {
+  if (!tracking?.txId) return;
+
+  const message = _resolveTaskActivityFailureMessage(failure);
+
+  await _insertTaskActivityRecord(tracking.agentId, {
+    txId: tracking.txId,
+    type: 'bridge',
+    fromChain: params.fromChain || 'Arc Testnet',
+    toChain: params.toChain || 'Arc Testnet',
+    token: 'USDC',
+    amount: params.amountUsdc || 0,
+    status: 'failed',
+    meta: {
+      taskId: 'EXEC_CCTP_BRIDGE',
+      taskRunId: tracking.taskRunId,
+      bridgeType: 'cctp',
+      error: message,
+      summary: message,
+      lastError: message,
+    },
+  });
+
+  const current = await bridgeActivityService.getActivity(tracking.activity.id).catch(() => tracking.activity);
+  await bridgeActivityService.upsertActivity({
+    ...(current || tracking.activity),
+    status: bridgeActivityService.STATUS.FAILED,
+    error: message,
+  }).catch(() => {});
+}
+
+async function _keepPaidBridgePendingAttestation(tracking, params = {}, failure) {
+  if (!tracking?.txId) return;
+
+  const message = _resolveTaskActivityFailureMessage(failure);
+
+  await _insertTaskActivityRecord(tracking.agentId, {
+    txId: tracking.txId,
+    type: 'bridge',
+    fromChain: params.fromChain || 'Arc Testnet',
+    toChain: params.toChain || 'Arc Testnet',
+    token: 'USDC',
+    amount: params.amountUsdc || 0,
+    status: 'executing',
+    meta: {
+      taskId: 'EXEC_CCTP_BRIDGE',
+      taskRunId: tracking.taskRunId,
+      bridgeType: 'cctp',
+      bridgeStep: 'attesting',
+      bridgeCompletionStatus: 'destination_pending',
+      attestationPending: true,
+      lastError: message,
+      summary: 'Attestation is still pending. This bridge can take up to 30 minutes before the destination mint completes.',
+    },
+  });
+
+  const current = await bridgeActivityService.getActivity(tracking.activity.id).catch(() => tracking.activity);
+  const next = {
+    ...(current || tracking.activity),
+    status: bridgeActivityService.STATUS.PENDING_ATTESTATION,
+  };
+
+  delete next.error;
+  await bridgeActivityService.upsertActivity(next).catch(() => {});
+}
+
+async function _createPaidGasFanoutRuntimeTracking(agent, taskRunId = null) {
+  const txId = await _insertTaskActivityRecord(agent.id, {
+    type: 'gas_topup',
+    fromChain: 'Sepolia',
+    toChain: 'Multiple destinations',
+    token: 'ETH',
+    amount: 0,
+    status: 'executing',
+    meta: {
+      taskId: 'EXEC_SEPOLIA_GAS_FANOUT',
+      taskRunId,
+      bridgeType: 'native',
+      bridgeStep: 'source_submitted',
+      bridgeCompletionStatus: 'source_submitted',
+      amountEth: PAID_GAS_FANOUT_AMOUNT_ETH,
+      targets: [],
+    },
+  });
+
+  return {
+    txId,
+    taskRunId,
+    agentId: agent.id,
+    walletAddress: agent.wallet_address || agent.walletAddress,
+    targets: [],
+    bridgeActivities: [],
+  };
+}
+
+function _getPaidGasFanoutBridgeStatus(step) {
+  if (step === 'arrived' || step === 'complete') return bridgeActivityService.STATUS.MINTED;
+  if (step === 'awaiting_arrival') return bridgeActivityService.STATUS.PENDING_DESTINATION;
+  return bridgeActivityService.STATUS.SOURCE_SUBMITTED;
+}
+
+async function _upsertPaidGasFanoutBridgeActivity(tracking, step, data = {}) {
+  if (!tracking?.walletAddress || !data?.toChain) return;
+
+  const existing = Array.isArray(tracking.bridgeActivities)
+    ? tracking.bridgeActivities.find((activity) => activity.toChain === data.toChain)
+    : null;
+
+  const next = await bridgeActivityService.upsertActivity({
+    ...(existing || {}),
+    agentId: tracking.agentId,
+    walletAddress: tracking.walletAddress,
+    fromChain: 'Sepolia',
+    toChain: data.toChain,
+    amount: data.amountEth || existing?.amount || PAID_GAS_FANOUT_AMOUNT_ETH,
+    token: 'ETH',
+    mode: 'auto',
+    bridgeType: 'native',
+    status: _getPaidGasFanoutBridgeStatus(step),
+    sourceTxHash: data.topUpTxHash || existing?.sourceTxHash || null,
+    destinationTxHash: data.destinationTxHash || existing?.destinationTxHash || null,
+    mintTxHash: data.destinationTxHash || existing?.mintTxHash || null,
+    taskId: 'EXEC_SEPOLIA_GAS_FANOUT',
+    taskRunId: tracking.taskRunId,
+    parentTxId: tracking.txId,
+    startedAt: existing?.startedAt || Date.now(),
+  }).catch(() => null);
+
+  if (!next) return;
+
+  const nextActivities = Array.isArray(tracking.bridgeActivities)
+    ? tracking.bridgeActivities.filter((activity) => activity.toChain !== data.toChain)
+    : [];
+  nextActivities.push(next);
+  tracking.bridgeActivities = nextActivities;
+}
+
+function _applyGasFanoutStepToTargets(tracking, step, data = {}) {
+  const toChain = data.toChain;
+  if (!toChain) return Array.isArray(tracking.targets) ? tracking.targets : [];
+
+  const nextTargets = Array.isArray(tracking.targets) ? [...tracking.targets] : [];
+  const index = nextTargets.findIndex(target => target.toChain === toChain);
+  const current = index >= 0 ? nextTargets[index] : { toChain };
+  const updated = {
+    ...current,
+    fromChain: data.fromChain || current.fromChain || 'Sepolia',
+    amountEth: data.amountEth || current.amountEth || PAID_GAS_FANOUT_AMOUNT_ETH,
+    topUpTxHash: data.topUpTxHash || current.topUpTxHash || null,
+    sourceTxHash: data.topUpTxHash || data.sourceTxHash || current.sourceTxHash || current.topUpTxHash || null,
+    destinationTxHash: data.destinationTxHash || current.destinationTxHash || null,
+    status: step,
+  };
+
+  if (index >= 0) nextTargets[index] = updated;
+  else nextTargets.push(updated);
+
+  tracking.targets = nextTargets;
+  return nextTargets;
+}
+
+async function _updatePaidGasFanoutRuntimeTracking(tracking, step, data = {}) {
+  if (!tracking?.txId) return;
+
+  const targets = _applyGasFanoutStepToTargets(tracking, step, data);
+  const txHash = data.topUpTxHash || targets.find(target => target?.topUpTxHash)?.topUpTxHash || null;
+
+  if (data?.toChain) {
+    await _upsertPaidGasFanoutBridgeActivity(tracking, step, data);
+  }
+
+  await _insertTaskActivityRecord(tracking.agentId, {
+    txId: tracking.txId,
+    type: 'gas_topup',
+    fromChain: 'Sepolia',
+    toChain: data.toChain || 'Multiple destinations',
+    token: 'ETH',
+    amount: 0,
+    txHash,
+    status: step === 'complete' ? 'confirmed' : 'executing',
+    meta: {
+      taskId: 'EXEC_SEPOLIA_GAS_FANOUT',
+      taskRunId: tracking.taskRunId,
+      bridgeType: 'native',
+      bridgeStep: step === 'complete' ? 'complete' : (data.topUpTxHash ? 'destination_pending' : 'source_submitted'),
+      bridgeCompletionStatus: step === 'complete' ? 'complete' : 'destination_pending',
+      amountEth: data.amountEth || PAID_GAS_FANOUT_AMOUNT_ETH,
+      currentTarget: data.toChain || null,
+      topUpTxHash: data.topUpTxHash || null,
+      targets,
+    },
+  });
+}
+
+async function _failPaidGasFanoutRuntimeTracking(tracking, failure) {
+  if (!tracking?.txId) return;
+
+  const message = _resolveTaskActivityFailureMessage(failure);
+
+  if (Array.isArray(tracking.bridgeActivities) && tracking.bridgeActivities.length > 0) {
+    await Promise.all(
+      tracking.bridgeActivities.map((activity) => {
+        if (!activity || ['minted', 'dismissed', 'failed'].includes(activity.status)) return null;
+        return bridgeActivityService.upsertActivity({
+          ...activity,
+          status: bridgeActivityService.STATUS.FAILED,
+          error: message,
+        }).catch(() => {});
+      }),
+    );
+  }
+
+  await _insertTaskActivityRecord(tracking.agentId, {
+    txId: tracking.txId,
+    type: 'gas_topup',
+    fromChain: 'Sepolia',
+    toChain: 'Multiple destinations',
+    token: 'ETH',
+    amount: 0,
+    status: 'failed',
+    meta: {
+      taskId: 'EXEC_SEPOLIA_GAS_FANOUT',
+      taskRunId: tracking.taskRunId,
+      bridgeType: 'native',
+      error: message,
+      summary: message,
+      lastError: message,
+      amountEth: PAID_GAS_FANOUT_AMOUNT_ETH,
+      targets: Array.isArray(tracking.targets) ? tracking.targets : [],
+    },
+  });
 }
 
 async function _recordPaidTaskActivity(agentId, taskId, payload, executionMeta) {
-  const status = _getPaidTaskActivityStatus(payload);
+  const status = _getPaidTaskActivityStatus(payload, executionMeta);
 
   if (taskId === 'EXEC_CIRBTC_USDC_ZAP_IN' || taskId === 'EXEC_CIRBTC_EURC_ZAP_IN' || taskId === 'EXEC_MANUAL_DIRECT_PAIR_LIQUIDITY_ADD') {
     await _insertTaskActivityRecord(agentId, {
@@ -4912,6 +6681,20 @@ async function _recordPaidTaskActivity(agentId, taskId, payload, executionMeta) 
       token: payload?.asset || 'USDC',
       amount: payload?.amount || 0,
       txHash: payload?.txHash || null,
+      status,
+      meta: executionMeta,
+    });
+    return;
+  }
+
+  if (taskId === 'EXEC_AUTO_CARRY_START' || taskId === 'EXEC_AUTO_CARRY_STOP') {
+    await _insertTaskActivityRecord(agentId, {
+      type: taskId === 'EXEC_AUTO_CARRY_START' ? 'carry_start' : 'carry_stop',
+      fromChain: 'arc-testnet',
+      toChain: 'arc-testnet',
+      token: payload?.stableToken || 'USDC',
+      amount: payload?.positionValueUsd || payload?.debtAmount || 0,
+      txHash: payload?.repayTxHash || payload?.removeLiquidityTxHash || payload?.conversionTxHash || payload?.txHash || null,
       status,
       meta: executionMeta,
     });
@@ -5030,6 +6813,7 @@ async function _recordPaidTaskActivity(agentId, taskId, payload, executionMeta) 
 
   if (taskId === 'EXEC_CCTP_BRIDGE') {
     await _insertTaskActivityRecord(agentId, {
+      txId: executionMeta.activityTxId || null,
       type: 'bridge',
       fromChain: payload?.fromChain || 'Arc Testnet',
       toChain: payload?.toChain || 'Arc Testnet',
@@ -5044,6 +6828,7 @@ async function _recordPaidTaskActivity(agentId, taskId, payload, executionMeta) 
 
   if (taskId === 'EXEC_SEPOLIA_GAS_FANOUT') {
     await _insertTaskActivityRecord(agentId, {
+      txId: executionMeta.activityTxId || null,
       type: 'gas_topup',
       fromChain: payload?.fromChain || 'Sepolia',
       toChain: Array.isArray(payload?.targets) && payload.targets.length === 1
@@ -5129,6 +6914,8 @@ async function _savePaidTaskResult(agentId, taskId, payload, agent, options = {}
 
   const executionMeta = {
     taskId,
+    taskRunId: options.taskRunId || null,
+    activityTxId: options.activityTxId || null,
     taskResultId: storedResult?.id || null,
     taskResultCreatedAt: storedResult?.created_at || null,
     txHash: payload?.txHash || payload?.hash || payload?.swapTxHash || null,
@@ -5188,7 +6975,7 @@ async function _savePaidTaskResult(agentId, taskId, payload, agent, options = {}
       [agentId],
     );
   }
-  recordReputationEvent(agentId, EVENT_TYPES.DAILY_TASK).catch(() => {});
+  recordReputationEvent(agentId, EVENT_TYPES.PAID_TASK).catch(() => {});
 
   return resultPayload;
 }
@@ -5208,7 +6995,10 @@ function registerPaidTaskProcessor(name, concurrency, executePaidTask, resolveEc
   registerTaskProcessor(name, concurrency, async (job) => {
     const { agentId, params = {}, taskRunId = null } = job.data;
     const guard = await guardTask(agentId);
-    if (!guard.ok) return guard;
+    if (!guard.ok) {
+      await _recordFailedPaidTaskActivity(agentId, name, params, guard, { taskRunId });
+      return guard;
+    }
     const { agent } = guard;
 
     const context = {
@@ -5220,7 +7010,10 @@ function registerPaidTaskProcessor(name, concurrency, executePaidTask, resolveEc
       dryRun: shouldUseDryRun(agent),
     };
     const result = await executePaidTask(context);
-    if (!result.ok) return result;
+    if (!result.ok) {
+      await _recordFailedPaidTaskActivity(agentId, name, params, result, { taskRunId });
+      return result;
+    }
 
     const economyOptions = economyResolver
       ? economyResolver({ ...context, result }) || {}
@@ -5229,6 +7022,7 @@ function registerPaidTaskProcessor(name, concurrency, executePaidTask, resolveEc
     const storedPayload = await _savePaidTaskResult(agentId, name, result.payload, agent, {
       feeUsdc: getExecutionTaskFeeUsdc(name),
       incrementDailyPaidCount,
+      taskRunId,
       ...economyOptions,
     });
     return { ...result, payload: storedPayload };
@@ -5812,36 +7606,107 @@ registerPaidTaskProcessor('EXEC_MANUAL_LENDING_LIQUIDATE', 2, async ({ agent, pa
   })
 ), MANUAL_DEFI_PAID_TASK_OPTIONS);
 
+registerPaidTaskProcessor('EXEC_AUTO_CARRY_START', 1, async ({ agent, dryRun, taskRunId }) => (
+  executeAutoCarryStartTask({
+    agent,
+    dryRun,
+    taskRunId,
+  })
+));
+
+registerPaidTaskProcessor('EXEC_AUTO_CARRY_STOP', 1, async ({ agent, dryRun, taskRunId }) => (
+  executeAutoCarryStopTask({
+    agent,
+    dryRun,
+    taskRunId,
+  })
+));
+
 // ── EXEC_CCTP_BRIDGE ──────────────────────────────────────────────────────────
 // Paid (Tier-2) — fee settles back into the shared Arc revenue pool.
-registerPaidTaskProcessor('EXEC_CCTP_BRIDGE', 1, async ({ agent, params, dryRun, taskRunId }) => (
-  agenticTaskExecutionService.executeBridgeTask({
-    agent,
-    params,
-    dryRun,
-    onStep: async (step, data) => {
-      await _reportTaskRunStage(taskRunId, _buildBridgeStageMeta(step, params, data));
-    },
-  })
-), ({ result, params }) => ({
-    fromChain: result.payload?.fromChain || params.fromChain || 'Arc Testnet',
-    toChain: 'Arc Testnet',
+registerPaidTaskProcessor('EXEC_CCTP_BRIDGE', 1, async ({ agent, params, dryRun, taskRunId }) => {
+  const hasValidParams = params?.fromChain && params?.toChain && Number(params?.amountUsdc) > 0;
+  const tracking = !dryRun && hasValidParams
+    ? await _createPaidBridgeRuntimeTracking(agent, params, taskRunId)
+    : null;
+
+  try {
+    const result = await agenticTaskExecutionService.executeBridgeTask({
+      agent,
+      params,
+      dryRun,
+      onStep: async (step, data) => {
+        await _reportTaskRunStage(taskRunId, _buildBridgeStageMeta(step, params, data));
+        if (tracking) {
+          await _updatePaidBridgeRuntimeTracking(tracking, params, step, data);
+        }
+      },
+    });
+
+    if (tracking && result?.ok === false) {
+      await _failPaidBridgeRuntimeTracking(tracking, params, result);
+    }
+
+    if (tracking && result?.ok && result?.payload) {
+      result.payload.activityTxId = tracking.txId;
+    }
+
+    return result;
+  } catch (error) {
+    if (tracking) {
+      if (_isAttestationPendingFailure(error)) {
+        await _keepPaidBridgePendingAttestation(tracking, params, error);
+      } else {
+        await _failPaidBridgeRuntimeTracking(tracking, params, error);
+      }
+    }
+    throw error;
+  }
+}, ({ result, params, taskRunId }) => ({
+  fromChain: result?.payload?.fromChain || params.fromChain || 'Arc Testnet',
+  toChain: 'Arc Testnet',
+  taskRunId,
+  activityTxId: result?.payload?.activityTxId || null,
 }));
 
 // ── EXEC_SEPOLIA_GAS_FANOUT ──────────────────────────────────────────────────
-registerPaidTaskProcessor('EXEC_SEPOLIA_GAS_FANOUT', 1, async ({ agent, dryRun, taskRunId }) => (
-  agenticTaskExecutionService.executeSepoliaGasFanoutTask({
-    agent,
-    dryRun,
-    onStep: async (step, data) => {
-      await _reportTaskRunStage(taskRunId, _buildGasFanoutStageMeta(step, data));
-    },
-  })
-), () => {
+registerPaidTaskProcessor('EXEC_SEPOLIA_GAS_FANOUT', 1, async ({ agent, dryRun, taskRunId }) => {
+  const tracking = dryRun ? null : await _createPaidGasFanoutRuntimeTracking(agent, taskRunId);
+
+  try {
+    const result = await agenticTaskExecutionService.executeSepoliaGasFanoutTask({
+      agent,
+      dryRun,
+      onStep: async (step, data) => {
+        await _reportTaskRunStage(taskRunId, _buildGasFanoutStageMeta(step, data));
+        if (tracking) {
+          await _updatePaidGasFanoutRuntimeTracking(tracking, step, data);
+        }
+      },
+    });
+
+    if (tracking && result?.ok === false) {
+      await _failPaidGasFanoutRuntimeTracking(tracking, result);
+    }
+
+    if (tracking && result?.ok && result?.payload) {
+      result.payload.activityTxId = tracking.txId;
+    }
+
+    return result;
+  } catch (error) {
+    if (tracking) {
+      await _failPaidGasFanoutRuntimeTracking(tracking, error);
+    }
+    throw error;
+  }
+}, ({ result, taskRunId }) => {
   const taskEconomyChain = taskEconomyService.getTaskEconomyConfigSummary().chain;
   return {
     fromChain: taskEconomyChain,
     toChain: taskEconomyChain,
+    taskRunId,
+    activityTxId: result?.payload?.activityTxId || null,
   };
 });
 
@@ -5915,3 +7780,5 @@ module.exports.runTaskInline = runTaskInline;
 module.exports.guardTaskPermission = guardTaskPermission;
 module.exports.resumeLocalWorkers = resumeLocalWorkers;
 module.exports.pauseLocalWorkers = pauseLocalWorkers;
+module.exports.cleanupMalformedActiveDefiLoopJobs = cleanupMalformedActiveDefiLoopJobs;
+module.exports.recoverMissingAutoCarryHandoffRuns = recoverMissingAutoCarryHandoffRuns;

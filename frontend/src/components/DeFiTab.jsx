@@ -1081,7 +1081,7 @@ function CarryMigrationControls({ agentId, carry, carryAutomationEnabled, onRunQ
     try {
       const response = await defiApi.manualExecute(
         agentId,
-        buildManualActionRequest(curvePool, 'remove_dual', { lpAmount }),
+        buildManualActionRequest(curvePool, 'remove_dual', { lpAmount: lpBalance }),
       );
       const feeLabel = Number(response?.feeUsdc) > 0
         ? `${Number(response.feeUsdc).toFixed(2)} USDC fee applied.`

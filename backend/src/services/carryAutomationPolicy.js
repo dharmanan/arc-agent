@@ -27,6 +27,7 @@ const MAX_POSITION_USD_DEFAULT = (() => {
   const numeric = Number(process.env.CARRY_AUTOMATION_MAX_POSITION_USD || '250');
   return Number.isFinite(numeric) && numeric > 0 ? numeric : 250;
 })();
+const PREFERRED_OPEN_ASSET = String(process.env.CARRY_AUTOMATION_OPEN_ASSET || 'USDC').trim().toUpperCase() || 'USDC';
 
 const LP_DAILY_TURNOVER_BASELINES = {
   curve: 0.22,
@@ -154,14 +155,7 @@ function selectCarryCandidate(candidates) {
 
   if (activeDebtCandidate) return activeDebtCandidate;
 
-  return candidates
-    .slice()
-    .sort((left, right) => {
-      if (right.netCarryApyPct !== left.netCarryApyPct) {
-        return right.netCarryApyPct - left.netCarryApyPct;
-      }
-      return left.borrowApyPct - right.borrowApyPct;
-    })[0] || null;
+  return candidates.find((candidate) => candidate.symbol === PREFERRED_OPEN_ASSET) || null;
 }
 
 function buildCarryOpportunitySnapshot({
@@ -275,6 +269,8 @@ function buildCarryOpportunitySnapshot({
     policyId: CARRY_POLICY_ID,
     lane: CARRY_EXECUTION_LANE,
     exclusiveMode: true,
+    preferredOpenAssetSymbol: PREFERRED_OPEN_ASSET,
+    availableCandidateSymbols: candidates.map((candidate) => candidate.symbol),
     selectedAssetSymbol: selectedCandidate?.symbol || null,
     lpYield: lpYieldMetrics,
     selectedAsset: selectedCandidate,
@@ -331,6 +327,15 @@ function evaluateCarryAutomationPolicy(options = {}) {
   }
 
   if (!selectedAsset) {
+    if (Array.isArray(snapshot.availableCandidateSymbols) && snapshot.availableCandidateSymbols.length > 0) {
+      return buildHoldPolicy(
+        snapshot,
+        'preferred_carry_asset_unavailable',
+        'preferred_carry_asset_unavailable',
+        `${snapshot.preferredOpenAssetSymbol || 'USDC'} is the default Auto Carry open asset on this lane. That borrow lane is not available right now, so no new carry leg will open here.`,
+      );
+    }
+
     return buildHoldPolicy(
       snapshot,
       'carry_asset_unavailable',

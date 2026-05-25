@@ -69,8 +69,19 @@ function isNativeBridge(act) {
   return act?.bridgeType === 'native' || act?.token === 'ETH';
 }
 
+function isAttestationStillPending(act) {
+  if (!act || isNativeBridge(act)) return false;
+  const error = String(act.error || '');
+  if (!/attestation.*(timeout|zaman aşımı)/i.test(error)) return false;
+  if (act.destinationTxHash || act.mintTxHash) return false;
+  return Boolean(act.messageHash || act.sourceTxHash);
+}
+
 function getActivityStatus(act) {
   if (!act) return null;
+  if (isAttestationStillPending(act)) {
+    return 'pending_attestation';
+  }
   if (act.autoRetryReason && !['dismissed', 'minted'].includes(act.status)) {
     return act.status;
   }
@@ -127,7 +138,7 @@ function getTrackerHeadline(act) {
   if (status === 'source_submitted') return `Submitting on ${act.fromChain}`;
   if (status === 'pending_destination') return `Waiting for ${act.toChain} receipt`;
   if (status === 'ready_to_mint') return `Ready to mint on ${act.toChain}`;
-  if (status === 'pending_attestation') return 'Wait about 15 min';
+  if (status === 'pending_attestation') return 'Wait up to 30 min';
   if (status === 'awaiting_burn') return 'Waiting for source-chain burn';
   if (status === 'awaiting_approve') return 'Waiting for approval';
   if (status === 'minted') return 'Bridge completed';
@@ -138,7 +149,7 @@ function getTrackerHeadline(act) {
 function formatActivityError(error) {
   if (!error) return '';
   if (/txpool is full/i.test(error)) return 'RPC mempool is full. Retry this bridge in a moment.';
-  if (/attestation.*(timeout|zaman aşımı)/i.test(error)) return 'Attestation timed out after 10 minutes.';
+  if (/attestation.*(timeout|zaman aşımı)/i.test(error)) return 'Attestation is still pending. Testnet minting can take up to 30 minutes.';
   if (/insufficient funds for gas \* price \+ value/i.test(error)) return 'Destination chain gas is too low for mint. Fund the agent wallet on that destination chain and the bridge can continue.';
   return error.split('\n')[0].trim();
 }
@@ -175,6 +186,7 @@ function ActivityCard({ act, onClaim, onDismiss, onOpenTracker, claiming, dismis
   const tokenLabel = act.token || 'USDC';
   const destinationTxHash = act.destinationTxHash || act.mintTxHash;
   const nativeBridge = isNativeBridge(act);
+  const attestationPending = isAttestationStillPending(act);
 
   return (
     <div className={`rounded-xl border p-3 space-y-2 ${STATUS_COLOR[status] || 'border-slate-200 bg-white'}`}>
@@ -217,7 +229,7 @@ function ActivityCard({ act, onClaim, onDismiss, onOpenTracker, claiming, dismis
       {act.autoRetryReason && (
         <p className="text-xs font-medium text-amber-700">{getAutoRetryMessage(act)}</p>
       )}
-      {!act.autoRetryReason && act.error && (
+      {!act.autoRetryReason && act.error && !attestationPending && (
         <p className="break-all text-xs font-medium text-red-600">{formatActivityError(act.error)}</p>
       )}
 
