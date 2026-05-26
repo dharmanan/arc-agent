@@ -521,12 +521,13 @@ describe('jobs route smoke', () => {
           agent_id: TEST_AGENT_ID,
           status: 'delivered',
           deliverable_hash: 'ipfs://deliverable',
-          review_deadline_at: '2026-05-19T00:00:00.000Z',
+          review_deadline_at: '2999-05-19T00:00:00.000Z',
           amount_usdc: 5,
           provider_address: '0x00000000000000000000000000000000000000CC',
           economy: {},
         }],
       })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ id: TEST_AGENT_ID, private_key_encrypted: null }] })
       .mockResolvedValueOnce({
         rows: [{
@@ -558,7 +559,7 @@ describe('jobs route smoke', () => {
 
     expect(deliveredResponse.status).toBe(200);
     expect(deliveredResponse.body.status).toBe('delivered');
-    expect(deliveredResponse.body.review_deadline_at).toBe('2026-05-19T00:00:00.000Z');
+    expect(deliveredResponse.body.review_deadline_at).toBe('2999-05-19T00:00:00.000Z');
 
     const completedResponse = await request(app)
       .put(`/api/agents/${TEST_AGENT_ID}/jobs/job-1/complete`)

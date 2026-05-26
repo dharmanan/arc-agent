@@ -172,7 +172,8 @@ async function _recordJobActivity({
   const providerAddress = job.provider_address || meta.providerAddress || null;
   const amountUsdc = Number(job.amount_usdc || 0);
 
-  await db.query(
+  try {
+    await Promise.resolve(db.query(
     `INSERT INTO transactions
        (agent_id, type, from_chain, to_chain, token, amount_usdc, from_address, to_address, tx_hash, status, meta, confirmed_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'confirmed', $10::jsonb, NOW())`,
@@ -198,7 +199,10 @@ async function _recordJobActivity({
         ...meta,
       }),
     ],
-  ).catch(() => {});
+    ));
+  } catch {
+    // Activity logging is best-effort and must never block the job workflow.
+  }
 }
 
 function isReviewWindowExpired(job) {
