@@ -173,7 +173,7 @@ function buildPayoutState({ jobStatus, txHashSettle = null, jobIdOnchain = null 
     case 'completed':
       return {
         ...base,
-        status: jobIdOnchain ? 'confirmed' : 'recorded',
+        status: txHashSettle ? 'confirmed' : 'recorded',
       };
     case 'rejected':
       return {

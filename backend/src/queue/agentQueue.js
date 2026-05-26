@@ -1181,6 +1181,47 @@ async function executeAutoCarryStartTask({ agent, dryRun, taskRunId }) {
         error: error.message,
       }));
 
+  if (!dryRun && !kickoff.queued) {
+    const failureSummary = carryState === 'manual_lp_conflict'
+      ? 'Removed the manual stable LP and enabled Auto Carry, but the immediate carry review could not be queued. Refresh once, then retry this start product.'
+      : 'Enabled Auto Carry, but the immediate carry review could not be queued. Refresh once, then retry this start product.';
+
+    console.error(
+      `[QUEUE] Auto Carry start could not queue the immediate review agent=${agent.id}:`,
+      kickoff.error || 'unknown error',
+    );
+
+    return {
+      ok: false,
+      reason: 'carry_handoff_queue_failed',
+      error: kickoff.error || 'carry_handoff_queue_failed',
+      errorSummary: failureSummary,
+      payload: {
+        ok: false,
+        action: 'auto_carry_start',
+        executionRail: 'carry_automation_trigger',
+        stableToken,
+        carryStateBefore: carryState,
+        carryAutomationEnabled: true,
+        manualLpConverted: Boolean(conversionResult?.ok),
+        manualLpBalance: snapshot.lpBalance || null,
+        positionValueUsd: snapshot.positionValueUsd || 0,
+        blockedBy: context.carryPolicy?.verdict?.blockedBy || null,
+        triggerQueued: false,
+        triggerJobId: null,
+        triggerQueueError: kickoff.error || null,
+        conversionTxHash: conversionResult?.payload?.txHash || null,
+        conversionSummary: conversionResult?.payload?.summary || null,
+        dryRun: false,
+        finalAutomationStatus: 'queue_failed',
+        reason: 'carry_handoff_queue_failed',
+        errorSummary: failureSummary,
+        summary: failureSummary,
+        executedAt: new Date().toISOString(),
+      },
+    };
+  }
+
   let summary;
   if (carryState === 'manual_lp_conflict') {
     summary = dryRun
@@ -3901,6 +3942,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   let latestPositionSummary = null;
   let activeAutomationKey = 'defiLoop';
   let stableStatePersisted = false;
+  let allowCirbtcReviewDespiteStablePriority = false;
 
   const persistAutomationSnapshot = async (automationKey, status, payload) => {
     await _setAutomationState(agentId, automationKey, status);
@@ -4404,8 +4446,39 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       }
 
       if (carryAutomationEnabled) {
-        activeAutomationKey = 'carryAutomation';
-        return finishDefi('fetch_error', {
+        if (!cirbtcLpEnabled) {
+          activeAutomationKey = 'carryAutomation';
+          return finishDefi('fetch_error', {
+            ok: false,
+            reason: 'lending_surface_unavailable',
+            error: err.message,
+          });
+        }
+
+        if (stableLoopEnabled && !stableStatePersisted) {
+          latestStablePolicy = stablePolicy;
+          latestExecutionSource = getStableAutomationExecutionSource();
+          latestPositionSummary = positionContext.position
+            ? {
+                poolKey: positionContext.position.poolKey,
+                lpBalance: positionContext.position.lpToken?.balance || '0',
+                sharePct: positionContext.position.sharePct || 0,
+                valueUsd: positionContext.position.valuation?.totalUsd || null,
+              }
+            : null;
+          await persistAutomationSnapshot('defiLoop', 'policy_hold', {
+            ok: true,
+            action: 'hold',
+            reason: 'carry_mode_exclusive',
+            summary: 'Stable DeFi Loop is paused because Auto Carry owns the stable LP lane while it is enabled.',
+            stablePolicy,
+            executionGate,
+          });
+          stableStatePersisted = true;
+        }
+
+        allowCirbtcReviewDespiteStablePriority = true;
+        await persistAutomationSnapshot('carryAutomation', 'fetch_error', {
           ok: false,
           reason: 'lending_surface_unavailable',
           error: err.message,
@@ -4492,7 +4565,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     });
   }
 
-  if (carryAutomationEnabled && automationType !== 'lending') {
+  if (carryAutomationEnabled && latestCarryPolicy && automationType !== 'lending') {
     if (stableLoopEnabled && !stableStatePersisted) {
       latestStablePolicy = stablePolicy;
       latestExecutionSource = getStableAutomationExecutionSource();
@@ -4508,167 +4581,161 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       stableStatePersisted = true;
     }
 
-    if (cirbtcLpEnabled) {
-      await _setAutomationState(agentId, 'cirbtcLp', 'policy_hold');
-    }
-
-    automationPolicy = latestCarryPolicy || {
-      policyId: 'carry_stable_lp_v1',
-      verdict: {
-        execute: false,
-        lane: 'carry_stable_lp',
-        operationType: null,
-        reason: 'Carry automation is waiting for the first carry review.',
-        suggestedAmountUsdc: 0,
-        actionAssetSymbol: 'USDC',
-        actionParams: null,
-        blockedBy: 'waiting_for_snapshot',
-      },
-      metrics: {},
-      checks: {},
-    };
-    automationType = 'carry';
-    activeAutomationKey = 'carryAutomation';
-    latestExecutionSource = getCarryAutomationExecutionSource();
-
-    if (automationPolicy.verdict.execute !== true) {
-      latestPositionSummary = positionSummary;
-      return finishDefi('policy_hold', {
+    if (latestCarryPolicy.verdict.execute === true) {
+      automationPolicy = latestCarryPolicy;
+      automationType = 'carry';
+      activeAutomationKey = 'carryAutomation';
+      latestExecutionSource = getCarryAutomationExecutionSource();
+    } else {
+      const carryHoldPayload = {
         ok: true,
         action: 'hold',
         reason: 'carry_policy_hold',
-        summary: automationPolicy.verdict.reason,
-      });
+        summary: latestCarryPolicy.verdict.reason,
+      };
+
+      if (!cirbtcLpEnabled) {
+        automationPolicy = latestCarryPolicy;
+        automationType = 'carry';
+        activeAutomationKey = 'carryAutomation';
+        latestExecutionSource = getCarryAutomationExecutionSource();
+        latestPositionSummary = positionSummary;
+        return finishDefi('policy_hold', carryHoldPayload);
+      }
+
+      allowCirbtcReviewDespiteStablePriority = true;
+      await persistAutomationSnapshot('carryAutomation', 'policy_hold', carryHoldPayload);
     }
   }
 
-  if (automationType === 'stable' && automationPolicy.verdict.execute !== true) {
+  if (cirbtcLpEnabled && (
+    (automationType === 'stable' && automationPolicy.verdict.execute !== true)
+    || allowCirbtcReviewDespiteStablePriority
+  )) {
     latestExecutionSource = getStableAutomationExecutionSource();
 
     let cirbtcHoldPayload = null;
 
-    if (cirbtcLpEnabled) {
-      if (stableLoopEnabled && !stableStatePersisted) {
-        latestStablePolicy = stablePolicy;
-        latestPositionSummary = positionSummary;
-      }
+    if (stableLoopEnabled && !stableStatePersisted) {
+      latestStablePolicy = stablePolicy;
+      latestPositionSummary = positionSummary;
+    }
 
-      activeAutomationKey = 'cirbtcLp';
-      await _setAutomationState(agentId, 'cirbtcLp', 'running');
+    activeAutomationKey = 'cirbtcLp';
+    await _setAutomationState(agentId, 'cirbtcLp', 'running');
 
-      let cirbtcPositionContext;
-      try {
-        cirbtcPositionContext = await readCirbtcDirectPairPositionContext(agent.wallet_address);
-      } catch (err) {
-        console.error(`[QUEUE] DEFI_LOOP cirBTC position guard error agent=${agentId}:`, err.message);
-        return finishDefi('position_guard_unavailable', {
-          ok: false,
-          reason: 'cirbtc_position_guard_unavailable',
-          error: err.message,
-          stablePolicy,
-        });
-      }
-
-      let cirbtcPoolContexts;
-      try {
-        cirbtcPoolContexts = await loadCirbtcDirectPairPoolContexts();
-      } catch (err) {
-        console.error(`[QUEUE] DEFI_LOOP cirBTC pool-state error agent=${agentId}:`, err.message);
-        return finishDefi('fetch_error', {
-          ok: false,
-          reason: 'cirbtc_pool_state_unavailable',
-          error: err.message,
-          stablePolicy,
-        });
-      }
-
-      let cirbtcGrowthHistoryByToken;
-      try {
-        const [usdcGrowthHistory, eurcGrowthHistory] = await Promise.all([
-          readCirbtcGrowthAddHistory(agentId, 'USDC'),
-          readCirbtcGrowthAddHistory(agentId, 'EURC'),
-        ]);
-        cirbtcGrowthHistoryByToken = {
-          USDC: usdcGrowthHistory,
-          EURC: eurcGrowthHistory,
-        };
-      } catch (err) {
-        console.error(`[QUEUE] DEFI_LOOP cirBTC growth-history error agent=${agentId}:`, err.message);
-        cirbtcGrowthHistoryByToken = {
-          USDC: {
-            totalAddsToday: 0,
-            lastAddAt: null,
-          },
-          EURC: {
-            totalAddsToday: 0,
-            lastAddAt: null,
-          },
-        };
-      }
-
-      const cirbtcPolicy = evaluateCirbtcLpAutomationPolicy({
-        pairContexts: cirbtcPoolContexts.map((context) => {
-          const poolKey = String(context.pool?.key || `${context.stableToken}-CIRBTC`).toUpperCase();
-          return {
-            stableToken: context.stableToken,
-            pool: context.pool,
-            poolState: context.poolState,
-            walletStableBalance: context.stableToken === 'EURC'
-              ? cirbtcIdleCapitalBudgets.eurc
-              : cirbtcIdleCapitalBudgets.usdc,
-            position: cirbtcPositionContext.positionsByKey?.[poolKey] || null,
-            growthHistory: cirbtcGrowthHistoryByToken?.[context.stableToken] || {
-              totalAddsToday: 0,
-              lastAddAt: null,
-            },
-            warning: cirbtcPositionContext.warningsByKey?.[poolKey] || null,
-            error: context.error,
-          };
-        }),
+    let cirbtcPositionContext;
+    try {
+      cirbtcPositionContext = await readCirbtcDirectPairPositionContext(agent.wallet_address);
+    } catch (err) {
+      console.error(`[QUEUE] DEFI_LOOP cirBTC position guard error agent=${agentId}:`, err.message);
+      return finishDefi('position_guard_unavailable', {
+        ok: false,
+        reason: 'cirbtc_position_guard_unavailable',
+        error: err.message,
+        stablePolicy,
       });
-      const cirbtcPositionSummary = summarizePosition(
-        cirbtcPositionContext.positionsByKey?.[String(cirbtcPolicy.metrics?.selectedPoolKey || '').toUpperCase()] || null,
-      ) || positionSummary;
+    }
 
-      if (cirbtcPolicy.verdict.execute === true) {
-        if (stableLoopEnabled && !stableStatePersisted) {
-          latestStablePolicy = stablePolicy;
-          latestExecutionSource = getStableAutomationExecutionSource();
-          latestPositionSummary = positionSummary;
-          await persistAutomationSnapshot('defiLoop', 'policy_hold', {
-            ok: true,
-            action: 'hold',
-            reason: 'stable_policy_hold',
-            stablePolicy,
-            executionGate,
-          });
-          stableStatePersisted = true;
-        }
+    let cirbtcPoolContexts;
+    try {
+      cirbtcPoolContexts = await loadCirbtcDirectPairPoolContexts();
+    } catch (err) {
+      console.error(`[QUEUE] DEFI_LOOP cirBTC pool-state error agent=${agentId}:`, err.message);
+      return finishDefi('fetch_error', {
+        ok: false,
+        reason: 'cirbtc_pool_state_unavailable',
+        error: err.message,
+        stablePolicy,
+      });
+    }
 
-        automationPolicy = cirbtcPolicy;
-        automationType = 'cirbtc';
-        latestStablePolicy = cirbtcPolicy;
-        latestExecutionSource = getCirbtcAutomationExecutionSource();
-        positionSummary = cirbtcPositionSummary;
-      } else {
-        latestStablePolicy = cirbtcPolicy;
-        latestExecutionSource = getCirbtcAutomationExecutionSource();
-        latestPositionSummary = cirbtcPositionSummary;
-        cirbtcHoldPayload = {
-          ok: true,
-          action: 'hold',
-          reason: 'cirbtc_policy_hold',
-          stablePolicy: cirbtcPolicy,
-          executionGate,
-          fallbackPolicy: stablePolicy,
+    let cirbtcGrowthHistoryByToken;
+    try {
+      const [usdcGrowthHistory, eurcGrowthHistory] = await Promise.all([
+        readCirbtcGrowthAddHistory(agentId, 'USDC'),
+        readCirbtcGrowthAddHistory(agentId, 'EURC'),
+      ]);
+      cirbtcGrowthHistoryByToken = {
+        USDC: usdcGrowthHistory,
+        EURC: eurcGrowthHistory,
+      };
+    } catch (err) {
+      console.error(`[QUEUE] DEFI_LOOP cirBTC growth-history error agent=${agentId}:`, err.message);
+      cirbtcGrowthHistoryByToken = {
+        USDC: {
+          totalAddsToday: 0,
+          lastAddAt: null,
+        },
+        EURC: {
+          totalAddsToday: 0,
+          lastAddAt: null,
+        },
+      };
+    }
+
+    const cirbtcPolicy = evaluateCirbtcLpAutomationPolicy({
+      pairContexts: cirbtcPoolContexts.map((context) => {
+        const poolKey = String(context.pool?.key || `${context.stableToken}-CIRBTC`).toUpperCase();
+        return {
+          stableToken: context.stableToken,
+          pool: context.pool,
+          poolState: context.poolState,
+          walletStableBalance: context.stableToken === 'EURC'
+            ? cirbtcIdleCapitalBudgets.eurc
+            : cirbtcIdleCapitalBudgets.usdc,
+          position: cirbtcPositionContext.positionsByKey?.[poolKey] || null,
+          growthHistory: cirbtcGrowthHistoryByToken?.[context.stableToken] || {
+            totalAddsToday: 0,
+            lastAddAt: null,
+          },
+          warning: cirbtcPositionContext.warningsByKey?.[poolKey] || null,
+          error: context.error,
         };
-        await persistAutomationSnapshot('cirbtcLp', 'policy_hold', cirbtcHoldPayload);
+      }),
+    });
+    const cirbtcPositionSummary = summarizePosition(
+      cirbtcPositionContext.positionsByKey?.[String(cirbtcPolicy.metrics?.selectedPoolKey || '').toUpperCase()] || null,
+    ) || positionSummary;
 
+    if (cirbtcPolicy.verdict.execute === true) {
+      if (stableLoopEnabled && !stableStatePersisted) {
         latestStablePolicy = stablePolicy;
         latestExecutionSource = getStableAutomationExecutionSource();
         latestPositionSummary = positionSummary;
-        activeAutomationKey = 'defiLoop';
+        await persistAutomationSnapshot('defiLoop', 'policy_hold', {
+          ok: true,
+          action: 'hold',
+          reason: 'stable_policy_hold',
+          stablePolicy,
+          executionGate,
+        });
+        stableStatePersisted = true;
       }
+
+      automationPolicy = cirbtcPolicy;
+      automationType = 'cirbtc';
+      latestStablePolicy = cirbtcPolicy;
+      latestExecutionSource = getCirbtcAutomationExecutionSource();
+      positionSummary = cirbtcPositionSummary;
+    } else {
+      latestStablePolicy = cirbtcPolicy;
+      latestExecutionSource = getCirbtcAutomationExecutionSource();
+      latestPositionSummary = cirbtcPositionSummary;
+      cirbtcHoldPayload = {
+        ok: true,
+        action: 'hold',
+        reason: 'cirbtc_policy_hold',
+        stablePolicy: cirbtcPolicy,
+        executionGate,
+        fallbackPolicy: stablePolicy,
+      };
+      await persistAutomationSnapshot('cirbtcLp', 'policy_hold', cirbtcHoldPayload);
+
+      latestStablePolicy = stablePolicy;
+      latestExecutionSource = getStableAutomationExecutionSource();
+      latestPositionSummary = positionSummary;
+      activeAutomationKey = 'defiLoop';
     }
 
     const [oracleExitQuote, latestOracleInventoryExit] = automationType === 'stable' && stableLoopEnabled

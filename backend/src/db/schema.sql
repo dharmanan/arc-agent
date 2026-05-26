@@ -117,6 +117,8 @@ CREATE TABLE IF NOT EXISTS agents (
   cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
   reputation_last_run_at     TIMESTAMPTZ,
   reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle',
+  reputation_proof_last_read_day DATE,
+  reputation_proof_daily_read_count INTEGER NOT NULL DEFAULT 0,
 
   -- ERC-8004 onchain identity (Arc Testnet IdentityRegistry)
   -- status: 'pending' | 'registered' | 'failed'
@@ -187,6 +189,8 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_status      VARCHAR(3
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cirbtc_lp_last_decision    JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_run_at     TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_last_status     VARCHAR(30) NOT NULL DEFAULT 'idle';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_proof_last_read_day DATE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS reputation_proof_daily_read_count INTEGER NOT NULL DEFAULT 0;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 5. AGENT PERMISSIONS (only relevant in smart mode)

@@ -264,6 +264,249 @@ function _getDirectPairDecimalsMap(directPair) {
   };
 }
 
+function _parsePositiveAmount(value) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : 0;
+}
+
+async function _quotePrimaryOnlyCirbtcSwapLeg({ fromToken, amountIn }) {
+  const quote = await agentWalletService.getSwapQuoteResult({
+    fromToken,
+    toToken: 'cirBTC',
+    amountIn,
+    routeMode: 'primary_only',
+  });
+
+  return {
+    routeKey: 'live_swap',
+    amountOut: quote.amountOut,
+    quoteError: quote.quoteError || null,
+    executionRail: quote.executionRail || null,
+    routeStrategy: quote.routeStrategy || null,
+    routeReason: quote.routeReason || null,
+    poolAddress: quote.poolAddress || null,
+    poolSource: quote.poolSource || null,
+  };
+}
+
+async function _quoteCurveThenLiveCirbtcSwapLeg({ amountIn }) {
+  const curvePool = _resolveStableCurvePoolForToken('EURC');
+  const eurcCoin = _resolveCurveCoin(curvePool, 'EURC');
+  const usdcCoin = _resolveCurveCoin(curvePool, 'USDC');
+
+  if (!curvePool?.address || !eurcCoin?.address || !usdcCoin?.address) {
+    return {
+      routeKey: 'curve_then_live_swap',
+      amountOut: null,
+      quoteError: 'Curve EURC/USDC route is not configured.',
+      executionRail: null,
+      routeStrategy: null,
+      routeReason: null,
+      poolAddress: null,
+      poolSource: null,
+      stableSwapExecutionRail: null,
+      stableSwapPoolAddress: null,
+      stableSwapPoolSource: null,
+      intermediateAmountOut: null,
+    };
+  }
+
+  try {
+    const stableQuote = await protocols.getCurveQuote(
+      curvePool.address,
+      eurcCoin.index,
+      usdcCoin.index,
+      amountIn,
+      eurcCoin.decimals || 6,
+      usdcCoin.decimals || 6,
+    );
+
+    const intermediateAmountOut = stableQuote?.amountOut || null;
+    if (!(_parsePositiveAmount(intermediateAmountOut) > 0)) {
+      return {
+        routeKey: 'curve_then_live_swap',
+        amountOut: null,
+        quoteError: 'Curve could not quote EURC to USDC for this amount.',
+        executionRail: null,
+        routeStrategy: null,
+        routeReason: null,
+        poolAddress: null,
+        poolSource: null,
+        stableSwapExecutionRail: 'curve_fallback',
+        stableSwapPoolAddress: curvePool.address,
+        stableSwapPoolSource: curvePool.source || 'verified_default',
+        intermediateAmountOut: null,
+      };
+    }
+
+    const liveQuote = await agentWalletService.getSwapQuoteResult({
+      fromToken: 'USDC',
+      toToken: 'cirBTC',
+      amountIn: intermediateAmountOut,
+      routeMode: 'primary_only',
+    });
+
+    return {
+      routeKey: 'curve_then_live_swap',
+      amountOut: liveQuote.amountOut,
+      quoteError: liveQuote.quoteError || null,
+      executionRail: 'curve_then_live_swap',
+      routeStrategy: 'curve_then_live_swap',
+      routeReason: 'This route first rotates EURC through the Curve stable pool, then finishes the cirBTC buy on the live app swap path.',
+      poolAddress: liveQuote.poolAddress || null,
+      poolSource: liveQuote.poolSource || null,
+      stableSwapExecutionRail: 'curve_fallback',
+      stableSwapPoolAddress: curvePool.address,
+      stableSwapPoolSource: curvePool.source || 'verified_default',
+      intermediateAmountOut,
+      finalSwapExecutionRail: liveQuote.executionRail || null,
+      finalSwapRouteStrategy: liveQuote.routeStrategy || null,
+      finalSwapRouteReason: liveQuote.routeReason || null,
+      finalSwapPoolAddress: liveQuote.poolAddress || null,
+      finalSwapPoolSource: liveQuote.poolSource || null,
+    };
+  } catch (error) {
+    return {
+      routeKey: 'curve_then_live_swap',
+      amountOut: null,
+      quoteError: error.message,
+      executionRail: null,
+      routeStrategy: null,
+      routeReason: null,
+      poolAddress: null,
+      poolSource: null,
+      stableSwapExecutionRail: 'curve_fallback',
+      stableSwapPoolAddress: curvePool.address,
+      stableSwapPoolSource: curvePool.source || 'verified_default',
+      intermediateAmountOut: null,
+    };
+  }
+}
+
+async function _buildDirectPairZapSwapPlan({ stableToken, amountIn }) {
+  const primaryPlan = await _quotePrimaryOnlyCirbtcSwapLeg({
+    fromToken: stableToken,
+    amountIn,
+  });
+  const candidatePlans = [primaryPlan];
+
+  if (stableToken === 'EURC') {
+    candidatePlans.push(await _quoteCurveThenLiveCirbtcSwapLeg({ amountIn }));
+  }
+
+  const selectedPlan = candidatePlans.reduce((bestPlan, currentPlan) => {
+    if (_parsePositiveAmount(currentPlan?.amountOut) <= 0) {
+      return bestPlan;
+    }
+
+    if (!bestPlan) {
+      return currentPlan;
+    }
+
+    return _parsePositiveAmount(currentPlan.amountOut) > _parsePositiveAmount(bestPlan.amountOut)
+      ? currentPlan
+      : bestPlan;
+  }, null);
+
+  if (selectedPlan) {
+    return {
+      ok: true,
+      selectedPlan,
+      candidatePlans,
+    };
+  }
+
+  const quoteErrors = candidatePlans
+    .map(plan => plan?.quoteError)
+    .filter(Boolean);
+
+  return {
+    ok: false,
+    error: quoteErrors[0] || 'No live route was available for the cirBTC swap leg.',
+    candidatePlans,
+  };
+}
+
+async function _executeDirectPairZapSwapPlan({ agent, stableToken, amountIn, swapPlan }) {
+  if (swapPlan?.routeKey === 'curve_then_live_swap') {
+    const curvePool = _resolveStableCurvePoolForToken('EURC');
+    const eurcCoin = _resolveCurveCoin(curvePool, 'EURC');
+    const usdcCoin = _resolveCurveCoin(curvePool, 'USDC');
+
+    if (!curvePool?.address || !eurcCoin?.address || !usdcCoin?.address) {
+      throw new Error('Curve EURC/USDC route is not configured.');
+    }
+
+    const stableSwapResult = await protocols.executeCurveSwap({
+      poolAddress: curvePool.address,
+      tokenInAddress: eurcCoin.address,
+      indexIn: eurcCoin.index,
+      indexOut: usdcCoin.index,
+      amountIn: String(amountIn),
+      slippagePct: 0.5,
+      agentPrivateKey: decrypt(agent.private_key_encrypted),
+      decimalsIn: eurcCoin.decimals || 6,
+      decimalsOut: usdcCoin.decimals || 6,
+    });
+
+    const finalSwapResult = await agentWalletService.agentSwap({
+      agent,
+      fromToken: 'USDC',
+      toToken: 'cirBTC',
+      amountIn: stableSwapResult.amountOut,
+      routeMode: 'primary_only',
+    });
+
+    return {
+      hash: finalSwapResult.hash,
+      amountOut: finalSwapResult.amountOut,
+      executionRail: 'curve_then_live_swap',
+      routeStrategy: 'curve_then_live_swap',
+      routeReason: 'This route first rotates EURC through the Curve stable pool, then finishes the cirBTC buy on the live app swap path.',
+      poolAddress: finalSwapResult.poolAddress || null,
+      poolSource: finalSwapResult.poolSource || null,
+      stableSwapTxHash: stableSwapResult.txHash,
+      stableSwapAmountOut: stableSwapResult.amountOut,
+      stableSwapExecutionRail: 'curve_fallback',
+      stableSwapPoolAddress: curvePool.address,
+      stableSwapPoolSource: curvePool.source || 'verified_default',
+      finalSwapExecutionRail: finalSwapResult.executionRail || null,
+      finalSwapRouteStrategy: finalSwapResult.routeStrategy || null,
+      finalSwapRouteReason: finalSwapResult.routeReason || null,
+      finalSwapPoolAddress: finalSwapResult.poolAddress || null,
+      finalSwapPoolSource: finalSwapResult.poolSource || null,
+    };
+  }
+
+  const directSwapResult = await agentWalletService.agentSwap({
+    agent,
+    fromToken: stableToken,
+    toToken: 'cirBTC',
+    amountIn,
+    routeMode: 'primary_only',
+  });
+
+  return {
+    hash: directSwapResult.hash,
+    amountOut: directSwapResult.amountOut,
+    executionRail: directSwapResult.executionRail || null,
+    routeStrategy: directSwapResult.routeStrategy || null,
+    routeReason: directSwapResult.routeReason || null,
+    poolAddress: directSwapResult.poolAddress || null,
+    poolSource: directSwapResult.poolSource || null,
+    stableSwapTxHash: null,
+    stableSwapAmountOut: null,
+    stableSwapExecutionRail: null,
+    stableSwapPoolAddress: null,
+    stableSwapPoolSource: null,
+    finalSwapExecutionRail: null,
+    finalSwapRouteStrategy: null,
+    finalSwapRouteReason: null,
+    finalSwapPoolAddress: null,
+    finalSwapPoolSource: null,
+  };
+}
+
 async function _readCurvePositionGuard(agent, curvePool) {
   const snapshot = await positionsService.getWalletPositions(agent?.wallet_address, {
     poolKeys: [curvePool?.key].filter(Boolean),
@@ -582,13 +825,28 @@ async function executeDirectPairZapInTask({ agent, params = {}, dryRun = false, 
     return { ok: false, reason: 'direct_pair_not_configured' };
   }
 
-  if (dryRun) {
-    const swapQuote = await agentWalletService.getSwapQuoteResult({
-      fromToken: normalizedStableToken,
-      toToken: 'cirBTC',
-      amountIn: swapAmountIn,
-    });
+  const swapPlanResult = await _buildDirectPairZapSwapPlan({
+    stableToken: normalizedStableToken,
+    amountIn: swapAmountIn,
+  });
 
+  if (!swapPlanResult.ok) {
+    return { ok: false, reason: 'swap_error', error: swapPlanResult.error };
+  }
+
+  const selectedSwapPlan = swapPlanResult.selectedPlan;
+  const availableSwapRoutes = swapPlanResult.candidatePlans
+    .filter(plan => _parsePositiveAmount(plan?.amountOut) > 0)
+    .map(plan => ({
+      routeKey: plan.routeKey,
+      amountOut: plan.amountOut,
+    }));
+
+  const dryRunSummary = selectedSwapPlan.routeKey === 'curve_then_live_swap'
+    ? `Would route ${swapAmountIn} ${normalizedStableToken} through Curve into ${selectedSwapPlan.intermediateAmountOut} USDC, then through the live app swap path into ${selectedSwapPlan.amountOut} cirBTC before adding liquidity on the configured direct ${normalizedStableToken}/cirBTC pair with the remaining ${remainingAmountIn} ${normalizedStableToken}.`
+    : `Would swap ${swapAmountIn} ${normalizedStableToken} into cirBTC using the live app swap path, then add liquidity on the configured direct ${normalizedStableToken}/cirBTC pair with the remaining ${remainingAmountIn} ${normalizedStableToken}.`;
+
+  if (dryRun) {
     return {
       ok: true,
       payload: _timestamped({
@@ -598,28 +856,55 @@ async function executeDirectPairZapInTask({ agent, params = {}, dryRun = false, 
         amountIn,
         swapAmountIn,
         remainingAmountIn: String(remainingAmountIn),
-        amountOut: swapQuote.amountOut,
-        swapExecutionRail: swapQuote.executionRail || null,
-        swapRouteStrategy: swapQuote.routeStrategy || null,
-        swapRouteReason: swapQuote.routeReason || null,
-        swapPoolAddress: swapQuote.poolAddress || null,
-        swapPoolSource: swapQuote.poolSource || null,
+        amountOut: selectedSwapPlan.amountOut,
+        selectedSwapRoute: selectedSwapPlan.routeKey,
+        availableSwapRoutes,
+        swapExecutionRail: selectedSwapPlan.executionRail || null,
+        swapRouteStrategy: selectedSwapPlan.routeStrategy || null,
+        swapRouteReason: selectedSwapPlan.routeReason || null,
+        swapPoolAddress: selectedSwapPlan.poolAddress || null,
+        swapPoolSource: selectedSwapPlan.poolSource || null,
+        stableSwapExecutionRail: selectedSwapPlan.stableSwapExecutionRail || null,
+        stableSwapPoolAddress: selectedSwapPlan.stableSwapPoolAddress || null,
+        stableSwapPoolSource: selectedSwapPlan.stableSwapPoolSource || null,
+        intermediateAmountOut: selectedSwapPlan.intermediateAmountOut || null,
         maxSwapAmountIn: config.maxSwapAmountIn,
         poolAddress: directPair.address,
         poolSource: directPair.source || 'env',
         executionRail: 'swap_then_direct_lp_add',
-        summary: `Would swap ${swapAmountIn} ${normalizedStableToken} into cirBTC using the normal swap route, then add liquidity on the configured direct ${normalizedStableToken}/cirBTC pair with the remaining ${remainingAmountIn} ${normalizedStableToken}.`,
+        summary: dryRunSummary,
       }),
     };
   }
 
   try {
-    const swapResult = await agentWalletService.agentSwap({
-      agent,
-      fromToken: normalizedStableToken,
-      toToken: 'cirBTC',
-      amountIn: swapAmountIn,
-    });
+    let executedSwapPlan = selectedSwapPlan;
+    let swapResult;
+
+    try {
+      swapResult = await _executeDirectPairZapSwapPlan({
+        agent,
+        stableToken: normalizedStableToken,
+        amountIn: swapAmountIn,
+        swapPlan: executedSwapPlan,
+      });
+    } catch (swapError) {
+      const fallbackPlan = swapPlanResult.candidatePlans.find(
+        plan => plan?.routeKey !== executedSwapPlan.routeKey && _parsePositiveAmount(plan?.amountOut) > 0,
+      );
+
+      if (!fallbackPlan) {
+        throw swapError;
+      }
+
+      executedSwapPlan = fallbackPlan;
+      swapResult = await _executeDirectPairZapSwapPlan({
+        agent,
+        stableToken: normalizedStableToken,
+        amountIn: swapAmountIn,
+        swapPlan: executedSwapPlan,
+      });
+    }
 
     const liquidityResult = await protocols.executeConstantProductAddLiquidity({
       pairAddress: directPair.address,
@@ -643,12 +928,16 @@ async function executeDirectPairZapInTask({ agent, params = {}, dryRun = false, 
     const leftoverSummary = leftoverParts.length > 0
       ? ` Unmatched remainder stayed in the agent wallet: ${leftoverParts.join(' + ')}.`
       : '';
+    const swapSummary = executedSwapPlan.routeKey === 'curve_then_live_swap'
+      ? `LP bootstrap completed with a fixed half split: routed ${swapAmountIn} ${normalizedStableToken} through Curve into ${swapResult.stableSwapAmountOut} USDC, then through the live app swap path into ${swapResult.amountOut} cirBTC before adding liquidity.`
+      : `LP bootstrap completed with a fixed half split: swapped ${swapAmountIn} ${normalizedStableToken} into ${swapResult.amountOut} cirBTC using the live app swap path, then added liquidity.`;
 
     return {
       ok: true,
       payload: _timestamped({
         txHash: liquidityResult.txHash,
         swapTxHash: swapResult.hash,
+        stableSwapTxHash: swapResult.stableSwapTxHash || null,
         mintTxHash: liquidityResult.mintTxHash,
         stableToken: normalizedStableToken,
         volatileToken: 'cirBTC',
@@ -657,6 +946,9 @@ async function executeDirectPairZapInTask({ agent, params = {}, dryRun = false, 
         swappedAmountIn: String(swapAmountIn),
         remainingAmountIn: String(remainingAmountIn),
         amountOut: swapResult.amountOut,
+        selectedSwapRoute: executedSwapPlan.routeKey,
+        availableSwapRoutes,
+        intermediateAmountOut: swapResult.stableSwapAmountOut || null,
         maxSwapAmountIn: config.maxSwapAmountIn,
         poolAddress: directPair.address,
         poolSource: directPair.source || 'env',
@@ -670,8 +962,16 @@ async function executeDirectPairZapInTask({ agent, params = {}, dryRun = false, 
         swapRouteReason: swapResult.routeReason || null,
         swapPoolAddress: swapResult.poolAddress || null,
         swapPoolSource: swapResult.poolSource || null,
+        stableSwapExecutionRail: swapResult.stableSwapExecutionRail || null,
+        stableSwapPoolAddress: swapResult.stableSwapPoolAddress || null,
+        stableSwapPoolSource: swapResult.stableSwapPoolSource || null,
+        finalSwapExecutionRail: swapResult.finalSwapExecutionRail || null,
+        finalSwapRouteStrategy: swapResult.finalSwapRouteStrategy || null,
+        finalSwapRouteReason: swapResult.finalSwapRouteReason || null,
+        finalSwapPoolAddress: swapResult.finalSwapPoolAddress || null,
+        finalSwapPoolSource: swapResult.finalSwapPoolSource || null,
         executionRail: 'swap_then_direct_lp_add',
-        summary: `LP bootstrap completed with a fixed half split: swapped ${swapAmountIn} ${normalizedStableToken} into ${swapResult.amountOut} cirBTC using the normal swap route, then added ${stableUsed > 0 ? liquidityResult.amountAUsed : '0'} ${normalizedStableToken} + ${cirbtcUsed > 0 ? liquidityResult.amountBUsed : '0'} cirBTC to the direct ${normalizedStableToken}/cirBTC pair.${leftoverSummary} This manual paid task does not use the LLM.`,
+        summary: `${swapSummary} Added ${stableUsed > 0 ? liquidityResult.amountAUsed : '0'} ${normalizedStableToken} + ${cirbtcUsed > 0 ? liquidityResult.amountBUsed : '0'} cirBTC to the direct ${normalizedStableToken}/cirBTC pair.${leftoverSummary} This manual paid task does not use the LLM.`,
       }),
     };
   } catch (error) {

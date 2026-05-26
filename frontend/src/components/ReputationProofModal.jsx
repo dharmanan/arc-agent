@@ -196,6 +196,12 @@ export default function ReputationProofModal({ agentId, onClose }) {
           </div>
         )}
 
+        {!loading && data?.status === 'rate_limited' && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            This agent already used {Number(data?.dailyReadCount || 0)}/{Number(data?.dailyReadLimit || 0)} live proof reads today. Try again after the UTC reset.
+          </div>
+        )}
+
         {/* RPC read error — show contract + token info and let user retry */}
         {!loading && data?.status === 'read_error' && (
           <>
@@ -378,7 +384,9 @@ export default function ReputationProofModal({ agentId, onClose }) {
       {/* ── Footer ── */}
       <div className="flex items-center justify-between gap-4 rounded-b-2xl border-t border-slate-100 bg-slate-50 px-6 py-3">
         <p className="text-[11px] text-slate-400">
-          Score is read live from the Arc Testnet blockchain for identity token{data?.tokenId ? ` #${data.tokenId}` : ''} — no server cache or intermediary.
+          {data?.status === 'rate_limited'
+            ? `Live proof reads for identity token${data?.tokenId ? ` #${data.tokenId}` : ''} are capped per agent each UTC day.`
+            : `Score is read live from the Arc Testnet blockchain for identity token${data?.tokenId ? ` #${data.tokenId}` : ''} — no server cache or intermediary.`}
         </p>
         <button
           onClick={onClose}

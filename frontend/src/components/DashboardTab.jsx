@@ -162,12 +162,12 @@ function summarizeActivityError(error) {
   return primary.length > 180 ? `${primary.slice(0, 177)}...` : primary;
 }
 
-function summarizeActivityFailureReason(meta, actionLabel) {
+function summarizeActivityFailureReason(meta, actionLabel, blockedActionLabel = 'exit') {
   const reason = String(meta?.reason || '').trim();
   if (!reason) return null;
 
   if (reason === 'position_guard_unavailable') {
-    return `${actionLabel} failed: The app could not verify the current LP position, so it skipped the exit before sending a transaction.`;
+    return `${actionLabel} failed: The app could not verify the current LP position, so it skipped the ${blockedActionLabel} before sending a transaction.`;
   }
 
   if (reason === 'lp_position_not_found') {
@@ -181,8 +181,8 @@ function summarizeActivityFailureReason(meta, actionLabel) {
   return null;
 }
 
-function getUserFacingFailedActivityPhase(meta, actionLabel, fallbackLabel) {
-  const structuredReason = summarizeActivityFailureReason(meta, actionLabel);
+function getUserFacingFailedActivityPhase(meta, actionLabel, fallbackLabel, blockedActionLabel = 'exit') {
+  const structuredReason = summarizeActivityFailureReason(meta, actionLabel, blockedActionLabel);
   if (structuredReason) {
     return structuredReason;
   }
@@ -1012,6 +1012,7 @@ function getOracleSignalFollowUp(tx, allTxs) {
 
 function getRecentActivityStatus(tx) {
   const meta = getTxMeta(tx);
+  const txHash = tx?.tx_hash || tx?.txHash || meta?.txHash || null;
 
   if (tx?.type === 'oracle_signal') {
     return {
@@ -1031,6 +1032,17 @@ function getRecentActivityStatus(tx) {
     return {
       label: 'balance hold',
       variant: 'yellow',
+    };
+  }
+
+  if (
+    ['carry_start', 'carry_stop'].includes(tx?.type)
+    && tx?.status === 'confirmed'
+    && !isRealHash(txHash)
+  ) {
+    return {
+      label: meta?.triggerQueued ? 'waiting' : 'updated',
+      variant: meta?.triggerQueued ? 'yellow' : 'green',
     };
   }
 
@@ -1112,6 +1124,7 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
   const isTaskArb = tx.type === 'task_arb';
   const isRebalance = tx.type === 'rebalance';
   const isGasFanout = tx.type === 'gas_topup' && Array.isArray(meta.targets) && meta.targets.length > 0;
+  const isJobActivity = ['job_create', 'job_assign', 'job_deliver', 'job_complete', 'job_cancel', 'job_reject'].includes(tx.type);
 
   if (isOracleSignal) {
     const strategy = meta.signal?.strategy === 'stablecoin_fx'
@@ -1353,7 +1366,12 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     const lpMintedLabel = meta.lpAmount ? `${formatLpAmount(meta.lpAmount)} LP minted` : null;
     const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
     const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
-    const failedCurveAddPhase = getUserFacingFailedActivityPhase(meta, 'This Curve LP add', 'This Curve LP add failed before confirmation.');
+    const failedCurveAddPhase = getUserFacingFailedActivityPhase(
+      meta,
+      'This Curve LP add',
+      'This Curve LP add failed before confirmation.',
+      'add',
+    );
 
     return {
       title: 'curve liquidity add',
@@ -1393,7 +1411,12 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     ].filter(Boolean);
     const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
     const txUrl = getExplorerTxUrl('Arc Testnet', txHash);
-    const failedCurveExitPhase = getUserFacingFailedActivityPhase(meta, 'This Curve LP exit', 'This Curve LP exit failed before confirmation.');
+    const failedCurveExitPhase = getUserFacingFailedActivityPhase(
+      meta,
+      'This Curve LP exit',
+      'This Curve LP exit failed before confirmation.',
+      'exit',
+    );
 
     return {
       title: 'curve liquidity remove',
@@ -1522,6 +1545,43 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
     };
   }
 
+  if (tx.type === 'carry_start' || tx.type === 'carry_stop') {
+    const isCarryStart = tx.type === 'carry_start';
+    const stableToken = meta.stableToken || tx.token || 'USDC';
+    const amountLabel = formatTokenAmount(meta.positionValueUsd ?? meta.debtAmount ?? tx.amount_usdc, stableToken);
+    const txHash = tx.tx_hash || tx.txHash || meta.txHash || null;
+    const txUrl = getExplorerTxUrl(tx.from_chain || meta.sourceChain || 'Arc Testnet', txHash);
+    const defaultSummary = isCarryStart
+      ? 'Enabled Auto Carry and queued the next carry review.'
+      : 'Stopped Auto Carry and saved the next carry review state.';
+
+    let phase = meta.errorSummary || meta.summary || null;
+    if (tx.status === 'failed') {
+      phase = meta.errorSummary || meta.summary || meta.error || (isCarryStart
+        ? 'Auto Carry start could not finish.'
+        : 'Auto Carry stop could not finish.');
+    } else if (!isRealHash(txHash) && meta.triggerQueued) {
+      phase = `${meta.summary || defaultSummary} The follow-up carry review is running separately, so this row only tracks the trigger.`;
+    } else if (!isRealHash(txHash)) {
+      phase = `${meta.summary || defaultSummary} This row tracks the trigger state, not a separate carry transaction.`;
+    }
+
+    return {
+      title: isCarryStart ? 'Auto Carry Start' : 'Auto Carry Stop',
+      routeLabel: `${formatActivityChainLabel(tx.from_chain || meta.sourceChain || 'Arc Testnet')} · Carry trigger`,
+      amountLabel,
+      phase,
+      links: txUrl
+        ? [{
+            key: `${tx.id}-carry-trigger`,
+            label: 'Tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
+    };
+  }
+
   if (tx.type === 'carry_automation') {
     const actionLabel = humanizeAutomationAction(meta.operationType || meta.action || 'carry_automation');
     const stableToken = meta.stableToken || meta.actionAssetSymbol || meta.tokenIn || tx.token || 'USDC';
@@ -1599,6 +1659,52 @@ function getTxDisplay(tx, { allTxs = [], agentStatus = null } = {}) {
           url,
         };
       }).filter(Boolean),
+    };
+  }
+
+  if (isJobActivity) {
+    const txHash = tx.tx_hash || tx.txHash || null;
+    const txUrl = getExplorerTxUrl(tx.from_chain || meta.sourceChain || 'Arc Testnet', txHash);
+    const providerLabel = meta.providerAddress ? formatAddress(meta.providerAddress, 6, 4) : null;
+    const amountLabel = formatTokenAmount(tx.amount_usdc ?? meta.amountUsdc, tx.token || 'USDC');
+    const titleMap = {
+      job_create: 'job created',
+      job_assign: 'provider assigned',
+      job_deliver: 'job delivered',
+      job_complete: 'job completed',
+      job_cancel: 'job cancelled',
+      job_reject: 'job rejected',
+    };
+
+    let phase = meta.summary || null;
+    if (!phase) {
+      if (tx.type === 'job_create') phase = 'Created a new funded job.';
+      else if (tx.type === 'job_assign') phase = providerLabel ? `Locked ${providerLabel} as the provider for this job.` : 'Locked a provider for this job.';
+      else if (tx.type === 'job_deliver') phase = 'Marked this job as delivered for review.';
+      else if (tx.type === 'job_complete') phase = providerLabel ? `Completed this job and released payout to ${providerLabel}.` : 'Completed this job and released the payout.';
+      else if (tx.type === 'job_cancel') phase = 'Cancelled this job before delivery.';
+      else if (tx.type === 'job_reject') phase = 'Rejected the delivered work and closed this job.';
+    }
+
+    if (meta.txMode === 'local_only') {
+      phase = phase
+        ? `${phase} Saved without a separate on-chain job transaction.`
+        : 'Saved without a separate on-chain job transaction.';
+    }
+
+    return {
+      title: titleMap[tx.type] || 'job update',
+      routeLabel: 'Arc Testnet · Jobs',
+      amountLabel,
+      phase,
+      links: txUrl
+        ? [{
+            key: `${tx.id}-job-activity`,
+            label: 'Tx',
+            hash: txHash,
+            url: txUrl,
+          }]
+        : [],
     };
   }
 

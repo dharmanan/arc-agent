@@ -2121,6 +2121,8 @@ function getTaskRunErrorMessage(message, taskId = null) {
       return 'The live carry snapshot could not be loaded right now. Retry after the lending and LP surface refreshes.';
     case 'carry_manual_lp_balance_unavailable':
       return 'The current manual stable LP balance is not visible yet. Refresh the carry surface, then retry this Auto Carry start product.';
+    case 'carry_handoff_queue_failed':
+      return 'Auto Carry mode was enabled, but the immediate carry review could not be queued. Refresh once, then retry this card if the lane is still idle.';
     case 'lending_surface_unavailable':
       return 'The live lending surface could not be read right now, so Auto Carry could not continue. Refresh the lending data and retry in a moment.';
     case 'swap_not_configured':
@@ -2627,6 +2629,51 @@ function deriveCarryAutomationDisplayState(state, liveSurface, enabled) {
   };
 }
 
+function deriveReputationAutomationDisplayState(state, reputationOverview, enabled) {
+  const baseState = {
+    ...(state || {}),
+    enabled: Boolean(enabled),
+  };
+
+  if (!enabled) {
+    return {
+      ...baseState,
+      lastStatus: 'disabled',
+    };
+  }
+
+  const onchain = reputationOverview?.onchain;
+  if (!onchain || typeof onchain !== 'object') {
+    return baseState;
+  }
+
+  if (onchain.status === 'live') {
+    return {
+      ...baseState,
+      lastStatus: 'success',
+      displaySummary: 'Reputation writes are mirrored on-chain and the current score is readable from the registry.',
+    };
+  }
+
+  if (onchain.status === 'read_error') {
+    return {
+      ...baseState,
+      lastStatus: 'chain_error',
+      displaySummary: 'Registry is configured, but the current on-chain score could not be read.',
+    };
+  }
+
+  if (onchain.configured === false) {
+    return {
+      ...baseState,
+      lastStatus: 'db_only',
+      displaySummary: 'Saving reputation activity locally. On-chain posting is off right now.',
+    };
+  }
+
+  return baseState;
+}
+
 function getCirbtcPairStatusLabel(status) {
   const labels = {
     executed: 'Sent',
@@ -2715,6 +2762,9 @@ function getAutomationSummary(feature, state, agent) {
       }
       return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} cirBTC LP checks ran and ${Number(state?.autoTxToday || 0)} live LP actions were sent. This card only tracks LP adds and removals.${bypassNote}`;
     case 'reputation':
+      if (state?.displaySummary) {
+        return state.displaySummary;
+      }
       return state?.lastStatus === 'db_only'
         ? 'Saving reputation activity locally. On-chain posting is off right now.'
         : 'Updates when tasks, oracle events, or transactions create new reputation activity.';
@@ -3037,6 +3087,28 @@ function TaskExecutionLinks({ links }) {
   );
 }
 
+function isAutoCarryQueueFailurePayload(task, payload) {
+  return task?.id === 'EXEC_AUTO_CARRY_START'
+    && payload?.executionRail === 'carry_automation_trigger'
+    && Boolean(payload?.triggerQueueError);
+}
+
+function isAutoCarryWaitingPayload(task, payload) {
+  if (!AUTO_CARRY_TASK_IDS.has(task?.id)) return false;
+
+  const action = String(payload?.action || '').trim().toLowerCase();
+  const finalAutomationStatus = String(payload?.finalAutomationStatus || '').trim().toLowerCase();
+
+  return finalAutomationStatus === 'policy_hold'
+    || action === 'hold'
+    || (task?.id === 'EXEC_AUTO_CARRY_START'
+      && payload?.executionRail === 'carry_automation_trigger'
+      && payload?.carryAutomationEnabled === true
+      && payload?.triggerQueued === true
+      && !payload?.triggerQueueError
+      && !payload?.txHash);
+}
+
 function getCompletedTaskLabel(task, payload) {
   switch (task?.id) {
     case 'EXEC_CURVE_SWAP':
@@ -3077,6 +3149,13 @@ function getCompletedTaskLabel(task, payload) {
       return 'Recovery completed';
     case 'EXEC_LENDING_LIQUIDATE':
       return 'Liquidation completed';
+    case 'EXEC_AUTO_CARRY_START':
+      if (isAutoCarryQueueFailurePayload(task, payload)) return 'Needs retry';
+      if (isAutoCarryWaitingPayload(task, payload)) return 'Waiting';
+      return 'Auto Carry updated';
+    case 'EXEC_AUTO_CARRY_STOP':
+      if (isAutoCarryWaitingPayload(task, payload)) return 'Waiting';
+      return 'Auto Carry updated';
     default:
       return 'Task completed';
   }
@@ -3191,6 +3270,30 @@ function getTaskResultStatusMeta(task, payload) {
     };
   }
 
+  if (isAutoCarryQueueFailurePayload(task, payload)) {
+    return {
+      label: 'Needs retry',
+      buttonLabel: 'Retry',
+      panelClasses: 'bg-rose-50/80',
+      iconClasses: 'text-rose-600',
+      titleClasses: 'text-rose-800',
+      detailClasses: 'text-rose-700',
+      summary: payload?.summary || getTaskRunErrorMessage('carry_handoff_queue_failed', task?.id),
+    };
+  }
+
+  if (isAutoCarryWaitingPayload(task, payload)) {
+    return {
+      label: 'Waiting',
+      buttonLabel: 'Waiting',
+      panelClasses: 'bg-sky-50/80',
+      iconClasses: 'text-sky-600',
+      titleClasses: 'text-sky-800',
+      detailClasses: 'text-sky-700',
+      summary: payload?.summary || 'Auto Carry is enabled, but the live carry lane is waiting for the next review.',
+    };
+  }
+
   if (payload?.ok === false) {
     const failureSummary = getTaskRunErrorMessage(
       payload?.errorSummary || payload?.error || payload?.summary || payload?.reason || 'task_execution_failed',
@@ -3222,6 +3325,8 @@ function getTaskResultStatusMeta(task, payload) {
 function getTaskResultHistoryLabel(resultMeta) {
   if (resultMeta?.buttonLabel === 'Simulated') return 'Last simulated';
   if (resultMeta?.buttonLabel === 'Skipped') return 'Last skipped';
+  if (resultMeta?.buttonLabel === 'Retry') return 'Last failed';
+  if (resultMeta?.buttonLabel === 'Waiting') return 'Last waiting';
   return 'Last completed';
 }
 
@@ -5094,6 +5199,8 @@ export default function TasksTab() {
         const rawAutomationState = agentStatus?.automation?.[feature.statusKey] || null;
         const automationState = feature.statusKey === 'carryAutomation'
           ? deriveCarryAutomationDisplayState(rawAutomationState, carryLiveSurface, enabled)
+          : feature.statusKey === 'reputation'
+            ? deriveReputationAutomationDisplayState(rawAutomationState, reputationOverview, enabled)
           : rawAutomationState;
         const liveCarry = feature.statusKey === 'carryAutomation' ? carryLiveSurface?.carry || null : null;
         const carryLpBalance = feature.statusKey === 'carryAutomation'

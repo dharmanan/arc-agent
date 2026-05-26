@@ -44,6 +44,79 @@ const SCORE_DELTAS = {
   [EVENT_TYPES.JOB_REVIEW_TIMEOUT]: -2,
 };
 
+const REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT = (() => {
+  const numeric = Number(process.env.REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT || 0);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : 0;
+})();
+
+function getUtcDateKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+async function reserveReputationProofReadBudget(agentId) {
+  if (!(REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT > 0)) {
+    return {
+      allowLiveRead: true,
+      dailyLimit: 0,
+      dailyCount: 0,
+    };
+  }
+
+  const today = getUtcDateKey();
+  const client = await db.getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    const { rows: [row] } = await client.query(
+      `SELECT reputation_proof_last_read_day, reputation_proof_daily_read_count
+       FROM agents
+       WHERE id = $1
+       FOR UPDATE`,
+      [agentId],
+    );
+
+    const currentCount = row?.reputation_proof_last_read_day === today
+      ? Number(row?.reputation_proof_daily_read_count || 0)
+      : 0;
+
+    if (currentCount >= REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT) {
+      await client.query('COMMIT');
+      return {
+        allowLiveRead: false,
+        dailyLimit: REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT,
+        dailyCount: currentCount,
+      };
+    }
+
+    const nextCount = currentCount + 1;
+    await client.query(
+      `UPDATE agents
+       SET reputation_proof_last_read_day = $2,
+           reputation_proof_daily_read_count = $3
+       WHERE id = $1`,
+      [agentId, today, nextCount],
+    );
+
+    await client.query('COMMIT');
+    return {
+      allowLiveRead: true,
+      dailyLimit: REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT,
+      dailyCount: nextCount,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(`[REPUTATION] proof budget error agent=${agentId}:`, error.message);
+    return {
+      allowLiveRead: true,
+      dailyLimit: REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT,
+      dailyCount: 0,
+    };
+  } finally {
+    client.release();
+  }
+}
+
 async function setReputationState(agentId, status) {
   await db.query(
     `UPDATE agents
@@ -250,10 +323,20 @@ async function getReputationProof(agentId, userId) {
     events: [],
     eventsStatus: 'not_scanned',
     status: 'not_configured',
+    dailyReadLimit: REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT,
+    dailyReadCount: 0,
   };
 
   if (!REPUTATION_REGISTRY_ADDRESS || agent.erc8004_status !== 'registered' || !result.tokenId) {
     result.status = agent.erc8004_status !== 'registered' ? 'identity_required' : 'not_configured';
+    return result;
+  }
+
+  const budget = await reserveReputationProofReadBudget(agentId);
+  result.dailyReadCount = budget.dailyCount;
+
+  if (!budget.allowLiveRead) {
+    result.status = 'rate_limited';
     return result;
   }
 

@@ -5,7 +5,7 @@ import { jobs as jobsApi } from '../lib/api.js';
 import {
   Card, Button, Input, Alert, Spinner, SectionHeader
 } from './ui/index.jsx';
-import { Briefcase, Plus, CheckCircle, XCircle, Package, RefreshCw, ChevronDown, ChevronUp } from 'lucide-react';
+import { Briefcase, Plus, CheckCircle, XCircle, Package, RefreshCw, ChevronDown, ChevronUp, Download, TerminalSquare } from 'lucide-react';
 
 const STATUS_COLORS = {
   open:       'bg-blue-50 text-blue-700 border-blue-200',
@@ -75,6 +75,65 @@ const JOB_TEMPLATES = [
     sources: 'X, CoinGecko, exchange charts, Curve or DEX pool views',
   },
 ];
+
+const PUBLIC_JOB_PAID_EXAMPLE_URL = '/downloads/publicJobPaidIntakeExample.js';
+const PUBLIC_JOB_PAID_HELPER_URL = '/downloads/arcOracleBuyerHelper.js';
+const DOWNLOAD_LINK_CLASS = 'inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-[#66D121]/40 hover:bg-arc-greenBg hover:text-arc-green';
+const DEFAULT_PUBLIC_JOB_APPLY_NOTE = 'Short note about what the external agent will deliver';
+const DEFAULT_PUBLIC_JOB_DELIVERABLE_HASH = 'https://example.com/deliverable';
+
+function normalizePublicJobIntakeSummary(summary) {
+  const paid = summary?.paid || {};
+
+  return {
+    legacy: {
+      applicationMode: summary?.legacy?.applicationMode || 'wallet_signature',
+      deliveryMode: summary?.legacy?.deliveryMode || 'wallet_signature',
+    },
+    paid: {
+      configured: Boolean(paid.configured),
+      paymentRail: paid.paymentRail || 'circle_gateway',
+      paidIdentity: paid.paidIdentity || 'x402_payer',
+      sellerAddress: paid.sellerAddress || null,
+      applyFeeUsdc: Number(paid.applyFeeUsdc || 0),
+      deliverFeeUsdc: Number(paid.deliverFeeUsdc || 0),
+      applyPath: paid.applyPath || '/api/jobs/public/:jobId/apply-paid',
+      deliverPath: paid.deliverPath || '/api/jobs/public/:jobId/deliver-paid',
+    },
+  };
+}
+
+function getPublicApiBaseUrl() {
+  if (typeof window === 'undefined') return 'https://arcmachina.xyz/api';
+
+  return new URL(import.meta.env.VITE_API_URL || '/api', window.location.origin)
+    .toString()
+    .replace(/\/$/, '');
+}
+
+function buildPublicJobCurlCommand({ jobId, action, note, deliverableHash }) {
+  const endpoint = action === 'deliver'
+    ? `/jobs/public/${jobId}/deliver-paid`
+    : `/jobs/public/${jobId}/apply-paid`;
+  const payload = action === 'deliver'
+    ? { deliverableHash: deliverableHash || DEFAULT_PUBLIC_JOB_DELIVERABLE_HASH }
+    : { note: note || DEFAULT_PUBLIC_JOB_APPLY_NOTE };
+  const escapedBody = JSON.stringify(payload).replace(/"/g, '\\"');
+
+  return [
+    `curl -i -X POST "${getPublicApiBaseUrl()}${endpoint}"`,
+    '-H "Content-Type: application/json"',
+    `-d "${escapedBody}"`,
+  ].join(' \\\n  ');
+}
+
+async function copyToClipboard(value) {
+  if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) {
+    throw new Error('Clipboard is not available in this browser');
+  }
+
+  await navigator.clipboard.writeText(value);
+}
 
 function getJobCreateFeeSummary(summary) {
   if (!summary) {
@@ -630,6 +689,24 @@ function JobRow({ job, agentId, onRefresh }) {
             </div>
           )}
 
+          {job.deliverableHash && (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-3 text-xs text-emerald-800">
+              <p className="font-semibold text-emerald-900">Delivered Reference</p>
+              {String(job.deliverableHash).startsWith('http://') || String(job.deliverableHash).startsWith('https://') ? (
+                <a
+                  href={job.deliverableHash}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 block break-all font-mono text-emerald-700 underline underline-offset-2"
+                >
+                  {job.deliverableHash}
+                </a>
+              ) : (
+                <p className="mt-1 break-all font-mono text-emerald-700">{job.deliverableHash}</p>
+              )}
+            </div>
+          )}
+
           {reviewStatusCard && (
             <div className={`rounded-xl border px-3 py-3 text-xs ${reviewStatusCard.tone}`}>
               <p className="font-semibold">{reviewStatusCard.title}</p>
@@ -713,6 +790,7 @@ function PublicJobRow({ job, walletAddress, signMessageAsync, onRefresh }) {
   const [disputeReason, setDisputeReason] = useState('');
 
   const providerMatches = addressesEqual(walletAddress, job.providerAddress);
+  const publicIntake = normalizePublicJobIntakeSummary(job.publicIntake);
   const boardModeBadge = getBoardModeBadge(job);
   const reviewStatusCard = getReviewStatusCard(job);
   const viewerGuidance = job.applicationsOpen && !job.providerAddress
@@ -771,6 +849,36 @@ function PublicJobRow({ job, walletAddress, signMessageAsync, onRefresh }) {
       setErr(e.shortMessage || e.message || 'Unable to record delivery');
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleCopyPaidApplyPreview() {
+    try {
+      await copyToClipboard(buildPublicJobCurlCommand({
+        jobId: job.id,
+        action: 'apply',
+        note: applicationNote.trim() || DEFAULT_PUBLIC_JOB_APPLY_NOTE,
+      }));
+      setErr('');
+      setSuccess('Preview cURL copied. Run it first to receive the 402 challenge, then use the downloaded buyer script to pay with the external wallet.');
+    } catch (e) {
+      setSuccess('');
+      setErr(e.message || 'Unable to copy preview command');
+    }
+  }
+
+  async function handleCopyPaidDeliverPreview() {
+    try {
+      await copyToClipboard(buildPublicJobCurlCommand({
+        jobId: job.id,
+        action: 'deliver',
+        deliverableHash: hashInput.trim() || DEFAULT_PUBLIC_JOB_DELIVERABLE_HASH,
+      }));
+      setErr('');
+      setSuccess('Preview cURL copied. Run it first to receive the 402 challenge, then use the downloaded buyer script to pay from the assigned provider wallet.');
+    } catch (e) {
+      setSuccess('');
+      setErr(e.message || 'Unable to copy preview command');
     }
   }
 
@@ -925,8 +1033,16 @@ function PublicJobRow({ job, walletAddress, signMessageAsync, onRefresh }) {
                   {busy ? <Spinner size={12} /> : <Plus size={12} />}
                   Apply With Wallet
                 </Button>
+                <Button size="sm" variant="outline" type="button" onClick={handleCopyPaidApplyPreview}>
+                  <TerminalSquare size={12} />
+                  Copy Paid Preview cURL
+                </Button>
                 {!walletAddress && <span className="text-[11px] text-blue-700">Connect a wallet to submit this application.</span>}
               </div>
+
+              <p className="text-[11px] leading-5 text-blue-700">
+                External x402 path: preview <span className="font-semibold">{publicIntake.paid.applyPath.replace(':jobId', job.id)}</span>, expect a 402 challenge, then pay it with the downloadable buyer script. The x402 payer becomes the applicant wallet. Current fee: <span className="font-semibold">{formatUsdc(publicIntake.paid.applyFeeUsdc)} USDC</span>.
+              </p>
             </div>
           )}
 
@@ -951,6 +1067,24 @@ function PublicJobRow({ job, walletAddress, signMessageAsync, onRefresh }) {
             </div>
           )}
 
+          {job.deliverableHash && (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-3 text-xs text-emerald-800">
+              <p className="font-semibold text-emerald-900">Delivered Reference</p>
+              {String(job.deliverableHash).startsWith('http://') || String(job.deliverableHash).startsWith('https://') ? (
+                <a
+                  href={job.deliverableHash}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 block break-all font-mono text-emerald-700 underline underline-offset-2"
+                >
+                  {job.deliverableHash}
+                </a>
+              ) : (
+                <p className="mt-1 break-all font-mono text-emerald-700">{job.deliverableHash}</p>
+              )}
+            </div>
+          )}
+
           {reviewStatusCard && (
             <div className={`rounded-xl border px-3 py-3 text-xs ${reviewStatusCard.tone}`}>
               <p className="font-semibold">{reviewStatusCard.title}</p>
@@ -966,17 +1100,27 @@ function PublicJobRow({ job, walletAddress, signMessageAsync, onRefresh }) {
           )}
 
           {job.status === 'funded' && providerMatches && !job.applicationsOpen && (
-            <div className="flex flex-wrap gap-2 items-center w-full">
-              <Input
-                placeholder="Deliverable hash or URL"
-                value={hashInput}
-                onChange={e => setHashInput(e.target.value)}
-                className="flex-1 text-xs"
-              />
-              <Button size="sm" onClick={handlePublicDeliver} disabled={busy || !hashInput.trim()}>
-                {busy ? <Spinner size={12} /> : <Package size={12} />}
-                Deliver As Provider
-              </Button>
+            <div className="space-y-2">
+              <div className="flex flex-wrap gap-2 items-center w-full">
+                <Input
+                  placeholder="Deliverable hash or URL"
+                  value={hashInput}
+                  onChange={e => setHashInput(e.target.value)}
+                  className="flex-1 text-xs"
+                />
+                <Button size="sm" onClick={handlePublicDeliver} disabled={busy || !hashInput.trim()}>
+                  {busy ? <Spinner size={12} /> : <Package size={12} />}
+                  Deliver As Provider
+                </Button>
+                <Button size="sm" variant="outline" type="button" onClick={handleCopyPaidDeliverPreview}>
+                  <TerminalSquare size={12} />
+                  Copy Paid Preview cURL
+                </Button>
+              </div>
+
+              <p className="text-[11px] leading-5 text-slate-500">
+                External x402 path: preview <span className="font-semibold text-slate-700">{publicIntake.paid.deliverPath.replace(':jobId', job.id)}</span>, expect a 402 challenge, then pay it with the downloadable buyer script. The x402 payer must match the assigned provider wallet. Current fee: <span className="font-semibold text-slate-700">{formatUsdc(publicIntake.paid.deliverFeeUsdc)} USDC</span>.
+              </p>
             </div>
           )}
 
@@ -1023,6 +1167,7 @@ export default function JobsTab() {
 
   const [jobList, setJobList]       = useState([]);
   const [publicJobList, setPublicJobList] = useState([]);
+  const [publicIntakeSummary, setPublicIntakeSummary] = useState(() => normalizePublicJobIntakeSummary(null));
   const [loading, setLoading]       = useState(false);
   const [publicLoading, setPublicLoading] = useState(false);
   const [error, setError]           = useState('');
@@ -1047,6 +1192,7 @@ export default function JobsTab() {
     try {
       const data = await jobsApi.board({ limit: 40 });
       setPublicJobList((data.jobs || []).map(normalizeJob));
+      setPublicIntakeSummary(normalizePublicJobIntakeSummary(data.publicIntake));
     } catch (e) {
       setPublicError(e.message);
     } finally {
@@ -1186,6 +1332,36 @@ export default function JobsTab() {
             <div className="space-y-4">
               <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-700">
                 <p><span className="font-semibold text-slate-900">Humans and agent wallets both apply from this public board.</span> Open a card in Anyone Can Apply, write a short note, then use Apply With Wallet.</p>
+              </div>
+
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 px-4 py-4 text-xs text-emerald-800">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-emerald-900">Headless paid intake is live</p>
+                    <p className="mt-1 leading-5">
+                      This page keeps the browser flow on wallet signatures. Outside agents can use the new x402 routes instead: preview the endpoint, receive the 402 challenge, then retry with the buyer script. The payer wallet becomes the applicant or provider identity.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2 text-[11px] font-medium">
+                    <span className="rounded-full border border-emerald-200 bg-white px-2 py-0.5 text-emerald-700">
+                      Apply fee {formatUsdc(publicIntakeSummary.paid.applyFeeUsdc)} USDC
+                    </span>
+                    <span className="rounded-full border border-emerald-200 bg-white px-2 py-0.5 text-emerald-700">
+                      Deliver fee {formatUsdc(publicIntakeSummary.paid.deliverFeeUsdc)} USDC
+                    </span>
+                  </div>
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <a href={PUBLIC_JOB_PAID_EXAMPLE_URL} download className={DOWNLOAD_LINK_CLASS}>
+                    <Download size={12} />
+                    Download Buyer Example
+                  </a>
+                  <a href={PUBLIC_JOB_PAID_HELPER_URL} download className={DOWNLOAD_LINK_CLASS}>
+                    <Download size={12} />
+                    Download Buyer Helper
+                  </a>
+                </div>
               </div>
 
               <div className="rounded-xl border border-blue-200 bg-blue-50/70 px-4 py-4">

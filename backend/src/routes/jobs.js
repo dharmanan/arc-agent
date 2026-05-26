@@ -29,6 +29,7 @@ router.use(requireAuth);
 
 const AGENTIC_COMMERCE_ADDRESS = process.env.AGENTIC_COMMERCE_ADDRESS || null;
 const ARC_RPC_URL              = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
+const ARC_USDC_ADDRESS         = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
 const PROVIDER_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
 // Minimal ABI — only what we need
@@ -37,10 +38,15 @@ const AGENTIC_COMMERCE_ABI = [
   'function deliver(uint256 jobId, bytes32 deliverableHash)',
   'function complete(uint256 jobId)',
   'function cancel(uint256 jobId)',
-  'event JobCreated(uint256 indexed jobId, address indexed client, address indexed provider, uint256 amount)',
+  'event JobCreated(uint256 indexed jobId, address indexed client, address indexed provider, uint256 amount, string description)',
   'event JobDelivered(uint256 indexed jobId, bytes32 deliverableHash)',
-  'event JobCompleted(uint256 indexed jobId)',
-  'event JobCancelled(uint256 indexed jobId)',
+  'event JobCompleted(uint256 indexed jobId, address provider, uint256 amount)',
+  'event JobCancelled(uint256 indexed jobId, address client, uint256 refund)',
+];
+
+const ERC20_APPROVE_ABI = [
+  'function approve(address spender, uint256 amount) returns (bool)',
+  'function allowance(address owner, address spender) view returns (uint256)',
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -65,6 +71,75 @@ async function _getProviderAndSigner(privateKey) {
   return { provider, signer };
 }
 
+async function _ensureJobCreateAllowance(signer, amountWei) {
+  if (!AGENTIC_COMMERCE_ADDRESS) return;
+
+  const usdc = new ethers.Contract(ARC_USDC_ADDRESS, ERC20_APPROVE_ABI, signer);
+  const currentAllowance = await usdc.allowance(signer.address, AGENTIC_COMMERCE_ADDRESS);
+  if (currentAllowance >= amountWei) {
+    return;
+  }
+
+  try {
+    const approveTx = await usdc.approve(AGENTIC_COMMERCE_ADDRESS, ethers.MaxUint256);
+    await approveTx.wait(1);
+  } catch (error) {
+    if (currentAllowance > 0n) {
+      const resetTx = await usdc.approve(AGENTIC_COMMERCE_ADDRESS, 0n);
+      await resetTx.wait(1);
+      const approveTx = await usdc.approve(AGENTIC_COMMERCE_ADDRESS, ethers.MaxUint256);
+      await approveTx.wait(1);
+    } else {
+      throw error;
+    }
+  }
+
+  const refreshedAllowance = await usdc.allowance(signer.address, AGENTIC_COMMERCE_ADDRESS);
+  if (refreshedAllowance < amountWei) {
+    throw new Error('Job create allowance remained below the required amount');
+  }
+}
+
+async function _createOnchainJobIfPossible(agent, { providerAddress, amountUsdc, description }) {
+  if (!providerAddress || !AGENTIC_COMMERCE_ADDRESS || !agent?.private_key_encrypted) {
+    return { jobIdOnchain: null, txHashCreate: null };
+  }
+
+  try {
+    const privateKey = decrypt(agent.private_key_encrypted);
+    const { signer } = await _getProviderAndSigner(privateKey);
+    const contract = _getContract(signer);
+    const amountWei = ethers.parseUnits(String(amountUsdc), 6);
+
+    await _ensureJobCreateAllowance(signer, amountWei);
+
+    const tx = await contract.createJob(providerAddress, amountWei, description);
+    const receipt = await tx.wait(1);
+
+    let jobIdOnchain = null;
+    const iface = new ethers.Interface(AGENTIC_COMMERCE_ABI);
+    for (const log of receipt.logs) {
+      try {
+        const parsed = iface.parseLog(log);
+        if (parsed?.name === 'JobCreated') {
+          jobIdOnchain = parsed.args.jobId.toString();
+          break;
+        }
+      } catch {
+        // Ignore unrelated logs.
+      }
+    }
+
+    return {
+      jobIdOnchain,
+      txHashCreate: receipt.hash,
+    };
+  } catch (err) {
+    console.error('[JOBS] on-chain createJob error:', err.message);
+    return { jobIdOnchain: null, txHashCreate: null };
+  }
+}
+
 function _decorateJob(job) {
   if (!job) return job;
 
@@ -72,6 +147,58 @@ function _decorateJob(job) {
     ...job,
     economy: jobEconomyService.buildJobEconomy({ economy: job.economy, job }),
   };
+}
+
+function _formatJobAmount(amountUsdc) {
+  const normalized = Number(amountUsdc || 0);
+  if (!Number.isFinite(normalized) || normalized <= 0) return '0 USDC';
+  return `${normalized.toFixed(normalized >= 100 ? 0 : 2).replace(/\.00$/, '')} USDC`;
+}
+
+async function _recordJobActivity({
+  agent,
+  job,
+  type,
+  txHash = null,
+  toAddress = null,
+  summary = null,
+  meta = {},
+} = {}) {
+  if (!agent?.id || !job || !type) return;
+
+  const normalizedType = String(type || '').trim();
+  if (!normalizedType || normalizedType.length > 20) return;
+
+  const providerAddress = job.provider_address || meta.providerAddress || null;
+  const amountUsdc = Number(job.amount_usdc || 0);
+
+  await db.query(
+    `INSERT INTO transactions
+       (agent_id, type, from_chain, to_chain, token, amount_usdc, from_address, to_address, tx_hash, status, meta, confirmed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'confirmed', $10::jsonb, NOW())`,
+    [
+      agent.id,
+      normalizedType,
+      'Arc Testnet',
+      'Arc Testnet',
+      'USDC',
+      Number.isFinite(amountUsdc) ? amountUsdc : 0,
+      agent.wallet_address || null,
+      toAddress || providerAddress,
+      txHash,
+      JSON.stringify({
+        activitySource: 'jobs',
+        summary,
+        txMode: txHash ? 'onchain' : 'local_only',
+        jobId: job.id,
+        jobIdOnchain: job.job_id_onchain || null,
+        jobStatus: job.status || null,
+        description: job.description || null,
+        providerAddress,
+        ...meta,
+      }),
+    ],
+  ).catch(() => {});
 }
 
 function isReviewWindowExpired(job) {
@@ -176,34 +303,11 @@ router.post('/', async (req, res, next) => {
     let txHashCreate = null;
     const initialStatus = 'funded';
 
-    // On-chain: only if contract deployed
-    if (providerAddress && AGENTIC_COMMERCE_ADDRESS && agent.private_key_encrypted) {
-      try {
-        const privateKey      = decrypt(agent.private_key_encrypted);
-        const { signer }      = await _getProviderAndSigner(privateKey);
-        const contract        = _getContract(signer);
-        const amountWei       = ethers.parseUnits(String(amountUsdc), 6); // USDC 6 dec
-
-        const tx      = await contract.createJob(providerAddress, amountWei, description);
-        const receipt = await tx.wait(1);
-        txHashCreate  = receipt.hash;
-
-        // Parse JobCreated event for jobId
-        const iface = new ethers.Interface(AGENTIC_COMMERCE_ABI);
-        for (const log of receipt.logs) {
-          try {
-            const parsed = iface.parseLog(log);
-            if (parsed?.name === 'JobCreated') {
-              jobIdOnchain = parsed.args.jobId.toString();
-              break;
-            }
-          } catch { /* skip */ }
-        }
-      } catch (err) {
-        console.error('[JOBS] on-chain createJob error:', err.message);
-        // Non-fatal — fall through to DB-only record
-      }
-    }
+    ({ jobIdOnchain, txHashCreate } = await _createOnchainJobIfPossible(agent, {
+      providerAddress,
+      amountUsdc,
+      description,
+    }));
 
     let createFee = null;
     try {
@@ -263,6 +367,21 @@ router.post('/', async (req, res, next) => {
       payload: createFee || { status: 'missing' },
     });
 
+    await _recordJobActivity({
+      agent,
+      job,
+      type: 'job_create',
+      txHash: txHashCreate,
+      toAddress: providerAddress,
+      summary: acceptingApplications
+        ? `Created an open funded job for ${_formatJobAmount(job.amount_usdc)}.`
+        : `Created a funded job for ${_formatJobAmount(job.amount_usdc)}.`,
+      meta: {
+        applicationsOpen: acceptingApplications,
+        feeStatus: createFee?.status || null,
+      },
+    });
+
     res.status(201).json({
       job: _decorateJob(job),
       onchainEnabled: !!AGENTIC_COMMERCE_ADDRESS,
@@ -296,6 +415,12 @@ router.put('/:jobId/assign-provider', async (req, res, next) => {
       return res.status(409).json({ error: 'provider_already_assigned' });
     }
 
+    const onchainAssignment = await _createOnchainJobIfPossible(agent, {
+      providerAddress,
+      amountUsdc: job.amount_usdc,
+      description: job.description,
+    });
+
     const updatedEconomy = jobEconomyService.buildJobEconomy({
       economy: {
         ...(job.economy || {}),
@@ -304,18 +429,40 @@ router.put('/:jobId/assign-provider', async (req, res, next) => {
       job: {
         ...job,
         provider_address: providerAddress,
+        job_id_onchain: onchainAssignment.jobIdOnchain || job.job_id_onchain || null,
+        tx_hash_create: onchainAssignment.txHashCreate || job.tx_hash_create || null,
       },
     });
 
     const { rows: [updated] } = await db.query(
       `UPDATE agent_jobs
           SET provider_address = $1,
-              economy = $2::jsonb,
+              job_id_onchain = COALESCE($2, job_id_onchain),
+              tx_hash_create = COALESCE($3, tx_hash_create),
+              economy = $4::jsonb,
               updated_at = NOW()
-        WHERE id = $3
+        WHERE id = $5
         RETURNING *`,
-      [providerAddress, JSON.stringify(updatedEconomy), jobId],
+      [
+        providerAddress,
+        onchainAssignment.jobIdOnchain,
+        onchainAssignment.txHashCreate,
+        JSON.stringify(updatedEconomy),
+        jobId,
+      ],
     );
+
+    await _recordJobActivity({
+      agent,
+      job: updated,
+      type: 'job_assign',
+      txHash: onchainAssignment.txHashCreate,
+      toAddress: providerAddress,
+      summary: 'Locked a provider for this funded job.',
+      meta: {
+        providerAddress,
+      },
+    });
 
     res.json({
       job: _decorateJob(updated),
@@ -393,6 +540,19 @@ router.put('/:jobId/deliver', async (req, res, next) => {
       [deliverableHash, txHashDeliver, JOB_REVIEW_TIMEOUT_HOURS, JSON.stringify(deliveredEconomy), jobId],
     );
 
+    await _recordJobActivity({
+      agent,
+      job: updated,
+      type: 'job_deliver',
+      txHash: txHashDeliver,
+      toAddress: updated.provider_address || null,
+      summary: 'Marked this job as delivered and started the client review window.',
+      meta: {
+        deliverableHash,
+        reviewDeadlineAt: updated.review_deadline_at,
+      },
+    });
+
     res.json(_decorateJob(updated));
   } catch (err) { next(err); }
 });
@@ -462,6 +622,18 @@ router.put('/:jobId/complete', async (req, res, next) => {
       payload: completedEconomy.payout || {},
     });
 
+    await _recordJobActivity({
+      agent,
+      job: updated,
+      type: 'job_complete',
+      txHash: txHashSettle,
+      toAddress: updated.provider_address || null,
+      summary: 'Completed this job and released the payout.',
+      meta: {
+        payoutStatus: completedEconomy.payout?.status || null,
+      },
+    });
+
     // Reputation event — fire-and-forget
     recordReputationEvent(agentId, EVENT_TYPES.TX_COMPLETED).catch(() => {});
 
@@ -490,13 +662,16 @@ router.put('/:jobId/cancel', async (req, res, next) => {
       return res.status(409).json({ error: 'job_requires_reject', status: job.status });
     }
 
+    let txHashCancel = null;
+
     if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.private_key_encrypted) {
       try {
         const privateKey = decrypt(agent.private_key_encrypted);
         const { signer } = await _getProviderAndSigner(privateKey);
         const contract   = _getContract(signer);
         const tx = await contract.cancel(BigInt(job.job_id_onchain));
-        await tx.wait(1);
+        const receipt = await tx.wait(1);
+        txHashCancel = receipt.hash;
       } catch (err) {
         console.error('[JOBS] on-chain cancel error:', err.message);
       }
@@ -518,6 +693,14 @@ router.put('/:jobId/cancel', async (req, res, next) => {
         RETURNING *`,
       [JSON.stringify(cancelledEconomy), jobId],
     );
+
+    await _recordJobActivity({
+      agent,
+      job: updated,
+      type: 'job_cancel',
+      txHash: txHashCancel,
+      summary: 'Cancelled this job before delivery.',
+    });
 
     res.json(_decorateJob(updated));
   } catch (err) { next(err); }
@@ -544,13 +727,16 @@ router.put('/:jobId/reject', async (req, res, next) => {
       return res.status(409).json({ error: 'job_not_delivered', status: job.status });
     }
 
+    let txHashReject = null;
+
     if (AGENTIC_COMMERCE_ADDRESS && job.job_id_onchain && agent.private_key_encrypted) {
       try {
         const privateKey = decrypt(agent.private_key_encrypted);
         const { signer } = await _getProviderAndSigner(privateKey);
         const contract   = _getContract(signer);
         const tx = await contract.cancel(BigInt(job.job_id_onchain));
-        await tx.wait(1);
+        const receipt = await tx.wait(1);
+        txHashReject = receipt.hash;
       } catch (err) {
         console.error('[JOBS] on-chain reject error:', err.message);
       }
@@ -572,6 +758,14 @@ router.put('/:jobId/reject', async (req, res, next) => {
         RETURNING *`,
       [JSON.stringify(rejectedEconomy), jobId],
     );
+
+    await _recordJobActivity({
+      agent,
+      job: updated,
+      type: 'job_reject',
+      txHash: txHashReject,
+      summary: 'Rejected the delivered work and closed this job.',
+    });
 
     res.json(_decorateJob(updated));
   } catch (err) { next(err); }

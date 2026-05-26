@@ -277,7 +277,25 @@ function getDirectFallbackRouteReason(fallbackPool) {
   return 'This pair can still trade through the app\'s direct Arc pool if the main route is busy.';
 }
 
-function getSwapRouteStrategy({ fromToken, toToken }) {
+function normalizeSwapRouteMode(routeMode = 'auto') {
+  return String(routeMode || 'auto').trim().toLowerCase() === 'primary_only'
+    ? 'primary_only'
+    : 'auto';
+}
+
+function getSwapRouteStrategy({ fromToken, toToken, routeMode = 'auto' }) {
+  const normalizedRouteMode = normalizeSwapRouteMode(routeMode);
+
+  if (normalizedRouteMode === 'primary_only') {
+    return {
+      routeStrategy: isSwapConfigured() ? 'swap_kit_primary_only' : 'swap_kit_required',
+      routeReason: isSwapConfigured()
+        ? 'This route uses the live app swap path only and does not fall back to a direct pool.'
+        : 'This route needs the live app swap path, but it is not available on this deployment.',
+      fallbackAvailable: false,
+    };
+  }
+
   const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
 
   if (fallbackPool?.address) {
@@ -1056,7 +1074,8 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // AGENTIC SWAP (USDC / EURC / cirBTC on Arc Testnet)
 // ─────────────────────────────────────────────────────────────────────────────
-async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5 }) {
+async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5, routeMode = 'auto' }) {
+  const strategy = getSwapRouteStrategy({ fromToken, toToken, routeMode });
   const cirbtcSizeGuard = getCirbtcSwapSizeGuard({ fromToken, toToken, amountIn });
   if (cirbtcSizeGuard) {
     const error = new Error(cirbtcSizeGuard.userMessage);
@@ -1067,9 +1086,12 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
   }
 
   if (!isSwapConfigured()) {
+    if (normalizeSwapRouteMode(routeMode) === 'primary_only') {
+      throw new Error(strategy.routeReason || 'This route needs the live app swap path on this deployment.');
+    }
+
     const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
     if (!fallbackPool?.address) {
-      const strategy = getSwapRouteStrategy({ fromToken, toToken });
       throw new Error(strategy.routeReason || 'No direct Curve fallback is available for this pair.');
     }
 
@@ -1107,7 +1129,7 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
     return {
       hash: result.txHash,
       amountOut: result.amountOut,
-      ...getSwapRouteStrategy({ fromToken, toToken }),
+      ...strategy,
       executionRail,
       poolAddress: fallbackPool.address,
       poolSource: fallbackPool.source || 'verified_default',
@@ -1145,6 +1167,7 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
   return {
     hash: result.txHash,
     amountOut,
+    ...strategy,
     executionRail: 'swap_kit',
   };
 }
@@ -1152,8 +1175,9 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
 // ─────────────────────────────────────────────────────────────────────────────
 // QUOTE (okuma, tx yok)
 // ─────────────────────────────────────────────────────────────────────────────
-async function getSwapQuoteResult({ fromToken, toToken, amountIn }) {
-  const strategy = getSwapRouteStrategy({ fromToken, toToken });
+async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'auto' }) {
+  const normalizedRouteMode = normalizeSwapRouteMode(routeMode);
+  const strategy = getSwapRouteStrategy({ fromToken, toToken, routeMode: normalizedRouteMode });
   const cirbtcSizeGuard = getCirbtcSwapSizeGuard({ fromToken, toToken, amountIn });
 
   if (cirbtcSizeGuard) {
@@ -1169,6 +1193,14 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn }) {
   }
 
   if (!isSwapConfigured()) {
+    if (normalizedRouteMode === 'primary_only') {
+      return {
+        amountOut: null,
+        quoteError: strategy.routeReason || 'This route needs the live app swap path on this deployment.',
+        ...strategy,
+      };
+    }
+
     return getDirectSwapFallbackQuote({ fromToken, toToken, amountIn });
   }
 
@@ -1189,6 +1221,14 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn }) {
     };
   } catch (error) {
     console.warn('[AGENT-SWAP-QUOTE]', error.message);
+    if (normalizedRouteMode === 'primary_only') {
+      return {
+        amountOut: null,
+        quoteError: normalizeSwapQuoteError(error),
+        ...strategy,
+      };
+    }
+
     const directFallback = await getDirectSwapFallbackQuote({ fromToken, toToken, amountIn });
     if (directFallback.amountOut !== null) {
       return directFallback;

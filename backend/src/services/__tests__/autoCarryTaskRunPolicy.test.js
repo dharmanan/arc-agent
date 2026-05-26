@@ -48,12 +48,12 @@ describe('autoCarryTaskRunPolicy', () => {
     })).toBe(true);
   });
 
-  test('does not track a non-actionable hold review', () => {
+  test('tracks a non-actionable hold review so the paid trigger waits for the live review result', () => {
     expect(shouldTrackAutoCarryStartHandoff({
       dryRun: false,
       taskRunId: 'run-1',
       carryState: 'inactive',
       carryVerdictExecute: false,
-    })).toBe(false);
+    })).toBe(true);
   });
 });

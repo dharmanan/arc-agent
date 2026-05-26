@@ -165,6 +165,26 @@ function loadPublicJobsHarness() {
   process.env.NODE_ENV = 'test';
 
   const db = { query: jest.fn() };
+  const gatewayMiddleware = jest.fn((req, res, next) => {
+    const payer = String(req.header('x-test-x402-payer') || '').trim();
+    if (!payer) {
+      res
+        .status(402)
+        .set('PAYMENT-REQUIRED', 'test-payment-required')
+        .json({ error: 'payment_required' });
+      return;
+    }
+
+    req.arcX402 = {
+      payer: payer.toLowerCase(),
+      rail: 'circle_gateway',
+    };
+
+    next();
+  });
+  const gatewayServer = {
+    onAfterVerify: jest.fn().mockReturnThis(),
+  };
   const buildJobEconomy = jest.fn(({ economy, job }) => ({
     ...(economy || {}),
     summaryStatus: job?.status || null,
@@ -181,6 +201,17 @@ function loadPublicJobsHarness() {
   jest.doMock('../../db', () => db);
   jest.doMock('../../services/agenticEconomy/jobEconomyService', () => ({
     buildJobEconomy,
+    getJobEconomyConfigSummary: jest.fn(() => ({
+      sellerAddress: '0x00000000000000000000000000000000000000BB',
+      configured: true,
+    })),
+  }));
+  jest.doMock('../../services/agenticEconomy/gatewaySeller', () => ({
+    createGatewayRouteConfig: jest.fn((config) => config),
+    createGatewayResourceServer: jest.fn(() => gatewayServer),
+  }));
+  jest.doMock('@x402/express', () => ({
+    paymentMiddleware: jest.fn(() => gatewayMiddleware),
   }));
   jest.doMock('../../services/jobRetentionService', () => ({
     buildJobReviewPolicy: jest.fn((existing = {}) => ({
@@ -213,6 +244,7 @@ function loadPublicJobsHarness() {
   return {
     app: buildTestApp(routeModule, '/api/jobs'),
     db,
+    gatewayMiddleware,
     buildPublicJobDeliveryMessage: routeModule._buildPublicJobDeliveryMessage,
     buildPublicJobApplicationMessage: routeModule._buildPublicJobApplicationMessage,
     buildPublicJobDisputeMessage: routeModule._buildPublicJobDisputeMessage,
@@ -725,6 +757,8 @@ describe('jobs route smoke', () => {
     expect(response.status).toBe(200);
     expect(response.body.job.provider_address).toBe(assignedProvider);
     expect(response.body.job.economy.applicationsOpen).toBe(false);
+    expect(db.query.mock.calls[2][0]).toContain('WHERE id = $5');
+    expect(db.query.mock.calls[2][1][4]).toBe('job-open-1');
   });
 });
 
@@ -895,6 +929,139 @@ describe('public jobs route smoke', () => {
     expect(response.status).toBe(200);
     expect(response.body.job.applicationsOpen).toBe(true);
     expect(response.body.job.applicationCount).toBe(1);
+  });
+
+  test('returns a payment challenge for paid public application intake without x402 identity', async () => {
+    const { app, db } = loadPublicJobsHarness();
+
+    const response = await request(app)
+      .post('/api/jobs/public/job-open-1/apply-paid')
+      .send({ note: 'I can deliver this in markdown with source links.' });
+
+    expect(response.status).toBe(402);
+    expect(response.body.error).toBe('payment_required');
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  test('records a public manual application with x402 payer identity', async () => {
+    const { app, db } = loadPublicJobsHarness();
+    const applicant = Wallet.createRandom();
+    const note = 'I can deliver this in markdown with source links.';
+
+    db.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'job-open-1',
+          agent_id: TEST_AGENT_ID,
+          job_id_onchain: null,
+          client_address: TEST_OWNER_ADDRESS,
+          provider_address: null,
+          amount_usdc: '5',
+          description: 'Open applicant job',
+          status: 'funded',
+          deliverable_hash: null,
+          tx_hash_create: null,
+          tx_hash_settle: null,
+          economy: {
+            applicationsOpen: true,
+            applications: [],
+          },
+          created_at: '2026-05-17T00:00:00.000Z',
+          updated_at: '2026-05-17T00:00:00.000Z',
+        }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'job-open-1',
+          agent_id: TEST_AGENT_ID,
+          job_id_onchain: null,
+          client_address: TEST_OWNER_ADDRESS,
+          provider_address: null,
+          amount_usdc: '5',
+          description: 'Open applicant job',
+          status: 'funded',
+          deliverable_hash: null,
+          tx_hash_create: null,
+          tx_hash_settle: null,
+          economy: {
+            applicationsOpen: true,
+            applications: [{ applicantAddress: applicant.address, note, createdAt: '2026-05-17T00:05:00.000Z' }],
+          },
+          created_at: '2026-05-17T00:00:00.000Z',
+          updated_at: '2026-05-17T00:05:00.000Z',
+        }],
+      });
+
+    const response = await request(app)
+      .post('/api/jobs/public/job-open-1/apply-paid')
+      .set('x-test-x402-payer', applicant.address)
+      .send({ note });
+
+    expect(response.status).toBe(200);
+    expect(response.body.job.applicationsOpen).toBe(true);
+    expect(response.body.job.applicationCount).toBe(1);
+    expect(response.body.paymentRail).toBe('circle_gateway');
+    expect(response.body.paidIdentity).toBe('x402_payer');
+    expect(response.body.applicantAddress).toBe(applicant.address);
+  });
+
+  test('records a public provider delivery with x402 payer identity', async () => {
+    const { app, db } = loadPublicJobsHarness();
+    const provider = Wallet.createRandom();
+    const deliverableHash = 'ipfs://proof';
+
+    db.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'job-1',
+          agent_id: TEST_AGENT_ID,
+          job_id_onchain: null,
+          client_address: TEST_OWNER_ADDRESS,
+          provider_address: provider.address,
+          amount_usdc: '5',
+          description: 'Public research job',
+          status: 'funded',
+          deliverable_hash: null,
+          tx_hash_create: null,
+          tx_hash_settle: null,
+          economy: {},
+          created_at: '2026-05-17T00:00:00.000Z',
+          updated_at: '2026-05-17T00:00:00.000Z',
+        }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'job-1',
+          agent_id: TEST_AGENT_ID,
+          job_id_onchain: null,
+          client_address: TEST_OWNER_ADDRESS,
+          provider_address: provider.address,
+          amount_usdc: '5',
+          description: 'Public research job',
+          status: 'delivered',
+          deliverable_hash: deliverableHash,
+          tx_hash_create: null,
+          tx_hash_settle: null,
+          review_deadline_at: '2026-05-19T00:00:00.000Z',
+          economy: {},
+          created_at: '2026-05-17T00:00:00.000Z',
+          updated_at: '2026-05-17T00:05:00.000Z',
+        }],
+      });
+
+    const response = await request(app)
+      .post('/api/jobs/public/job-1/deliver-paid')
+      .set('x-test-x402-payer', provider.address)
+      .send({ deliverableHash });
+
+    expect(response.status).toBe(200);
+    expect(response.body.job.status).toBe('delivered');
+    expect(response.body.job.reviewRequired).toBe(true);
+    expect(response.body.job.reviewDeadlineAt).toBe('2026-05-19T00:00:00.000Z');
+    expect(response.body.paymentRule).toBe('deliver_does_not_release_payout');
+    expect(response.body.paymentRail).toBe('circle_gateway');
+    expect(response.body.paidIdentity).toBe('x402_payer');
+    expect(response.body.providerAddress).toBe(provider.address);
   });
 
   test('records a provider dispute during manual client review', async () => {
