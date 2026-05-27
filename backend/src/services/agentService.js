@@ -554,6 +554,8 @@ async function getAgentStatus(agentId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
             a.llm_model, a.wallet_address, a.last_reset_day, a.daily_limit_reset_at,
+            a.oracle_daily_reset_at, a.defi_daily_reset_at,
+            a.free_task_daily_reset_at, a.paid_task_daily_reset_at,
           a.market_analysis_enabled, a.oracle_enabled, a.defi_loop_enabled, a.lending_automation_enabled, a.carry_automation_enabled, a.cirbtc_lp_enabled, a.reputation_enabled,
             a.daily_market_analysis_count, a.daily_defi_loop_count, a.daily_auto_tx_count,
             a.market_analysis_last_run_at, a.market_analysis_last_status, a.market_analysis_last_decision,
@@ -584,12 +586,34 @@ async function getAgentStatus(agentId, userId) {
 
   const dailyLimitBypass = getDailyLimitBypass(a);
   const suspendScanJobsWhenDefiCapReached = String(process.env.SUSPEND_CAP_REACHED_SCAN_JOBS || '').trim().toLowerCase() === 'true';
-  const dailyCapResetAtMs = a.daily_limit_reset_at
-    ? new Date(a.daily_limit_reset_at).getTime() + 86_400_000
-    : Number.NaN;
-  const dailyCapResetsAt = Number.isFinite(dailyCapResetAtMs)
-    ? new Date(dailyCapResetAtMs).toISOString()
-    : null;
+  const nowMs = Date.now();
+  const toAnchorMs = (value) => (value ? new Date(value).getTime() : Number.NaN);
+  const utcDayKey = (ms) => new Date(ms).toISOString().slice(0, 10);
+  const getNextUtcMidnightIso = (baseMs = nowMs) => {
+    const d = new Date(baseMs);
+    const nextMidnightMs = Date.UTC(
+      d.getUTCFullYear(),
+      d.getUTCMonth(),
+      d.getUTCDate() + 1,
+      0,
+      0,
+      0,
+      0,
+    );
+    return new Date(nextMidnightMs).toISOString();
+  };
+  const hasElapsed = (anchorMs) => (Number.isFinite(anchorMs) ? utcDayKey(anchorMs) < utcDayKey(nowMs) : false);
+
+  const oracleResetAnchorMs = toAnchorMs(a.oracle_daily_reset_at || a.daily_limit_reset_at);
+  const defiResetAnchorMs = toAnchorMs(a.defi_daily_reset_at || a.daily_limit_reset_at);
+  const oracleDailyCapResetsAt = getNextUtcMidnightIso(nowMs);
+  const defiDailyCapResetsAt = getNextUtcMidnightIso(nowMs);
+
+  const oracleResetElapsed = hasElapsed(oracleResetAnchorMs);
+  const defiResetElapsed = hasElapsed(defiResetAnchorMs);
+  const effectiveDailyMarketAnalysisCount = oracleResetElapsed ? 0 : (a.daily_market_analysis_count ?? 0);
+  const effectiveDailyDefiLoopCount = defiResetElapsed ? 0 : (a.daily_defi_loop_count ?? 0);
+  const effectiveDailyAutoTxCount = defiResetElapsed ? 0 : (a.daily_auto_tx_count ?? 0);
   const marketAnalysisLastDecision = a.market_analysis_last_decision
     && typeof a.market_analysis_last_decision === 'object'
     && Object.keys(a.market_analysis_last_decision).length > 0
@@ -643,16 +667,16 @@ async function getAgentStatus(agentId, userId) {
         lastRunAt: a.market_analysis_last_run_at,
         lastStatus: a.market_analysis_last_status || 'idle',
         lastDecision: marketAnalysisLastDecision,
-        dailyCapResetsAt,
+        dailyCapResetsAt: oracleDailyCapResetsAt,
       },
       oracle: {
         enabled: a.oracle_enabled ?? false,
         lastRunAt: a.oracle_last_run_at,
         lastStatus: a.oracle_last_status || 'idle',
         entryCooldown: oracleEntryCooldown,
-        todayCount: a.daily_market_analysis_count ?? 0,
+        todayCount: effectiveDailyMarketAnalysisCount,
         dailyCap: DAILY_ORACLE_CAP,
-        dailyCapResetsAt,
+        dailyCapResetsAt: oracleDailyCapResetsAt,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
       defiLoop: {
@@ -661,10 +685,10 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: stableLoopState.lastStatus,
         lastDecision: stableLoopState.lastDecision,
         manualCooldownUntil: a.stable_manual_cooldown_until,
-        todayCount: a.daily_defi_loop_count ?? 0,
+        todayCount: effectiveDailyDefiLoopCount,
         dailyCap: DAILY_DEFI_LOOP_CAP,
-        dailyCapResetsAt,
-        autoTxToday: a.daily_auto_tx_count ?? 0,
+        dailyCapResetsAt: defiDailyCapResetsAt,
+        autoTxToday: effectiveDailyAutoTxCount,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
       lendingAutomation: {
@@ -672,10 +696,10 @@ async function getAgentStatus(agentId, userId) {
         lastRunAt: a.lending_automation_last_run_at,
         lastStatus: a.lending_automation_last_status || 'idle',
         lastDecision: lendingAutomationLastDecision,
-        todayCount: a.daily_defi_loop_count ?? 0,
+        todayCount: effectiveDailyDefiLoopCount,
         dailyCap: DAILY_DEFI_LOOP_CAP,
-        dailyCapResetsAt,
-        autoTxToday: a.daily_auto_tx_count ?? 0,
+        dailyCapResetsAt: defiDailyCapResetsAt,
+        autoTxToday: effectiveDailyAutoTxCount,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
       carryAutomation: {
@@ -683,10 +707,10 @@ async function getAgentStatus(agentId, userId) {
         lastRunAt: a.carry_automation_last_run_at,
         lastStatus: a.carry_automation_last_status || 'idle',
         lastDecision: carryAutomationLastDecision,
-        todayCount: a.daily_defi_loop_count ?? 0,
+        todayCount: effectiveDailyDefiLoopCount,
         dailyCap: DAILY_DEFI_LOOP_CAP,
-        dailyCapResetsAt,
-        autoTxToday: a.daily_auto_tx_count ?? 0,
+        dailyCapResetsAt: defiDailyCapResetsAt,
+        autoTxToday: effectiveDailyAutoTxCount,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
       cirbtcLp: {
@@ -694,10 +718,10 @@ async function getAgentStatus(agentId, userId) {
         lastRunAt: a.cirbtc_lp_last_run_at,
         lastStatus: a.cirbtc_lp_last_status || 'idle',
         lastDecision: cirbtcLpLastDecision,
-        todayCount: a.daily_defi_loop_count ?? 0,
+        todayCount: effectiveDailyDefiLoopCount,
         dailyCap: DAILY_DEFI_LOOP_CAP,
-        dailyCapResetsAt,
-        autoTxToday: a.daily_auto_tx_count ?? 0,
+        dailyCapResetsAt: defiDailyCapResetsAt,
+        autoTxToday: effectiveDailyAutoTxCount,
         bypassDailyCap: dailyLimitBypass.enabled,
       },
       reputation: {

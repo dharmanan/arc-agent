@@ -169,6 +169,19 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_defi_loop_count       INTEGER 
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_market_analysis_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_auto_tx_count         INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS daily_limit_reset_at        TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS oracle_daily_reset_at       TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS defi_daily_reset_at         TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS free_task_daily_reset_at    TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS paid_task_daily_reset_at    TIMESTAMPTZ DEFAULT NOW();
+UPDATE agents
+SET oracle_daily_reset_at = COALESCE(oracle_daily_reset_at, daily_limit_reset_at, NOW()),
+   defi_daily_reset_at = COALESCE(defi_daily_reset_at, daily_limit_reset_at, NOW()),
+   free_task_daily_reset_at = COALESCE(free_task_daily_reset_at, daily_limit_reset_at, NOW()),
+   paid_task_daily_reset_at = COALESCE(paid_task_daily_reset_at, daily_limit_reset_at, NOW())
+WHERE oracle_daily_reset_at IS NULL
+  OR defi_daily_reset_at IS NULL
+  OR free_task_daily_reset_at IS NULL
+  OR paid_task_daily_reset_at IS NULL;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_run_at TIMESTAMPTZ;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_status VARCHAR(30) NOT NULL DEFAULT 'idle';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS market_analysis_last_decision JSONB NOT NULL DEFAULT '{}'::jsonb;

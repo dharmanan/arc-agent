@@ -2373,7 +2373,7 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
   const { rows: [agent] } = await db.query(
     `SELECT llm_model, llm_api_key_encrypted,
             defi_loop_enabled, cirbtc_lp_enabled,
-            wallet_address, daily_defi_loop_count, daily_limit_reset_at,
+            wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at,
             defi_loop_last_run_at, cirbtc_lp_last_run_at
        FROM agents
       WHERE id = $1
@@ -2764,7 +2764,7 @@ async function loadAgentForAutoCarryHandoffRecovery(agentId) {
   const { rows: [agent] } = await db.query(
     `SELECT id, llm_model, llm_api_key_encrypted,
             defi_loop_enabled, lending_automation_enabled, carry_automation_enabled, cirbtc_lp_enabled, oracle_enabled,
-            daily_defi_loop_count, daily_limit_reset_at,
+            daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at,
             daily_limit_usdc, max_trade_usdc, defi_wallet_reserve_usdc,
             oracle_max_eurc_inventory, oracle_min_eurc_reserve, slippage_percent,
             gateway_auto_topup_enabled, gateway_auto_topup_min_usdc, gateway_auto_topup_target_usdc,
@@ -3135,13 +3135,15 @@ function hasDailyResetWindowElapsed(resetAtValue, nowMs = Date.now()) {
     : Number.NaN;
 
   if (!Number.isFinite(resetAtMs)) return false;
-  return (nowMs - resetAtMs) >= 86_400_000;
+  const nowUtcDay = new Date(nowMs).toISOString().slice(0, 10);
+  const resetUtcDay = new Date(resetAtMs).toISOString().slice(0, 10);
+  return resetUtcDay < nowUtcDay;
 }
 
 function hasReachedSharedDefiDailyCap(agent, nowMs = Date.now()) {
   if (!agent) return false;
   if (isDailyLimitBypassed(agent)) return false;
-  if (hasDailyResetWindowElapsed(agent.daily_limit_reset_at, nowMs)) return false;
+  if (hasDailyResetWindowElapsed(agent.defi_daily_reset_at || agent.daily_limit_reset_at, nowMs)) return false;
   return Number(agent.daily_defi_loop_count || 0) >= DAILY_DEFI_LOOP_CAP;
 }
 
@@ -3692,7 +3694,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   // Reload agent — double-check flag (may have been toggled off since job was queued)
   const { rows: [agent] } = await db.query(
     `SELECT id, llm_model, llm_api_key_encrypted, oracle_enabled,
-            daily_market_analysis_count, daily_limit_reset_at,
+            daily_market_analysis_count, oracle_daily_reset_at, daily_limit_reset_at,
             daily_tasks_enabled, defi_loop_enabled, daily_defi_loop_count, wallet_address,
             private_key_encrypted,
             gateway_auto_topup_enabled, gateway_auto_topup_min_usdc, gateway_auto_topup_target_usdc
@@ -3704,15 +3706,14 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   if (!agent.oracle_enabled) return finishOracle('disabled', { ok: false, reason: 'oracle_disabled' });
 
   // Reset daily counter if it's a new day
-  const resetAt   = new Date(agent.daily_limit_reset_at);
+  const resetAt   = new Date(agent.oracle_daily_reset_at || agent.daily_limit_reset_at);
   const nowUtc    = new Date();
-  const newDay    = (nowUtc - resetAt) >= 86_400_000; // 24 h
+  const newDay    = resetAt.toISOString().slice(0, 10) < nowUtc.toISOString().slice(0, 10);
   if (newDay) {
     await db.query(
       `UPDATE agents
        SET daily_market_analysis_count = 0,
-           daily_free_task_count       = 0,
-           daily_limit_reset_at        = NOW()
+           oracle_daily_reset_at       = NOW()
        WHERE id = $1`,
       [agentId],
     );
@@ -3846,7 +3847,7 @@ async function scheduleOracleLoop() {
   setInterval(async () => {
     try {
       const { rows } = await db.query(
-        `SELECT id, wallet_address, daily_defi_loop_count, daily_limit_reset_at FROM agents
+        `SELECT id, wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at FROM agents
          WHERE oracle_enabled = TRUE
            AND status NOT IN ('locked', 'inactive')`,
       );
@@ -3881,7 +3882,7 @@ async function scheduleMarketAnalysisLoop() {
   setInterval(async () => {
     try {
       const { rows } = await db.query(
-        `SELECT id, wallet_address, daily_defi_loop_count, daily_limit_reset_at FROM agents
+        `SELECT id, wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at FROM agents
          WHERE market_analysis_enabled = TRUE
            AND is_smart_mode = TRUE
            AND status NOT IN ('locked', 'inactive')`,
@@ -4107,7 +4108,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
   const { rows: [agent] } = await db.query(
     `SELECT id, llm_model, llm_api_key_encrypted,
             defi_loop_enabled, lending_automation_enabled, carry_automation_enabled, cirbtc_lp_enabled, oracle_enabled,
-            daily_defi_loop_count, daily_limit_reset_at,
+            daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at,
           daily_limit_usdc, max_trade_usdc, defi_wallet_reserve_usdc,
           oracle_max_eurc_inventory, oracle_min_eurc_reserve, slippage_percent,
             gateway_auto_topup_enabled, gateway_auto_topup_min_usdc, gateway_auto_topup_target_usdc,
@@ -4181,14 +4182,14 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     : null;
 
   // Reset daily counters if new day
-  const resetAt = new Date(agent.daily_limit_reset_at);
+  const resetAt = new Date(agent.defi_daily_reset_at || agent.daily_limit_reset_at);
   const nowUtc  = new Date();
-  if ((nowUtc - resetAt) >= 86_400_000) {
+  if (resetAt.toISOString().slice(0, 10) < nowUtc.toISOString().slice(0, 10)) {
     await db.query(
       `UPDATE agents
        SET daily_defi_loop_count       = 0,
            daily_auto_tx_count         = 0,
-           daily_limit_reset_at        = NOW()
+           defi_daily_reset_at         = NOW()
        WHERE id = $1`,
       [agentId],
     );
@@ -5606,7 +5607,7 @@ async function scheduleDefiLoop() {
       await cleanupMalformedActiveDefiLoopJobs();
 
       const { rows } = await db.query(
-        `SELECT id, wallet_address, daily_defi_loop_count, daily_limit_reset_at FROM agents
+        `SELECT id, wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at FROM agents
          WHERE (defi_loop_enabled = TRUE OR lending_automation_enabled = TRUE OR carry_automation_enabled = TRUE OR cirbtc_lp_enabled = TRUE)
            AND status NOT IN ('locked', 'inactive')`,
       );
@@ -6125,7 +6126,7 @@ async function ensureTaskCatalogSeeded() {
 // Helper: guard + day reset shared by all DAILY_* jobs
 async function _dailyTaskGuard(agentId) {
   const { rows: [agent] } = await db.query(
-    `SELECT id, daily_tasks_enabled, daily_free_task_count, daily_limit_reset_at,
+    `SELECT id, daily_tasks_enabled, daily_free_task_count, free_task_daily_reset_at, daily_limit_reset_at,
             wallet_address
      FROM agents WHERE id = $1`,
     [agentId],
@@ -6138,9 +6139,9 @@ async function _dailyTaskGuard(agentId) {
   if (!agent.daily_tasks_enabled)   return { ok: false, reason: 'daily_tasks_disabled' };
 
   // Daily reset
-  if ((new Date() - new Date(agent.daily_limit_reset_at)) >= 86_400_000) {
+  if (new Date(agent.free_task_daily_reset_at || agent.daily_limit_reset_at).toISOString().slice(0, 10) < new Date().toISOString().slice(0, 10)) {
     await db.query(
-      `UPDATE agents SET daily_free_task_count = 0, daily_limit_reset_at = NOW() WHERE id = $1`,
+      `UPDATE agents SET daily_free_task_count = 0, free_task_daily_reset_at = NOW() WHERE id = $1`,
       [agentId],
     );
     agent.daily_free_task_count = 0;
@@ -6171,7 +6172,7 @@ const DAILY_PAID_TASK_CAP  = parseInt(process.env.DAILY_PAID_TASK_CAP || '10', 1
 // Check daily paid cap; reset if a new UTC day has started
 async function _paidTaskGuard(agentId) {
   const { rows: [agent] } = await db.query(
-    `SELECT id, daily_tasks_enabled, daily_paid_task_count, daily_limit_reset_at,
+    `SELECT id, daily_tasks_enabled, daily_paid_task_count, paid_task_daily_reset_at, daily_limit_reset_at,
             wallet_address, private_key_encrypted,
             max_trade_usdc, oracle_max_eurc_inventory, oracle_min_eurc_reserve,
             carry_automation_enabled, defi_wallet_reserve_usdc
@@ -6185,9 +6186,9 @@ async function _paidTaskGuard(agentId) {
   }
   if (!agent.daily_tasks_enabled) return { ok: false, reason: 'daily_tasks_disabled' };
 
-  if ((new Date() - new Date(agent.daily_limit_reset_at)) >= 86_400_000) {
+  if (new Date(agent.paid_task_daily_reset_at || agent.daily_limit_reset_at).toISOString().slice(0, 10) < new Date().toISOString().slice(0, 10)) {
     await db.query(
-      `UPDATE agents SET daily_paid_task_count = 0, daily_limit_reset_at = NOW() WHERE id = $1`,
+      `UPDATE agents SET daily_paid_task_count = 0, paid_task_daily_reset_at = NOW() WHERE id = $1`,
       [agentId],
     );
     agent.daily_paid_task_count = 0;

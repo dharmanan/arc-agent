@@ -997,7 +997,8 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
     // Verify ownership
     const { rows: [agent] } = await db.query(
       `SELECT id, daily_tasks_enabled, daily_free_task_count, daily_paid_task_count,
-              daily_limit_reset_at, wallet_address, status, is_active,
+              free_task_daily_reset_at, paid_task_daily_reset_at, daily_limit_reset_at,
+              wallet_address, status, is_active,
               security_frozen_at, security_freeze_reason
        FROM agents WHERE id = $1 AND user_id = $2`,
       [agentId, req.user.userId],
@@ -1017,9 +1018,9 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
 
     if (!isBypass && task.tier === 1) {
       // Daily reset check
-      if ((new Date() - new Date(agent.daily_limit_reset_at)) >= 86_400_000) {
+      if (new Date(agent.free_task_daily_reset_at || agent.daily_limit_reset_at).toISOString().slice(0, 10) < new Date().toISOString().slice(0, 10)) {
         await db.query(
-          `UPDATE agents SET daily_free_task_count = 0, daily_limit_reset_at = NOW() WHERE id = $1`,
+          `UPDATE agents SET daily_free_task_count = 0, free_task_daily_reset_at = NOW() WHERE id = $1`,
           [agentId],
         );
         agent.daily_free_task_count = 0;
@@ -1035,9 +1036,9 @@ router.post('/agents/:id/tasks/run', requireAuth, async (req, res, next) => {
 
     if (!isBypass && task.tier === 2) {
       // Daily reset check
-      if ((new Date() - new Date(agent.daily_limit_reset_at)) >= 86_400_000) {
+      if (new Date(agent.paid_task_daily_reset_at || agent.daily_limit_reset_at).toISOString().slice(0, 10) < new Date().toISOString().slice(0, 10)) {
         await db.query(
-          `UPDATE agents SET daily_paid_task_count = 0, daily_limit_reset_at = NOW() WHERE id = $1`,
+          `UPDATE agents SET daily_paid_task_count = 0, paid_task_daily_reset_at = NOW() WHERE id = $1`,
           [agentId],
         );
         agent.daily_paid_task_count = 0;

@@ -307,6 +307,20 @@ function formatDateTime(value) {
   }).format(parsed);
 }
 
+function formatDateTimeUtc(value) {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '—';
+
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: 'UTC',
+  }).format(parsed);
+}
+
 function formatPercentAmount(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return '—';
@@ -1863,7 +1877,7 @@ export default function DashboardTab({ onNavigate }) {
     || null;
   const suspendScanJobsWhenDefiCapReached = agentStatus?.config?.suspendScanJobsWhenDefiCapReached === true;
   const sharedDefiCapResetLabel = sharedDefiDailyCapResetsAt
-    ? `${formatDateTime(sharedDefiDailyCapResetsAt)} UTC`
+    ? `${formatDateTimeUtc(sharedDefiDailyCapResetsAt)} UTC`
     : 'the next daily reset window';
   const sharedDefiTodayCount = Number(defiLoopState?.todayCount || 0);
   const sharedDefiDailyCap = Number(defiLoopState?.dailyCap || 0);
