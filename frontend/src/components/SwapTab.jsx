@@ -55,7 +55,9 @@ export default function SwapTab({ onBack }) {
     ? 'Enter a value between 0.1 and 50.'
     : '';
   const effectiveSlippagePct = hasSlippageOverride ? parsedSlippageOverride : normalizedDefaultSlippagePct;
-  const activeRouteMode = fallbackOffer ? 'fallback_only' : 'auto';
+  const cirbtcPair = fromToken === 'cirBTC' || toToken === 'cirBTC';
+  const activeRouteMode = fallbackOffer ? 'fallback_only' : (cirbtcPair ? 'primary_only' : 'auto');
+  const isCircleOnlyMode = cirbtcPair;
   const parsedAmount = parseFloat(amountIn);
   const quotedAmountOut = parseFloat(quote?.amountOut ?? '');
   const backupQuote = fallbackOffer?.fallbackQuote || quote?.fallbackQuote || null;
@@ -68,7 +70,6 @@ export default function SwapTab({ onBack }) {
   const isNano       = usdEquivalentIn !== null && usdEquivalentIn < 0.01;
   const isAgentic    = usdEquivalentIn !== null && usdEquivalentIn <= maxTrade;
   const exceedsMax   = usdEquivalentIn !== null && usdEquivalentIn > maxTrade;
-  const cirbtcPair = fromToken === 'cirBTC' || toToken === 'cirBTC';
   const cirbtcNeedsSwapKit = cirbtcPair && quote?.routeStrategy === 'swap_kit_required';
   const limitAwaitingQuote = hasAmount && fromToken === 'cirBTC' && usdEquivalentIn === null && !cirbtcNeedsSwapKit;
   const swapDisabledByDex = hasAmount && !quoting && !!quote && !quote.isDexQuote;
@@ -403,7 +404,7 @@ export default function SwapTab({ onBack }) {
                 min="0"
                 step={fromToken === 'cirBTC' ? '0.00000001' : '0.01'}
                 value={amountIn}
-                onChange={e => setAmountIn(e.target.value)}
+                onChange={handleAmountChange}
                 className="w-36 border-0 bg-transparent text-right text-base font-bold text-slate-900 focus:ring-0 p-0"
               />
             </div>
@@ -449,6 +450,36 @@ export default function SwapTab({ onBack }) {
                 The live app route moved before broadcast. The primary quote was {formatQuotedAmount(fallbackOffer.primaryAmountOut, toToken)} {toToken}; the updated backup quote is {formatQuotedAmount(fallbackOffer.fallbackQuote.amountOut, toToken)} {toToken} on the direct Arc pool. Review it, then confirm if you want to continue.
               </Alert>
             )}
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-[180px_1fr]">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-slate-500 uppercase tracking-wide">Route mode</label>
+              <select
+                value={isCircleOnlyMode ? 'primary_only' : 'auto'}
+                onChange={() => {}}
+                disabled
+                className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-700 outline-none disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isCircleOnlyMode ? (
+                  <option value="primary_only">Circle only (enforced for cirBTC pairs)</option>
+                ) : (
+                  <option value="auto">Auto (backup pool enabled for USDC/EURC)</option>
+                )}
+              </select>
+            </div>
+            <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+              <p className="font-medium text-slate-700">
+                {isCircleOnlyMode
+                  ? 'This swap will use the Circle primary route only.'
+                  : 'USDC/EURC swaps stay in auto mode and can use direct Arc backup pools when needed.'}
+              </p>
+              <p className="mt-1">
+                {isCircleOnlyMode
+                  ? 'No direct Arc fallback is allowed for cirBTC pairs. If Circle pricing or execution is unavailable, the swap will stop.'
+                  : 'Stable pair swaps continue to run in auto mode with fallback support.'}
+              </p>
+            </div>
           </div>
 
           <div className="grid gap-3 sm:grid-cols-[180px_1fr]">
@@ -500,7 +531,7 @@ export default function SwapTab({ onBack }) {
               </div>
             )}
             <p>
-              Route: <span className="text-slate-700">{fallbackOffer ? 'Direct Arc backup pool' : quote?.executionRail === 'swap_kit' ? 'Circle Kit primary route' : backupQuote?.executionRail === 'curve_fallback' || quote?.executionRail === 'curve_fallback' ? 'Direct Arc stable backup pool' : quote?.executionRail === 'uniswap_v2_fallback' ? 'Direct Arc backup pool' : 'Waiting for live route'}</span>
+              Route: <span className="text-slate-700">{fallbackOffer ? 'Direct Arc backup pool' : quote?.executionRail === 'swap_kit' ? 'Circle Kit primary route' : backupQuote?.executionRail === 'curve_fallback' || quote?.executionRail === 'curve_fallback' ? 'Direct Arc stable backup pool' : quote?.executionRail === 'uniswap_v2_fallback' ? 'Direct Arc backup pool' : isCircleOnlyMode ? 'Waiting for Circle route' : 'Waiting for live route'}</span>
             </p>
             <p>
               Slippage: <span className="text-slate-700">{hasSlippageOverride ? `${effectiveSlippagePct}% for this swap only` : `Agent default ${normalizedDefaultSlippagePct}%`}</span>
@@ -523,7 +554,7 @@ export default function SwapTab({ onBack }) {
               ? <><Bot size={15}/> Confirm Backup Swap {amountIn || '0'} {fromToken} → {formatQuotedAmount(quote?.amountOut, toToken)} {toToken}</>
               : isNano
               ? '⚡ Nano Swap'
-              : <><Bot size={15}/> Agent Swap {amountIn || '0'} {fromToken} → {toToken}</>}
+              : <><Bot size={15}/> {isCircleOnlyMode ? 'Circle-only Swap' : 'Agent Swap'} {amountIn || '0'} {fromToken} → {toToken}</>}
           </Button>
         </div>
       </Card>

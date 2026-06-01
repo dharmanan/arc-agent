@@ -299,6 +299,7 @@ function normalizeSwapRouteMode(routeMode = 'auto') {
 function getSwapRouteStrategy({ fromToken, toToken, routeMode = 'auto' }) {
   const normalizedRouteMode = normalizeSwapRouteMode(routeMode);
   const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+  const cirbtcPair = isCirbtcPair(fromToken, toToken);
 
   if (normalizedRouteMode === 'primary_only') {
     return {
@@ -311,6 +312,14 @@ function getSwapRouteStrategy({ fromToken, toToken, routeMode = 'auto' }) {
   }
 
   if (normalizedRouteMode === 'fallback_only') {
+    if (cirbtcPair) {
+      return {
+        routeStrategy: 'route_unavailable',
+        routeReason: 'cirBTC swaps do not allow direct pool fallback on this deployment.',
+        fallbackAvailable: false,
+      };
+    }
+
     if (!fallbackPool?.address) {
       return {
         routeStrategy: 'route_unavailable',
@@ -329,6 +338,16 @@ function getSwapRouteStrategy({ fromToken, toToken, routeMode = 'auto' }) {
     };
   }
 
+  if (cirbtcPair) {
+    return {
+      routeStrategy: isSwapConfigured() ? 'swap_kit_only' : 'swap_kit_required',
+      routeReason: isSwapConfigured()
+        ? 'cirBTC swaps use the Circle route only on this deployment.'
+        : 'cirBTC swaps require the Circle route on this deployment, but it is not configured.',
+      fallbackAvailable: false,
+    };
+  }
+
   if (fallbackPool?.address) {
     const isCurveFallback = fallbackPool.protocol === 'curve';
     return {
@@ -339,14 +358,6 @@ function getSwapRouteStrategy({ fromToken, toToken, routeMode = 'auto' }) {
       fallbackAvailable: true,
       poolAddress: fallbackPool.address,
       poolSource: fallbackPool.source || 'verified_default',
-    };
-  }
-
-  if (isCirbtcPair(fromToken, toToken)) {
-    return {
-      routeStrategy: isSwapConfigured() ? 'swap_kit_only' : 'swap_kit_required',
-      routeReason: 'cirBTC swaps only work when a live market is available on this deployment.',
-      fallbackAvailable: false,
     };
   }
 
@@ -1247,11 +1258,14 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
   }
 
   if (normalizedRouteMode === 'fallback_only') {
+    if (!strategy.fallbackAvailable) {
+      throw new Error(strategy.routeReason || 'This pair does not allow backup pool execution on this deployment.');
+    }
     return executeDirectSwapFallback({ agent, fromToken, toToken, amountIn, slippagePct, strategy });
   }
 
   if (!isSwapConfigured()) {
-    if (normalizedRouteMode === 'primary_only') {
+    if (normalizedRouteMode === 'primary_only' || !strategy.fallbackAvailable) {
       throw new Error(strategy.routeReason || 'This route needs the live app swap path on this deployment.');
     }
 
@@ -1270,7 +1284,7 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
     });
   } catch (error) {
     const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
-    if (normalizedRouteMode === 'primary_only' || !fallbackPool?.address) {
+    if (normalizedRouteMode === 'primary_only' || !strategy.fallbackAvailable || !fallbackPool?.address) {
       throw error;
     }
 
@@ -1300,6 +1314,7 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
     const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
     if (
       normalizedRouteMode === 'primary_only'
+      || !strategy.fallbackAvailable
       || !fallbackPool?.address
       || !isPrimarySwapFallbackCandidate(error)
     ) {
@@ -1352,11 +1367,18 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'a
   }
 
   if (normalizedRouteMode === 'fallback_only') {
+    if (!strategy.fallbackAvailable) {
+      return {
+        amountOut: null,
+        quoteError: strategy.routeReason || 'This pair does not allow backup pool quotes on this deployment.',
+        ...strategy,
+      };
+    }
     return getDirectSwapFallbackQuote({ fromToken, toToken, amountIn, routeMode: normalizedRouteMode });
   }
 
   if (!isSwapConfigured()) {
-    if (normalizedRouteMode === 'primary_only') {
+    if (normalizedRouteMode === 'primary_only' || !strategy.fallbackAvailable) {
       return {
         amountOut: null,
         quoteError: strategy.routeReason || 'This route needs the live app swap path on this deployment.',
@@ -1393,10 +1415,14 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'a
     };
   } catch (error) {
     console.warn('[AGENT-SWAP-QUOTE]', error.message);
-    if (normalizedRouteMode === 'primary_only') {
+    const normalizedQuoteError = normalizeSwapQuoteError(error);
+    const cirbtcCircleOnlyUnavailableMessage = isCirbtcPair(fromToken, toToken)
+      ? 'The Circle route is currently unavailable for this cirBTC pair. Direct Arc fallback is disabled.'
+      : normalizedQuoteError;
+    if (normalizedRouteMode === 'primary_only' || !strategy.fallbackAvailable) {
       return {
         amountOut: null,
-        quoteError: normalizeSwapQuoteError(error),
+        quoteError: !strategy.fallbackAvailable ? cirbtcCircleOnlyUnavailableMessage : normalizedQuoteError,
         ...strategy,
       };
     }
@@ -1407,7 +1433,7 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'a
     }
     return {
       amountOut: null,
-      quoteError: normalizeSwapQuoteError(error),
+      quoteError: normalizedQuoteError,
       ...strategy,
     };
   }

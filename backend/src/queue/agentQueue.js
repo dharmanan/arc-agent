@@ -4150,30 +4150,10 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     await _setAutomationState(agentId, 'cirbtcLp', 'running');
   }
 
-  if (!stableLoopEnabled && !lendingAutomationEnabled && !carryAutomationEnabled && !cirbtcLpEnabled) {
-    if (!arbitragePermissionGranted && (stableLoopConfigured || cirbtcLpConfigured)) {
-      await db.query(
-        `INSERT INTO transactions
-           (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
-         VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'dry_run', $2::jsonb)`,
-        [agentId, JSON.stringify({
-          executionState: 'permission_blocked',
-          executionSource: 'oracle_strategy',
-          reason: 'Arbitrage strategy preference is disabled for this agent.',
-          permission: 'arbitrage',
-        })],
-      );
-
-      return finishDefi('permission_blocked', {
-        ok: true,
-        action: 'hold',
-        reason: 'permission_blocked',
-        permission: 'arbitrage',
-      });
-    }
-
-    return finishDefi('disabled', { ok: false, reason: 'defi_loop_disabled' });
-  }
+  const shouldSkipDefiCycle = !stableLoopEnabled
+    && !lendingAutomationEnabled
+    && !carryAutomationEnabled
+    && !cirbtcLpEnabled;
 
   const marketAnalysisDecision = agent.market_analysis_last_decision
     && typeof agent.market_analysis_last_decision === 'object'
@@ -4228,6 +4208,31 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     'UPDATE agents SET daily_defi_loop_count = daily_defi_loop_count + 1 WHERE id = $1',
     [agentId],
   );
+
+  if (shouldSkipDefiCycle) {
+    if (!arbitragePermissionGranted && (stableLoopConfigured || cirbtcLpConfigured)) {
+      await db.query(
+        `INSERT INTO transactions
+           (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
+         VALUES ($1, 'defi_loop_dry', 'arc-testnet', 'arc-testnet', 'USDC', 0, 'dry_run', $2::jsonb)`,
+        [agentId, JSON.stringify({
+          executionState: 'permission_blocked',
+          executionSource: 'oracle_strategy',
+          reason: 'Arbitrage strategy preference is disabled for this agent.',
+          permission: 'arbitrage',
+        })],
+      );
+
+      return finishDefi('permission_blocked', {
+        ok: true,
+        action: 'hold',
+        reason: 'permission_blocked',
+        permission: 'arbitrage',
+      });
+    }
+
+    return finishDefi('disabled', { ok: false, reason: 'defi_loop_disabled' });
+  }
 
   await maybeWarmAgentGatewayBalance(agent, 'defi_loop');
 
