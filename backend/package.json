@@ -25,7 +25,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.97.1",
     "@circle-fin/adapter-ethers-v6": "^1.7.0",
-    "@circle-fin/swap-kit": "^1.2.2",
+    "@circle-fin/swap-kit": "^1.2.3",
     "@circle-fin/x402-batching": "^3.0.4",
     "@coral-xyz/anchor": "^0.32.1",
     "@simplewebauthn/server": "^13.3.0",
