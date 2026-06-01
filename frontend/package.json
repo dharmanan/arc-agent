@@ -24,14 +24,14 @@
     "lucide-react": "^1.16.0",
     "motion": "^12.40.0",
     "qrcode": "^1.5.4",
-    "react": "^18.3.1",
+    "react": "^19.2.7",
     "react-dom": "^18.3.1",
     "tailwind-merge": "^3.6.0",
     "viem": "^2.50.4",
     "wagmi": "^2.10.6"
   },
   "devDependencies": {
-    "@types/react": "^18.3.3",
+    "@types/react": "^19.2.16",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^6.0.2",
     "autoprefixer": "^10.4.19",
