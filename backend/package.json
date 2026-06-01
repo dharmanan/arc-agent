@@ -29,7 +29,7 @@
     "@circle-fin/x402-batching": "^3.0.4",
     "@coral-xyz/anchor": "^0.32.1",
     "@simplewebauthn/server": "^13.3.0",
-    "@x402/core": "^2.13.0",
+    "@x402/core": "^2.14.0",
     "@x402/evm": "^2.13.0",
     "@x402/express": "^2.12.0",
     "axios": "^1.16.0",
