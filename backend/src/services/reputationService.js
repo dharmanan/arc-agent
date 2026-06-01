@@ -9,6 +9,7 @@
  */
 const { ethers } = require('ethers');
 const db          = require('../db');
+const { sendProtectedContractTx } = require('./txSecurityService');
 
 // Arc Testnet ReputationRegistry contract
 // Address TBD — set REPUTATION_REGISTRY_ADDRESS env once deployed on Arc Testnet.
@@ -48,6 +49,112 @@ const REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT = (() => {
   const numeric = Number(process.env.REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT || 0);
   return Number.isInteger(numeric) && numeric > 0 ? numeric : 0;
 })();
+
+const REPUTATION_CHAIN_TX_RETRY_LIMIT = readPositiveIntegerEnv('REPUTATION_CHAIN_TX_RETRY_LIMIT', 3);
+const REPUTATION_CHAIN_TX_FEE_BUMP_BPS = readPositiveIntegerEnv('REPUTATION_CHAIN_TX_FEE_BUMP_BPS', 1200);
+const REPUTATION_CHAIN_TX_LOCK_WAIT_MS = readPositiveIntegerEnv('REPUTATION_CHAIN_TX_LOCK_WAIT_MS', 60000);
+
+function readPositiveIntegerEnv(name, fallback) {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isReplacementUnderpricedError(error) {
+  const code = String(error?.code || '').trim();
+  const message = String(
+    error?.shortMessage
+    || error?.message
+    || error?.info?.error?.message
+    || '',
+  ).trim();
+
+  if (code === 'REPLACEMENT_UNDERPRICED') return true;
+  return /replacement transaction underpriced|replacement fee too low/i.test(message);
+}
+
+function isNonceConflictError(error) {
+  const code = String(error?.code || '').trim();
+  const message = String(
+    error?.shortMessage
+    || error?.message
+    || error?.info?.error?.message
+    || '',
+  ).trim();
+
+  if (code === 'NONCE_EXPIRED') return true;
+  return /nonce too low|nonce has already been used|already known/i.test(message);
+}
+
+function applyFeeBump(value, attempt) {
+  if (!value || value <= 0n) return null;
+  const extraBps = BigInt((Math.max(attempt, 1) - 1) * REPUTATION_CHAIN_TX_FEE_BUMP_BPS);
+  const multiplier = 10000n + extraBps;
+  return (value * multiplier + 9999n) / 10000n;
+}
+
+function buildReputationTxOptions(feeData, nonce, attempt) {
+  const txOptions = {};
+
+  if (Number.isInteger(nonce) && nonce >= 0) {
+    txOptions.nonce = nonce;
+  }
+
+  if (feeData?.maxFeePerGas && feeData?.maxPriorityFeePerGas) {
+    txOptions.maxFeePerGas = applyFeeBump(feeData.maxFeePerGas, attempt);
+    txOptions.maxPriorityFeePerGas = applyFeeBump(feeData.maxPriorityFeePerGas, attempt);
+  } else if (feeData?.gasPrice) {
+    txOptions.gasPrice = applyFeeBump(feeData.gasPrice, attempt);
+  }
+
+  return txOptions;
+}
+
+async function recordOnchainEventWithProtection({
+  agentId,
+  tokenId,
+  eventType,
+  scoreDelta,
+  provider,
+  registry,
+  relayerAddress,
+}) {
+  const feeData = await provider.getFeeData().catch(() => null);
+  let pendingNonce = await provider.getTransactionCount(relayerAddress, 'pending').catch(() => null);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= REPUTATION_CHAIN_TX_RETRY_LIMIT; attempt += 1) {
+    try {
+      const { tx } = await sendProtectedContractTx({
+        contract: registry,
+        methodName: 'recordEvent',
+        args: [BigInt(tokenId), eventType, BigInt(scoreDelta)],
+        txOptions: buildReputationTxOptions(feeData, pendingNonce, attempt),
+        chainName: 'Arc Testnet',
+        agentId,
+        walletAddress: relayerAddress,
+        operation: 'reputation_record_event',
+        replayFingerprint: null,
+        waitForLockMs: REPUTATION_CHAIN_TX_LOCK_WAIT_MS,
+        waitConfirmations: 1,
+      });
+
+      return tx?.hash || null;
+    } catch (error) {
+      lastError = error;
+      const retryable = isReplacementUnderpricedError(error) || isNonceConflictError(error);
+      if (!retryable || attempt >= REPUTATION_CHAIN_TX_RETRY_LIMIT) {
+        break;
+      }
+
+      pendingNonce = await provider.getTransactionCount(relayerAddress, 'pending').catch(() => pendingNonce);
+      console.warn(
+        `[REPUTATION] retry on-chain write agent=${agentId} event=${eventType} attempt=${attempt + 1}/${REPUTATION_CHAIN_TX_RETRY_LIMIT}`,
+      );
+    }
+  }
+
+  throw lastError || new Error('reputation_onchain_write_failed');
+}
 
 function getUtcDateKey(date = new Date()) {
   return date.toISOString().slice(0, 10);
@@ -189,13 +296,16 @@ async function recordReputationEvent(agentId, eventType) {
     const relayer  = new ethers.Wallet(relayerKey, provider);
     const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, relayer);
 
-    const tx = await registry.recordEvent(
-      BigInt(agent.erc8004_token_id),
+    const txHash = await recordOnchainEventWithProtection({
+      agentId,
+      tokenId: agent.erc8004_token_id,
       eventType,
-      BigInt(scoreDelta),
-    );
-    await tx.wait(1);
-    console.log(`[REPUTATION] Recorded on-chain agent=${agentId} event=${eventType} delta=+${scoreDelta}`);
+      scoreDelta,
+      provider,
+      registry,
+      relayerAddress: relayer.address,
+    });
+    console.log(`[REPUTATION] Recorded on-chain agent=${agentId} event=${eventType} delta=+${scoreDelta} tx=${txHash || 'unknown'}`);
   } catch (err) {
     // On-chain failure is non-fatal — already wrote to DB above
     console.error(`[REPUTATION] On-chain error agent=${agentId} event=${eventType}:`, err.message);

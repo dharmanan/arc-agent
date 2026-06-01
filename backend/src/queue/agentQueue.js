@@ -4223,6 +4223,12 @@ queue.process('DEFI_LOOP', 1, async (job) => {
     return finishDefi('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_defi_loop_count });
   }
 
+  // Count each started cycle once the shared daily cap gate is cleared.
+  await db.query(
+    'UPDATE agents SET daily_defi_loop_count = daily_defi_loop_count + 1 WHERE id = $1',
+    [agentId],
+  );
+
   await maybeWarmAgentGatewayBalance(agent, 'defi_loop');
 
   let forexRate = null;
@@ -4487,12 +4493,6 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       }
     }
   }
-
-  // Increment loop counter regardless of outcome
-  await db.query(
-    'UPDATE agents SET daily_defi_loop_count = daily_defi_loop_count + 1 WHERE id = $1',
-    [agentId],
-  );
 
   const summarizePosition = (position) => (position
     ? {
