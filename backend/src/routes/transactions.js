@@ -25,6 +25,7 @@ const quoteSchema = z.object({
   fromToken: z.enum(['USDC', 'EURC', 'cirBTC']),
   toToken:   z.enum(['USDC', 'EURC', 'cirBTC']),
   amountIn:  z.number().positive(),
+  routeMode: z.enum(['auto', 'primary_only', 'fallback_only']).optional(),
 });
 
 router.post('/swap/quote', txRateLimit, async (req, res, next) => {
@@ -39,6 +40,7 @@ router.post('/swap/quote', txRateLimit, async (req, res, next) => {
       executionRail = null,
       poolAddress = null,
       poolSource = null,
+      fallbackQuote = null,
     } = await agentWalletService.getSwapQuoteResult(body);
     const stablePair = ['USDC', 'EURC'].includes(body.fromToken) && ['USDC', 'EURC'].includes(body.toToken);
 
@@ -55,6 +57,7 @@ router.post('/swap/quote', txRateLimit, async (req, res, next) => {
       executionRail,
       poolAddress,
       poolSource,
+      fallbackQuote,
     });
   } catch (err) { next(err); }
 });
@@ -243,6 +246,7 @@ const swapSchema = z.object({
   toToken:   z.enum(['USDC', 'EURC', 'cirBTC']),
   amountIn:  z.number().positive(),
   slippage:  z.number().min(0.1).max(50).optional(),
+  routeMode: z.enum(['auto', 'primary_only', 'fallback_only']).optional(),
 }).refine(b => b.fromToken !== b.toToken, { message: 'fromToken and toToken must differ' });
 
 router.post('/swap', async (req, res, next) => {
@@ -255,6 +259,7 @@ router.post('/swap', async (req, res, next) => {
       toToken:   body.toToken,
       amountIn:  body.amountIn,
       slippage:  body.slippage,
+      routeMode: body.routeMode,
       chain:     'Arc Testnet',
     });
     res.status(202).json(tx);

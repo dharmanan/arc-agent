@@ -277,14 +277,28 @@ function getDirectFallbackRouteReason(fallbackPool) {
   return 'This pair can still trade through the app\'s direct Arc pool if the main route is busy.';
 }
 
+function getFallbackOnlyRouteReason(fallbackPool) {
+  if (!fallbackPool?.address) {
+    return 'This pair does not have a backup direct pool on this deployment right now.';
+  }
+
+  if (fallbackPool.protocol === 'curve') {
+    return 'This quote uses the app\'s direct Arc stable pool only.';
+  }
+
+  return 'This quote uses the app\'s direct Arc pool only.';
+}
+
 function normalizeSwapRouteMode(routeMode = 'auto') {
-  return String(routeMode || 'auto').trim().toLowerCase() === 'primary_only'
-    ? 'primary_only'
-    : 'auto';
+  const normalized = String(routeMode || 'auto').trim().toLowerCase();
+  if (normalized === 'primary_only') return 'primary_only';
+  if (normalized === 'fallback_only') return 'fallback_only';
+  return 'auto';
 }
 
 function getSwapRouteStrategy({ fromToken, toToken, routeMode = 'auto' }) {
   const normalizedRouteMode = normalizeSwapRouteMode(routeMode);
+  const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
 
   if (normalizedRouteMode === 'primary_only') {
     return {
@@ -296,7 +310,24 @@ function getSwapRouteStrategy({ fromToken, toToken, routeMode = 'auto' }) {
     };
   }
 
-  const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+  if (normalizedRouteMode === 'fallback_only') {
+    if (!fallbackPool?.address) {
+      return {
+        routeStrategy: 'route_unavailable',
+        routeReason: getFallbackOnlyRouteReason(fallbackPool),
+        fallbackAvailable: false,
+      };
+    }
+
+    const isCurveFallback = fallbackPool.protocol === 'curve';
+    return {
+      routeStrategy: isCurveFallback ? 'curve_fallback_only' : 'v2_fallback_only',
+      routeReason: getFallbackOnlyRouteReason(fallbackPool),
+      fallbackAvailable: true,
+      poolAddress: fallbackPool.address,
+      poolSource: fallbackPool.source || 'verified_default',
+    };
+  }
 
   if (fallbackPool?.address) {
     const isCurveFallback = fallbackPool.protocol === 'curve';
@@ -455,9 +486,24 @@ async function getExternalSwapQuoteResult({ chainName = 'Sepolia', fromToken, to
   };
 }
 
-async function getDirectSwapFallbackQuote({ fromToken, toToken, amountIn }) {
+function buildSwapQuotePreview(quoteResult) {
+  if (quoteResult?.amountOut == null) {
+    return null;
+  }
+
+  return {
+    amountOut: quoteResult.amountOut,
+    executionRail: quoteResult.executionRail || null,
+    routeStrategy: quoteResult.routeStrategy || null,
+    routeReason: quoteResult.routeReason || null,
+    poolAddress: quoteResult.poolAddress || null,
+    poolSource: quoteResult.poolSource || null,
+  };
+}
+
+async function getDirectSwapFallbackQuote({ fromToken, toToken, amountIn, routeMode = 'fallback_only' }) {
   const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
-  const strategy = getSwapRouteStrategy({ fromToken, toToken });
+  const strategy = getSwapRouteStrategy({ fromToken, toToken, routeMode });
   if (!fallbackPool?.address) {
     return {
       amountOut: null,
@@ -510,10 +556,84 @@ async function getDirectSwapFallbackQuote({ fromToken, toToken, amountIn }) {
   }
 }
 
+async function executeDirectSwapFallback({ agent, fromToken, toToken, amountIn, slippagePct, strategy = getSwapRouteStrategy({ fromToken, toToken }) }) {
+  const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+  if (!fallbackPool?.address) {
+    throw new Error(strategy.routeReason || 'No direct Curve fallback is available for this pair.');
+  }
+
+  let result = null;
+  let executionRail = 'curve_fallback';
+
+  if (fallbackPool.protocol === 'curve') {
+    const executeCurveFallback = (effectiveSlippagePct) => protocols.executeCurveSwap({
+      poolAddress: fallbackPool.address,
+      tokenInAddress: fallbackPool.baseToken.address,
+      indexIn: fallbackPool.baseToken.index,
+      indexOut: fallbackPool.quoteToken.index,
+      amountIn: String(amountIn),
+      slippagePct: effectiveSlippagePct,
+      agentPrivateKey: getAgentPrivateKey(agent),
+      decimalsIn: fallbackPool.baseToken.decimals || 6,
+      decimalsOut: fallbackPool.quoteToken.decimals || 6,
+    });
+
+    try {
+      result = await executeCurveFallback(slippagePct);
+    } catch (error) {
+      const baseSlippagePct = Number(slippagePct) || 0.5;
+      const retrySlippagePct = Math.max(baseSlippagePct, 1.5);
+
+      if (!isCurveInsufficientAmountOutError(error) || retrySlippagePct <= baseSlippagePct) {
+        throw error;
+      }
+
+      console.warn('[AGENT-SWAP:FALLBACK-RETRY]', error.message);
+      result = await executeCurveFallback(retrySlippagePct);
+    }
+  } else {
+    result = await protocols.executeConstantProductSwap({
+      pairAddress: fallbackPool.address,
+      tokenInAddress: fallbackPool.baseToken.address,
+      tokenOutAddress: fallbackPool.quoteToken.address,
+      amountIn: String(amountIn),
+      slippagePct,
+      agentPrivateKey: getAgentPrivateKey(agent),
+      decimalsIn: fallbackPool.baseToken.decimals || 6,
+      decimalsOut: fallbackPool.quoteToken.decimals || 6,
+      feePct: fallbackPool.feePct || 0.3,
+    });
+    executionRail = 'uniswap_v2_fallback';
+  }
+
+  console.log(`[AGENT-SWAP:FALLBACK] ✓ ${result.txHash} | out: ${result.amountOut} ${toToken}`);
+  return {
+    hash: result.txHash,
+    amountOut: result.amountOut,
+    ...strategy,
+    executionRail,
+    poolAddress: fallbackPool.address,
+    poolSource: fallbackPool.source || 'verified_default',
+  };
+}
+
 function toSlippageBps(slippagePct = 0.5) {
   const normalized = Number(slippagePct);
   if (!Number.isFinite(normalized) || normalized <= 0) return 50;
   return Math.max(1, Math.round(normalized * 100));
+}
+
+function isPrimarySwapFallbackCandidate(error) {
+  if (!error) return false;
+
+  const message = String(error.userMessage || error.message || '').trim();
+  const txHash = error.txHash || error.hash || error.transactionHash || null;
+
+  if (txHash) {
+    return false;
+  }
+
+  return /simulation failed|insufficientamountout|0xe52970aa|stop limit|execution reverted|swap failed/i.test(message);
 }
 
 function createArcSwapAdapter(privateKey) {
@@ -547,6 +667,46 @@ function normalizeSwapQuoteError(error) {
   }
 
   return 'Live quote is unavailable right now.';
+}
+
+function isCurveInsufficientAmountOutError(error) {
+  const message = error?.userMessage || error?.message || '';
+  return /InsufficientAmountOut/i.test(message) || message.includes('0xe52970aa');
+}
+
+async function createSwapFallbackConfirmationError({ fromToken, toToken, amountIn, primaryAmountOut = null, error = null }) {
+  const fallbackQuote = await getDirectSwapFallbackQuote({
+    fromToken,
+    toToken,
+    amountIn,
+    routeMode: 'fallback_only',
+  }).catch(() => null);
+
+  if (!fallbackQuote || fallbackQuote.amountOut == null) {
+    return null;
+  }
+
+  const nextError = new Error('The live app route changed before broadcast. Review the updated backup quote and confirm if you want to continue.');
+  nextError.code = 'SWAP_FALLBACK_CONFIRMATION_REQUIRED';
+  nextError.userMessage = 'The live app route changed before broadcast. Review the updated backup quote and confirm if you want to continue on the direct Arc pool.';
+  nextError.requiresFallbackConfirmation = true;
+  nextError.primaryAmountOut = primaryAmountOut;
+  nextError.primaryError = error?.userMessage || error?.message || null;
+  nextError.fallbackQuote = buildSwapQuotePreview(fallbackQuote);
+  return nextError;
+}
+
+function isPrimarySwapFallbackCandidate(error) {
+  if (!error) return false;
+
+  const message = String(error.userMessage || error.message || '').trim();
+  const txHash = error.txHash || error.hash || error.transactionHash || null;
+
+  if (txHash) {
+    return false;
+  }
+
+  return /simulation failed|insufficientamountout|0xe52970aa|stop limit|execution reverted|swap failed/i.test(message);
 }
 
 async function estimateArcSwap({ adapter, fromToken, toToken, amountIn, slippagePct }) {
@@ -1074,7 +1234,8 @@ async function nanoPayment({ agent, toAddress, amountUsdc, token = 'USDC' }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // AGENTIC SWAP (USDC / EURC / cirBTC on Arc Testnet)
 // ─────────────────────────────────────────────────────────────────────────────
-async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5, routeMode = 'auto' }) {
+async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.5, routeMode = 'auto', requireFallbackConfirmation = false }) {
+  const normalizedRouteMode = normalizeSwapRouteMode(routeMode);
   const strategy = getSwapRouteStrategy({ fromToken, toToken, routeMode });
   const cirbtcSizeGuard = getCirbtcSwapSizeGuard({ fromToken, toToken, amountIn });
   if (cirbtcSizeGuard) {
@@ -1085,82 +1246,80 @@ async function agentSwap({ agent, fromToken, toToken, amountIn, slippagePct = 0.
     throw error;
   }
 
+  if (normalizedRouteMode === 'fallback_only') {
+    return executeDirectSwapFallback({ agent, fromToken, toToken, amountIn, slippagePct, strategy });
+  }
+
   if (!isSwapConfigured()) {
-    if (normalizeSwapRouteMode(routeMode) === 'primary_only') {
+    if (normalizedRouteMode === 'primary_only') {
       throw new Error(strategy.routeReason || 'This route needs the live app swap path on this deployment.');
     }
 
-    const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
-    if (!fallbackPool?.address) {
-      throw new Error(strategy.routeReason || 'No direct Curve fallback is available for this pair.');
-    }
-
-    let result = null;
-    let executionRail = 'curve_fallback';
-
-    if (fallbackPool.protocol === 'curve') {
-      result = await protocols.executeCurveSwap({
-        poolAddress: fallbackPool.address,
-        tokenInAddress: fallbackPool.baseToken.address,
-        indexIn: fallbackPool.baseToken.index,
-        indexOut: fallbackPool.quoteToken.index,
-        amountIn: String(amountIn),
-        slippagePct,
-        agentPrivateKey: getAgentPrivateKey(agent),
-        decimalsIn: fallbackPool.baseToken.decimals || 6,
-        decimalsOut: fallbackPool.quoteToken.decimals || 6,
-      });
-    } else {
-      result = await protocols.executeConstantProductSwap({
-        pairAddress: fallbackPool.address,
-        tokenInAddress: fallbackPool.baseToken.address,
-        tokenOutAddress: fallbackPool.quoteToken.address,
-        amountIn: String(amountIn),
-        slippagePct,
-        agentPrivateKey: getAgentPrivateKey(agent),
-        decimalsIn: fallbackPool.baseToken.decimals || 6,
-        decimalsOut: fallbackPool.quoteToken.decimals || 6,
-        feePct: fallbackPool.feePct || 0.3,
-      });
-      executionRail = 'uniswap_v2_fallback';
-    }
-
-    console.log(`[AGENT-SWAP:CURVE] ✓ ${result.txHash} | out: ${result.amountOut} ${toToken}`);
-    return {
-      hash: result.txHash,
-      amountOut: result.amountOut,
-      ...strategy,
-      executionRail,
-      poolAddress: fallbackPool.address,
-      poolSource: fallbackPool.source || 'verified_default',
-    };
+    return executeDirectSwapFallback({ agent, fromToken, toToken, amountIn, slippagePct, strategy });
   }
 
   const adapter = createArcSwapAdapter(getAgentPrivateKey(agent));
-  const quote = await estimateArcSwap({
-    adapter,
-    fromToken,
-    toToken,
-    amountIn,
-    slippagePct,
-  });
+  let quote = null;
+  try {
+    quote = await estimateArcSwap({
+      adapter,
+      fromToken,
+      toToken,
+      amountIn,
+      slippagePct,
+    });
+  } catch (error) {
+    const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+    if (normalizedRouteMode === 'primary_only' || !fallbackPool?.address) {
+      throw error;
+    }
 
-  const result = await runProtectedWrite({
-    chainName: 'Arc Testnet',
-    ...getAgentIdentity(agent),
-    operation: 'swap_kit_swap',
-    replayFingerprint: [fromToken, toToken, String(amountIn), String(slippagePct)],
-  }, () => SWAP_KIT.swap({
-    from: { adapter, chain: ARC_SWAP_CHAIN },
-    tokenIn: fromToken,
-    tokenOut: toToken,
-    amountIn: String(amountIn),
-    config: {
-      kitKey: getSwapKitKey(),
-      slippageBps: toSlippageBps(slippagePct),
-      stopLimit: quote.stopLimit.amount,
-    },
-  }));
+    console.warn('[AGENT-SWAP:PRIMARY-QUOTE]', error.message);
+    return executeDirectSwapFallback({ agent, fromToken, toToken, amountIn, slippagePct, strategy });
+  }
+
+  let result = null;
+  try {
+    result = await runProtectedWrite({
+      chainName: 'Arc Testnet',
+      ...getAgentIdentity(agent),
+      operation: 'swap_kit_swap',
+      replayFingerprint: [fromToken, toToken, String(amountIn), String(slippagePct)],
+    }, () => SWAP_KIT.swap({
+      from: { adapter, chain: ARC_SWAP_CHAIN },
+      tokenIn: fromToken,
+      tokenOut: toToken,
+      amountIn: String(amountIn),
+      config: {
+        kitKey: getSwapKitKey(),
+        slippageBps: toSlippageBps(slippagePct),
+        stopLimit: quote.stopLimit.amount,
+      },
+    }));
+  } catch (error) {
+    const fallbackPool = getDirectSwapFallbackPool(fromToken, toToken);
+    if (
+      normalizedRouteMode === 'primary_only'
+      || !fallbackPool?.address
+      || !isPrimarySwapFallbackCandidate(error)
+    ) {
+      throw error;
+    }
+
+    console.warn('[AGENT-SWAP:PRIMARY-EXECUTE]', error.message);
+    if (!requireFallbackConfirmation) {
+      return executeDirectSwapFallback({ agent, fromToken, toToken, amountIn, slippagePct, strategy });
+    }
+
+    const fallbackConfirmationError = await createSwapFallbackConfirmationError({
+      fromToken,
+      toToken,
+      amountIn,
+      primaryAmountOut: quote?.estimatedOutput?.amount || null,
+      error,
+    });
+    throw fallbackConfirmationError || error;
+  }
 
   const amountOut = result.amountOut || quote.estimatedOutput.amount;
   console.log(`[AGENT-SWAP] ✓ ${result.txHash} | out: ${amountOut} ${toToken}`);
@@ -1192,6 +1351,10 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'a
     };
   }
 
+  if (normalizedRouteMode === 'fallback_only') {
+    return getDirectSwapFallbackQuote({ fromToken, toToken, amountIn, routeMode: normalizedRouteMode });
+  }
+
   if (!isSwapConfigured()) {
     if (normalizedRouteMode === 'primary_only') {
       return {
@@ -1213,11 +1376,20 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'a
       amountIn,
       slippagePct: 0.5,
     });
+    const fallbackQuote = strategy.fallbackAvailable
+      ? buildSwapQuotePreview(await getDirectSwapFallbackQuote({
+        fromToken,
+        toToken,
+        amountIn,
+        routeMode: 'fallback_only',
+      }).catch(() => null))
+      : null;
     return {
       amountOut: quote.estimatedOutput.amount,
       quoteError: null,
       ...strategy,
       executionRail: 'swap_kit',
+      fallbackQuote,
     };
   } catch (error) {
     console.warn('[AGENT-SWAP-QUOTE]', error.message);
@@ -1229,7 +1401,7 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'a
       };
     }
 
-    const directFallback = await getDirectSwapFallbackQuote({ fromToken, toToken, amountIn });
+    const directFallback = await getDirectSwapFallbackQuote({ fromToken, toToken, amountIn, routeMode: 'fallback_only' });
     if (directFallback.amountOut !== null) {
       return directFallback;
     }

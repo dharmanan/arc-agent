@@ -789,7 +789,7 @@ async function getBridgeAttestation({ txId, userId }) {
  * Agentic swap: USDC / EURC / cirBTC on Arc Testnet only.
  * Agent signs with its own private key — no user MetaMask interaction needed.
  */
-async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain }) {
+async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain, routeMode = 'auto' }) {
   if (chain !== 'Arc Testnet') {
     throw Object.assign(new Error('Swap is only supported on Arc Testnet'), { status: 400 });
   }
@@ -820,7 +820,7 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
     fromChain: 'Arc Testnet', toChain: 'Arc Testnet',
     token: fromToken, amountUsdc: usdcEquiv,
     fromAddress: agent.walletAddress,
-    meta: { fromToken, toToken, amountIn, slippage, isAgentic: true },
+    meta: { fromToken, toToken, amountIn, slippage, routeMode, isAgentic: true },
   });
 
   // Execute swap agentically (non-blocking)
@@ -829,6 +829,8 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
     fromToken, toToken,
     amountIn: parseFloat(amountIn),
     slippagePct: slippage ?? parseFloat(agent.settings?.slippagePercent ?? 0.5),
+    routeMode,
+    requireFallbackConfirmation: true,
   })
     .then(({ hash, amountOut, executionRail, routeStrategy, routeReason, fallbackAvailable, poolAddress, poolSource }) => {
       updateTxStatus(txId, 'confirmed', hash);
@@ -843,6 +845,10 @@ async function swapTokens({ agent, fromToken, toToken, amountIn, slippage, chain
         [JSON.stringify({
           error: err.userMessage || err.message || 'Swap failed before confirmation.',
           errorCode: err.code || null,
+          requiresFallbackConfirmation: Boolean(err.requiresFallbackConfirmation),
+          primaryAmountOut: err.primaryAmountOut || null,
+          primaryError: err.primaryError || null,
+          fallbackQuote: err.fallbackQuote || null,
           recommendedMaxAmountIn: Number.isFinite(Number(err.recommendedMaxAmountIn)) ? Number(err.recommendedMaxAmountIn) : null,
         }), txId],
       ).catch(() => {});

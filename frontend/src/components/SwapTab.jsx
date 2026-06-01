@@ -10,6 +10,13 @@ import { ArrowUpDown, Bot, Zap, ExternalLink, ChevronLeft, RefreshCw } from 'luc
 const ARC_EXPLORER = 'https://testnet.arcscan.app';
 const SWAP_TOKENS = ['USDC', 'EURC', 'cirBTC'];
 const STABLE_SWAP_TOKENS = new Set(['USDC', 'EURC']);
+const SWAP_FALLBACK_CONFIRMATION_CODE = 'SWAP_FALLBACK_CONFIRMATION_REQUIRED';
+
+function formatQuotedAmount(value, token) {
+  const numeric = parseFloat(value ?? '');
+  if (!Number.isFinite(numeric)) return '—';
+  return numeric.toFixed(token === 'cirBTC' ? 6 : 4);
+}
 
 /**
  * SwapTab — USDC / EURC / cirBTC on Arc Testnet, fully agentic
@@ -34,11 +41,24 @@ export default function SwapTab({ onBack }) {
   const [balances,  setBalances]  = useState({ usdc: null, eurc: null, cirbtc: null });
   const [loadingBalances, setLoadingBalances] = useState(false);
   const [manualRefreshing, setManualRefreshing] = useState(false);
+  const [slippageOverride, setSlippageOverride] = useState('');
+  const [fallbackOffer, setFallbackOffer] = useState(null);
   const quoteTimer = useRef(null);
 
   const maxTrade    = agent?.settings?.maxTradeUsdc  ?? 200;
+  const defaultSlippagePct = Number(agent?.settings?.slippagePercent ?? 0.5);
+  const normalizedDefaultSlippagePct = Number.isFinite(defaultSlippagePct) && defaultSlippagePct > 0 ? defaultSlippagePct : 0.5;
+  const parsedSlippageOverride = parseFloat(slippageOverride);
+  const hasSlippageOverride = slippageOverride.trim() !== '' && Number.isFinite(parsedSlippageOverride);
+  const slippageError = slippageOverride.trim() !== ''
+    && (!Number.isFinite(parsedSlippageOverride) || parsedSlippageOverride < 0.1 || parsedSlippageOverride > 50)
+    ? 'Enter a value between 0.1 and 50.'
+    : '';
+  const effectiveSlippagePct = hasSlippageOverride ? parsedSlippageOverride : normalizedDefaultSlippagePct;
+  const activeRouteMode = fallbackOffer ? 'fallback_only' : 'auto';
   const parsedAmount = parseFloat(amountIn);
   const quotedAmountOut = parseFloat(quote?.amountOut ?? '');
+  const backupQuote = fallbackOffer?.fallbackQuote || quote?.fallbackQuote || null;
   const hasAmount    = Number.isFinite(parsedAmount) && parsedAmount > 0;
   const usdEquivalentIn = !hasAmount
     ? null
@@ -62,11 +82,11 @@ export default function SwapTab({ onBack }) {
   const suggestLowerAmount = Boolean(quoteWarning && /try a smaller amount|stay at or below/i.test(quoteWarning));
 
   // ── Fetch quote on amount / direction change ──────────────────────────────
-  const fetchQuote = useCallback(async (amount, from, to) => {
+  const fetchQuote = useCallback(async (amount, from, to, routeMode = 'auto') => {
     if (!agent || !amount || parseFloat(amount) <= 0) { setQuote(null); return; }
     setQuoting(true);
     try {
-      const q = await txApi.swapQuote({ fromToken: from, toToken: to, amountIn: parseFloat(amount) });
+      const q = await txApi.swapQuote({ fromToken: from, toToken: to, amountIn: parseFloat(amount), routeMode });
       setQuote(q);
     } catch {
       const stablePair = STABLE_SWAP_TOKENS.has(from) && STABLE_SWAP_TOKENS.has(to);
@@ -76,6 +96,7 @@ export default function SwapTab({ onBack }) {
         quoteError: stablePair
           ? 'Live pricing is unavailable right now. Stable quotes may show a placeholder.'
           : 'Live pricing is unavailable right now.',
+        fallbackQuote: null,
       });
     } finally {
       setQuoting(false);
@@ -103,44 +124,64 @@ export default function SwapTab({ onBack }) {
     try {
       await Promise.all([
         refreshBalances(),
-        hasAmount ? fetchQuote(amountIn, fromToken, toToken) : Promise.resolve(),
+        hasAmount ? fetchQuote(amountIn, fromToken, toToken, activeRouteMode) : Promise.resolve(),
       ]);
     } finally {
       setManualRefreshing(false);
     }
-  }, [amountIn, fetchQuote, fromToken, hasAmount, refreshBalances, toToken]);
+  }, [activeRouteMode, amountIn, fetchQuote, fromToken, hasAmount, refreshBalances, toToken]);
 
   useEffect(() => {
     clearTimeout(quoteTimer.current);
     if (amountIn && parseFloat(amountIn) > 0) {
-      quoteTimer.current = setTimeout(() => fetchQuote(amountIn, fromToken, toToken), 600);
+      quoteTimer.current = setTimeout(() => fetchQuote(amountIn, fromToken, toToken, activeRouteMode), 600);
     } else {
       setQuote(null);
     }
     return () => clearTimeout(quoteTimer.current);
-  }, [amountIn, fromToken, toToken, fetchQuote]);
+  }, [activeRouteMode, amountIn, fromToken, toToken, fetchQuote]);
 
   useEffect(() => {
     refreshBalances();
   }, [refreshBalances]);
 
+  function clearSwapFlowState() {
+    setFallbackOffer(null);
+    setError('');
+    setStatus(null);
+  }
+
   // ── Flip direction ────────────────────────────────────────────────────────
   function flipTokens() {
+    clearSwapFlowState();
     setFromToken(toToken);
     setToToken(fromToken);
     setQuote(null);
   }
 
   function handleFromTokenChange(nextToken) {
+    clearSwapFlowState();
     if (nextToken === toToken) setToToken(fromToken);
     setFromToken(nextToken);
     setQuote(null);
   }
 
   function handleToTokenChange(nextToken) {
+    clearSwapFlowState();
     if (nextToken === fromToken) setFromToken(toToken);
     setToToken(nextToken);
     setQuote(null);
+  }
+
+  function handleAmountChange(event) {
+    clearSwapFlowState();
+    setAmountIn(event.target.value);
+    setQuote(null);
+  }
+
+  function handleSlippageChange(event) {
+    clearSwapFlowState();
+    setSlippageOverride(event.target.value);
   }
 
   // ── Execute swap (agent auto-signs) ──────────────────────────────────────
@@ -150,10 +191,11 @@ export default function SwapTab({ onBack }) {
     if (!quote.isDexQuote) { setError(quote?.quoteError || userRouteReason || 'This swap is unavailable right now.'); return; }
     if (limitAwaitingQuote) { setError('Waiting for live cirBTC pricing before checking your limit.'); return; }
     if (exceedsMax) { setError(`This amount is above your auto limit (${maxTrade} USDC). Lower it or raise the limit in Agent Settings.`); return; }
+    if (slippageError) { setError(slippageError); return; }
 
     setError('');
     setLoading(true);
-    setStatus('Your agent is executing the swap...');
+    setStatus(fallbackOffer ? 'Confirming the backup route on-chain...' : 'Your agent is executing the swap...');
 
     try {
       const res = await txApi.swap({
@@ -161,6 +203,8 @@ export default function SwapTab({ onBack }) {
         fromToken,
         toToken,
         amountIn:  parsedAmount,
+        routeMode: activeRouteMode,
+        ...(hasSlippageOverride ? { slippage: parsedSlippageOverride } : {}),
       });
 
       // Poll for confirmation
@@ -170,7 +214,34 @@ export default function SwapTab({ onBack }) {
         if (tx.status === 'pending')   setStatus('Sent to the network. Waiting for a block...');
       }, 90_000);
 
+      if (
+        final.status === 'failed'
+        && final.meta?.errorCode === SWAP_FALLBACK_CONFIRMATION_CODE
+        && final.meta?.fallbackQuote?.amountOut
+      ) {
+        setFallbackOffer({
+          primaryAmountOut: final.meta?.primaryAmountOut || quote?.amountOut || null,
+          primaryError: final.meta?.primaryError || final.meta?.error || null,
+          fallbackQuote: final.meta.fallbackQuote,
+        });
+        setQuote({
+          amountOut: final.meta.fallbackQuote.amountOut,
+          isDexQuote: true,
+          quoteError: null,
+          routeStrategy: final.meta.fallbackQuote.routeStrategy,
+          routeReason: final.meta.fallbackQuote.routeReason,
+          fallbackAvailable: false,
+          executionRail: final.meta.fallbackQuote.executionRail,
+          poolAddress: final.meta.fallbackQuote.poolAddress,
+          poolSource: final.meta.fallbackQuote.poolSource,
+          fallbackQuote: null,
+        });
+        setStatus(null);
+        return;
+      }
+
       setResult(final);
+      setFallbackOffer(null);
       setStatus(null);
     } catch (e) {
       setError(e.message);
@@ -182,6 +253,7 @@ export default function SwapTab({ onBack }) {
 
   function reset() {
     setResult(null);
+    setFallbackOffer(null);
     setStatus(null);
     setError('');
     setAmountIn('');
@@ -216,6 +288,7 @@ export default function SwapTab({ onBack }) {
   if (result) {
     const amountOut  = result.meta?.amountOut;
     const isConfirmed = result.status === 'confirmed';
+    const usedBackupRoute = ['curve_fallback', 'uniswap_v2_fallback'].includes(result.meta?.executionRail);
     return (
       <div className="max-w-lg mx-auto space-y-6">
         <div className="flex items-center gap-3">
@@ -239,6 +312,14 @@ export default function SwapTab({ onBack }) {
               <p className="text-sm text-slate-600">
                 {amountIn} {fromToken} → <span className="font-semibold text-arc-green">{amountOut} {toToken}</span>
               </p>
+            )}
+            {isConfirmed && usedBackupRoute && (
+              <p className="max-w-md text-sm text-slate-500">
+                The live app route was unavailable at execution time, so this swap used the direct Arc backup pool after the updated quote was approved.
+              </p>
+            )}
+            {!isConfirmed && result.meta?.error && (
+              <p className="max-w-md text-sm text-red-600">{result.meta.error}</p>
             )}
             {result.tx_hash && (
               <a href={`${ARC_EXPLORER}/tx/${result.tx_hash}`} target="_blank" rel="noopener noreferrer"
@@ -340,7 +421,7 @@ export default function SwapTab({ onBack }) {
 
           {/* To token */}
           <div className="space-y-1.5">
-            <label className="text-xs font-medium text-slate-500 uppercase tracking-wide">To (estimated)</label>
+            <label className="text-xs font-medium text-slate-500 uppercase tracking-wide">{fallbackOffer ? 'To (backup estimate)' : 'To (estimated)'}</label>
             <div className="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 px-4 py-3">
               <select
                 value={toToken}
@@ -350,7 +431,7 @@ export default function SwapTab({ onBack }) {
                 {SWAP_TOKENS.map(token => <option key={token} value={token}>{token}</option>)}
               </select>
               <span className="text-right text-base font-bold text-slate-400">
-                {quoting ? <RefreshCw size={14} className="animate-spin inline"/> : (quote && Number.isFinite(quotedAmountOut) ? quotedAmountOut.toFixed(toToken === 'cirBTC' ? 6 : 4) : '—')}
+                {quoting ? <RefreshCw size={14} className="animate-spin inline"/> : formatQuotedAmount(quote?.amountOut, toToken)}
               </span>
             </div>
             {quoteWarning && (
@@ -358,6 +439,40 @@ export default function SwapTab({ onBack }) {
                 {quoteWarning}
               </Alert>
             )}
+            {!fallbackOffer && quote?.executionRail === 'swap_kit' && backupQuote?.amountOut && (
+              <Alert type="info">
+                Primary route estimate: {formatQuotedAmount(quote?.amountOut, toToken)} {toToken}. If the live app route becomes unavailable, the direct Arc backup pool is currently quoting about {formatQuotedAmount(backupQuote.amountOut, toToken)} {toToken}.
+              </Alert>
+            )}
+            {fallbackOffer && fallbackOffer.fallbackQuote?.amountOut && (
+              <Alert type="warning">
+                The live app route moved before broadcast. The primary quote was {formatQuotedAmount(fallbackOffer.primaryAmountOut, toToken)} {toToken}; the updated backup quote is {formatQuotedAmount(fallbackOffer.fallbackQuote.amountOut, toToken)} {toToken} on the direct Arc pool. Review it, then confirm if you want to continue.
+              </Alert>
+            )}
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-[180px_1fr]">
+            <Input
+              label="Slippage (%)"
+              type="number"
+              min="0.1"
+              max="50"
+              step="0.1"
+              value={slippageOverride}
+              onChange={handleSlippageChange}
+              placeholder={String(normalizedDefaultSlippagePct)}
+              error={slippageError}
+            />
+            <div className="rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+              <p className="font-medium text-slate-700">
+                {hasSlippageOverride
+                  ? `This swap will use ${effectiveSlippagePct}% instead of the agent default.`
+                  : `This swap will use the agent default (${normalizedDefaultSlippagePct}%).`}
+              </p>
+              <p className="mt-1">
+                Leave this blank to use Agent Settings. A value here overrides only this swap and does not change the saved agent default.
+              </p>
+            </div>
           </div>
 
           {/* Swap info panel */}
@@ -384,6 +499,12 @@ export default function SwapTab({ onBack }) {
                 <span>No wallet pop-up is needed while the amount stays inside your limit.</span>
               </div>
             )}
+            <p>
+              Route: <span className="text-slate-700">{fallbackOffer ? 'Direct Arc backup pool' : quote?.executionRail === 'swap_kit' ? 'Circle Kit primary route' : backupQuote?.executionRail === 'curve_fallback' || quote?.executionRail === 'curve_fallback' ? 'Direct Arc stable backup pool' : quote?.executionRail === 'uniswap_v2_fallback' ? 'Direct Arc backup pool' : 'Waiting for live route'}</span>
+            </p>
+            <p>
+              Slippage: <span className="text-slate-700">{hasSlippageOverride ? `${effectiveSlippagePct}% for this swap only` : `Agent default ${normalizedDefaultSlippagePct}%`}</span>
+            </p>
             <p>Agent: <span className="font-mono text-slate-700">{agent.walletAddress?.slice(0, 12)}…{agent.walletAddress?.slice(-4)}</span></p>
           </div>
 
@@ -393,11 +514,13 @@ export default function SwapTab({ onBack }) {
           <Button
             onClick={handleSwap}
             loading={loading}
-            disabled={exceedsMax || limitAwaitingQuote || !hasAmount || quoting || !quote?.isDexQuote}
+            disabled={Boolean(slippageError) || exceedsMax || limitAwaitingQuote || !hasAmount || quoting || !quote?.isDexQuote}
             className="w-full"
           >
             {swapDisabledByDex
               ? (cirbtcNeedsSwapKit ? 'Market not ready' : suggestLowerAmount ? 'Try a smaller size' : 'Swap unavailable right now')
+              : fallbackOffer
+              ? <><Bot size={15}/> Confirm Backup Swap {amountIn || '0'} {fromToken} → {formatQuotedAmount(quote?.amountOut, toToken)} {toToken}</>
               : isNano
               ? '⚡ Nano Swap'
               : <><Bot size={15}/> Agent Swap {amountIn || '0'} {fromToken} → {toToken}</>}
