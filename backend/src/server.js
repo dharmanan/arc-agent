@@ -25,6 +25,10 @@ const { startLpRewardEpochSnapshotWriter } = require('./services/lpRewardProgram
 const bridgeActivityService = require('./services/bridgeActivityService');
 const agentWalletService    = require('./services/agentWalletService');
 const agentService          = require('./services/agentService');
+const {
+  startSecurityFreezeRecovery,
+  stopSecurityFreezeRecovery,
+} = require('./services/securityEventService');
 const db                   = require('./db');
 
 const app  = express();
@@ -378,6 +382,7 @@ async function bootstrap() {
     startChainEventRetention();
     startJobRetention();
     startLpRewardEpochSnapshotWriter();
+    startSecurityFreezeRecovery();
 
     // Start blockchain event indexer (non-blocking)
     startIndexer().catch(err => console.error('[INDEXER] startup error', err));
@@ -419,6 +424,8 @@ async function bootstrap() {
     shutdownStarted = true;
 
     console.log(`[BOOT] ${signal} received, shutting down gracefully`);
+
+    stopSecurityFreezeRecovery();
 
     if (typeof agentQueue.pauseLocalWorkers === 'function') {
       await agentQueue.pauseLocalWorkers(true).catch((err) => {

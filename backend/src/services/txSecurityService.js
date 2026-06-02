@@ -320,13 +320,27 @@ async function auditProtectedWriteFailure({ agentId, walletAddress, chainName, o
   };
 
   try {
-    if (code === 'AGENT_TX_BUSY' || code === 'TX_REPLAY_BLOCKED' || code === 'AGENT_TX_RATE_LIMITED') {
+    if (code === 'AGENT_TX_RATE_LIMITED') {
       await recordSuspiciousAgentActivity({
         agentId,
         walletAddress,
         chainName,
         eventType: code.toLowerCase(),
-        severity: code === 'AGENT_TX_RATE_LIMITED' ? 'critical' : 'warn',
+        severity: 'critical',
+        metadata,
+      });
+      return;
+    }
+
+    if (code === 'AGENT_TX_BUSY' || code === 'TX_REPLAY_BLOCKED') {
+      await recordSecurityEvent({
+        category: 'agent_tx',
+        eventType: code.toLowerCase(),
+        severity: 'info',
+        action: 'deferred',
+        agentId,
+        walletAddress,
+        chainName,
         metadata,
       });
       return;

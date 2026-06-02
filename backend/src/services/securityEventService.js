@@ -10,6 +10,39 @@ const SUSPICIOUS_AGENT_EVENT_FREEZE_THRESHOLD = Math.max(
   Number.parseInt(process.env.SECURITY_AGENT_FREEZE_THRESHOLD || '3', 10) || 3,
   1,
 );
+const SECURITY_AGENT_FREEZE_ENABLED = (() => {
+  const raw = String(process.env.SECURITY_AGENT_FREEZE_ENABLED || 'true').trim().toLowerCase();
+  return !['0', 'false', 'no', 'off'].includes(raw);
+})();
+const SECURITY_AGENT_AUTO_UNFREEZE_ENABLED = (() => {
+  const raw = String(process.env.SECURITY_AGENT_AUTO_UNFREEZE_ENABLED || 'true').trim().toLowerCase();
+  return !['0', 'false', 'no', 'off'].includes(raw);
+})();
+const SECURITY_AGENT_AUTO_UNFREEZE_COOLDOWN_SEC = Math.max(
+  Number.parseInt(
+    process.env.SECURITY_AGENT_AUTO_UNFREEZE_COOLDOWN_SEC
+      || process.env.SECURITY_AGENT_EVENT_WINDOW_SEC
+      || '900',
+    10,
+  ) || SUSPICIOUS_AGENT_EVENT_WINDOW_SEC,
+  60,
+);
+const SECURITY_AGENT_AUTO_UNFREEZE_SWEEP_INTERVAL_MS = Math.max(
+  Number.parseInt(process.env.SECURITY_AGENT_AUTO_UNFREEZE_SWEEP_INTERVAL_MS || '60000', 10) || 60000,
+  15000,
+);
+const SECURITY_AGENT_AUTO_UNFREEZE_BATCH_SIZE = Math.max(
+  Math.min(Number.parseInt(process.env.SECURITY_AGENT_AUTO_UNFREEZE_BATCH_SIZE || '50', 10) || 50, 200),
+  1,
+);
+const SECURITY_AGENT_AUTO_UNFREEZE_REASONS = new Set(
+  String(process.env.SECURITY_AGENT_AUTO_UNFREEZE_REASONS || 'suspicious_agent_activity')
+    .split(/[\s,;]+/)
+    .map((entry) => String(entry || '').trim().toLowerCase())
+    .filter(Boolean),
+);
+
+let securityFreezeRecoveryTimer = null;
 
 function normalizeSeverity(severity) {
   const normalized = String(severity || 'info').trim().toLowerCase();
@@ -20,6 +53,15 @@ function normalizeSeverity(severity) {
 function normalizeJsonObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return value;
+}
+
+function normalizeFreezeReason(reason) {
+  return String(reason || '').trim().toLowerCase();
+}
+
+function parseTimestampMs(value) {
+  const timestamp = new Date(value || '').getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function buildFrozenAgentError(agent) {
@@ -243,7 +285,7 @@ async function recordSuspiciousAgentActivity({
 
     let frozen = null;
     const suspiciousCount = Number(suspiciousWindow?.total || 0);
-    if (suspiciousCount >= SUSPICIOUS_AGENT_EVENT_FREEZE_THRESHOLD) {
+    if (SECURITY_AGENT_FREEZE_ENABLED && suspiciousCount >= SUSPICIOUS_AGENT_EVENT_FREEZE_THRESHOLD) {
       const { rows: [alreadyFrozen] } = await client.query(
         `SELECT id, user_id, wallet_address, status, is_active, security_frozen_at, security_freeze_reason
            FROM agents
@@ -296,6 +338,7 @@ async function recordSuspiciousAgentActivity({
       suspiciousCount,
       threshold: SUSPICIOUS_AGENT_EVENT_FREEZE_THRESHOLD,
       windowSec: SUSPICIOUS_AGENT_EVENT_WINDOW_SEC,
+      freezeEnabled: SECURITY_AGENT_FREEZE_ENABLED,
     };
   } catch (error) {
     await client.query('ROLLBACK');
@@ -305,7 +348,187 @@ async function recordSuspiciousAgentActivity({
   }
 }
 
+function canAutoUnfreezeAgent(agent, nowMs = Date.now()) {
+  if (!SECURITY_AGENT_AUTO_UNFREEZE_ENABLED || !agent) return false;
+
+  const status = String(agent.status || '').trim().toLowerCase();
+  if (status !== 'locked') return false;
+  if (agent.is_active !== false) return false;
+
+  const freezeReason = normalizeFreezeReason(agent.security_freeze_reason);
+  if (!SECURITY_AGENT_AUTO_UNFREEZE_REASONS.has(freezeReason)) return false;
+
+  const frozenAtMs = parseTimestampMs(agent.security_frozen_at);
+  if (!Number.isFinite(frozenAtMs)) return false;
+
+  return (nowMs - frozenAtMs) >= (SECURITY_AGENT_AUTO_UNFREEZE_COOLDOWN_SEC * 1000);
+}
+
+async function autoUnfreezeEligibleAgents({ limit = SECURITY_AGENT_AUTO_UNFREEZE_BATCH_SIZE } = {}) {
+  if (!SECURITY_AGENT_AUTO_UNFREEZE_ENABLED) {
+    return {
+      enabled: false,
+      scanned: 0,
+      unfrozen: 0,
+      skippedRecentSuspicious: 0,
+      skippedCooldown: 0,
+    };
+  }
+
+  const safeLimit = Math.max(Math.min(Number.parseInt(limit, 10) || SECURITY_AGENT_AUTO_UNFREEZE_BATCH_SIZE, 200), 1);
+  const nowMs = Date.now();
+
+  const { rows: candidates } = await db.query(
+    `SELECT id, user_id, wallet_address, status, is_active, security_frozen_at, security_freeze_reason
+       FROM agents
+      WHERE status = 'locked'
+        AND is_active = FALSE
+        AND security_frozen_at IS NOT NULL
+      ORDER BY security_frozen_at ASC
+      LIMIT $1`,
+    [safeLimit],
+  );
+
+  let unfrozen = 0;
+  let skippedRecentSuspicious = 0;
+  let skippedCooldown = 0;
+  const unfrozenAgentIds = [];
+
+  for (const candidate of candidates) {
+    if (!canAutoUnfreezeAgent(candidate, nowMs)) {
+      skippedCooldown += 1;
+      continue;
+    }
+
+    const { rows: [recentSuspicious] } = await db.query(
+      `SELECT COUNT(*)::int AS total
+         FROM security_events
+        WHERE agent_id = $1
+          AND category = 'agent_tx'
+          AND severity IN ('warn', 'critical')
+          AND created_at >= NOW() - ($2::text || ' seconds')::interval`,
+      [candidate.id, String(SUSPICIOUS_AGENT_EVENT_WINDOW_SEC)],
+    );
+
+    const recentCount = Number(recentSuspicious?.total || 0);
+    if (recentCount > 0) {
+      skippedRecentSuspicious += 1;
+      continue;
+    }
+
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
+
+      const { rows: [lockedAgent] } = await client.query(
+        `SELECT id, user_id, wallet_address, status, is_active, security_frozen_at, security_freeze_reason
+           FROM agents
+          WHERE id = $1
+          FOR UPDATE`,
+        [candidate.id],
+      );
+
+      if (!canAutoUnfreezeAgent(lockedAgent, nowMs)) {
+        await client.query('ROLLBACK');
+        continue;
+      }
+
+      const { rows: [unfrozenAgent] } = await client.query(
+        `UPDATE agents
+            SET status = 'idle',
+                is_active = TRUE,
+                security_frozen_at = NULL,
+                security_freeze_reason = NULL
+          WHERE id = $1
+            AND status = 'locked'
+            AND is_active = FALSE
+          RETURNING id, user_id, wallet_address`,
+        [candidate.id],
+      );
+
+      if (!unfrozenAgent) {
+        await client.query('ROLLBACK');
+        continue;
+      }
+
+      await recordSecurityEvent({
+        category: 'agent_security',
+        eventType: 'agent_unfrozen',
+        severity: 'warn',
+        action: 'unfrozen',
+        userId: unfrozenAgent.user_id,
+        agentId: unfrozenAgent.id,
+        walletAddress: unfrozenAgent.wallet_address,
+        metadata: {
+          autoRecovery: true,
+          previousFreezeReason: candidate.security_freeze_reason || null,
+          previousFrozenAt: candidate.security_frozen_at || null,
+          cooldownSec: SECURITY_AGENT_AUTO_UNFREEZE_COOLDOWN_SEC,
+          suspiciousWindowSec: SUSPICIOUS_AGENT_EVENT_WINDOW_SEC,
+        },
+      }, client);
+
+      await client.query('COMMIT');
+      unfrozen += 1;
+      unfrozenAgentIds.push(unfrozenAgent.id);
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      console.error('[SECURITY] auto unfreeze error:', error.message);
+    } finally {
+      client.release();
+    }
+  }
+
+  return {
+    enabled: true,
+    scanned: candidates.length,
+    unfrozen,
+    unfrozenAgentIds,
+    skippedRecentSuspicious,
+    skippedCooldown,
+  };
+}
+
+function startSecurityFreezeRecovery() {
+  if (!SECURITY_AGENT_AUTO_UNFREEZE_ENABLED) {
+    console.log('[SECURITY] Auto-unfreeze recovery disabled');
+    return;
+  }
+
+  if (securityFreezeRecoveryTimer) return;
+
+  const runRecovery = async () => {
+    const summary = await autoUnfreezeEligibleAgents();
+    if (summary.unfrozen > 0) {
+      console.log(
+        `[SECURITY] Auto-unfroze ${summary.unfrozen} agent(s) after cooldown (${summary.unfrozenAgentIds.join(', ')})`,
+      );
+    }
+  };
+
+  runRecovery().catch((error) => {
+    console.error('[SECURITY] Initial auto-unfreeze sweep failed:', error.message);
+  });
+
+  securityFreezeRecoveryTimer = setInterval(() => {
+    runRecovery().catch((error) => {
+      console.error('[SECURITY] Auto-unfreeze sweep failed:', error.message);
+    });
+  }, SECURITY_AGENT_AUTO_UNFREEZE_SWEEP_INTERVAL_MS);
+
+  console.log(
+    `[SECURITY] Auto-unfreeze recovery started — interval ${SECURITY_AGENT_AUTO_UNFREEZE_SWEEP_INTERVAL_MS / 1000}s, cooldown ${SECURITY_AGENT_AUTO_UNFREEZE_COOLDOWN_SEC}s`,
+  );
+}
+
+function stopSecurityFreezeRecovery() {
+  if (!securityFreezeRecoveryTimer) return;
+  clearInterval(securityFreezeRecoveryTimer);
+  securityFreezeRecoveryTimer = null;
+}
+
 module.exports = {
+  autoUnfreezeEligibleAgents,
   assertAgentOperational,
   buildFrozenAgentError,
   freezeAgentForSecurityReview,
@@ -313,4 +536,6 @@ module.exports = {
   recordAuthLockout,
   recordSecurityEvent,
   recordSuspiciousAgentActivity,
+  startSecurityFreezeRecovery,
+  stopSecurityFreezeRecovery,
 };

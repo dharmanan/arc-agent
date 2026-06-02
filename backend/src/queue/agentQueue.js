@@ -44,6 +44,153 @@ const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (ui
 const PAID_GAS_FANOUT_AMOUNT_ETH = String(process.env.SEPOLIA_GAS_FANOUT_AMOUNT_ETH || '0.01');
 const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC = 1;
 const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC = 3;
+const GATEWAY_AUTO_WARM_DEBOUNCE_MS = Math.max(
+  Number.parseInt(process.env.GATEWAY_AUTO_WARM_DEBOUNCE_MS || '15000', 10) || 15000,
+  5000,
+);
+const gatewayAutoWarmDebounceByAgent = new Map();
+
+const CIRBTC_GLOBAL_GUARD_WINDOW_MINUTES = Math.max(
+  Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_WINDOW_MINUTES || '30', 10) || 30,
+  5,
+);
+const CIRBTC_GLOBAL_GUARD_COOLDOWN_MINUTES = Math.max(
+  Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_COOLDOWN_MINUTES || '45', 10) || 45,
+  5,
+);
+const CIRBTC_GLOBAL_GUARD_MIN_FAILURES = Math.max(
+  Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_MIN_FAILURES || '2', 10) || 2,
+  1,
+);
+const CIRBTC_GLOBAL_GUARD_MIN_AGENTS = Math.max(
+  Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_MIN_AGENTS || '2', 10) || 2,
+  1,
+);
+const CIRBTC_GLOBAL_GUARD_CACHE_MS = Math.max(
+  Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_CACHE_MS || '45000', 10) || 45000,
+  5000,
+);
+const cirbtcGlobalFailureGuardCache = {
+  expiresAt: 0,
+  state: null,
+};
+
+function buildCirbtcGlobalGuardDefaultState(nowMs = Date.now()) {
+  return {
+    active: false,
+    reason: 'not_triggered',
+    failureCount: 0,
+    impactedAgentCount: 0,
+    windowMinutes: CIRBTC_GLOBAL_GUARD_WINDOW_MINUTES,
+    cooldownMinutes: CIRBTC_GLOBAL_GUARD_COOLDOWN_MINUTES,
+    minFailures: CIRBTC_GLOBAL_GUARD_MIN_FAILURES,
+    minAgents: CIRBTC_GLOBAL_GUARD_MIN_AGENTS,
+    lastFailureAt: null,
+    cooldownUntil: null,
+    retryAfterMs: 0,
+    checkedAt: new Date(nowMs).toISOString(),
+    summary: null,
+  };
+}
+
+function buildCirbtcGlobalGuardSummary(state = {}) {
+  if (!state?.active) {
+    return null;
+  }
+
+  const retryAfterMinutes = Math.max(Math.ceil(Number(state.retryAfterMs || 0) / 60000), 1);
+  return `cirBTC LP add-liquidity is temporarily paused for all agents because ${state.failureCount} recent direct-pair failures hit ${state.impactedAgentCount} agent(s) inside the last ${state.windowMinutes} minutes. The lane will retry in about ${retryAfterMinutes} minute(s).`;
+}
+
+async function readCirbtcGlobalFailureGuardState({ forceRefresh = false } = {}) {
+  const nowMs = Date.now();
+
+  if (!forceRefresh && Number(cirbtcGlobalFailureGuardCache.expiresAt || 0) > nowMs && cirbtcGlobalFailureGuardCache.state) {
+    return cirbtcGlobalFailureGuardCache.state;
+  }
+
+  let nextState = buildCirbtcGlobalGuardDefaultState(nowMs);
+  try {
+    const executionSource = getCirbtcAutomationExecutionSource();
+    const routeFailureLikePatterns = [
+      '%circle route is currently unavailable for this cirbtc pair%',
+      '%direct arc fallback is disabled%',
+      '%transaction execution reverted%',
+      '%call_exception%',
+      '%seeded before zap-in%',
+      '%pair reserves are inconsistent%',
+      '%liquidity addition down to zero%',
+    ];
+
+    const { rows: [aggregate] } = await db.query(
+      `SELECT
+         COUNT(*)::int AS failure_count,
+         COUNT(DISTINCT agent_id)::int AS impacted_agent_count,
+         MAX(created_at) AS last_failure_at
+       FROM transactions
+       WHERE created_at >= NOW() - ($1 * INTERVAL '1 minute')
+         AND status = 'failed'
+         AND type = 'direct_lp_add'
+         AND COALESCE(meta->>'executionSource', '') = $2
+         AND (
+           COALESCE(meta->>'reason', '') IN ('swap_error', 'execution_error', 'direct_pair_seed_required')
+           OR LOWER(COALESCE(meta->>'summary', '')) LIKE ANY($3::text[])
+           OR LOWER(COALESCE(meta->>'error', '')) LIKE ANY($3::text[])
+           OR LOWER(COALESCE(meta->>'errorSummary', '')) LIKE ANY($3::text[])
+         )`,
+      [
+        CIRBTC_GLOBAL_GUARD_WINDOW_MINUTES,
+        executionSource,
+        routeFailureLikePatterns,
+      ],
+    );
+
+    const failureCount = Number(aggregate?.failure_count || 0);
+    const impactedAgentCount = Number(aggregate?.impacted_agent_count || 0);
+    const lastFailureAtRaw = aggregate?.last_failure_at || null;
+    const lastFailureAtMs = lastFailureAtRaw ? new Date(lastFailureAtRaw).getTime() : null;
+    const cooldownUntilMs = Number.isFinite(lastFailureAtMs)
+      ? lastFailureAtMs + (CIRBTC_GLOBAL_GUARD_COOLDOWN_MINUTES * 60 * 1000)
+      : null;
+    const retryAfterMs = Number.isFinite(cooldownUntilMs)
+      ? Math.max(cooldownUntilMs - nowMs, 0)
+      : 0;
+    const active = (
+      failureCount >= CIRBTC_GLOBAL_GUARD_MIN_FAILURES
+      && impactedAgentCount >= CIRBTC_GLOBAL_GUARD_MIN_AGENTS
+      && retryAfterMs > 0
+    );
+
+    nextState = {
+      active,
+      reason: active ? 'global_cirbtc_route_guard' : 'not_triggered',
+      failureCount,
+      impactedAgentCount,
+      windowMinutes: CIRBTC_GLOBAL_GUARD_WINDOW_MINUTES,
+      cooldownMinutes: CIRBTC_GLOBAL_GUARD_COOLDOWN_MINUTES,
+      minFailures: CIRBTC_GLOBAL_GUARD_MIN_FAILURES,
+      minAgents: CIRBTC_GLOBAL_GUARD_MIN_AGENTS,
+      lastFailureAt: Number.isFinite(lastFailureAtMs) ? new Date(lastFailureAtMs).toISOString() : null,
+      cooldownUntil: Number.isFinite(cooldownUntilMs) ? new Date(cooldownUntilMs).toISOString() : null,
+      retryAfterMs,
+      checkedAt: new Date(nowMs).toISOString(),
+      summary: null,
+    };
+    nextState.summary = buildCirbtcGlobalGuardSummary(nextState);
+  } catch (error) {
+    console.warn('[QUEUE] cirBTC global failure guard lookup failed:', error.message);
+    nextState = {
+      ...nextState,
+      reason: 'guard_lookup_failed',
+      summary: null,
+      guardError: error.message,
+    };
+  }
+
+  cirbtcGlobalFailureGuardCache.state = nextState;
+  cirbtcGlobalFailureGuardCache.expiresAt = nowMs + CIRBTC_GLOBAL_GUARD_CACHE_MS;
+  return nextState;
+}
 
 function shouldUseDryRun(agent) {
   return GLOBAL_DRY_RUN;
@@ -70,6 +217,40 @@ function getAgentGatewayAutoTopupConfig(agent) {
   };
 }
 
+function pruneGatewayAutoWarmDebounce(now = Date.now()) {
+  for (const [agentId, expiresAt] of gatewayAutoWarmDebounceByAgent.entries()) {
+    if (!agentId || !Number.isFinite(expiresAt) || expiresAt <= now) {
+      gatewayAutoWarmDebounceByAgent.delete(agentId);
+    }
+  }
+}
+
+function getGatewayAutoWarmDebounceRemainingMs(agentId, now = Date.now()) {
+  if (!agentId) return 0;
+  pruneGatewayAutoWarmDebounce(now);
+  const expiresAt = Number(gatewayAutoWarmDebounceByAgent.get(agentId) || 0);
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) return 0;
+  return Math.max(Math.ceil(expiresAt - now), 0);
+}
+
+function markGatewayAutoWarmDebounce(agentId, now = Date.now()) {
+  if (!agentId) return;
+  gatewayAutoWarmDebounceByAgent.set(agentId, now + GATEWAY_AUTO_WARM_DEBOUNCE_MS);
+}
+
+function isGatewayAutoWarmExpectedSkipError(error) {
+  const code = String(error?.code || '').trim().toUpperCase();
+  if (code === 'AGENT_TX_BUSY' || code === 'TX_REPLAY_BLOCKED' || code === 'AGENT_TX_RATE_LIMITED') {
+    return true;
+  }
+
+  const status = Number.parseInt(String(error?.status || error?.statusCode || ''), 10);
+  if (status === 409 || status === 429) return true;
+
+  const message = String(error?.message || error?.cause?.message || '').trim();
+  return /another transaction is already executing|matching transaction was already submitted|rate limit/i.test(message);
+}
+
 async function maybeWarmAgentGatewayBalance(agent, trigger, overrides = {}) {
   const baseConfig = getAgentGatewayAutoTopupConfig(agent);
   const config = {
@@ -94,6 +275,17 @@ async function maybeWarmAgentGatewayBalance(agent, trigger, overrides = {}) {
     };
   }
 
+  const debounceRemainingMs = getGatewayAutoWarmDebounceRemainingMs(agent?.id);
+  if (debounceRemainingMs > 0) {
+    return {
+      attempted: false,
+      deposited: false,
+      reason: 'debounced',
+      retryAfterMs: debounceRemainingMs,
+    };
+  }
+  markGatewayAutoWarmDebounce(agent?.id);
+
   try {
     const result = await ensureGatewayWarmBalance(agent, {
       chainName: 'Arc Testnet',
@@ -109,12 +301,17 @@ async function maybeWarmAgentGatewayBalance(agent, trigger, overrides = {}) {
 
     return result;
   } catch (error) {
-    console.warn(`[GATEWAY] Auto-warm skipped agent=${agent?.id || 'unknown'} trigger=${trigger}: ${error.message}`);
+    if (isGatewayAutoWarmExpectedSkipError(error)) {
+      console.log(`[GATEWAY] Auto-warm deferred agent=${agent?.id || 'unknown'} trigger=${trigger}: ${error.message}`);
+    } else {
+      console.warn(`[GATEWAY] Auto-warm skipped agent=${agent?.id || 'unknown'} trigger=${trigger}: ${error.message}`);
+    }
     return {
       attempted: false,
       deposited: false,
-      reason: 'error',
+      reason: isGatewayAutoWarmExpectedSkipError(error) ? 'deferred' : 'error',
       error: error.message,
+      errorCode: error?.code || null,
     };
   }
 }
@@ -995,6 +1192,18 @@ const DEFI_LOOP_PRIORITY_CARRY_TASK = 1;
 const DEFI_LOOP_PRIORITY_RECOVERY = 2;
 const DEFI_LOOP_PRIORITY_MARKET = 10;
 const DEFI_LOOP_PRIORITY_SCHEDULED = 20;
+const DEFI_LOOP_MAX_ATTEMPTS = Math.min(
+  Math.max(parseInt(process.env.DEFI_LOOP_MAX_ATTEMPTS || '2', 10) || 2, 1),
+  2,
+);
+const DEFI_LOOP_RETRY_BACKOFF_MS = Math.max(
+  parseInt(process.env.DEFI_LOOP_RETRY_BACKOFF_MS || '1500', 10) || 1500,
+  250,
+);
+const DEFI_LOOP_JOB_TIMEOUT_MS = Math.max(
+  parseInt(process.env.DEFI_LOOP_JOB_TIMEOUT_MS || '240000', 10) || 240000,
+  60000,
+);
 
 function resolveDefiLoopJobPriority(reason, options = {}) {
   const explicitPriority = Number(options.priority);
@@ -1018,14 +1227,35 @@ function resolveDefiLoopJobPriority(reason, options = {}) {
 }
 
 async function queueDefiLoopForAgent(agentId, options = {}) {
-  if (!agentId) return { queued: false, jobId: null, delayMs: 0 };
+  const normalizedAgentId = String(agentId || '').trim();
+  if (!normalizedAgentId) return { queued: false, jobId: null, delayMs: 0, timeoutMs: DEFI_LOOP_JOB_TIMEOUT_MS };
+
+  if (!options.skipMalformedCleanup) {
+    await cleanupMalformedActiveDefiLoopJobs({ agentId: normalizedAgentId, limit: 50 }).catch(() => {});
+  }
+
+  if (!options.allowDuplicate) {
+    const liveJob = await findLiveDefiLoopJobForAgent(normalizedAgentId).catch(() => null);
+    if (liveJob?.id) {
+      return {
+        queued: false,
+        deduped: true,
+        existingJobId: String(liveJob.id),
+        jobId: String(liveJob.id),
+        delayMs: 0,
+        timeoutMs: Number(liveJob.opts?.timeout || DEFI_LOOP_JOB_TIMEOUT_MS),
+      };
+    }
+  }
 
   const delayMs = Math.max(Number(options.delayMs) || 0, 0);
+  const timeoutMs = Math.max(Number(options.timeoutMs) || DEFI_LOOP_JOB_TIMEOUT_MS, 60000);
   const reason = normalizeDefiLoopReason(options.reason);
-  const jobId = `defi-${agentId}-${reason}-${Date.now()}`;
+  const jobId = `defi-${normalizedAgentId}-${reason}-${Date.now()}`;
   const priority = resolveDefiLoopJobPriority(reason, options);
-  const jobData = { agentId };
+  const jobData = { agentId: normalizedAgentId };
 
+  if (options.trigger) jobData.trigger = options.trigger;
   if (options.taskRunId) jobData.taskRunId = options.taskRunId;
   if (options.sourceTaskId) jobData.sourceTaskId = options.sourceTaskId;
   if (options.carryFollowupPhase) jobData.carryFollowupPhase = options.carryFollowupPhase;
@@ -1033,7 +1263,13 @@ async function queueDefiLoopForAgent(agentId, options = {}) {
     jobData.orphanRecoveryCount = Number(options.orphanRecoveryCount);
   }
 
-  const jobOptions = { jobId, priority };
+  const jobOptions = {
+    jobId,
+    priority,
+    timeout: timeoutMs,
+    attempts: DEFI_LOOP_MAX_ATTEMPTS,
+    backoff: { type: 'exponential', delay: DEFI_LOOP_RETRY_BACKOFF_MS },
+  };
   if (delayMs > 0) jobOptions.delay = delayMs;
 
   const job = await queue.add('DEFI_LOOP', jobData, jobOptions);
@@ -1047,6 +1283,7 @@ async function queueDefiLoopForAgent(agentId, options = {}) {
     jobId: job?.id || jobId,
     delayMs,
     priority,
+    timeoutMs,
   };
 }
 
@@ -1514,11 +1751,20 @@ function createBullRedisClient(type) {
   return client;
 }
 
+const QUEUE_DEFAULT_MAX_ATTEMPTS = Math.min(
+  Math.max(parseInt(process.env.QUEUE_DEFAULT_MAX_ATTEMPTS || '2', 10) || 2, 1),
+  2,
+);
+const QUEUE_DEFAULT_BACKOFF_DELAY_MS = Math.max(
+  parseInt(process.env.QUEUE_DEFAULT_BACKOFF_DELAY_MS || '1500', 10) || 1500,
+  250,
+);
+
 const queue = new Bull('agent-jobs', {
   createClient: createBullRedisClient,
   defaultJobOptions: {
-    attempts:    3,
-    backoff:     { type: 'exponential', delay: 2000 },
+    attempts:    QUEUE_DEFAULT_MAX_ATTEMPTS,
+    backoff:     { type: 'exponential', delay: QUEUE_DEFAULT_BACKOFF_DELAY_MS },
     removeOnComplete: 50,
     removeOnFail:     20,
   },
@@ -2018,8 +2264,75 @@ async function _reportTaskRunStage(taskRunId, stageMeta) {
   }).catch(() => {});
 }
 
+const LLM_AUTH_FAILURE_COOLDOWN_MS = Math.max(
+  Number.parseInt(process.env.LLM_AUTH_FAILURE_COOLDOWN_MS || '300000', 10) || 300000,
+  60000,
+);
+const LLM_AUTH_FALLBACK_LOG_COOLDOWN_MS = Math.max(
+  Number.parseInt(process.env.LLM_AUTH_FALLBACK_LOG_COOLDOWN_MS || '180000', 10) || 180000,
+  15000,
+);
+const llmAuthFailureCooldownByAgent = new Map();
+const llmAuthFallbackLogCooldownByAgent = new Map();
+
+function pruneLlmAuthFailureCooldowns(now = Date.now()) {
+  for (const [agentId, expiresAt] of llmAuthFailureCooldownByAgent.entries()) {
+    if (!agentId || !Number.isFinite(expiresAt) || expiresAt <= now) {
+      llmAuthFailureCooldownByAgent.delete(agentId);
+    }
+  }
+}
+
+function isAgentInLlmAuthFailureCooldown(agentId) {
+  if (!agentId) return false;
+  pruneLlmAuthFailureCooldowns();
+  const expiresAt = Number(llmAuthFailureCooldownByAgent.get(agentId) || 0);
+  return Number.isFinite(expiresAt) && expiresAt > Date.now();
+}
+
+function markAgentLlmAuthFailure(agentId) {
+  if (!agentId) return;
+  llmAuthFailureCooldownByAgent.set(agentId, Date.now() + LLM_AUTH_FAILURE_COOLDOWN_MS);
+}
+
+function clearAgentLlmAuthFailure(agentId) {
+  if (!agentId) return;
+  llmAuthFailureCooldownByAgent.delete(agentId);
+}
+
+function pruneLlmAuthFallbackLogCooldowns(now = Date.now()) {
+  for (const [agentId, expiresAt] of llmAuthFallbackLogCooldownByAgent.entries()) {
+    if (!agentId || !Number.isFinite(expiresAt) || expiresAt <= now) {
+      llmAuthFallbackLogCooldownByAgent.delete(agentId);
+    }
+  }
+}
+
+function shouldLogLlmAuthFallback(agentId, now = Date.now()) {
+  if (!agentId) return true;
+  pruneLlmAuthFallbackLogCooldowns(now);
+  const expiresAt = Number(llmAuthFallbackLogCooldownByAgent.get(agentId) || 0);
+  if (Number.isFinite(expiresAt) && expiresAt > now) {
+    return false;
+  }
+  llmAuthFallbackLogCooldownByAgent.set(agentId, now + LLM_AUTH_FALLBACK_LOG_COOLDOWN_MS);
+  return true;
+}
+
+function logLlmAuthFallback(scope, agentId, error) {
+  const message = String(error?.message || error?.cause?.message || error || 'unknown auth error').trim();
+  if (!shouldLogLlmAuthFallback(agentId)) {
+    return;
+  }
+  console.warn(`[QUEUE] ${scope} auth fallback agent=${agentId}: ${message}`);
+}
+
 // ── Engine selector — use LLM when key is available, fall back to rule engine ──
-async function resolveEngine(agent) {
+async function resolveEngine(agent, agentId = null) {
+  if (isAgentInLlmAuthFailureCooldown(agentId)) {
+    return { engine: ruleEngine, apiKey: null, reason: 'llm_auth_cooldown' };
+  }
+
   if (!agent?.llm_api_key_encrypted) return { engine: ruleEngine, apiKey: null };
   try {
     const { decrypt } = require('../services/cryptoService');
@@ -2028,6 +2341,35 @@ async function resolveEngine(agent) {
   } catch {
     return { engine: ruleEngine, apiKey: null };
   }
+}
+
+function isLlmAuthError(error) {
+  const statusCandidates = [
+    error?.status,
+    error?.statusCode,
+    error?.response?.status,
+    error?.cause?.status,
+  ];
+
+  const hasAuthStatus = statusCandidates
+    .map((value) => Number.parseInt(String(value || ''), 10))
+    .some((value) => value === 401 || value === 403);
+  if (hasAuthStatus) return true;
+
+  const code = String(error?.code || '').trim().toLowerCase();
+  if (code === 'unauthorized' || code === 'invalid_api_key' || code === 'authentication_error') {
+    return true;
+  }
+
+  const message = String(
+    error?.message
+    || error?.shortMessage
+    || error?.cause?.message
+    || error?.response?.data?.error?.message
+    || '',
+  ).trim();
+
+  return /401|403|invalid api key|incorrect api key|authentication|unauthorized|forbidden/i.test(message);
 }
 
 function parseStructuredDecision(rawDecision) {
@@ -2164,19 +2506,40 @@ function shouldTriggerDefiReviewFromMarketAnalysis(snapshot, agent) {
 }
 
 async function evaluateExecutionGate(agent, signal, agentId) {
-  const { engine, apiKey } = await resolveEngine(agent);
+  const { engine, apiKey, reason: resolveReason } = await resolveEngine(agent, agentId);
   const opportunity = {
     ...(signal?.opportunity || {}),
     fromChain: signal?.opportunity?.fromChain || 'arc-testnet',
     amountUsdc: signal?.opportunity?.amountUsdc ?? signal?.opportunity?.steps?.[0]?.amountUsdc ?? 0,
   };
 
-  const result = await engine.getArbitrageDecision({
-    opportunity,
-    model: agent?.llm_model,
-    apiKey,
-    agentId,
-  });
+  let result;
+  let fallbackReason = resolveReason || null;
+
+  try {
+    result = await engine.getArbitrageDecision({
+      opportunity,
+      model: agent?.llm_model,
+      apiKey,
+      agentId,
+    });
+    if (engine === llmService) {
+      clearAgentLlmAuthFailure(agentId);
+    }
+  } catch (error) {
+    if (engine === llmService && isLlmAuthError(error)) {
+      fallbackReason = 'llm_auth_error';
+      markAgentLlmAuthFailure(agentId);
+      logLlmAuthFallback('ORACLE_QUERY', agentId, error);
+      result = await ruleEngine.getArbitrageDecision({
+        opportunity,
+        agentId,
+      });
+    } else {
+      throw error;
+    }
+  }
+
   const parsed = parseStructuredDecision(result?.decision);
   const verdict = parsed && typeof parsed.execute === 'boolean'
     ? parsed
@@ -2191,6 +2554,7 @@ async function evaluateExecutionGate(agent, signal, agentId) {
     decision: result?.decision || null,
     verdict,
     opportunity,
+    fallbackReason,
   };
 }
 
@@ -2429,10 +2793,29 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
   }
 
   try {
-    const { engine, apiKey } = await resolveEngine(agent);
-    const engineName = engine === llmService ? 'llm' : 'rule';
-    const result = await engine.analyzeMarket({ chain, token, model: agent.llm_model, apiKey, agentId });
-    console.log(`[QUEUE] MARKET_ANALYSIS (${result.engine || 'llm'}) for agent ${agentId}`);
+    const { engine, apiKey, reason: resolveReason } = await resolveEngine(agent, agentId);
+    let engineName = engine === llmService ? 'llm' : 'rule';
+    let result;
+    let fallbackReason = resolveReason || null;
+
+    try {
+      result = await engine.analyzeMarket({ chain, token, model: agent.llm_model, apiKey, agentId });
+      if (engine === llmService) {
+        clearAgentLlmAuthFailure(agentId);
+      }
+    } catch (error) {
+      if (engine === llmService && isLlmAuthError(error)) {
+        fallbackReason = 'llm_auth_error';
+        markAgentLlmAuthFailure(agentId);
+        logLlmAuthFallback('MARKET_ANALYSIS', agentId, error);
+        result = await ruleEngine.analyzeMarket({ chain, token, agentId });
+        engineName = 'rule';
+      } else {
+        throw error;
+      }
+    }
+
+    console.log(`[QUEUE] MARKET_ANALYSIS (${result.engine || engineName}) for agent ${agentId}`);
 
     const decisionSnapshot = buildMarketAnalysisDecisionSnapshot({
       status: 'success',
@@ -2441,18 +2824,19 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
       result,
       engineName,
     });
+    if (fallbackReason) {
+      decisionSnapshot.fallbackReason = fallbackReason;
+    }
     let queuedDefiReview = false;
 
     if (shouldTriggerDefiReviewFromMarketAnalysis(decisionSnapshot, agent)) {
       try {
-        await queue.add('DEFI_LOOP', {
-          agentId,
+        const enqueueResult = await queueDefiLoopForAgent(agentId, {
+          reason: 'market-analysis',
           trigger: 'market_analysis',
-        }, {
-          jobId: `defi-market-analysis-${agentId}-${Date.now()}`,
           priority: DEFI_LOOP_PRIORITY_MARKET,
         });
-        queuedDefiReview = true;
+        queuedDefiReview = enqueueResult.queued === true;
       } catch (queueErr) {
         console.error(`[QUEUE] MARKET_ANALYSIS enqueue DEFI_LOOP error agent=${agentId}:`, queueErr.message);
       }
@@ -2481,6 +2865,18 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
 // every ORACLE_LOOP_INTERVAL_MS (default 30 min) per eligible agent.
 const ORACLE_LOOP_INTERVAL_MS = parseInt(process.env.ORACLE_LOOP_INTERVAL_MS || '1800000', 10);
 const MARKET_ANALYSIS_LOOP_INTERVAL_MS = parseInt(process.env.MARKET_ANALYSIS_LOOP_INTERVAL_MS || '1800000', 10);
+const DEFI_LOOP_WORKER_CONCURRENCY = Math.max(
+  parseInt(process.env.DEFI_LOOP_WORKER_CONCURRENCY || '2', 10) || 2,
+  1,
+);
+const ORACLE_RUNNING_REQUEUE_GRACE_MS = Math.max(
+  parseInt(process.env.ORACLE_RUNNING_REQUEUE_GRACE_MS || '180000', 10) || 180000,
+  30000,
+);
+const MARKET_ANALYSIS_RUNNING_REQUEUE_GRACE_MS = Math.max(
+  parseInt(process.env.MARKET_ANALYSIS_RUNNING_REQUEUE_GRACE_MS || '180000', 10) || 180000,
+  30000,
+);
 const CURVE_USDC_EURC_POOL    = process.env.CURVE_USDC_EURC_POOL || null;
 const DEFI_LOOP_INTERVAL_MS   = parseInt(process.env.DEFI_LOOP_INTERVAL_MS   || '3600000',  10); // default 1h
 const DEFI_LOOP_STARTUP_DELAY_MS = parseInt(process.env.DEFI_LOOP_STARTUP_DELAY_MS || '60000', 10);
@@ -2671,6 +3067,7 @@ async function cleanupMalformedActiveDefiLoopJobs({ agentId = null, limit = 200 
       sourceTaskId: recovery.sourceTaskId,
       carryFollowupPhase: recovery.carryFollowupPhase,
       orphanRecoveryCount: recovery.orphanRecoveryCount + 1,
+      skipMalformedCleanup: true,
     }).catch((error) => ({
       queued: false,
       error: error.message,
@@ -2732,6 +3129,24 @@ async function findLiveDefiLoopJobForTaskRun(taskRunId) {
 
     if (await isLiveDefiLoopJob(job, now)) return job;
     await removeMalformedDefiLoopJobReferences(job, 'task-run-live-check');
+  }
+
+  return null;
+}
+
+async function findLiveDefiLoopJobForAgent(agentId) {
+  const normalizedAgentId = String(agentId || '').trim();
+  if (!normalizedAgentId) return null;
+
+  const jobs = await queue.getJobs(['waiting', 'active', 'delayed', 'paused'], 0, 500, true);
+  const now = Date.now();
+
+  for (const job of jobs) {
+    if (job?.name !== 'DEFI_LOOP') continue;
+    if (String(job?.data?.agentId || '').trim() !== normalizedAgentId) continue;
+
+    if (await isLiveDefiLoopJob(job, now)) return job;
+    await removeMalformedDefiLoopJobReferences(job, 'agent-live-check');
   }
 
   return null;
@@ -3847,17 +4262,29 @@ async function scheduleOracleLoop() {
   setInterval(async () => {
     try {
       const { rows } = await db.query(
-        `SELECT id, wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at FROM agents
+        `SELECT id, wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at,
+                oracle_last_run_at, oracle_last_status
+           FROM agents
          WHERE oracle_enabled = TRUE
            AND status NOT IN ('locked', 'inactive')`,
       );
       let queuedCount = 0;
       let suspendedCount = 0;
+      let runningSkipCount = 0;
       for (const agent of rows) {
         if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
           suspendedCount += 1;
           continue;
         }
+
+        if (String(agent.oracle_last_status || '').toLowerCase() === 'running') {
+          const lastRunAtMs = Date.parse(agent.oracle_last_run_at || '');
+          if (Number.isFinite(lastRunAtMs) && (Date.now() - lastRunAtMs) < ORACLE_RUNNING_REQUEUE_GRACE_MS) {
+            runningSkipCount += 1;
+            continue;
+          }
+        }
+
         const { id } = agent;
         await queue.add('ORACLE_QUERY', { agentId: id }, { jobId: `oracle-${id}-${Date.now()}` });
         queuedCount += 1;
@@ -3867,6 +4294,9 @@ async function scheduleOracleLoop() {
       }
       if (suspendedCount > 0) {
         console.log(`[ORACLE_LOOP] Skipped ${suspendedCount} oracle job(s) because the shared daily DeFi cap is already full`);
+      }
+      if (runningSkipCount > 0) {
+        console.log(`[ORACLE_LOOP] Skipped ${runningSkipCount} oracle job(s) because a recent run is still marked running`);
       }
     } catch (err) {
       console.error('[ORACLE_LOOP] Schedule error:', err.message);
@@ -3882,18 +4312,30 @@ async function scheduleMarketAnalysisLoop() {
   setInterval(async () => {
     try {
       const { rows } = await db.query(
-        `SELECT id, wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at FROM agents
+        `SELECT id, wallet_address, daily_defi_loop_count, defi_daily_reset_at, daily_limit_reset_at,
+                market_analysis_last_run_at, market_analysis_last_status
+           FROM agents
          WHERE market_analysis_enabled = TRUE
            AND is_smart_mode = TRUE
            AND status NOT IN ('locked', 'inactive')`,
       );
       let queuedCount = 0;
       let suspendedCount = 0;
+      let runningSkipCount = 0;
       for (const agent of rows) {
         if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
           suspendedCount += 1;
           continue;
         }
+
+        if (String(agent.market_analysis_last_status || '').toLowerCase() === 'running') {
+          const lastRunAtMs = Date.parse(agent.market_analysis_last_run_at || '');
+          if (Number.isFinite(lastRunAtMs) && (Date.now() - lastRunAtMs) < MARKET_ANALYSIS_RUNNING_REQUEUE_GRACE_MS) {
+            runningSkipCount += 1;
+            continue;
+          }
+        }
+
         const { id } = agent;
         await queue.add(
           'MARKET_ANALYSIS',
@@ -3908,6 +4350,9 @@ async function scheduleMarketAnalysisLoop() {
       if (suspendedCount > 0) {
         console.log(`[MARKET_ANALYSIS_LOOP] Skipped ${suspendedCount} market analysis job(s) because the shared daily DeFi cap is already full`);
       }
+      if (runningSkipCount > 0) {
+        console.log(`[MARKET_ANALYSIS_LOOP] Skipped ${runningSkipCount} market analysis job(s) because a recent run is still marked running`);
+      }
     } catch (err) {
       console.error('[MARKET_ANALYSIS_LOOP] Schedule error:', err.message);
     }
@@ -3921,7 +4366,7 @@ async function scheduleMarketAnalysisLoop() {
 // Flow: oracle fetch → arb signal → engine decision → protocol tx (unless dry-run stays enabled for this agent).
 // Hard cap: 10 runs per agent per day (daily_defi_loop_count).
 
-queue.process('DEFI_LOOP', 1, async (job) => {
+queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
   const { agentId } = job.data;
   const carryTaskRunId = job?.data?.taskRunId || null;
   const carrySourceTaskId = String(job?.data?.sourceTaskId || '').trim().toUpperCase();
@@ -4680,7 +5125,7 @@ queue.process('DEFI_LOOP', 1, async (job) => {
       };
     }
 
-    const cirbtcPolicy = evaluateCirbtcLpAutomationPolicy({
+    let cirbtcPolicy = evaluateCirbtcLpAutomationPolicy({
       pairContexts: cirbtcPoolContexts.map((context) => {
         const poolKey = String(context.pool?.key || `${context.stableToken}-CIRBTC`).toUpperCase();
         return {
@@ -4700,6 +5145,39 @@ queue.process('DEFI_LOOP', 1, async (job) => {
         };
       }),
     });
+
+    if (cirbtcPolicy?.verdict?.execute === true && cirbtcPolicy?.verdict?.operationType === 'add_liquidity') {
+      const cirbtcGlobalFailureGuard = await readCirbtcGlobalFailureGuardState();
+      if (cirbtcGlobalFailureGuard.active) {
+        const holdSummary = cirbtcGlobalFailureGuard.summary
+          || 'cirBTC LP add-liquidity is temporarily paused due to recent shared route failures across agents.';
+        cirbtcPolicy = {
+          ...cirbtcPolicy,
+          verdict: {
+            ...(cirbtcPolicy.verdict || {}),
+            execute: false,
+            blockedBy: 'global_route_cooldown',
+            reason: holdSummary,
+            actionParams: null,
+            suggestedAmountUsdc: 0,
+          },
+          metrics: {
+            ...(cirbtcPolicy.metrics || {}),
+            globalFailureGuard: {
+              ...cirbtcGlobalFailureGuard,
+            },
+          },
+          checks: {
+            ...(cirbtcPolicy.checks || {}),
+            globalRouteCooldown: {
+              passed: false,
+              detail: holdSummary,
+            },
+          },
+        };
+      }
+    }
+
     const cirbtcPositionSummary = summarizePosition(
       cirbtcPositionContext.positionsByKey?.[String(cirbtcPolicy.metrics?.selectedPoolKey || '').toUpperCase()] || null,
     ) || positionSummary;
@@ -5620,6 +6098,7 @@ async function scheduleDefiLoop() {
       const queuedOrActiveAgentIds = await getQueuedOrActiveDefiLoopAgentIds();
       let queuedCount = 0;
       let cappedCount = 0;
+      let queueErrorCount = 0;
       const nowUtc = Date.now();
 
       for (const agent of rows) {
@@ -5633,17 +6112,25 @@ async function scheduleDefiLoop() {
           continue;
         }
 
-        await queue.add('DEFI_LOOP', { agentId: id }, {
-          jobId: `defi-${id}-${Date.now()}`,
-          priority: DEFI_LOOP_PRIORITY_SCHEDULED,
-        });
-        queuedCount += 1;
+        try {
+          const enqueueResult = await queueDefiLoopForAgent(id, {
+            reason: 'scheduled',
+            priority: DEFI_LOOP_PRIORITY_SCHEDULED,
+          });
+          if (enqueueResult.queued) queuedCount += 1;
+        } catch (enqueueError) {
+          queueErrorCount += 1;
+          console.error(`[DEFI_LOOP] Could not queue scheduled job for agent ${id}:`, enqueueError.message);
+        }
       }
       if (queuedCount > 0) {
         console.log(`[DEFI_LOOP] Queued ${queuedCount} defi loop job(s)`);
       }
       if (cappedCount > 0) {
         console.log(`[DEFI_LOOP] Skipped ${cappedCount} agent(s) because their daily DeFi loop cap is already full`);
+      }
+      if (queueErrorCount > 0) {
+        console.error(`[DEFI_LOOP] Queue errors for ${queueErrorCount} agent(s) during this schedule pass`);
       }
     } catch (err) {
       console.error('[DEFI_LOOP] Schedule error:', err.message);
@@ -5669,7 +6156,7 @@ async function scheduleDefiLoop() {
   }, CARRY_AUTOMATION_HANDOFF_RECOVERY_INTERVAL_MS);
   setInterval(queueEligibleDefiLoops, DEFI_LOOP_INTERVAL_MS);
 
-  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, startup delay ${Math.max(DEFI_LOOP_STARTUP_DELAY_MS, 0) / 1000}s, orphan sweep ${DEFI_LOOP_ORPHAN_SWEEP_INTERVAL_MS / 1000}s, carry handoff recovery ${CARRY_AUTOMATION_HANDOFF_RECOVERY_INTERVAL_MS / 1000}s, GLOBAL_DRY_RUN=${GLOBAL_DRY_RUN}`);
+  console.log(`[DEFI_LOOP] Started — interval ${DEFI_LOOP_INTERVAL_MS / 60000} min, startup delay ${Math.max(DEFI_LOOP_STARTUP_DELAY_MS, 0) / 1000}s, orphan sweep ${DEFI_LOOP_ORPHAN_SWEEP_INTERVAL_MS / 1000}s, carry handoff recovery ${CARRY_AUTOMATION_HANDOFF_RECOVERY_INTERVAL_MS / 1000}s, worker concurrency ${DEFI_LOOP_WORKER_CONCURRENCY}, max attempts ${DEFI_LOOP_MAX_ATTEMPTS}, GLOBAL_DRY_RUN=${GLOBAL_DRY_RUN}`);
 }
 
 // ── DAILY FREE TASKS (Tier 1) ──────────────────────────────────────────────────
@@ -7855,3 +8342,4 @@ module.exports.resumeLocalWorkers = resumeLocalWorkers;
 module.exports.pauseLocalWorkers = pauseLocalWorkers;
 module.exports.cleanupMalformedActiveDefiLoopJobs = cleanupMalformedActiveDefiLoopJobs;
 module.exports.recoverMissingAutoCarryHandoffRuns = recoverMissingAutoCarryHandoffRuns;
+module.exports.queueDefiLoopForAgent = queueDefiLoopForAgent;

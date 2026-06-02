@@ -133,10 +133,8 @@ router.put('/:id', async (req, res, next) => {
       || data.carryAutomationEnabled === true
       || data.cirbtcLpEnabled === true
     ) {
-      kickoffJobs.push(agentQueue.add('DEFI_LOOP', {
-        agentId: agent.id,
-      }, {
-        jobId: `defi-manual-${agent.id}-${Date.now()}`,
+      kickoffJobs.push(agentQueue.queueDefiLoopForAgent(agent.id, {
+        reason: 'manual',
       }));
     }
 

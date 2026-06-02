@@ -53,10 +53,94 @@ const REPUTATION_ONCHAIN_PROOF_DAILY_LIMIT = (() => {
 const REPUTATION_CHAIN_TX_RETRY_LIMIT = readPositiveIntegerEnv('REPUTATION_CHAIN_TX_RETRY_LIMIT', 3);
 const REPUTATION_CHAIN_TX_FEE_BUMP_BPS = readPositiveIntegerEnv('REPUTATION_CHAIN_TX_FEE_BUMP_BPS', 1200);
 const REPUTATION_CHAIN_TX_LOCK_WAIT_MS = readPositiveIntegerEnv('REPUTATION_CHAIN_TX_LOCK_WAIT_MS', 60000);
+const REPUTATION_CHAIN_REPLAY_TTL_SEC = readPositiveIntegerEnv('REPUTATION_CHAIN_REPLAY_TTL_SEC', 75);
+const REPUTATION_CHAIN_EVENT_BUCKET_SEC = readPositiveIntegerEnv('REPUTATION_CHAIN_EVENT_BUCKET_SEC', 60);
+const REPUTATION_CHAIN_REPLAY_EVENTS = new Set([
+  EVENT_TYPES.ORACLE_QUERY,
+  EVENT_TYPES.DEFI_LOOP,
+  EVENT_TYPES.DAILY_TASK,
+]);
+const ARC_TESTNET_DEFAULT_RPC = 'https://rpc.testnet.arc.network';
+const ARC_TESTNET_NETWORK = { chainId: 5042002, name: 'Arc Testnet' };
+const REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS = (() => {
+  const parsed = Number.parseInt(process.env.REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS || '', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
+})();
+const arcProviderCache = new Map();
+let arcRpcFailoverCursor = 0;
+let reputationOnchainDispatchTail = Promise.resolve();
 
 function readPositiveIntegerEnv(name, fallback) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseRpcUrlList(value) {
+  if (!value) return [];
+  return String(value)
+    .split(/[\n,;\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function getArcRpcUrls() {
+  const candidates = [
+    process.env.ARC_TESTNET_RPC,
+    process.env.ARC_RPC_URL,
+    ...parseRpcUrlList(process.env.ARC_TESTNET_RPC_FALLBACKS),
+  ];
+
+  const unique = [];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    unique.push(normalized);
+  }
+
+  if (unique.length === 0) {
+    unique.push(ARC_TESTNET_DEFAULT_RPC);
+  }
+
+  return unique;
+}
+
+function describeRpcUrl(rpcUrl) {
+  try {
+    const parsed = new URL(String(rpcUrl || ''));
+    return parsed.host || 'unknown-rpc-host';
+  } catch {
+    return String(rpcUrl || '').slice(0, 48) || 'unknown-rpc-host';
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(Number(ms) || 0, 0)));
+}
+
+async function reserveReputationOnchainWriteDispatchSlot() {
+  if (!(REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS > 0)) return;
+
+  const reservation = reputationOnchainDispatchTail
+    .catch(() => {})
+    .then(async () => {
+      await delay(REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS);
+    });
+
+  reputationOnchainDispatchTail = reservation;
+  await reservation;
+}
+
+function createArcTestnetProvider(rpcUrl) {
+  const resolvedRpcUrl = String(rpcUrl || ARC_TESTNET_DEFAULT_RPC).trim() || ARC_TESTNET_DEFAULT_RPC;
+  const cached = arcProviderCache.get(resolvedRpcUrl);
+  if (cached) return cached;
+
+  const provider = new ethers.JsonRpcProvider(resolvedRpcUrl, ARC_TESTNET_NETWORK);
+  arcProviderCache.set(resolvedRpcUrl, provider);
+  return provider;
 }
 
 function isReplacementUnderpricedError(error) {
@@ -92,12 +176,8 @@ function applyFeeBump(value, attempt) {
   return (value * multiplier + 9999n) / 10000n;
 }
 
-function buildReputationTxOptions(feeData, nonce, attempt) {
+function buildReputationTxOptions(feeData, attempt) {
   const txOptions = {};
-
-  if (Number.isInteger(nonce) && nonce >= 0) {
-    txOptions.nonce = nonce;
-  }
 
   if (feeData?.maxFeePerGas && feeData?.maxPriorityFeePerGas) {
     txOptions.maxFeePerGas = applyFeeBump(feeData.maxFeePerGas, attempt);
@@ -107,6 +187,110 @@ function buildReputationTxOptions(feeData, nonce, attempt) {
   }
 
   return txOptions;
+}
+
+function buildReputationReplayFingerprint(agentId, eventType) {
+  if (!agentId || !eventType) return null;
+  if (!REPUTATION_CHAIN_REPLAY_EVENTS.has(eventType)) return null;
+
+  const bucketSec = Math.max(REPUTATION_CHAIN_EVENT_BUCKET_SEC, 1);
+  const bucket = Math.floor(Date.now() / (bucketSec * 1000));
+  return ['reputation_event', agentId, eventType, bucket];
+}
+
+function isRpcRateLimitError(error) {
+  const numericCodeCandidates = [
+    error?.status,
+    error?.statusCode,
+    error?.error?.code,
+    error?.info?.error?.code,
+    error?.cause?.code,
+  ]
+    .map((value) => Number.parseInt(String(value ?? ''), 10))
+    .filter(Number.isFinite);
+
+  if (numericCodeCandidates.some((value) => value === 429 || value === -32005 || value === -32007)) {
+    return true;
+  }
+
+  const message = String(
+    error?.message
+    || error?.shortMessage
+    || error?.error?.message
+    || error?.info?.error?.message
+    || error?.cause?.message
+    || '',
+  ).trim();
+
+  return /rate limit|too many requests|request limit reached|requests per second|429/i.test(message);
+}
+
+function isRetryableRpcProviderError(error) {
+  if (isRpcRateLimitError(error)) return true;
+
+  const code = String(error?.code || '').trim().toUpperCase();
+  if (
+    code === 'NETWORK_ERROR'
+    || code === 'SERVER_ERROR'
+    || code === 'TIMEOUT'
+    || code === 'ECONNRESET'
+    || code === 'ETIMEDOUT'
+    || code === 'EAI_AGAIN'
+  ) {
+    return true;
+  }
+
+  const message = String(
+    error?.message
+    || error?.shortMessage
+    || error?.error?.message
+    || error?.info?.error?.message
+    || error?.cause?.message
+    || '',
+  ).trim();
+
+  return /timeout|temporarily unavailable|socket hang up|connection reset|service unavailable|bad gateway|gateway timeout|503|504/i.test(message);
+}
+
+async function withArcRpcFailover(operationLabel, execute) {
+  const rpcUrls = getArcRpcUrls();
+  let lastError = null;
+  const startOffset = rpcUrls.length > 0
+    ? (arcRpcFailoverCursor % rpcUrls.length)
+    : 0;
+
+  if (rpcUrls.length > 0) {
+    arcRpcFailoverCursor = (arcRpcFailoverCursor + 1) % rpcUrls.length;
+  }
+
+  for (let attempt = 0; attempt < rpcUrls.length; attempt += 1) {
+    const index = (startOffset + attempt) % rpcUrls.length;
+    const rpcUrl = rpcUrls[index];
+    const provider = createArcTestnetProvider(rpcUrl);
+    try {
+      return await execute({ provider, rpcUrl, index, total: rpcUrls.length });
+    } catch (error) {
+      lastError = error;
+      const hasFallback = attempt < (rpcUrls.length - 1);
+      if (!hasFallback || !isRetryableRpcProviderError(error)) {
+        throw error;
+      }
+
+      console.warn(
+        `[REPUTATION] ${operationLabel} rpc failover ${attempt + 1}/${rpcUrls.length} rpc=${describeRpcUrl(rpcUrl)}: ${error.message}`,
+      );
+    }
+  }
+
+  throw lastError || new Error(`[REPUTATION] ${operationLabel} failed before an RPC provider was selected.`);
+}
+
+function isProtectedTxThrottleError(error) {
+  const code = String(error?.code || '').trim();
+  return code === 'AGENT_TX_RATE_LIMITED'
+    || code === 'TX_REPLAY_BLOCKED'
+    || code === 'AGENT_TX_BUSY'
+    || isRpcRateLimitError(error);
 }
 
 async function recordOnchainEventWithProtection({
@@ -119,7 +303,7 @@ async function recordOnchainEventWithProtection({
   relayerAddress,
 }) {
   const feeData = await provider.getFeeData().catch(() => null);
-  let pendingNonce = await provider.getTransactionCount(relayerAddress, 'pending').catch(() => null);
+  const replayFingerprint = buildReputationReplayFingerprint(agentId, eventType);
   let lastError = null;
 
   for (let attempt = 1; attempt <= REPUTATION_CHAIN_TX_RETRY_LIMIT; attempt += 1) {
@@ -128,12 +312,13 @@ async function recordOnchainEventWithProtection({
         contract: registry,
         methodName: 'recordEvent',
         args: [BigInt(tokenId), eventType, BigInt(scoreDelta)],
-        txOptions: buildReputationTxOptions(feeData, pendingNonce, attempt),
+        txOptions: buildReputationTxOptions(feeData, attempt),
         chainName: 'Arc Testnet',
         agentId,
         walletAddress: relayerAddress,
         operation: 'reputation_record_event',
-        replayFingerprint: null,
+        replayFingerprint,
+        replayTtlSec: REPUTATION_CHAIN_REPLAY_TTL_SEC,
         waitForLockMs: REPUTATION_CHAIN_TX_LOCK_WAIT_MS,
         waitConfirmations: 1,
       });
@@ -145,8 +330,6 @@ async function recordOnchainEventWithProtection({
       if (!retryable || attempt >= REPUTATION_CHAIN_TX_RETRY_LIMIT) {
         break;
       }
-
-      pendingNonce = await provider.getTransactionCount(relayerAddress, 'pending').catch(() => pendingNonce);
       console.warn(
         `[REPUTATION] retry on-chain write agent=${agentId} event=${eventType} attempt=${attempt + 1}/${REPUTATION_CHAIN_TX_RETRY_LIMIT}`,
       );
@@ -291,25 +474,44 @@ async function recordReputationEvent(agentId, eventType) {
   }
 
   try {
-    const rpc      = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
-    const provider = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
-    const relayer  = new ethers.Wallet(relayerKey, provider);
-    const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, relayer);
+    await reserveReputationOnchainWriteDispatchSlot();
 
-    const txHash = await recordOnchainEventWithProtection({
-      agentId,
-      tokenId: agent.erc8004_token_id,
-      eventType,
-      scoreDelta,
-      provider,
-      registry,
-      relayerAddress: relayer.address,
-    });
-    console.log(`[REPUTATION] Recorded on-chain agent=${agentId} event=${eventType} delta=+${scoreDelta} tx=${txHash || 'unknown'}`);
+    const { txHash, rpcUrl } = await withArcRpcFailover(
+      `on-chain write agent=${agentId} event=${eventType}`,
+      async ({ provider, rpcUrl: selectedRpcUrl }) => {
+        const relayer  = new ethers.Wallet(relayerKey, provider);
+        const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, relayer);
+        const hash = await recordOnchainEventWithProtection({
+          agentId,
+          tokenId: agent.erc8004_token_id,
+          eventType,
+          scoreDelta,
+          provider,
+          registry,
+          relayerAddress: relayer.address,
+        });
+
+        return {
+          txHash: hash,
+          rpcUrl: selectedRpcUrl,
+        };
+      },
+    );
+    console.log(
+      `[REPUTATION] Recorded on-chain agent=${agentId} event=${eventType} delta=+${scoreDelta} tx=${txHash || 'unknown'} rpc=${describeRpcUrl(rpcUrl)}`,
+    );
   } catch (err) {
     // On-chain failure is non-fatal — already wrote to DB above
-    console.error(`[REPUTATION] On-chain error agent=${agentId} event=${eventType}:`, err.message);
-    if (finalStatus === 'success') finalStatus = 'chain_error';
+    if (isProtectedTxThrottleError(err)) {
+      console.warn(
+        `[REPUTATION] On-chain write skipped agent=${agentId} event=${eventType}:`,
+        err.message,
+      );
+      if (finalStatus === 'success') finalStatus = 'throttled';
+    } else {
+      console.error(`[REPUTATION] On-chain error agent=${agentId} event=${eventType}:`, err.message);
+      if (finalStatus === 'success') finalStatus = 'chain_error';
+    }
   }
 
   await setReputationState(agentId, finalStatus);
@@ -367,10 +569,13 @@ async function getReputationOverview(agentId, userId, limit = 10) {
 
   if (onchain.configured && onchain.identityRegistered && onchain.tokenId) {
     try {
-      const rpc = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
-      const provider = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
-      const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
-      const score = await registry.getScore(BigInt(onchain.tokenId));
+      const score = await withArcRpcFailover(
+        `on-chain read agent=${agentId}`,
+        async ({ provider }) => {
+          const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
+          return registry.getScore(BigInt(onchain.tokenId));
+        },
+      );
       onchain.score = Number(score);
       onchain.status = 'live';
     } catch (err) {
@@ -450,22 +655,35 @@ async function getReputationProof(agentId, userId) {
     return result;
   }
 
-  const rpc      = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
-  const provider = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
-  const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
-
   // ── Phase 1: score read (fast view calls) ────────────────────────────────
   let blockNumber;
+  let registry;
   try {
-    const [scoreRaw, totalRaw, bn] = await Promise.all([
-      registry.getScore(BigInt(result.tokenId)),
-      registry.totalEvents(BigInt(result.tokenId)),
-      provider.getBlockNumber(),
-    ]);
+    const liveRead = await withArcRpcFailover(
+      `proof score read agent=${agentId}`,
+      async ({ provider }) => {
+        const selectedRegistry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
+        const [scoreRaw, totalRaw, bn] = await Promise.all([
+          selectedRegistry.getScore(BigInt(result.tokenId)),
+          selectedRegistry.totalEvents(BigInt(result.tokenId)),
+          provider.getBlockNumber(),
+        ]);
+
+        return {
+          scoreRaw,
+          totalRaw,
+          blockNumber: bn,
+          registry: selectedRegistry,
+        };
+      },
+    );
+
+    const { scoreRaw, totalRaw, blockNumber: resolvedBlockNumber, registry: selectedRegistry } = liveRead;
     result.score       = Number(scoreRaw);
     result.totalEvents = Number(totalRaw);
     result.status      = 'live';
-    blockNumber        = bn;
+    blockNumber        = resolvedBlockNumber;
+    registry           = selectedRegistry;
   } catch (err) {
     console.error(`[REPUTATION] proof score read error agent=${agentId}:`, err.message);
     result.status = 'read_error';

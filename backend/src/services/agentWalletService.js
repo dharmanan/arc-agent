@@ -1414,7 +1414,11 @@ async function getSwapQuoteResult({ fromToken, toToken, amountIn, routeMode = 'a
       fallbackQuote,
     };
   } catch (error) {
-    console.warn('[AGENT-SWAP-QUOTE]', error.message);
+    const rawErrorMessage = String(error?.message || error?.userMessage || '').trim();
+    const expectedQuoteMiss = /no route available|invalid api key format/i.test(rawErrorMessage);
+    if (!expectedQuoteMiss) {
+      console.warn('[AGENT-SWAP-QUOTE]', error.message);
+    }
     const normalizedQuoteError = normalizeSwapQuoteError(error);
     const cirbtcCircleOnlyUnavailableMessage = isCirbtcPair(fromToken, toToken)
       ? 'The Circle route is currently unavailable for this cirBTC pair. Direct Arc fallback is disabled.'
