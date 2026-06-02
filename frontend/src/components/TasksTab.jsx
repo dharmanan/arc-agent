@@ -2446,8 +2446,8 @@ function humanizeAutomationStatus(status) {
     permission_blocked: 'Permission Needed',
     fetch_error: 'Fetch Error',
     decision_error: 'Decision Error',
-    execution_error: 'Execution Error',
-    execution_blocked: 'Execution Blocked',
+    execution_error: 'Needs Attention',
+    execution_blocked: 'Needs Review',
     dry_run_failed: 'Dry Run Failed',
     disabled: 'Disabled',
     missing_agent: 'Missing Agent',
@@ -2715,8 +2715,8 @@ function getAutomationSummary(feature, state, agent) {
   switch (feature.statusKey) {
     case 'marketAnalysis':
       return state?.lastStatus === 'success'
-        ? 'Latest market check completed. This step only refreshes context.'
-        : 'Runs background market checks. No funds move here.';
+        ? 'Latest market check completed. This step only refreshes context. Any X/Y budget counter belongs to DeFi execution, not this loop.'
+        : 'Runs background market checks. No funds move here. Any X/Y budget counter belongs to DeFi execution, not this loop.';
     case 'oracle':
       return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 48)} price refreshes completed. This keeps pricing and opportunity data fresh for later decisions. Later stable/oracle execution can use up to ${maxTradeUsdc.toFixed(2)} USDC per cycle, stop fresh EURC buys above ${eurcCap.toFixed(2)} EURC, and keep ${eurcReserve.toFixed(2)} EURC protected before selling the excess back into USDC on the live swap route whenever the exit quote is strong enough.${oracleCooldownNote}${bypassNote}`;
     case 'defiLoop':

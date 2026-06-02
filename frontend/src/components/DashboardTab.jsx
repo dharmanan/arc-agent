@@ -608,8 +608,8 @@ function humanizeAutomationStatus(status) {
     fetch_error: 'Fetch Error',
     position_guard_unavailable: 'Position Guard',
     balance_check_failed: 'Balance Check',
-    execution_blocked: 'Execution Blocked',
-    execution_error: 'Execution Error',
+    execution_blocked: 'Needs Review',
+    execution_error: 'Needs Attention',
     dry_run_failed: 'Dry Run Failed',
     pool_unconfigured: 'Pool Missing',
     disabled: 'Disabled',
@@ -647,11 +647,39 @@ function isAutomationErrorStatus(status) {
 function getAutomationStatusSummary(status, lastDecision) {
   if (!lastDecision) return null;
 
-  if (isAutomationErrorStatus(status)) {
-    return lastDecision.error || lastDecision.reason || lastDecision.summary || null;
+  const actionLabel = humanizeAutomationAction(
+    lastDecision.operationType,
+    lastDecision.execute === false ? 'Hold' : 'This action',
+  );
+  const rawSummary = normalizeActivitySummary(lastDecision.summary);
+  const machineLikeSummary = isMachineLikeActivitySummary(rawSummary);
+  const summarizedError = summarizeActivityError(lastDecision.error || (machineLikeSummary ? rawSummary : ''));
+
+  if (String(status || '') === 'execution_blocked') {
+    if (/missing revert data|CALL_EXCEPTION|transaction execution reverted/i.test(String(lastDecision.error || rawSummary || ''))) {
+      return `${actionLabel} was approved by policy, but the on-chain call was rejected before a transaction could be completed. No funds moved in this cycle.`;
+    }
+
+    if (summarizedError) {
+      return `${actionLabel} was approved by policy, but the transaction was not sent: ${summarizedError}`;
+    }
+
+    return `${actionLabel} was approved by policy, but the transaction was not sent in the latest cycle.`;
   }
 
-  return lastDecision.summary || lastDecision.reason || lastDecision.error || null;
+  if (String(status || '') === 'execution_error') {
+    if (summarizedError) {
+      return `${actionLabel} started, but the live transaction failed: ${summarizedError}`;
+    }
+
+    return `${actionLabel} started, but the live transaction did not finish cleanly.`;
+  }
+
+  if (isAutomationErrorStatus(status)) {
+    return summarizedError || lastDecision.reason || (!machineLikeSummary ? rawSummary : null) || null;
+  }
+
+  return rawSummary || lastDecision.reason || summarizedError || null;
 }
 
 function getStableAutomationStatus(defiLoopState, lastDecision) {
@@ -1842,6 +1870,7 @@ export default function DashboardTab({ onNavigate }) {
   const defiLoopState = agentStatus?.automation?.defiLoop || null;
   const lastStableDecision = defiLoopState?.lastDecision || null;
   const stableAutomationStatus = getStableAutomationStatus(defiLoopState, lastStableDecision);
+  const stableAutomationHasExecutionIssue = isAutomationErrorStatus(defiLoopState?.lastStatus);
   const stableAutomationDecisionSize = formatAutomationDecisionSize(lastStableDecision);
   const stableAutomationAllocationPctLabel = formatAllocationBandPct(
     lastStableDecision?.targetLpMinAllocationPct,
@@ -1860,6 +1889,13 @@ export default function DashboardTab({ onNavigate }) {
     ? formatUsdAmount(lastStableDecision?.positionValueUsd)
     : '—';
   const stableOracleGuardContext = getStableOracleGuardContext(lastStableDecision);
+  const stableAutomationIssueTitle = stableAutomationHasExecutionIssue ? 'Latest Issue' : 'Blocked By';
+  const stableAutomationIssueLabel = stableAutomationHasExecutionIssue
+    ? (String(defiLoopState?.lastStatus || '') === 'execution_blocked' ? 'On-chain call rejected' : humanizeAutomationStatus(defiLoopState?.lastStatus))
+    : (stableOracleGuardContext?.reasonLabel || (lastStableDecision?.blockedBy ? humanizeAutomationAction(lastStableDecision.blockedBy) : 'None'));
+  const stableAutomationIssueDetail = stableAutomationHasExecutionIssue
+    ? 'Policy approved the action. The issue happened during the live execution step, not during the policy review.'
+    : (stableOracleGuardContext?.reasonDetail || 'Hold reason appears here when the policy refuses execution.');
   const stableManualCooldownUntil = defiLoopState?.manualCooldownUntil || lastStableDecision?.manualCooldownUntil || null;
   const stableManualCooldownActive = Number.isFinite(Date.parse(stableManualCooldownUntil || '')) && Date.parse(stableManualCooldownUntil) > Date.now();
   const cirbtcStatusMissingFromBackend = Boolean(agentStatus?.automation && !agentStatus?.automation?.cirbtcLp);
@@ -1887,7 +1923,7 @@ export default function DashboardTab({ onNavigate }) {
       : `This agent's daily DeFi automation cap is full. Autonomous execution is paused until ${sharedDefiCapResetLabel}, but advisory scans may still continue.`
     : null;
   const sharedDefiCapNotice = sharedDefiDailyCap > 0
-    ? `Automation budget today: ${sharedDefiTodayCount}/${sharedDefiDailyCap} checks used. Resets at ${sharedDefiCapResetLabel}.`
+    ? `DeFi execution budget today (separate from market checks): ${sharedDefiTodayCount}/${sharedDefiDailyCap} cycles used. Resets at ${sharedDefiCapResetLabel}.`
     : null;
   const lastCirbtcDecision = cirbtcLoopState?.lastDecision || null;
   const cirbtcAutomationFreshness = getCirbtcAutomationFreshness(defiLoopState, cirbtcLoopState, lastCirbtcDecision);
@@ -2360,7 +2396,7 @@ export default function DashboardTab({ onNavigate }) {
               <Alert type={sharedDefiDailyCapReached ? 'warning' : 'info'}>
                 {sharedDefiDailyCapReached
                   ? sharedDefiCapWarning
-                  : `${sharedDefiCapNotice} When this agent reaches the daily cap, new DeFi checks pause until the reset window.`}
+                  : `${sharedDefiCapNotice} Market analysis snapshots run on their own loop. This counter tracks DeFi execution budget only.`}
               </Alert>
             )}
 
@@ -2498,7 +2534,9 @@ export default function DashboardTab({ onNavigate }) {
               </div>
 
               <p className="mt-3 text-sm leading-6 text-slate-700">
-                {lastStableDecision?.summary || stableAutomationStatus.detail}
+                {isAutomationErrorStatus(defiLoopState?.lastStatus)
+                  ? stableAutomationStatus.detail
+                  : (lastStableDecision?.summary || stableAutomationStatus.detail)}
               </p>
 
               {stableDecisionIsLegacy && (
@@ -2515,12 +2553,12 @@ export default function DashboardTab({ onNavigate }) {
 
               <div className="mt-3 grid gap-2 md:grid-cols-3">
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Blocked By</p>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{stableAutomationIssueTitle}</p>
                   <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {stableOracleGuardContext?.reasonLabel || (lastStableDecision?.blockedBy ? humanizeAutomationAction(lastStableDecision.blockedBy) : 'None')}
+                    {stableAutomationIssueLabel}
                   </p>
                   <p className="mt-1 text-[11px] text-slate-500">
-                    {stableOracleGuardContext?.reasonDetail || 'Hold reason appears here when the policy refuses execution.'}
+                    {stableAutomationIssueDetail}
                   </p>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
