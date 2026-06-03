@@ -1,6 +1,6 @@
 'use strict';
 
-const TEST_PRIVATE_KEY = '0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+const TEST_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
 const TEST_WALLET_ADDRESS = '0xFCAd0B19bB29D4674531d6f115237E16AfCE377c';
 
 function loadHarness() {

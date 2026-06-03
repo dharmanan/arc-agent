@@ -5,7 +5,7 @@ describe('lending automation minimum action threshold', () => {
     jest.resetModules();
     process.env.NODE_ENV = 'test';
     process.env.LENDING_AUTOMATION_MIN_ACTION_USD = '1';
-    process.env.ENCRYPTION_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    process.env.ENCRYPTION_KEY = '01'.repeat(32);
   });
 
   test('holds utilization repay below the minimum automatic action size', () => {

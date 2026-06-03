@@ -1,6 +1,7 @@
 # Arc Machina
 
 
+
 Arc Machina exists because the agent economy still asks non-technical users to do too much by hand: write code, manage raw private keys, stitch together fragile testnet infrastructure, and find usable data before an agent can do anything meaningful.
 
 This project turns that broken path into one product. A user connects a normal wallet, creates a separate agent wallet, protects that agent with a passkey, sets limits and permissions, and then uses the agent for swaps, bridges, DeFi actions, jobs, paid research cards, and background automation.
@@ -769,6 +770,34 @@ UI state and product surfaces
 
 7. Protocol integrations are layered, not hardcoded into routes.
 	The backend uses service adapters for Curve, lending, swaps, bridge flow, and Gateway payment rails.
+
+### 12.1 Live Contract Surface
+
+The live Arc Testnet surface used by the product is split between repo-owned contracts, liquidity rails, and external infrastructure.
+
+1. Repo-owned contracts on Arc Testnet
+	- AgentWalletFactory: `0xA16B21F856BB0b33220D7391f48D0D0248834643`
+	- AgenticCommerce (ERC-8183): `0x35e9EA4cba090f5C38C57CEBa67AB558c2FB3397`
+	- ReputationRegistry (ERC-8004): `0xBDa45b03781Ea61A4ee9B19F27B5c063DE031bDF`
+	- ArcRevenuePool: `0x7E84fFFAA5f0524CD55b13B6AEC7eE0785c07e5e`
+	- ArcLendingPool: `0x2774242539CCB2e63FED506beC77ceDb96984d6C`
+
+2. Live liquidity and token rails used by the product
+	- cirBTC token: `0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF`
+	- cirBTC / USDC direct pair: `0x10D4115Da1880C4b4D424F69f3a9DBd7a2B8ffd0`
+	- cirBTC / EURC direct pair: `0x6f29F477D950821683dbE249DbB5D87d48183535`
+	- USDC / EURC Curve fallback pool: `0x2D84D79C852f6842AbE0304b70bBaA1506AdD457`
+
+3. External Circle and Arc infrastructure rails used by the product
+	- Circle CCTP TokenMessenger: `0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA`
+	- Circle CCTP MessageTransmitter: `0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275`
+	- Circle Gateway Wallet: `0x0077777d7EBA4688BDeF3E311b846F25870A19B9`
+	- Circle Gateway Minter: `0x0022222ABE238Cc2C7Bb1f21003F0a260052475B`
+	- Arc BridgeKit contract: `0xC5567a5E3370d4DBfB0540025078e283e36A363d`
+
+4. Swap fallback routing is code-routed, not contract-routed.
+	There is no separate custom fallback swap contract in the repo.
+	Stable fallback uses the verified Curve pool, while cirBTC fallback uses the direct pair contracts listed above.
 
 ### 13. Core Data Model
 

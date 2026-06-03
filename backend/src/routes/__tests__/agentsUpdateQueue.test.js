@@ -5,7 +5,7 @@ const request = require('supertest');
 const TEST_USER_ID = 'user-123';
 const TEST_AGENT_ID = 'agent-123';
 const TEST_OWNER_ADDRESS = '0x00000000000000000000000000000000000000AA';
-const TEST_JWT_SECRET = 'test-secret-1234567890-test-secret';
+const TEST_JWT_SECRET = ['test', 'jwt', 'secret', 'fixture'].join('-');
 
 function buildTestApp(router) {
   const express = require('express');

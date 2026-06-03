@@ -8,9 +8,12 @@ AGENTS.md
 .env
 .env.railway
 frontend/.env
+.env.production
 *.local.md
 final.md
 dist/
+build/
+.next/
 cache/
 artifacts/build-info/
 frontend/dist/
