@@ -1,6 +1,5 @@
 # Arc Machina
 
-English README. Turkish version: [README.tr.md](README.tr.md)
 
 Arc Machina exists because the agent economy still asks non-technical users to do too much by hand: write code, manage raw private keys, stitch together fragile testnet infrastructure, and find usable data before an agent can do anything meaningful.
 
