@@ -2386,9 +2386,15 @@ function formatTaskIdLabel(taskId, fallback = 'Task') {
   return words.length > 0 ? words.join(' ') : fallback;
 }
 
-function formatAutomationMetric(value, digits = 2) {
+function toFiniteAutomationMetric(value) {
+  if (value === null || value === undefined || value === '') return null;
   const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return '—';
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function formatAutomationMetric(value, digits = 2) {
+  const numeric = toFiniteAutomationMetric(value);
+  if (numeric === null) return '—';
   return numeric.toFixed(digits).replace(/\.0+$|(?<=\.\d*?)0+$/g, '');
 }
 
@@ -2473,6 +2479,11 @@ function getAutomationStatusClasses(status, enabled) {
     return 'border-amber-200 bg-amber-50 text-amber-700';
   }
   return 'border-red-200 bg-red-50 text-red-700';
+}
+
+function shouldShowLendingGuardThresholds(lastStatus) {
+  const normalized = String(lastStatus || '').trim().toLowerCase();
+  return !['position_guard_unavailable', 'fetch_error'].includes(normalized);
 }
 
 function getCirbtcAutomationFreshness(defiLoopState, cirbtcState) {
@@ -2725,10 +2736,22 @@ function getAutomationSummary(feature, state, agent) {
       }
       return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} stable checks ran and ${Number(state?.autoTxToday || 0)} live trades were sent. This card only controls the stable USDC/EURC route.${bypassNote}`;
     case 'lendingAutomation': {
-      const healthFactor = Number(state?.lastDecision?.healthFactor);
-      const utilizationCap = Number(state?.lastDecision?.utilizationCapPct);
-      const triggerSummary = Number.isFinite(healthFactor) || Number.isFinite(utilizationCap)
-        ? ` Latest visible thresholds: HF ${formatAutomationMetric(healthFactor, 4)} and utilization cap ${formatAutomationMetric(utilizationCap, 2)}%.`
+      const metricsVisible = shouldShowLendingGuardThresholds(state?.lastStatus);
+      const healthFactor = metricsVisible
+        ? toFiniteAutomationMetric(state?.lastDecision?.healthFactor)
+        : null;
+      const utilizationCap = metricsVisible
+        ? toFiniteAutomationMetric(state?.lastDecision?.utilizationCapPct)
+        : null;
+      const thresholdLabels = [];
+      if (healthFactor !== null) {
+        thresholdLabels.push(`HF ${formatAutomationMetric(healthFactor, 4)}`);
+      }
+      if (utilizationCap !== null) {
+        thresholdLabels.push(`utilization cap ${formatAutomationMetric(utilizationCap, 2)}%`);
+      }
+      const triggerSummary = thresholdLabels.length > 0
+        ? ` Latest visible thresholds: ${thresholdLabels.join(' and ')}.`
         : '';
       if (state?.lastStatus === 'dry_run') {
         return `Practice mode is active. ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} lending protection checks ran, and no live protection step was sent from this card.${triggerSummary}${bypassNote}`;
@@ -2736,12 +2759,12 @@ function getAutomationSummary(feature, state, agent) {
       return `Today ${Number(state?.todayCount || 0)}/${Number(state?.dailyCap || 10)} lending protection checks ran and ${Number(state?.autoTxToday || 0)} live protection steps were sent. This card can auto-repay, top up collateral, or force LP reduction before the stable lane takes fresh risk.${triggerSummary}${bypassNote}`;
     }
     case 'carryAutomation': {
-      const netCarryApyPct = Number(state?.lastDecision?.netCarryApyPct);
-      const projectedHealthFactor = Number(state?.lastDecision?.projectedOpenHealthFactor);
-      const spreadSummary = Number.isFinite(netCarryApyPct)
+      const netCarryApyPct = toFiniteAutomationMetric(state?.lastDecision?.netCarryApyPct);
+      const projectedHealthFactor = toFiniteAutomationMetric(state?.lastDecision?.projectedOpenHealthFactor);
+      const spreadSummary = netCarryApyPct !== null
         ? ` Latest visible estimated net yield: ${formatAutomationMetric(netCarryApyPct, 2)}%.`
         : '';
-      const healthSummary = Number.isFinite(projectedHealthFactor)
+      const healthSummary = projectedHealthFactor !== null
         ? ` Projected safety buffer after a new carry leg: ${formatAutomationMetric(projectedHealthFactor, 4)}.`
         : '';
       const carryHoldSummary = state?.lastDecision?.summary
@@ -5213,6 +5236,9 @@ export default function TasksTab() {
           ? getCirbtcAutomationFreshness(agentStatus?.automation?.defiLoop || null, automationState)
           : null;
         const lastStatus = automationState?.lastStatus || (enabled ? 'idle' : 'disabled');
+        const lendingMetricsVisible = feature.statusKey === 'lendingAutomation'
+          ? shouldShowLendingGuardThresholds(lastStatus)
+          : true;
         const displayLastRunAt = automationState?.lastDecision?.recordedAt || automationState?.lastRunAt || null;
         const automationSummary = feature.statusKey === 'cirbtcLp'
           ? getCirbtcAutomationRuntimeSummary(automationState, cirbtcFreshness)
@@ -5328,15 +5354,15 @@ export default function TasksTab() {
                   <div className="mt-3 grid gap-2 md:grid-cols-3">
                     <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
                       <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Health Factor</p>
-                      <p className="mt-1 text-sm font-medium text-slate-700">{formatAutomationMetric(automationState.lastDecision.healthFactor, 4)}</p>
+                      <p className="mt-1 text-sm font-medium text-slate-700">{formatAutomationMetric(lendingMetricsVisible ? automationState.lastDecision.healthFactor : null, 4)}</p>
                     </div>
                     <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
                       <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Utilization Cap</p>
-                      <p className="mt-1 text-sm font-medium text-slate-700">{formatAutomationMetric(automationState.lastDecision.utilizationCapPct, 2)}%</p>
+                      <p className="mt-1 text-sm font-medium text-slate-700">{lendingMetricsVisible ? `${formatAutomationMetric(automationState.lastDecision.utilizationCapPct, 2)}%` : '—'}</p>
                     </div>
                     <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
                       <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Next Protected Asset</p>
-                      <p className="mt-1 text-sm font-medium text-slate-700">{automationState.lastDecision.actionAssetSymbol || automationState.lastDecision.targetDebtAsset || '—'}</p>
+                      <p className="mt-1 text-sm font-medium text-slate-700">{lendingMetricsVisible ? (automationState.lastDecision.actionAssetSymbol || automationState.lastDecision.targetDebtAsset || '—') : '—'}</p>
                     </div>
                   </div>
                 )}

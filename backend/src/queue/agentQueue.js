@@ -202,6 +202,11 @@ function normalizeUsdcAmount(amount) {
   return Math.floor(numeric * 1_000_000) / 1_000_000;
 }
 
+function normalizeOptionalUsdcAmount(amount) {
+  if (amount === null || amount === undefined || amount === '') return null;
+  return normalizeUsdcAmount(amount);
+}
+
 function getAgentGatewayAutoTopupConfig(agent) {
   const minAvailableUsdc = normalizeUsdcAmount(
     agent?.gateway_auto_topup_min_usdc ?? DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC,
@@ -703,6 +708,7 @@ function buildLendingAutomationDecisionSnapshot({
 } = {}) {
   const verdict = lendingPolicy?.verdict || {};
   const metrics = lendingPolicy?.metrics || {};
+  const utilizationCapPct = normalizeOptionalUsdcAmount(metrics.utilizationCapPct);
 
   return {
     recordedAt: new Date().toISOString(),
@@ -728,7 +734,7 @@ function buildLendingAutomationDecisionSnapshot({
     healthFactorTrigger: metrics.healthFactorTrigger ?? null,
     totalBorrowUsd: normalizeUsdcAmount(metrics.totalBorrowUsd ?? lendingSurface?.risk?.totalBorrowUsd),
     totalSuppliedUsd: normalizeUsdcAmount(metrics.totalSuppliedUsd ?? lendingSurface?.risk?.totalSuppliedUsd),
-    utilizationCapPct: normalizeUsdcAmount(metrics.utilizationCapPct),
+    utilizationCapPct,
     breachedAssets: Array.isArray(metrics.breachedAssets) ? metrics.breachedAssets : [],
     recoveryStatus: metrics.recoveryStatus || null,
     collateralTopUpStatus: metrics.collateralTopUpStatus || null,
