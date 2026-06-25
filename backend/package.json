@@ -30,7 +30,7 @@
     "@coral-xyz/anchor": "^0.32.1",
     "@simplewebauthn/server": "^13.3.0",
     "@x402/core": "^2.13.0",
-    "@x402/evm": "^2.13.0",
+    "@x402/evm": "^2.16.0",
     "@x402/express": "^2.12.0",
     "axios": "^1.16.0",
     "bcryptjs": "^3.0.3",
