@@ -56,6 +56,7 @@ const WATCHED_CONTRACTS = {
 
 const httpProviders = new Map();
 const lastPolledBlock = new Map();
+const archiveBackfillSkippedChains = new Set();
 
 let pollInFlight = false;
 let lastWatcherCount = null;
@@ -86,6 +87,11 @@ function withTimeout(promise, ms) {
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)),
   ]);
+}
+
+function isArchiveAccessError(error) {
+  const message = String(error?.message || error?.error?.message || '').toLowerCase();
+  return message.includes('archive requests require');
 }
 
 function normalizeWatchedTokenSymbol(symbol) {
@@ -482,13 +488,15 @@ async function pollChain(chain, config) {
   const watchedTokens = (config.tokens || []).filter(token => token?.address);
   if (!config.rpcHttp || watchedTokens.length === 0) return;
 
+  let latest = null;
+
   try {
     const watchedAgents = await loadWatchedAgents();
     const walletAddresses = [...watchedAgents.keys()];
     if (walletAddresses.length === 0) return;
 
     const httpProvider = getHttpProvider(chain, config.rpcHttp);
-    const latest = await withTimeout(httpProvider.getBlockNumber(), 8_000);
+    latest = await withTimeout(httpProvider.getBlockNumber(), 8_000);
     const previousBlock = lastPolledBlock.get(chain);
     const fromBlock = previousBlock == null
       ? Math.max(latest - STARTUP_BACKFILL_BLOCKS, 0)
@@ -520,6 +528,19 @@ async function pollChain(chain, config) {
       console.log(`[INDEXER] ${chain} poll blocks ${fromBlock}–${latest}: ${matchedTransfers} matched transfer(s)`);
     }
   } catch (err) {
+    if (isArchiveAccessError(err)) {
+      lastPolledBlock.set(chain, latest);
+
+      if (!archiveBackfillSkippedChains.has(chain)) {
+        archiveBackfillSkippedChains.add(chain);
+        console.warn(
+          `[INDEXER] ${chain} RPC does not allow historical eth_getLogs; skipping backfill to resume live polling from block ${latest}.`,
+        );
+      }
+
+      return;
+    }
+
     console.warn(`[INDEXER] ${chain} poll error:`, err.message);
   }
 }

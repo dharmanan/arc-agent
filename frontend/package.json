@@ -37,14 +37,16 @@
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",
-    "vite": "^8.0.13"
+    "vite": "^8.0.16"
   },
   "overrides": {
     "axios": "^1.16.0",
     "esbuild": "^0.25.0",
-    "hono": "^4.12.21",
+    "form-data": "4.0.6",
+    "hono": "^4.12.25",
     "jayson": {
-      "uuid": "11.1.1"
+      "uuid": "11.1.1",
+      "ws": "7.5.11"
     },
     "@metamask/eth-json-rpc-provider": {
       "uuid": "11.1.1"
@@ -64,9 +66,16 @@
     "@metamask/sdk-communication-layer": {
       "uuid": "11.1.1"
     },
+    "@solana/web3.js": {
+      "ws": "8.21.0"
+    },
     "@metamask/utils": {
       "uuid": "11.1.1"
     },
-    "ws": "8.20.1"
+    "rpc-websockets": {
+      "ws": "8.21.0"
+    },
+    "ua-parser-js": "2.0.10",
+    "ws": "8.21.0"
   }
 }
