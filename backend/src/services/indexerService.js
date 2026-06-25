@@ -36,6 +36,11 @@ const TOKEN_PRICE_FALLBACK_USD = {
   EURC: 1.08,
 };
 
+const CHAIN_ENV_PREFIX = {
+  'Arc Testnet': 'ARC_TESTNET',
+  'Sepolia': 'SEPOLIA',
+};
+
 const WATCHED_CONTRACTS = {
   'Arc Testnet': {
     tokens: [
@@ -43,20 +48,21 @@ const WATCHED_CONTRACTS = {
       { symbol: 'EURC', address: process.env.EURC_ADDRESS_ARC, decimals: 6 },
       { symbol: 'cirBTC', address: process.env.CIRBTC_ADDRESS_ARC, decimals: 8 },
     ],
-    rpcHttp: process.env.ARC_TESTNET_RPC,
+    rpcHttp: process.env.ARC_TESTNET_INDEXER_RPC || process.env.ARC_TESTNET_RPC,
   },
   'Sepolia': {
     tokens: [
       { symbol: 'USDC', address: process.env.USDC_ADDRESS_SEPOLIA, decimals: 6 },
       { symbol: 'EURC', address: process.env.EURC_ADDRESS_SEPOLIA, decimals: 6 },
     ],
-    rpcHttp: process.env.SEPOLIA_RPC,
+    rpcHttp: process.env.SEPOLIA_INDEXER_RPC || process.env.SEPOLIA_RPC,
   },
 };
 
 const httpProviders = new Map();
 const lastPolledBlock = new Map();
 const archiveBackfillSkippedChains = new Set();
+const initialCursorLoadedChains = new Set();
 
 let pollInFlight = false;
 let lastWatcherCount = null;
@@ -92,6 +98,57 @@ function withTimeout(promise, ms) {
 function isArchiveAccessError(error) {
   const message = String(error?.message || error?.error?.message || '').toLowerCase();
   return message.includes('archive requests require');
+}
+
+function getChainEnvPrefix(chain) {
+  return CHAIN_ENV_PREFIX[chain] || String(chain || '').trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+}
+
+function readBackfillBlocks(chain) {
+  const chainPrefix = getChainEnvPrefix(chain);
+  const chainValue = Number.parseInt(process.env[`${chainPrefix}_INDEXER_BACKFILL_BLOCKS`] || '', 10);
+  if (Number.isInteger(chainValue) && chainValue >= 0) return chainValue;
+
+  const sharedValue = Number.parseInt(process.env.INDEXER_BACKFILL_BLOCKS || '', 10);
+  if (Number.isInteger(sharedValue) && sharedValue >= 0) return sharedValue;
+
+  return STARTUP_BACKFILL_BLOCKS;
+}
+
+function readPinnedStartBlock(chain) {
+  const chainPrefix = getChainEnvPrefix(chain);
+  const rawValue = process.env[`${chainPrefix}_INDEXER_START_BLOCK`] || process.env.INDEXER_START_BLOCK;
+  const pinnedBlock = Number.parseInt(rawValue || '', 10);
+  return Number.isInteger(pinnedBlock) && pinnedBlock >= 0 ? pinnedBlock : null;
+}
+
+async function loadInitialCursor(chain, latest) {
+  if (initialCursorLoadedChains.has(chain)) return;
+
+  const pinnedStartBlock = readPinnedStartBlock(chain);
+  if (pinnedStartBlock != null) {
+    lastPolledBlock.set(chain, Math.max(Math.min(pinnedStartBlock - 1, latest), -1));
+    initialCursorLoadedChains.add(chain);
+    return;
+  }
+
+  const { rows: [row] } = await db.query(
+    `SELECT MAX(block_number)::bigint AS last_block
+       FROM chain_events
+      WHERE chain = $1`,
+    [chain],
+  );
+
+  const persistedBlock = Number(row?.last_block);
+  if (Number.isFinite(persistedBlock) && persistedBlock >= 0) {
+    lastPolledBlock.set(chain, persistedBlock);
+    initialCursorLoadedChains.add(chain);
+    return;
+  }
+
+  const backfillBlocks = readBackfillBlocks(chain);
+  lastPolledBlock.set(chain, Math.max(latest - backfillBlocks, -1));
+  initialCursorLoadedChains.add(chain);
 }
 
 function normalizeWatchedTokenSymbol(symbol) {
@@ -497,10 +554,9 @@ async function pollChain(chain, config) {
 
     const httpProvider = getHttpProvider(chain, config.rpcHttp);
     latest = await withTimeout(httpProvider.getBlockNumber(), 8_000);
+    await loadInitialCursor(chain, latest);
     const previousBlock = lastPolledBlock.get(chain);
-    const fromBlock = previousBlock == null
-      ? Math.max(latest - STARTUP_BACKFILL_BLOCKS, 0)
-      : previousBlock + 1;
+    const fromBlock = previousBlock == null ? latest : previousBlock + 1;
 
     if (fromBlock > latest) {
       lastPolledBlock.set(chain, latest);
