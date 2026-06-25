@@ -12,6 +12,7 @@ const {
   createGatewayResourceServer,
 } = require('../services/agenticEconomy/gatewaySeller');
 const { buildJobReviewPolicy, JOB_REVIEW_TIMEOUT_HOURS } = require('../services/jobRetentionService');
+const { createArcRpcProvider } = require('../services/arcProvider');
 const { assertAgentOperational } = require('../services/securityEventService');
 
 const ACTIVE_JOB_STATUSES = ['funded', 'delivered', 'open'];
@@ -50,7 +51,7 @@ function getContract(signerOrProvider) {
 }
 
 async function getProviderAndSigner(privateKey) {
-  const provider = new ethers.JsonRpcProvider(ARC_RPC_URL, { chainId: 5042002, name: 'Arc Testnet' });
+  const provider = createArcRpcProvider(ARC_RPC_URL);
   const signer = new ethers.Wallet(privateKey, provider);
   return { provider, signer };
 }

@@ -17,7 +17,7 @@ async function main() {
     ),
   );
 
-  const rpc     = process.env.ARC_TESTNET_RPC || 'https://rpc.arc-testnet.io';
+  const rpc     = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
   const usdc    = process.env.USDC_ADDRESS_ARC || '0x3600000000000000000000000000000000000000';
 
   const provider = new ethers.JsonRpcProvider(rpc);

@@ -2,6 +2,7 @@
 
 const { ethers } = require('ethers');
 const { sendProtectedContractTx } = require('../txSecurityService');
+const { createArcRpcProvider } = require('../arcProvider');
 
 const CONSTANT_PRODUCT_PAIR_ABI = [
   'function token0() view returns (address)',
@@ -193,7 +194,7 @@ async function getConstantProductQuote({
   decimalsOut = 6,
   feePct = 0.3,
 }) {
-  const provider = new ethers.JsonRpcProvider(getArcRpcUrl());
+  const provider = createArcRpcProvider(getArcRpcUrl());
   const pairState = await readPairState(pairAddress, provider);
   const direction = resolveSwapDirection(pairState, tokenInAddress, tokenOutAddress);
   const amountInRaw = ethers.parseUnits(String(amountIn), decimalsIn);
@@ -222,7 +223,7 @@ async function executeConstantProductSwap({
     throw new Error('agentPrivateKey is required');
   }
 
-  const provider = new ethers.JsonRpcProvider(getArcRpcUrl());
+  const provider = createArcRpcProvider(getArcRpcUrl());
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const pairState = await readPairState(pairAddress, signer);
   const direction = resolveSwapDirection(pairState, tokenInAddress, tokenOutAddress);
@@ -281,7 +282,7 @@ async function executeConstantProductAddLiquidity({
     throw new Error('agentPrivateKey is required');
   }
 
-  const provider = new ethers.JsonRpcProvider(getArcRpcUrl());
+  const provider = createArcRpcProvider(getArcRpcUrl());
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const pairState = await readPairState(pairAddress, signer);
   const pair = new ethers.Contract(pairAddress, CONSTANT_PRODUCT_PAIR_ABI, signer);
@@ -349,7 +350,7 @@ async function executeConstantProductZapIn({
     throw new Error('agentPrivateKey is required');
   }
 
-  const provider = new ethers.JsonRpcProvider(getArcRpcUrl());
+  const provider = createArcRpcProvider(getArcRpcUrl());
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const pairState = await readPairState(pairAddress, signer);
   const direction = resolveSwapDirection(pairState, tokenInAddress, tokenOutAddress);
@@ -476,7 +477,7 @@ async function executeConstantProductRemoveLiquidity({
     throw new Error('withdrawPct must be between 0 and 100');
   }
 
-  const provider = new ethers.JsonRpcProvider(getArcRpcUrl());
+  const provider = createArcRpcProvider(getArcRpcUrl());
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const pairState = await readPairState(pairAddress, signer);
   const pair = new ethers.Contract(pairAddress, CONSTANT_PRODUCT_PAIR_ABI, signer);

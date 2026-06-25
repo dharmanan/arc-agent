@@ -3,6 +3,7 @@
 const { ethers } = require('ethers');
 const db = require('../db');
 const { decrypt } = require('./cryptoService');
+const { createArcRpcProvider } = require('./arcProvider');
 const gatewayAuditService = require('./agenticEconomy/gatewayAuditService');
 const { recordReputationEvent, EVENT_TYPES } = require('./reputationService');
 
@@ -76,7 +77,7 @@ async function cancelOnchainJobIfNeeded(job) {
   }
 
   try {
-    const provider = new ethers.JsonRpcProvider(ARC_RPC_URL, { chainId: 5042002, name: 'Arc Testnet' });
+    const provider = createArcRpcProvider(ARC_RPC_URL);
     const signer = new ethers.Wallet(decrypt(job.private_key_encrypted), provider);
     const contract = new ethers.Contract(AGENTIC_COMMERCE_ADDRESS, AGENTIC_COMMERCE_ABI, signer);
     const tx = await contract.cancel(BigInt(job.job_id_onchain));

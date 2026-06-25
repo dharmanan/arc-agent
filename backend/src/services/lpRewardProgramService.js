@@ -4,6 +4,7 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const oracle = require('./oracle');
 const { resolveCurvePool, resolveDirectSwapFallbackPool } = require('./oracle/pools');
+const { createArcRpcProvider } = require('./arcProvider');
 
 const DEFAULT_EPOCH_DURATION_MINUTES = 60;
 const DEFAULT_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
@@ -20,8 +21,7 @@ function readPositiveIntegerEnv(name, fallback) {
 }
 
 function getProvider() {
-  const rpcUrl = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
-  return new ethers.JsonRpcProvider(rpcUrl);
+  return createArcRpcProvider();
 }
 
 function toNumericString(value, fallback = '0') {

@@ -5,6 +5,7 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const oracle = require('./oracle');
 const positionsService = require('./positionsService');
+const { createArcRpcProvider } = require('./arcProvider');
 
 const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
 const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
@@ -36,7 +37,7 @@ let _provider = null;
 
 function getProvider() {
   if (!_provider) {
-    _provider = new ethers.JsonRpcProvider(ARC_RPC_URL);
+    _provider = createArcRpcProvider(ARC_RPC_URL);
   }
 
   return _provider;

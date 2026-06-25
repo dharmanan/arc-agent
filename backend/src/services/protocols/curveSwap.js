@@ -12,6 +12,7 @@
  */
 const { ethers }  = require('ethers');
 const { sendProtectedContractTx } = require('../txSecurityService');
+const { createArcRpcProvider } = require('../arcProvider');
 
 const CURVE_EXCHANGE_ABI = [
   // Read: how many coins[j] do I get for dx coins[i]?
@@ -118,7 +119,7 @@ async function approveIfNeeded(tokenAddress, signer, spender, amountRaw, txSecur
 async function getCurveQuote(poolAddress, indexIn, indexOut, amountIn, decimalsIn = 6, decimalsOut = 6) {
   const rpcUrl  = getArcRpcUrl();
 
-  const provider  = new ethers.JsonRpcProvider(rpcUrl);
+  const provider  = createArcRpcProvider(rpcUrl);
   const pool      = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, provider);
   const amountRaw = ethers.parseUnits(String(amountIn), decimalsIn);
   const outRaw    = await pool.get_dy(indexIn, indexOut, amountRaw);
@@ -158,7 +159,7 @@ async function executeCurveSwap({
   const rpcUrl  = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
-  const provider  = new ethers.JsonRpcProvider(rpcUrl);
+  const provider  = createArcRpcProvider(rpcUrl);
   const signer    = new ethers.Wallet(agentPrivateKey, provider);
   const amountRaw = ethers.parseUnits(String(amountIn), decimalsIn);
 
@@ -204,7 +205,7 @@ async function executeCurveAddLiquidity({
   const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const provider = createArcRpcProvider(rpcUrl);
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const amountRaw = ethers.parseUnits(String(amountIn), decimalsIn);
   const depositAmounts = buildCurveDepositAmounts(indexIn, amountRaw);
@@ -250,7 +251,7 @@ async function executeCurveAddLiquidityBalanced({
   const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const provider = createArcRpcProvider(rpcUrl);
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const amount0Raw = ethers.parseUnits(String(amount0), decimals0);
   const amount1Raw = ethers.parseUnits(String(amount1), decimals1);
@@ -300,7 +301,7 @@ async function executeCurveRemoveLiquidityOneCoin({
   const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const provider = createArcRpcProvider(rpcUrl);
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
   const lpAmountRaw = ethers.parseUnits(String(lpAmount), lpDecimals);
@@ -339,7 +340,7 @@ async function executeCurveRemoveLiquidity({
   const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const provider = createArcRpcProvider(rpcUrl);
   const signer = new ethers.Wallet(agentPrivateKey, provider);
   const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
   const lpAmountRaw = ethers.parseUnits(String(lpAmount), lpDecimals);

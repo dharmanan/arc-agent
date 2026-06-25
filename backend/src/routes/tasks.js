@@ -17,6 +17,7 @@ const { isDailyLimitBypassed } = require('../services/dailyLimitBypass');
 const taskRunService = require('../services/taskRunService');
 const nativeLendingRiskService = require('../services/nativeLendingRiskService');
 const { getAgentWithKey } = require('../services/agentService');
+const { createArcRpcProvider } = require('../services/arcProvider');
 const { assertAgentOperational } = require('../services/securityEventService');
 const {
   buildCirclePaidHandoff,
@@ -43,9 +44,8 @@ const DEFAULT_REVENUE_POOL_ADDRESS = '0x7E84fFFAA5f0524CD55b13B6AEC7eE0785c07e5e
 
 function _getPoolContract() {
   const addr = process.env.REVENUE_POOL_ADDRESS || DEFAULT_REVENUE_POOL_ADDRESS;
-  const rpc  = process.env.ARC_TESTNET_RPC || 'https://rpc.arc-testnet.io';
   if (!addr) return null;
-  const provider = new ethers.JsonRpcProvider(rpc);
+  const provider = createArcRpcProvider();
   return new ethers.Contract(addr, _POOL_VIEW_ABI, provider);
 }
 

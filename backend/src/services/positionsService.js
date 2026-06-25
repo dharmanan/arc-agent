@@ -4,6 +4,7 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const oracle = require('./oracle');
 const { resolveCurvePool, resolveDirectSwapFallbackPool } = require('./oracle/pools');
+const { createArcRpcProvider } = require('./arcProvider');
 
 const CURVE_POSITION_ABI = [
   'function balanceOf(address account) view returns (uint256)',
@@ -53,8 +54,7 @@ const LP_MAX_APR_PCT = {
 };
 
 function getProvider() {
-  const rpcUrl = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
-  return new ethers.JsonRpcProvider(rpcUrl);
+  return createArcRpcProvider();
 }
 
 function formatUnits(value, decimals) {

@@ -2,6 +2,7 @@
 
 const { ethers } = require('ethers');
 const { sendProtectedContractTx } = require('../txSecurityService');
+const { createArcRpcProvider } = require('../arcProvider');
 
 const ERC20_APPROVE_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
@@ -69,7 +70,7 @@ function getNativeLendingContract(signerOrProvider) {
 }
 
 function getReadProvider() {
-  return new ethers.JsonRpcProvider(getArcRpcUrl());
+  return createArcRpcProvider(getArcRpcUrl());
 }
 
 function resolveLendingAsset(asset) {

@@ -2,6 +2,7 @@
 
 const { ethers } = require('ethers');
 const { getCache, setCache, TTL } = require('./cache');
+const { createArcRpcProvider } = require('../arcProvider');
 
 // Curve pool ABI — only needed functions
 const CURVE_POOL_ABI = [
@@ -124,7 +125,7 @@ function roundTo(value, digits) {
 function getProvider() {
   const rpcUrl = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC;
   if (!rpcUrl) throw new Error('ARC_RPC_URL or ARC_TESTNET_RPC is not defined');
-  return new ethers.JsonRpcProvider(rpcUrl);
+  return createArcRpcProvider(rpcUrl);
 }
 
 async function getCurvePoolState(poolName, poolAddress, token0Decimals = 6, token1Decimals = 6) {

@@ -8,6 +8,7 @@
  * the agent's primary operation is never blocked by this.
  */
 const { ethers } = require('ethers');
+const { createArcRpcProvider } = require('./arcProvider');
 const db          = require('../db');
 const { sendProtectedContractTx } = require('./txSecurityService');
 
@@ -138,7 +139,7 @@ function createArcTestnetProvider(rpcUrl) {
   const cached = arcProviderCache.get(resolvedRpcUrl);
   if (cached) return cached;
 
-  const provider = new ethers.JsonRpcProvider(resolvedRpcUrl, ARC_TESTNET_NETWORK);
+  const provider = createArcRpcProvider(resolvedRpcUrl);
   arcProviderCache.set(resolvedRpcUrl, provider);
   return provider;
 }

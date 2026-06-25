@@ -7,6 +7,7 @@ const agentWalletService = require('../agentWalletService');
 const positionsService = require('../positionsService');
 const { decrypt } = require('../cryptoService');
 const nativeLendingRiskService = require('../nativeLendingRiskService');
+const { createArcRpcProvider } = require('../arcProvider');
 const { readOracleEntryCooldown } = require('../agentService');
 const { resolveDirectSwapFallbackPool } = require('../oracle/pools');
 const { evaluateOracleStrategyPolicy } = require('../oracleStrategyPolicy');
@@ -38,7 +39,7 @@ let _arcProvider = null;
 
 function _getArcProvider() {
   if (!_arcProvider) {
-    _arcProvider = new ethers.JsonRpcProvider(ARC_RPC_URL);
+    _arcProvider = createArcRpcProvider(ARC_RPC_URL);
   }
 
   return _arcProvider;

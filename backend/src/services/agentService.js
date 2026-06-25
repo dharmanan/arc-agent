@@ -251,9 +251,10 @@ async function _registerErc8004(agentId, walletAddress, agentPrivateKey) {
   const rpc = process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
   const relayerKey = process.env.RELAYER_PRIVATE_KEY;
 
+  const { createArcRpcProvider } = require('./arcProvider');
   if (!relayerKey) throw new Error('RELAYER_PRIVATE_KEY not set');
 
-  const provider   = new ethers.JsonRpcProvider(rpc, { chainId: 5042002, name: 'Arc Testnet' });
+  const provider   = createArcRpcProvider(rpc);
   const relayer    = new ethers.Wallet(relayerKey, provider);
   const agentEOA   = new ethers.Wallet(agentPrivateKey, provider);
   const registry   = new ethers.Contract(IDENTITY_REGISTRY_ADDRESS, IDENTITY_REGISTRY_ABI, relayer);

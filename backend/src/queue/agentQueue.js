@@ -36,6 +36,7 @@ const bridgeActivityService = require('../services/bridgeActivityService');
 const taskRunService = require('../services/taskRunService');
 const { ensureGatewayWarmBalance } = require('../services/agenticEconomy/gatewayBuyer');
 const { shouldTrackAutoCarryStartHandoff } = require('../services/autoCarryTaskRunPolicy');
+const { createArcRpcProvider } = require('../services/arcProvider');
 
 const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
 const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
@@ -47,6 +48,9 @@ const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC = 3;
 const GATEWAY_AUTO_WARM_DEBOUNCE_MS = Math.max(
   Number.parseInt(process.env.GATEWAY_AUTO_WARM_DEBOUNCE_MS || '15000', 10) || 15000,
   5000,
+);
+const LOG_LLM_AUTH_FALLBACKS = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.LOG_LLM_AUTH_FALLBACKS || '').trim().toLowerCase(),
 );
 const gatewayAutoWarmDebounceByAgent = new Map();
 
@@ -323,7 +327,7 @@ async function maybeWarmAgentGatewayBalance(agent, trigger, overrides = {}) {
 
 async function getArcTokenBalance(walletAddress, tokenAddress, decimals = 6) {
   if (!walletAddress || !tokenAddress) return 0;
-  const provider = new ethers.JsonRpcProvider(ARC_RPC_URL);
+  const provider = createArcRpcProvider(ARC_RPC_URL);
   const contract = new ethers.Contract(tokenAddress, ERC20_BALANCE_ABI, provider);
   const rawBalance = await contract.balanceOf(walletAddress);
   return normalizeUsdcAmount(ethers.formatUnits(rawBalance, decimals));
@@ -2326,6 +2330,9 @@ function shouldLogLlmAuthFallback(agentId, now = Date.now()) {
 }
 
 function logLlmAuthFallback(scope, agentId, error) {
+  if (!LOG_LLM_AUTH_FALLBACKS) {
+    return;
+  }
   const message = String(error?.message || error?.cause?.message || error || 'unknown auth error').trim();
   if (!shouldLogLlmAuthFallback(agentId)) {
     return;

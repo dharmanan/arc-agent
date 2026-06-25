@@ -11,6 +11,7 @@
  */
 const { ethers }  = require('ethers');
 const defiLlama   = require('../oracle/defiLlama');
+const { createArcRpcProvider } = require('../arcProvider');
 
 // Minimal Aave V3 Pool ABI
 const AAVE_POOL_ABI = [
@@ -46,7 +47,7 @@ async function getAaveApy(assetAddress, assetSymbol = 'USDC') {
     try {
       const rpcUrl  = getArcRpcUrl();
 
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const provider = createArcRpcProvider(rpcUrl);
       const pool     = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
       const data     = await pool.getReserveData(assetAddress);
 
@@ -94,7 +95,7 @@ async function executeAaveSupply({ assetAddress, amount, agentPrivateKey, decima
   const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
-  const provider  = new ethers.JsonRpcProvider(rpcUrl);
+  const provider  = createArcRpcProvider(rpcUrl);
   const signer    = new ethers.Wallet(agentPrivateKey, provider);
   const amountRaw = ethers.parseUnits(String(amount), decimals);
 
@@ -131,7 +132,7 @@ async function executeAaveWithdraw({ assetAddress, amount, agentPrivateKey, deci
   const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
 
-  const provider  = new ethers.JsonRpcProvider(rpcUrl);
+  const provider  = createArcRpcProvider(rpcUrl);
   const signer    = new ethers.Wallet(agentPrivateKey, provider);
 
   // ethers.MaxUint256 = withdraw entire balance
