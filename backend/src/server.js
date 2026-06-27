@@ -175,10 +175,30 @@ function startOptionalAsyncBackgroundJob(flagName, label, startFn, defaultValue 
   return true;
 }
 
-const BACKGROUND_JOBS_ENABLED = isEnvEnabled('BACKGROUND_JOBS_ENABLED', true);
+const BOOT_FLAGS = Object.freeze({
+  BACKGROUND_JOBS_ENABLED: isEnvEnabled('BACKGROUND_JOBS_ENABLED', true),
+  CHAIN_EVENT_RETENTION_ENABLED: isEnvEnabled('CHAIN_EVENT_RETENTION_ENABLED', true),
+  JOB_RETENTION_ENABLED: isEnvEnabled('JOB_RETENTION_ENABLED', true),
+  SECURITY_FREEZE_RECOVERY_ENABLED: isEnvEnabled('SECURITY_FREEZE_RECOVERY_ENABLED', true),
+  LP_REWARD_SNAPSHOT_ENABLED: isEnvEnabled('LP_REWARD_SNAPSHOT_ENABLED', true),
+  INDEXER_ENABLED: isEnvEnabled('INDEXER_ENABLED', true),
+  BRIDGE_POLLER_ENABLED: isEnvEnabled('BRIDGE_POLLER_ENABLED', true),
+  ORACLE_LOOP_ENABLED: isEnvEnabled('ORACLE_LOOP_ENABLED', true),
+  MARKET_ANALYSIS_LOOP_ENABLED: isEnvEnabled('MARKET_ANALYSIS_LOOP_ENABLED', true),
+  DEFI_LOOP_ENABLED: isEnvEnabled('DEFI_LOOP_ENABLED', true),
+  DAILY_TASKS_ENABLED: isEnvEnabled('DAILY_TASKS_ENABLED', true),
+  QUEUE_WORKERS_ENABLED: isEnvEnabled('QUEUE_WORKERS_ENABLED', true),
+  DRY_RUN: process.env.DRY_RUN === 'true',
+});
 const HEALTHCHECK_DB_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_DB_PROBE_ENABLED', true);
 const HEALTHCHECK_REDIS_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_REDIS_PROBE_ENABLED', true);
 const QUEUE_WORKER_STARTUP_DELAY_MS = parseInt(process.env.QUEUE_WORKER_STARTUP_DELAY_MS || '60000', 10);
+
+function formatBootFlagSummary(flags) {
+  return Object.entries(flags)
+    .map(([name, value]) => `${name}=${value}`)
+    .join(', ');
+}
 
 function shouldSkipAccessLog(req, res) {
   if (process.env.NODE_ENV !== 'production') return false;
@@ -405,7 +425,9 @@ async function bootstrap() {
     console.error('[REDIS] startup warning:', err.message);
   }
 
-  if (BACKGROUND_JOBS_ENABLED) {
+  console.log(`[BOOT] Background flags: ${formatBootFlagSummary(BOOT_FLAGS)}`);
+
+  if (BOOT_FLAGS.BACKGROUND_JOBS_ENABLED) {
     startOptionalBackgroundJob('CHAIN_EVENT_RETENTION_ENABLED', 'Chain event retention', startChainEventRetention);
     startOptionalBackgroundJob('JOB_RETENTION_ENABLED', 'Job retention', startJobRetention);
     startOptionalBackgroundJob('LP_REWARD_SNAPSHOT_ENABLED', 'LP reward snapshot writer', startLpRewardEpochSnapshotWriter);
@@ -427,7 +449,7 @@ async function bootstrap() {
     startOptionalAsyncBackgroundJob('DEFI_LOOP_ENABLED', 'DEFI_LOOP', () => agentQueue.scheduleDefiLoop());
     startOptionalAsyncBackgroundJob('DAILY_TASKS_ENABLED', 'DAILY_TASKS', () => agentQueue.scheduleDailyTasks());
 
-    if (isEnvEnabled('QUEUE_WORKERS_ENABLED', true)) {
+    if (BOOT_FLAGS.QUEUE_WORKERS_ENABLED) {
       setTimeout(() => {
         agentQueue.resumeLocalWorkers().catch(err => console.error('[QUEUE] resume startup error', err));
       }, Math.max(QUEUE_WORKER_STARTUP_DELAY_MS, 0));

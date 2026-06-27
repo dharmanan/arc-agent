@@ -18,10 +18,17 @@ const ERC20_ABI = [
 const TRANSFER_IFACE = new ethers.Interface(ERC20_ABI);
 const TRANSFER_TOPIC = TRANSFER_IFACE.getEvent('Transfer').topicHash;
 
-const POLL_INTERVAL_MS        = 30_000;
-const STARTUP_BACKFILL_BLOCKS = 300;
-const BLOCK_CHUNK_SIZE        = 250;
-const WALLET_CHUNK_SIZE       = 20;
+const DEFAULT_POLL_INTERVAL_MS = 30_000;
+const DEFAULT_STARTUP_BACKFILL_BLOCKS = 300;
+const DEFAULT_BLOCK_CHUNK_SIZE = 250;
+const DEFAULT_WALLET_CHUNK_SIZE = 20;
+const DEFAULT_RATE_LIMIT_BACKOFF_MS = 120_000;
+
+const INDEXER_POLL_INTERVAL_MS = readPositiveInteger(Number.parseInt(process.env.INDEXER_POLL_INTERVAL_MS || '', 10), DEFAULT_POLL_INTERVAL_MS);
+const INDEXER_BACKFILL_BLOCKS = readPositiveInteger(Number.parseInt(process.env.INDEXER_BACKFILL_BLOCKS || '', 10), DEFAULT_STARTUP_BACKFILL_BLOCKS);
+const INDEXER_BLOCK_CHUNK_SIZE = readPositiveInteger(Number.parseInt(process.env.INDEXER_BLOCK_CHUNK_SIZE || '', 10), DEFAULT_BLOCK_CHUNK_SIZE);
+const INDEXER_WALLET_CHUNK_SIZE = readPositiveInteger(Number.parseInt(process.env.INDEXER_WALLET_CHUNK_SIZE || '', 10), DEFAULT_WALLET_CHUNK_SIZE);
+const INDEXER_RATE_LIMIT_BACKOFF_MS = readPositiveInteger(Number.parseInt(process.env.INDEXER_RATE_LIMIT_BACKOFF_MS || '', 10), DEFAULT_RATE_LIMIT_BACKOFF_MS);
 const STALE_PENDING_EVENT_AGE_HOURS = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_HOURS || '48', 10);
 const STALE_PENDING_RESTORE_BATCH_SIZE = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_RESTORE_BATCH_SIZE || '500', 10);
 const STALE_PENDING_DELETE_BATCH_SIZE = parseInt(process.env.CHAIN_EVENTS_STALE_PENDING_DELETE_BATCH_SIZE || '10000', 10);
@@ -61,6 +68,7 @@ const WATCHED_CONTRACTS = {
 
 const httpProviders = new Map();
 const lastPolledBlock = new Map();
+const rateLimitedUntil = new Map();
 const archiveBackfillSkippedChains = new Set();
 const initialCursorLoadedChains = new Set();
 
@@ -109,10 +117,7 @@ function readBackfillBlocks(chain) {
   const chainValue = Number.parseInt(process.env[`${chainPrefix}_INDEXER_BACKFILL_BLOCKS`] || '', 10);
   if (Number.isInteger(chainValue) && chainValue >= 0) return chainValue;
 
-  const sharedValue = Number.parseInt(process.env.INDEXER_BACKFILL_BLOCKS || '', 10);
-  if (Number.isInteger(sharedValue) && sharedValue >= 0) return sharedValue;
-
-  return STARTUP_BACKFILL_BLOCKS;
+  return INDEXER_BACKFILL_BLOCKS;
 }
 
 function readPinnedStartBlock(chain) {
@@ -149,6 +154,27 @@ async function loadInitialCursor(chain, latest) {
   const backfillBlocks = readBackfillBlocks(chain);
   lastPolledBlock.set(chain, Math.max(latest - backfillBlocks, -1));
   initialCursorLoadedChains.add(chain);
+}
+
+function getRateLimitCooldownUntil(chain) {
+  const cooldownUntil = rateLimitedUntil.get(chain);
+  return Number.isFinite(cooldownUntil) ? cooldownUntil : 0;
+}
+
+function isRateLimitError(error) {
+  const text = [
+    error?.message,
+    error?.shortMessage,
+    error?.code,
+    error?.info?.responseStatus,
+    error?.info?.responseBody,
+    error?.error?.message,
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  return text.includes('429')
+    || text.includes('too many requests')
+    || text.includes('rate limit')
+    || text.includes('exceeded maximum retry limit');
 }
 
 function normalizeWatchedTokenSymbol(symbol) {
@@ -516,15 +542,15 @@ async function getTransferLogs(provider, config, walletAddresses, fromBlock, toB
   }
 
   for (const blockRange of chunk(
-    Array.from({ length: Math.ceil((toBlock - fromBlock + 1) / BLOCK_CHUNK_SIZE) }, (_, index) => ({
-      fromBlock: fromBlock + (index * BLOCK_CHUNK_SIZE),
-      toBlock: Math.min(fromBlock + ((index + 1) * BLOCK_CHUNK_SIZE) - 1, toBlock),
+    Array.from({ length: Math.ceil((toBlock - fromBlock + 1) / INDEXER_BLOCK_CHUNK_SIZE) }, (_, index) => ({
+      fromBlock: fromBlock + (index * INDEXER_BLOCK_CHUNK_SIZE),
+      toBlock: Math.min(fromBlock + ((index + 1) * INDEXER_BLOCK_CHUNK_SIZE) - 1, toBlock),
     })),
     1,
   )) {
     const { fromBlock: rangeStart, toBlock: rangeEnd } = blockRange[0];
 
-    for (const walletChunk of chunk(walletAddresses, WALLET_CHUNK_SIZE)) {
+    for (const walletChunk of chunk(walletAddresses, INDEXER_WALLET_CHUNK_SIZE)) {
       const topics = walletChunk.map((address) => ethers.zeroPadValue(address, 32));
       for (const token of watchedTokens) {
         const chunkLogs = await withTimeout(provider.getLogs({
@@ -544,6 +570,12 @@ async function getTransferLogs(provider, config, walletAddresses, fromBlock, toB
 async function pollChain(chain, config) {
   const watchedTokens = (config.tokens || []).filter(token => token?.address);
   if (!config.rpcHttp || watchedTokens.length === 0) return;
+
+  const cooldownUntil = getRateLimitCooldownUntil(chain);
+  if (cooldownUntil > Date.now()) {
+    console.warn(`[INDEXER] ${chain} in rate-limit cooldown; skipping poll`);
+    return;
+  }
 
   let latest = null;
 
@@ -597,6 +629,13 @@ async function pollChain(chain, config) {
       return;
     }
 
+    if (isRateLimitError(err)) {
+      const cooldownMs = INDEXER_RATE_LIMIT_BACKOFF_MS;
+      rateLimitedUntil.set(chain, Date.now() + cooldownMs);
+      console.warn(`[INDEXER] ${chain} rate limited; pausing polling for ${Math.round(cooldownMs / 1000)}s`);
+      return;
+    }
+
     console.warn(`[INDEXER] ${chain} poll error:`, err.message);
   }
 }
@@ -617,6 +656,9 @@ async function pollAllChains() {
 }
 
 async function startIndexer() {
+  console.log(
+    `[INDEXER] Config: poll=${INDEXER_POLL_INTERVAL_MS}ms, backfill=${INDEXER_BACKFILL_BLOCKS} blocks, blockChunk=${INDEXER_BLOCK_CHUNK_SIZE}, walletChunk=${INDEXER_WALLET_CHUNK_SIZE}, rateLimitBackoff=${INDEXER_RATE_LIMIT_BACKOFF_MS}ms`,
+  );
   console.log('[INDEXER] Starting HTTP polling indexer');
   await reconcilePendingEvents().catch(err =>
     console.error('[INDEXER] reconcile error:', err.message),
@@ -629,7 +671,7 @@ async function startIndexer() {
   );
   setInterval(() => {
     pollAllChains().catch(err => console.error('[INDEXER] poll loop error:', err.message));
-  }, POLL_INTERVAL_MS);
+  }, INDEXER_POLL_INTERVAL_MS);
 }
 
 module.exports = { startIndexer };
