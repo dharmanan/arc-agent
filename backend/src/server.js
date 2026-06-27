@@ -148,6 +148,33 @@ function isEnvEnabled(name, defaultValue = true) {
   return !['0', 'false', 'no', 'off'].includes(String(raw).trim().toLowerCase());
 }
 
+function startOptionalBackgroundJob(flagName, label, startFn, defaultValue = true) {
+  if (!isEnvEnabled(flagName, defaultValue)) {
+    console.log(`[BOOT] ${label} disabled via ${flagName}=false`);
+    return false;
+  }
+
+  try {
+    startFn();
+    return true;
+  } catch (err) {
+    console.error(`[BOOT] ${label} startup error:`, err.message);
+    return false;
+  }
+}
+
+function startOptionalAsyncBackgroundJob(flagName, label, startFn, defaultValue = true) {
+  if (!isEnvEnabled(flagName, defaultValue)) {
+    console.log(`[BOOT] ${label} disabled via ${flagName}=false`);
+    return false;
+  }
+
+  Promise.resolve()
+    .then(startFn)
+    .catch(err => console.error(`[${label}] startup error`, err.message));
+  return true;
+}
+
 const BACKGROUND_JOBS_ENABLED = isEnvEnabled('BACKGROUND_JOBS_ENABLED', true);
 const HEALTHCHECK_DB_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_DB_PROBE_ENABLED', true);
 const HEALTHCHECK_REDIS_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_REDIS_PROBE_ENABLED', true);
@@ -379,37 +406,35 @@ async function bootstrap() {
   }
 
   if (BACKGROUND_JOBS_ENABLED) {
-    startChainEventRetention();
-    startJobRetention();
-    startLpRewardEpochSnapshotWriter();
-    startSecurityFreezeRecovery();
+    startOptionalBackgroundJob('CHAIN_EVENT_RETENTION_ENABLED', 'Chain event retention', startChainEventRetention);
+    startOptionalBackgroundJob('JOB_RETENTION_ENABLED', 'Job retention', startJobRetention);
+    startOptionalBackgroundJob('LP_REWARD_SNAPSHOT_ENABLED', 'LP reward snapshot writer', startLpRewardEpochSnapshotWriter);
+    startOptionalBackgroundJob('SECURITY_FREEZE_RECOVERY_ENABLED', 'Security freeze recovery', startSecurityFreezeRecovery);
 
     // Start blockchain event indexer (non-blocking)
-    startIndexer().catch(err => console.error('[INDEXER] startup error', err));
+    startOptionalAsyncBackgroundJob('INDEXER_ENABLED', 'INDEXER', startIndexer);
 
     // Inject cctpMint + agentFetch into bridge activity poller (circular dep'i kır)
     bridgeActivityService.setMintInjection(
       agentWalletService.cctpMint,
       (agentId) => agentService.getAgentWithKeyById(agentId),
     );
-    bridgeActivityService.startPoller();
+    startOptionalBackgroundJob('BRIDGE_POLLER_ENABLED', 'Bridge poller', () => bridgeActivityService.startPoller());
 
-    // Start oracle query loop (only runs for agents with oracle_enabled = TRUE)
-    agentQueue.scheduleOracleLoop().catch(err => console.error('[ORACLE_LOOP] startup error', err));
+    // Start scheduled loops only when their specific lane is enabled.
+    startOptionalAsyncBackgroundJob('ORACLE_LOOP_ENABLED', 'ORACLE_LOOP', () => agentQueue.scheduleOracleLoop());
+    startOptionalAsyncBackgroundJob('MARKET_ANALYSIS_LOOP_ENABLED', 'MARKET_ANALYSIS_LOOP', () => agentQueue.scheduleMarketAnalysisLoop());
+    startOptionalAsyncBackgroundJob('DEFI_LOOP_ENABLED', 'DEFI_LOOP', () => agentQueue.scheduleDefiLoop());
+    startOptionalAsyncBackgroundJob('DAILY_TASKS_ENABLED', 'DAILY_TASKS', () => agentQueue.scheduleDailyTasks());
 
-    // Start market analysis loop (only runs for agents with market_analysis_enabled = TRUE)
-    agentQueue.scheduleMarketAnalysisLoop().catch(err => console.error('[MARKET_ANALYSIS_LOOP] startup error', err));
-
-    // Start DeFi loop (only runs for agents with defi_loop_enabled = TRUE)
-    agentQueue.scheduleDefiLoop().catch(err => console.error('[DEFI_LOOP] startup error', err));
-
-    // Start daily free task scheduler (only for agents with daily_tasks_enabled = TRUE)
-    agentQueue.scheduleDailyTasks().catch(err => console.error('[DAILY_TASKS] startup error', err));
-
-    setTimeout(() => {
-      agentQueue.resumeLocalWorkers().catch(err => console.error('[QUEUE] resume startup error', err));
-    }, Math.max(QUEUE_WORKER_STARTUP_DELAY_MS, 0));
-    console.log(`[BOOT] Queue workers will resume in ${Math.max(QUEUE_WORKER_STARTUP_DELAY_MS, 0) / 1000}s`);
+    if (isEnvEnabled('QUEUE_WORKERS_ENABLED', true)) {
+      setTimeout(() => {
+        agentQueue.resumeLocalWorkers().catch(err => console.error('[QUEUE] resume startup error', err));
+      }, Math.max(QUEUE_WORKER_STARTUP_DELAY_MS, 0));
+      console.log(`[BOOT] Queue workers will resume in ${Math.max(QUEUE_WORKER_STARTUP_DELAY_MS, 0) / 1000}s`);
+    } else {
+      console.log('[BOOT] Queue workers disabled via QUEUE_WORKERS_ENABLED=false');
+    }
   } else {
     console.log('[BOOT] Background jobs disabled via BACKGROUND_JOBS_ENABLED=false');
   }
