@@ -2,7 +2,7 @@
 
 const { ethers } = require('ethers');
 const { sendProtectedContractTx } = require('../txSecurityService');
-const { createArcRpcProvider } = require('../arcProvider');
+const { createArcRpcProvider, safeArcRpcCall } = require('../arcProvider');
 
 const ERC20_APPROVE_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
@@ -126,14 +126,32 @@ async function readConfiguredReserveSnapshots(contract) {
   }
 
   const loadPromise = (async () => {
-  const count = Number(await contract.supportedAssetCount());
+  const count = await safeArcRpcCall('native_lending_supported_asset_count', async () => (
+    contract.supportedAssetCount()
+  ), null);
+  if (count == null) {
+    throw new Error('Arc RPC unavailable for supportedAssetCount');
+  }
+
   const reserves = [];
 
-  for (let index = 0; index < count; index += 1) {
-    const assetAddress = await contract.supportedAssetAt(index);
+  for (let index = 0; index < Number(count); index += 1) {
+    const assetAddress = await safeArcRpcCall('native_lending_supported_asset_at', async () => (
+      contract.supportedAssetAt(index)
+    ), null);
+    if (!assetAddress) {
+      throw new Error('Arc RPC unavailable for supportedAssetAt');
+    }
     const knownAsset = resolveLendingAsset(assetAddress);
-    const config = await contract.getReserveConfig(assetAddress);
-    const state = await contract.getReserveState(assetAddress);
+    const config = await safeArcRpcCall('native_lending_reserve_config', async () => (
+      contract.getReserveConfig(assetAddress)
+    ), null);
+    const state = await safeArcRpcCall('native_lending_reserve_state', async () => (
+      contract.getReserveState(assetAddress)
+    ), null);
+    if (!config || !state) {
+      throw new Error('Arc RPC unavailable for reserve snapshot');
+    }
     const decimals = Number(config.decimals || knownAsset?.decimals || 18);
 
     reserves.push({
@@ -208,11 +226,22 @@ async function getNativeLendingOverview() {
   const provider = getReadProvider();
   const contract = getNativeLendingContract(provider);
   const [treasury, globalPaused, buildState, reserves] = await Promise.all([
-    contract.treasury(),
-    contract.globalPaused(),
-    contract.implementationStatus(),
+    safeArcRpcCall('native_lending_treasury', async () => contract.treasury(), null),
+    safeArcRpcCall('native_lending_global_paused', async () => contract.globalPaused(), null),
+    safeArcRpcCall('native_lending_status', async () => contract.implementationStatus(), null),
     readConfiguredReserveSnapshots(contract),
   ]);
+
+  if (treasury == null || globalPaused == null || buildState == null) {
+    return {
+      source: 'arc_native_lending_contract',
+      live: false,
+      contractAddress,
+      buildState: 'rpc_unavailable',
+      actions: ['supply', 'withdraw', 'borrow', 'repay', 'deleverage', 'liquidate'],
+      reserves: [],
+    };
+  }
 
   return {
     source: 'arc_native_lending_contract',
@@ -242,9 +271,32 @@ async function getNativeLendingAccountOverview(account) {
   const provider = getReadProvider();
   const contract = getNativeLendingContract(provider);
   const reserves = await readConfiguredReserveSnapshots(contract);
-  const liquidity = await contract.previewAccountLiquidity(account);
+  const liquidity = await safeArcRpcCall('native_lending_account_liquidity', async () => (
+    contract.previewAccountLiquidity(account)
+  ), null);
+  if (!liquidity) {
+    return {
+      source: 'arc_native_lending_contract',
+      live: true,
+      contractAddress,
+      account,
+      liquidity: null,
+      positions: [],
+    };
+  }
   const positions = await Promise.all(reserves.map(async reserve => {
-    const position = await contract.getUserPosition(account, reserve.assetAddress);
+    const position = await safeArcRpcCall('native_lending_user_position', async () => (
+      contract.getUserPosition(account, reserve.assetAddress)
+    ), null);
+    if (!position) {
+      return {
+        symbol: reserve.symbol,
+        assetAddress: reserve.assetAddress,
+        suppliedPrincipal: null,
+        borrowPrincipal: null,
+        useAsCollateral: false,
+      };
+    }
     return {
       symbol: reserve.symbol,
       assetAddress: reserve.assetAddress,

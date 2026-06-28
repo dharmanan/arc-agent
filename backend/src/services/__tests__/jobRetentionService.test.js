@@ -5,6 +5,7 @@ describe('jobRetentionService', () => {
     jest.resetModules();
     process.env.NODE_ENV = 'test';
     process.env.JOB_REVIEW_TIMEOUT_HOURS = '48';
+    process.env.ENCRYPTION_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
     delete process.env.AGENTIC_COMMERCE_ADDRESS;
   });
 

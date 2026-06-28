@@ -6,7 +6,7 @@ const { Wallet } = require('ethers');
 const TEST_USER_ID = 'user-123';
 const TEST_AGENT_ID = 'agent-123';
 const TEST_OWNER_ADDRESS = '0x00000000000000000000000000000000000000AA';
-const TEST_JWT_SECRET = ['test', 'jwt', 'secret', 'fixture'].join('-');
+const TEST_JWT_SECRET = ['test', 'jwt', 'secret', 'fixture', 'for', 'arc', 'agent'].join('-');
 
 function buildTestApp(router, mountPath) {
   const express = require('express');

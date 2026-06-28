@@ -2,7 +2,7 @@
 
 const { ethers } = require('ethers');
 const { sendProtectedContractTx } = require('../txSecurityService');
-const { createArcRpcProvider } = require('../arcProvider');
+const { createArcRpcProvider, safeArcRpcCall } = require('../arcProvider');
 
 const CONSTANT_PRODUCT_PAIR_ABI = [
   'function token0() view returns (address)',
@@ -96,11 +96,20 @@ function calculateOptimalZapInSwapAmount(totalAmountInRaw, reserveInRaw, feePct 
 
 async function readPairState(pairAddress, provider) {
   const pair = new ethers.Contract(pairAddress, CONSTANT_PRODUCT_PAIR_ABI, provider);
-  const [token0, token1, reserves] = await Promise.all([
-    pair.token0(),
-    pair.token1(),
-    pair.getReserves(),
-  ]);
+  const state = await safeArcRpcCall('constant_product_pair_state', async () => {
+    const [token0, token1, reserves] = await Promise.all([
+      pair.token0(),
+      pair.token1(),
+      pair.getReserves(),
+    ]);
+    return { token0, token1, reserves };
+  }, null);
+
+  if (!state) {
+    throw new Error('Arc RPC unavailable for direct pair state');
+  }
+
+  const { token0, token1, reserves } = state;
 
   return {
     pair,
@@ -312,7 +321,12 @@ async function executeConstantProductAddLiquidity({
     replayFingerprint: [pairAddress, tokenBAddress, plan.amountBUsedRaw.toString()],
   });
 
-  const lpAmountRaw = await pair.mint.staticCall(signer.address);
+  const lpAmountRaw = await safeArcRpcCall('constant_product_mint_preview', async () => (
+    pair.mint.staticCall(signer.address)
+  ), null);
+  if (lpAmountRaw == null) {
+    throw new Error('Arc RPC unavailable for direct pair mint preview');
+  }
   const { receipt: mintReceipt } = await sendProtectedContractTx({
     contract: pair,
     methodName: 'mint',
@@ -387,7 +401,12 @@ async function executeConstantProductZapIn({
   const tokenOut = new ethers.Contract(tokenOutAddress, ERC20_ABI, signer);
   const pair = new ethers.Contract(pairAddress, CONSTANT_PRODUCT_PAIR_ABI, signer);
 
-  const tokenOutBalanceBefore = await tokenOut.balanceOf(signer.address);
+  const tokenOutBalanceBefore = await safeArcRpcCall('constant_product_token_out_before', async () => (
+    tokenOut.balanceOf(signer.address)
+  ), null);
+  if (tokenOutBalanceBefore == null) {
+    throw new Error('Arc RPC unavailable for zap-in pre-balance');
+  }
   await sendProtectedContractTx({
     contract: tokenIn,
     methodName: 'transfer',
@@ -410,7 +429,12 @@ async function executeConstantProductZapIn({
     replayFingerprint: [pairAddress, amount0Out.toString(), amount1Out.toString(), swapAmountInRaw.toString()],
   });
 
-  const tokenOutBalanceAfter = await tokenOut.balanceOf(signer.address);
+  const tokenOutBalanceAfter = await safeArcRpcCall('constant_product_token_out_after', async () => (
+    tokenOut.balanceOf(signer.address)
+  ), null);
+  if (tokenOutBalanceAfter == null) {
+    throw new Error('Arc RPC unavailable for zap-in post-balance');
+  }
   const receivedAmountOutRaw = tokenOutBalanceAfter - tokenOutBalanceBefore;
   if (receivedAmountOutRaw <= 0n) {
     throw new Error('Zap-in swap did not return output tokens to the agent wallet');
@@ -436,8 +460,15 @@ async function executeConstantProductZapIn({
     replayFingerprint: [pairAddress, tokenOutAddress, receivedAmountOutRaw.toString()],
   });
 
-  const lpDecimals = await pair.decimals().catch(() => 18);
-  const lpAmountRaw = await pair.mint.staticCall(signer.address);
+  const lpDecimals = await safeArcRpcCall('constant_product_lp_decimals', async () => (
+    pair.decimals()
+  ), 18);
+  const lpAmountRaw = await safeArcRpcCall('constant_product_zap_mint_preview', async () => (
+    pair.mint.staticCall(signer.address)
+  ), null);
+  if (lpAmountRaw == null) {
+    throw new Error('Arc RPC unavailable for zap-in mint preview');
+  }
   const { receipt: mintReceipt } = await sendProtectedContractTx({
     contract: pair,
     methodName: 'mint',
@@ -482,7 +513,12 @@ async function executeConstantProductRemoveLiquidity({
   const pairState = await readPairState(pairAddress, signer);
   const pair = new ethers.Contract(pairAddress, CONSTANT_PRODUCT_PAIR_ABI, signer);
 
-  const lpBalanceRaw = await pair.balanceOf(signer.address);
+  const lpBalanceRaw = await safeArcRpcCall('constant_product_lp_balance', async () => (
+    pair.balanceOf(signer.address)
+  ), null);
+  if (lpBalanceRaw == null) {
+    throw new Error('Arc RPC unavailable for LP balance read');
+  }
   if (lpBalanceRaw <= 0n) {
     throw new Error('Direct-pair LP position not found for this wallet');
   }
@@ -503,7 +539,14 @@ async function executeConstantProductRemoveLiquidity({
     replayFingerprint: [pairAddress, lpAmountRaw.toString(), normalizedWithdrawPct],
   });
 
-  const [amount0Raw, amount1Raw] = await pair.burn.staticCall(signer.address);
+  const burnPreview = await safeArcRpcCall('constant_product_burn_preview', async () => {
+    const [amount0Raw, amount1Raw] = await pair.burn.staticCall(signer.address);
+    return { amount0Raw, amount1Raw };
+  }, null);
+  if (!burnPreview) {
+    throw new Error('Arc RPC unavailable for LP burn preview');
+  }
+  const { amount0Raw, amount1Raw } = burnPreview;
   const { receipt: burnReceipt } = await sendProtectedContractTx({
     contract: pair,
     methodName: 'burn',

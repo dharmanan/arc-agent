@@ -4,7 +4,7 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const oracle = require('./oracle');
 const { resolveCurvePool, resolveDirectSwapFallbackPool } = require('./oracle/pools');
-const { createArcRpcProvider } = require('./arcProvider');
+const { getHealthyArcRpcProvider, safeArcRpcCall } = require('./arcProvider');
 
 const CURVE_POSITION_ABI = [
   'function balanceOf(address account) view returns (uint256)',
@@ -54,7 +54,7 @@ const LP_MAX_APR_PCT = {
 };
 
 function getProvider() {
-  return createArcRpcProvider();
+  return getHealthyArcRpcProvider('positions_provider');
 }
 
 function formatUnits(value, decimals) {
@@ -355,14 +355,24 @@ function getTokenMetaForAddress(pool, address) {
 }
 
 async function readDirectPairPosition(provider, walletAddress, pool) {
-  const contract = new ethers.Contract(pool.address, V2_PAIR_POSITION_ABI, provider);
-  const [lpBalanceRaw, totalSupplyRaw, token0, token1, reserves] = await Promise.all([
-    contract.balanceOf(walletAddress),
-    contract.totalSupply(),
-    contract.token0(),
-    contract.token1(),
-    contract.getReserves(),
-  ]);
+  const readResult = await safeArcRpcCall('positions_direct_pair_read', async () => {
+    const contract = new ethers.Contract(pool.address, V2_PAIR_POSITION_ABI, provider);
+    const [lpBalanceRaw, totalSupplyRaw, token0, token1, reserves] = await Promise.all([
+      contract.balanceOf(walletAddress),
+      contract.totalSupply(),
+      contract.token0(),
+      contract.token1(),
+      contract.getReserves(),
+    ]);
+
+    return { lpBalanceRaw, totalSupplyRaw, token0, token1, reserves };
+  }, null);
+
+  if (!readResult) {
+    throw new Error('Arc RPC unavailable for direct-pair position read');
+  }
+
+  const { lpBalanceRaw, totalSupplyRaw, token0, token1, reserves } = readResult;
 
   if (lpBalanceRaw <= 0n) {
     return null;
@@ -413,14 +423,24 @@ async function readDirectPairPosition(provider, walletAddress, pool) {
 }
 
 async function readCurvePosition(provider, walletAddress, pool) {
-  const contract = new ethers.Contract(pool.address, CURVE_POSITION_ABI, provider);
-  const [lpBalanceRaw, totalSupplyRaw, reserve0Raw, reserve1Raw, virtualPriceRaw] = await Promise.all([
-    contract.balanceOf(walletAddress),
-    contract.totalSupply(),
-    contract.balances(pool.baseToken.index),
-    contract.balances(pool.quoteToken.index),
-    contract.get_virtual_price().catch(() => null),
-  ]);
+  const readResult = await safeArcRpcCall('positions_curve_read', async () => {
+    const contract = new ethers.Contract(pool.address, CURVE_POSITION_ABI, provider);
+    const [lpBalanceRaw, totalSupplyRaw, reserve0Raw, reserve1Raw, virtualPriceRaw] = await Promise.all([
+      contract.balanceOf(walletAddress),
+      contract.totalSupply(),
+      contract.balances(pool.baseToken.index),
+      contract.balances(pool.quoteToken.index),
+      contract.get_virtual_price().catch(() => null),
+    ]);
+
+    return { lpBalanceRaw, totalSupplyRaw, reserve0Raw, reserve1Raw, virtualPriceRaw };
+  }, null);
+
+  if (!readResult) {
+    throw new Error('Arc RPC unavailable for curve position read');
+  }
+
+  const { lpBalanceRaw, totalSupplyRaw, reserve0Raw, reserve1Raw, virtualPriceRaw } = readResult;
 
   if (lpBalanceRaw <= 0n) {
     return null;

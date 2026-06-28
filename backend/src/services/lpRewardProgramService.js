@@ -4,7 +4,7 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const oracle = require('./oracle');
 const { resolveCurvePool, resolveDirectSwapFallbackPool } = require('./oracle/pools');
-const { createArcRpcProvider } = require('./arcProvider');
+const { safeArcRpcCall } = require('./arcProvider');
 
 const DEFAULT_EPOCH_DURATION_MINUTES = 60;
 const DEFAULT_SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
@@ -18,10 +18,6 @@ function readPositiveIntegerEnv(name, fallback) {
   if (raw == null || raw === '') return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function getProvider() {
-  return createArcRpcProvider();
 }
 
 function toNumericString(value, fallback = '0') {
@@ -208,14 +204,22 @@ async function loadPoolSnapshot(program) {
   const fallbackPool = resolveDirectSwapFallbackPool(program.pool_key);
 
   try {
-    const provider = getProvider();
-
     if (curvePool?.address) {
-      const [state, totalSupplyRaw, blockNumber] = await Promise.all([
-        oracle.getCurvePoolState(curvePool),
-        new ethers.Contract(curvePool.address, LP_TOTAL_SUPPLY_ABI, provider).totalSupply(),
-        provider.getBlockNumber(),
-      ]);
+      const onchainResult = await safeArcRpcCall('lp_rewards_curve_snapshot', async (provider) => {
+        const [state, totalSupplyRaw, blockNumber] = await Promise.all([
+          oracle.getCurvePoolState(curvePool),
+          new ethers.Contract(curvePool.address, LP_TOTAL_SUPPLY_ABI, provider).totalSupply(),
+          provider.getBlockNumber(),
+        ]);
+
+        return { state, totalSupplyRaw, blockNumber };
+      }, null);
+
+      if (!onchainResult) {
+        throw new Error('Arc RPC unavailable for LP rewards curve snapshot');
+      }
+
+      const { state, totalSupplyRaw, blockNumber } = onchainResult;
 
       const poolLpSupply = ethers.formatUnits(totalSupplyRaw, 18);
       const isEligible = program.status === 'live' && state?.liquidityState !== 'empty';
@@ -240,11 +244,21 @@ async function loadPoolSnapshot(program) {
     }
 
     if (fallbackPool?.address) {
-      const [state, totalSupplyRaw, blockNumber] = await Promise.all([
-        oracle.getConstantProductPoolState(fallbackPool),
-        new ethers.Contract(fallbackPool.address, LP_TOTAL_SUPPLY_ABI, provider).totalSupply(),
-        provider.getBlockNumber(),
-      ]);
+      const onchainResult = await safeArcRpcCall('lp_rewards_direct_pair_snapshot', async (provider) => {
+        const [state, totalSupplyRaw, blockNumber] = await Promise.all([
+          oracle.getConstantProductPoolState(fallbackPool),
+          new ethers.Contract(fallbackPool.address, LP_TOTAL_SUPPLY_ABI, provider).totalSupply(),
+          provider.getBlockNumber(),
+        ]);
+
+        return { state, totalSupplyRaw, blockNumber };
+      }, null);
+
+      if (!onchainResult) {
+        throw new Error('Arc RPC unavailable for LP rewards direct-pair snapshot');
+      }
+
+      const { state, totalSupplyRaw, blockNumber } = onchainResult;
 
       const poolLpSupply = ethers.formatUnits(totalSupplyRaw, 18);
       const isEligible = program.status === 'live' && state?.liquidityState !== 'empty';

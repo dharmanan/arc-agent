@@ -36,9 +36,8 @@ const bridgeActivityService = require('../services/bridgeActivityService');
 const taskRunService = require('../services/taskRunService');
 const { ensureGatewayWarmBalance } = require('../services/agenticEconomy/gatewayBuyer');
 const { shouldTrackAutoCarryStartHandoff } = require('../services/autoCarryTaskRunPolicy');
-const { createArcRpcProvider } = require('../services/arcProvider');
+const { safeArcRpcCall } = require('../services/arcProvider');
 
-const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
 const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
 const ARC_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || process.env.EURC_ADDRESS || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
 const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
@@ -327,9 +326,16 @@ async function maybeWarmAgentGatewayBalance(agent, trigger, overrides = {}) {
 
 async function getArcTokenBalance(walletAddress, tokenAddress, decimals = 6) {
   if (!walletAddress || !tokenAddress) return 0;
-  const provider = createArcRpcProvider(ARC_RPC_URL);
-  const contract = new ethers.Contract(tokenAddress, ERC20_BALANCE_ABI, provider);
-  const rawBalance = await contract.balanceOf(walletAddress);
+
+  const rawBalance = await safeArcRpcCall('agent_queue_token_balance', async (provider) => {
+    const contract = new ethers.Contract(tokenAddress, ERC20_BALANCE_ABI, provider);
+    return contract.balanceOf(walletAddress);
+  }, null);
+
+  if (rawBalance == null) {
+    return 0;
+  }
+
   return normalizeUsdcAmount(ethers.formatUnits(rawBalance, decimals));
 }
 

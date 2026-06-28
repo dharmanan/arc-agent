@@ -2,7 +2,7 @@
 
 const { ethers } = require('ethers');
 const { getCache, setCache, TTL } = require('./cache');
-const { createArcRpcProvider } = require('../arcProvider');
+const { getHealthyArcRpcProvider, safeArcRpcCall } = require('../arcProvider');
 
 // Curve pool ABI — only needed functions
 const CURVE_POOL_ABI = [
@@ -123,9 +123,7 @@ function roundTo(value, digits) {
 }
 
 function getProvider() {
-  const rpcUrl = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC;
-  if (!rpcUrl) throw new Error('ARC_RPC_URL or ARC_TESTNET_RPC is not defined');
-  return createArcRpcProvider(rpcUrl);
+  return getHealthyArcRpcProvider('oracle_arc_rpc_provider');
 }
 
 async function getCurvePoolState(poolName, poolAddress, token0Decimals = 6, token1Decimals = 6) {
@@ -140,15 +138,24 @@ async function getCurvePoolState(poolName, poolAddress, token0Decimals = 6, toke
   const cached   = getCache(cacheKey);
   if (cached) return cached;
 
-  const provider = getProvider();
-  const pool     = new ethers.Contract(resolvedPoolAddress, CURVE_POOL_ABI, provider);
+  const onchainResult = await safeArcRpcCall('oracle_curve_pool_state', async (provider) => {
+    const pool = new ethers.Contract(resolvedPoolAddress, CURVE_POOL_ABI, provider);
 
-  const [balance0Raw, balance1Raw, feeRaw, spotAmountOutRaw] = await Promise.all([
-    pool.balances(baseToken.index),
-    pool.balances(quoteToken.index),
-    pool.fee(),
-    pool.get_dy(baseToken.index, quoteToken.index, ethers.parseUnits('1', baseToken.decimals)).catch(() => 0n),
-  ]);
+    const [balance0Raw, balance1Raw, feeRaw, spotAmountOutRaw] = await Promise.all([
+      pool.balances(baseToken.index),
+      pool.balances(quoteToken.index),
+      pool.fee(),
+      pool.get_dy(baseToken.index, quoteToken.index, ethers.parseUnits('1', baseToken.decimals)).catch(() => 0n),
+    ]);
+
+    return { pool, balance0Raw, balance1Raw, feeRaw, spotAmountOutRaw };
+  }, null);
+
+  if (!onchainResult) {
+    throw new Error('Arc RPC unavailable for curve pool state');
+  }
+
+  const { pool, balance0Raw, balance1Raw, feeRaw, spotAmountOutRaw } = onchainResult;
 
   const balance0   = Number(ethers.formatUnits(balance0Raw, baseToken.decimals));
   const balance1   = Number(ethers.formatUnits(balance1Raw, quoteToken.decimals));
@@ -230,13 +237,22 @@ async function getConstantProductPoolState(poolName, poolAddress, token0Decimals
   const cached = getCache(cacheKey);
   if (cached) return cached;
 
-  const provider = getProvider();
-  const pool = new ethers.Contract(resolvedPoolAddress, CONSTANT_PRODUCT_POOL_ABI, provider);
-  const [token0Address, token1Address, reservesRaw] = await Promise.all([
-    pool.token0(),
-    pool.token1(),
-    pool.getReserves(),
-  ]);
+  const onchainResult = await safeArcRpcCall('oracle_constant_product_pool_state', async (provider) => {
+    const pool = new ethers.Contract(resolvedPoolAddress, CONSTANT_PRODUCT_POOL_ABI, provider);
+    const [token0Address, token1Address, reservesRaw] = await Promise.all([
+      pool.token0(),
+      pool.token1(),
+      pool.getReserves(),
+    ]);
+
+    return { token0Address, token1Address, reservesRaw };
+  }, null);
+
+  if (!onchainResult) {
+    throw new Error('Arc RPC unavailable for constant-product pool state');
+  }
+
+  const { token0Address, token1Address, reservesRaw } = onchainResult;
 
   const token0Lower = String(token0Address || '').toLowerCase();
   const token1Lower = String(token1Address || '').toLowerCase();
@@ -320,9 +336,14 @@ async function getAaveReserveData(assetAddress) {
   const cached   = getCache(cacheKey);
   if (cached) return cached;
 
-  const provider = getProvider();
-  const pool     = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
-  const data     = await pool.getReserveData(assetAddress);
+  const data = await safeArcRpcCall('oracle_aave_reserve_data', async (provider) => {
+    const pool = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
+    return pool.getReserveData(assetAddress);
+  }, null);
+
+  if (!data) {
+    return null;
+  }
 
   // currentLiquidityRate is in ray (1e27) → convert to APY
   const liquidityRate    = Number(data.currentLiquidityRate);
@@ -348,14 +369,22 @@ async function getBandFeed(pair = 'USDC/USD') {
   const cached   = getCache(cacheKey);
   if (cached) return cached;
 
-  const provider = getProvider();
-  const ref      = new ethers.Contract(contractAddress, BAND_REFERENCE_ABI, provider);
+  const feed = await safeArcRpcCall('oracle_band_feed', async (provider) => {
+    const ref = new ethers.Contract(contractAddress, BAND_REFERENCE_ABI, provider);
+    const [answer, timestamp, decimals] = await Promise.all([
+      ref.latestAnswer(),
+      ref.latestTimestamp(),
+      ref.decimals(),
+    ]);
 
-  const [answer, timestamp, decimals] = await Promise.all([
-    ref.latestAnswer(),
-    ref.latestTimestamp(),
-    ref.decimals(),
-  ]);
+    return { answer, timestamp, decimals };
+  }, null);
+
+  if (!feed) {
+    return null;
+  }
+
+  const { answer, timestamp, decimals } = feed;
 
   const rate      = Number(answer) / 10 ** Number(decimals);
   const updatedAt = new Date(Number(timestamp) * 1000).toISOString();

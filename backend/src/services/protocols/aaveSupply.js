@@ -11,7 +11,7 @@
  */
 const { ethers }  = require('ethers');
 const defiLlama   = require('../oracle/defiLlama');
-const { createArcRpcProvider } = require('../arcProvider');
+const { createArcRpcProvider, safeArcRpcCall } = require('../arcProvider');
 
 // Minimal Aave V3 Pool ABI
 const AAVE_POOL_ABI = [
@@ -48,8 +48,14 @@ async function getAaveApy(assetAddress, assetSymbol = 'USDC') {
       const rpcUrl  = getArcRpcUrl();
 
       const provider = createArcRpcProvider(rpcUrl);
-      const pool     = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
-      const data     = await pool.getReserveData(assetAddress);
+      const data = await safeArcRpcCall('aave_reserve_data', async () => {
+        const pool = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
+        return pool.getReserveData(assetAddress);
+      }, null);
+
+      if (!data) {
+        throw new Error('Arc RPC unavailable for Aave reserve data');
+      }
 
       // currentLiquidityRate is in ray (1e27) — convert to annual APY
       const liquidityRate      = Number(data.currentLiquidityRate);

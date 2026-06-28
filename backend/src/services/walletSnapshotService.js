@@ -5,10 +5,9 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const oracle = require('./oracle');
 const positionsService = require('./positionsService');
-const { createArcRpcProvider } = require('./arcProvider');
+const { safeArcRpcCall } = require('./arcProvider');
 
 const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
-const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
 const TRACKED_TOKENS = Object.freeze([
   {
     symbol: 'USDC',
@@ -32,16 +31,6 @@ const TRACKED_TOKENS = Object.freeze([
     fallbackUsd: null,
   },
 ]);
-
-let _provider = null;
-
-function getProvider() {
-  if (!_provider) {
-    _provider = createArcRpcProvider(ARC_RPC_URL);
-  }
-
-  return _provider;
-}
 
 function roundTo(value, digits = 4) {
   const numeric = Number(value);
@@ -414,8 +403,15 @@ function getUsdPrice(priceLookup, token) {
 
 async function readTrackedTokenBalance(walletAddress, token, priceLookup) {
   try {
-    const contract = new ethers.Contract(token.address, ERC20_BALANCE_ABI, getProvider());
-    const rawBalance = await contract.balanceOf(walletAddress);
+    const rawBalance = await safeArcRpcCall(`wallet_snapshot_balance_${token.symbol}`, async (provider) => {
+      const contract = new ethers.Contract(token.address, ERC20_BALANCE_ABI, provider);
+      return contract.balanceOf(walletAddress);
+    }, null);
+
+    if (rawBalance == null) {
+      throw new Error('arc_rpc_unavailable');
+    }
+
     const amount = Number(ethers.formatUnits(rawBalance, token.decimals));
     const priceMeta = getUsdPrice(priceLookup, token);
     const usdValue = Number.isFinite(amount) && Number.isFinite(priceMeta.usdPrice)

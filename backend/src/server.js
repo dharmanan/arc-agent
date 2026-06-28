@@ -29,6 +29,10 @@ const {
   startSecurityFreezeRecovery,
   stopSecurityFreezeRecovery,
 } = require('./services/securityEventService');
+const {
+  isArcRpcRateLimitError,
+  markArcRpcEndpointUnhealthy,
+} = require('./services/arcProvider');
 const db                   = require('./db');
 
 const app  = express();
@@ -500,6 +504,16 @@ async function bootstrap() {
       console.error('[BOOT] Graceful shutdown failed:', err);
       process.exit(1);
     });
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    if (isArcRpcRateLimitError(reason)) {
+      markArcRpcEndpointUnhealthy(null, reason, 'unhandledRejection');
+      console.warn('[ARC_RPC] swallowed unhandled rate-limit rejection; backend stays alive');
+      return;
+    }
+
+    console.error('[UNHANDLED_REJECTION]', reason);
   });
 }
 

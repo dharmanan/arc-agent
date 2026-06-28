@@ -8,7 +8,12 @@
  * the agent's primary operation is never blocked by this.
  */
 const { ethers } = require('ethers');
-const { createArcRpcProvider } = require('./arcProvider');
+const {
+  safeArcRpcCall,
+  getArcRpcUrl,
+  createArcRpcProvider,
+  isArcRpcRateLimitError,
+} = require('./arcProvider');
 const db          = require('../db');
 const { sendProtectedContractTx } = require('./txSecurityService');
 
@@ -61,51 +66,16 @@ const REPUTATION_CHAIN_REPLAY_EVENTS = new Set([
   EVENT_TYPES.DEFI_LOOP,
   EVENT_TYPES.DAILY_TASK,
 ]);
-const ARC_TESTNET_DEFAULT_RPC = 'https://rpc.testnet.arc.network';
 const ARC_TESTNET_NETWORK = { chainId: 5042002, name: 'Arc Testnet' };
 const REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS = (() => {
   const parsed = Number.parseInt(process.env.REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS || '', 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
 })();
-const arcProviderCache = new Map();
-let arcRpcFailoverCursor = 0;
 let reputationOnchainDispatchTail = Promise.resolve();
 
 function readPositiveIntegerEnv(name, fallback) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function parseRpcUrlList(value) {
-  if (!value) return [];
-  return String(value)
-    .split(/[\n,;\s]+/)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-function getArcRpcUrls() {
-  const candidates = [
-    process.env.ARC_TESTNET_RPC,
-    process.env.ARC_RPC_URL,
-    ...parseRpcUrlList(process.env.ARC_TESTNET_RPC_FALLBACKS),
-  ];
-
-  const unique = [];
-  const seen = new Set();
-
-  for (const candidate of candidates) {
-    const normalized = String(candidate || '').trim();
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    unique.push(normalized);
-  }
-
-  if (unique.length === 0) {
-    unique.push(ARC_TESTNET_DEFAULT_RPC);
-  }
-
-  return unique;
 }
 
 function describeRpcUrl(rpcUrl) {
@@ -132,16 +102,6 @@ async function reserveReputationOnchainWriteDispatchSlot() {
 
   reputationOnchainDispatchTail = reservation;
   await reservation;
-}
-
-function createArcTestnetProvider(rpcUrl) {
-  const resolvedRpcUrl = String(rpcUrl || ARC_TESTNET_DEFAULT_RPC).trim() || ARC_TESTNET_DEFAULT_RPC;
-  const cached = arcProviderCache.get(resolvedRpcUrl);
-  if (cached) return cached;
-
-  const provider = createArcRpcProvider(resolvedRpcUrl);
-  arcProviderCache.set(resolvedRpcUrl, provider);
-  return provider;
 }
 
 function isReplacementUnderpricedError(error) {
@@ -199,32 +159,7 @@ function buildReputationReplayFingerprint(agentId, eventType) {
   return ['reputation_event', agentId, eventType, bucket];
 }
 
-function isRpcRateLimitError(error) {
-  const numericCodeCandidates = [
-    error?.status,
-    error?.statusCode,
-    error?.error?.code,
-    error?.info?.error?.code,
-    error?.cause?.code,
-  ]
-    .map((value) => Number.parseInt(String(value ?? ''), 10))
-    .filter(Number.isFinite);
-
-  if (numericCodeCandidates.some((value) => value === 429 || value === -32005 || value === -32007)) {
-    return true;
-  }
-
-  const message = String(
-    error?.message
-    || error?.shortMessage
-    || error?.error?.message
-    || error?.info?.error?.message
-    || error?.cause?.message
-    || '',
-  ).trim();
-
-  return /rate limit|too many requests|request limit reached|requests per second|429/i.test(message);
-}
+const isRpcRateLimitError = isArcRpcRateLimitError;
 
 function isRetryableRpcProviderError(error) {
   if (isRpcRateLimitError(error)) return true;
@@ -253,37 +188,12 @@ function isRetryableRpcProviderError(error) {
   return /timeout|temporarily unavailable|socket hang up|connection reset|service unavailable|bad gateway|gateway timeout|503|504/i.test(message);
 }
 
-async function withArcRpcFailover(operationLabel, execute) {
-  const rpcUrls = getArcRpcUrls();
-  let lastError = null;
-  const startOffset = rpcUrls.length > 0
-    ? (arcRpcFailoverCursor % rpcUrls.length)
-    : 0;
+async function withArcRpcFailover(operationLabel, execute, fallbackValue) {
+  const fallbackProvided = arguments.length >= 3;
 
-  if (rpcUrls.length > 0) {
-    arcRpcFailoverCursor = (arcRpcFailoverCursor + 1) % rpcUrls.length;
-  }
-
-  for (let attempt = 0; attempt < rpcUrls.length; attempt += 1) {
-    const index = (startOffset + attempt) % rpcUrls.length;
-    const rpcUrl = rpcUrls[index];
-    const provider = createArcTestnetProvider(rpcUrl);
-    try {
-      return await execute({ provider, rpcUrl, index, total: rpcUrls.length });
-    } catch (error) {
-      lastError = error;
-      const hasFallback = attempt < (rpcUrls.length - 1);
-      if (!hasFallback || !isRetryableRpcProviderError(error)) {
-        throw error;
-      }
-
-      console.warn(
-        `[REPUTATION] ${operationLabel} rpc failover ${attempt + 1}/${rpcUrls.length} rpc=${describeRpcUrl(rpcUrl)}: ${error.message}`,
-      );
-    }
-  }
-
-  throw lastError || new Error(`[REPUTATION] ${operationLabel} failed before an RPC provider was selected.`);
+  return safeArcRpcCall(`reputation_${operationLabel}`, async (provider, rpcUrl) => (
+    execute({ provider, rpcUrl, index: 0, total: 1 })
+  ), fallbackProvided ? fallbackValue : undefined);
 }
 
 function isProtectedTxThrottleError(error) {
@@ -577,8 +487,12 @@ async function getReputationOverview(agentId, userId, limit = 10) {
           return registry.getScore(BigInt(onchain.tokenId));
         },
       );
-      onchain.score = Number(score);
-      onchain.status = 'live';
+      if (score == null) {
+        onchain.status = 'read_error';
+      } else {
+        onchain.score = Number(score);
+        onchain.status = 'live';
+      }
     } catch (err) {
       console.error(`[REPUTATION] On-chain read error agent=${agentId}:`, err.message);
       onchain.status = 'read_error';
@@ -661,7 +575,7 @@ async function getReputationProof(agentId, userId) {
   let registry;
   try {
     const liveRead = await withArcRpcFailover(
-      `proof score read agent=${agentId}`,
+      `proof_score_read_agent_${agentId}`,
       async ({ provider }) => {
         const selectedRegistry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
         const [scoreRaw, totalRaw, bn] = await Promise.all([
@@ -677,7 +591,13 @@ async function getReputationProof(agentId, userId) {
           registry: selectedRegistry,
         };
       },
+      null,
     );
+
+    if (!liveRead) {
+      result.status = 'read_error';
+      return result;
+    }
 
     const { scoreRaw, totalRaw, blockNumber: resolvedBlockNumber, registry: selectedRegistry } = liveRead;
     result.score       = Number(scoreRaw);

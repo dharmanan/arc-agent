@@ -12,7 +12,7 @@
  */
 const { ethers }  = require('ethers');
 const { sendProtectedContractTx } = require('../txSecurityService');
-const { createArcRpcProvider } = require('../arcProvider');
+const { createArcRpcProvider, safeArcRpcCall } = require('../arcProvider');
 
 const CURVE_EXCHANGE_ABI = [
   // Read: how many coins[j] do I get for dx coins[i]?
@@ -117,12 +117,15 @@ async function approveIfNeeded(tokenAddress, signer, spender, amountRaw, txSecur
  * @returns {{ amountOut: string, amountOutRaw: bigint }}
  */
 async function getCurveQuote(poolAddress, indexIn, indexOut, amountIn, decimalsIn = 6, decimalsOut = 6) {
-  const rpcUrl  = getArcRpcUrl();
-
-  const provider  = createArcRpcProvider(rpcUrl);
-  const pool      = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, provider);
   const amountRaw = ethers.parseUnits(String(amountIn), decimalsIn);
-  const outRaw    = await pool.get_dy(indexIn, indexOut, amountRaw);
+  const outRaw = await safeArcRpcCall('curve_get_quote', async (provider) => {
+    const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, provider);
+    return pool.get_dy(indexIn, indexOut, amountRaw);
+  }, null);
+
+  if (outRaw == null) {
+    throw new Error('Arc RPC unavailable for curve quote');
+  }
 
   return {
     amountOut:    ethers.formatUnits(outRaw, decimalsOut),
@@ -165,7 +168,12 @@ async function executeCurveSwap({
 
   // Get expected output → apply slippage floor
   const pool     = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
-  const outRaw   = await pool.get_dy(indexIn, indexOut, amountRaw);
+  const outRaw = await safeArcRpcCall('curve_swap_quote', async () => (
+    pool.get_dy(indexIn, indexOut, amountRaw)
+  ), null);
+  if (outRaw == null) {
+    throw new Error('Arc RPC unavailable for curve swap quote');
+  }
   const minDy    = applySlippageFloor(outRaw, slippagePct);
 
   // Approve pool to spend tokenIn if allowance is insufficient
@@ -211,7 +219,9 @@ async function executeCurveAddLiquidity({
   const depositAmounts = buildCurveDepositAmounts(indexIn, amountRaw);
   const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
 
-  const lpOutRaw = await pool.calc_token_amount(depositAmounts, true).catch(() => null);
+  const lpOutRaw = await safeArcRpcCall('curve_add_liquidity_quote', async () => (
+    pool.calc_token_amount(depositAmounts, true)
+  ), null);
   const minMintAmount = lpOutRaw ? applySlippageFloor(lpOutRaw, slippagePct) : 0n;
 
   await approveIfNeeded(tokenInAddress, signer, poolAddress, amountRaw, {
@@ -258,7 +268,9 @@ async function executeCurveAddLiquidityBalanced({
   const depositAmounts = [amount0Raw, amount1Raw];
   const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
 
-  const lpOutRaw = await pool.calc_token_amount(depositAmounts, true).catch(() => null);
+  const lpOutRaw = await safeArcRpcCall('curve_add_liquidity_balanced_quote', async () => (
+    pool.calc_token_amount(depositAmounts, true)
+  ), null);
   const minMintAmount = lpOutRaw ? applySlippageFloor(lpOutRaw, slippagePct) : 0n;
 
   await approveIfNeeded(token0Address, signer, poolAddress, amount0Raw, {
@@ -306,7 +318,9 @@ async function executeCurveRemoveLiquidityOneCoin({
   const pool = new ethers.Contract(poolAddress, CURVE_EXCHANGE_ABI, signer);
   const lpAmountRaw = ethers.parseUnits(String(lpAmount), lpDecimals);
 
-  const amountOutRaw = await pool.calc_withdraw_one_coin(lpAmountRaw, indexOut).catch(() => null);
+  const amountOutRaw = await safeArcRpcCall('curve_remove_one_coin_quote', async () => (
+    pool.calc_withdraw_one_coin(lpAmountRaw, indexOut)
+  ), null);
   const minAmountOut = amountOutRaw ? applySlippageFloor(amountOutRaw, slippagePct) : 0n;
 
   const { receipt } = await sendProtectedContractTx({
@@ -349,13 +363,35 @@ async function executeCurveRemoveLiquidity({
   const token0 = new ethers.Contract(resolvedToken0Address, ERC20_APPROVE_ABI, signer);
   const token1 = new ethers.Contract(resolvedToken1Address, ERC20_APPROVE_ABI, signer);
 
-  const [poolToken0BalanceRaw, poolToken1BalanceRaw, totalSupplyRaw, token0BalanceBeforeRaw, token1BalanceBeforeRaw] = await Promise.all([
-    token0.balanceOf(poolAddress),
-    token1.balanceOf(poolAddress),
-    pool.totalSupply(),
-    token0.balanceOf(signer.address),
-    token1.balanceOf(signer.address),
-  ]);
+  const balanceSnapshot = await safeArcRpcCall('curve_remove_liquidity_snapshot', async () => {
+    const [poolToken0BalanceRaw, poolToken1BalanceRaw, totalSupplyRaw, token0BalanceBeforeRaw, token1BalanceBeforeRaw] = await Promise.all([
+      token0.balanceOf(poolAddress),
+      token1.balanceOf(poolAddress),
+      pool.totalSupply(),
+      token0.balanceOf(signer.address),
+      token1.balanceOf(signer.address),
+    ]);
+
+    return {
+      poolToken0BalanceRaw,
+      poolToken1BalanceRaw,
+      totalSupplyRaw,
+      token0BalanceBeforeRaw,
+      token1BalanceBeforeRaw,
+    };
+  }, null);
+
+  if (!balanceSnapshot) {
+    throw new Error('Arc RPC unavailable for curve remove-liquidity snapshot');
+  }
+
+  const {
+    poolToken0BalanceRaw,
+    poolToken1BalanceRaw,
+    totalSupplyRaw,
+    token0BalanceBeforeRaw,
+    token1BalanceBeforeRaw,
+  } = balanceSnapshot;
 
   const expectedAmount0Raw = totalSupplyRaw > 0n ? (poolToken0BalanceRaw * lpAmountRaw) / totalSupplyRaw : 0n;
   const expectedAmount1Raw = totalSupplyRaw > 0n ? (poolToken1BalanceRaw * lpAmountRaw) / totalSupplyRaw : 0n;
@@ -374,10 +410,20 @@ async function executeCurveRemoveLiquidity({
     replayFingerprint: [poolAddress, lpAmountRaw.toString(), minAmounts.map((amount) => amount.toString())],
   });
 
-  const [token0BalanceAfterRaw, token1BalanceAfterRaw] = await Promise.all([
-    token0.balanceOf(signer.address),
-    token1.balanceOf(signer.address),
-  ]);
+  const afterSnapshot = await safeArcRpcCall('curve_remove_liquidity_after', async () => {
+    const [token0BalanceAfterRaw, token1BalanceAfterRaw] = await Promise.all([
+      token0.balanceOf(signer.address),
+      token1.balanceOf(signer.address),
+    ]);
+
+    return { token0BalanceAfterRaw, token1BalanceAfterRaw };
+  }, null);
+
+  if (!afterSnapshot) {
+    throw new Error('Arc RPC unavailable for curve remove-liquidity post-balance');
+  }
+
+  const { token0BalanceAfterRaw, token1BalanceAfterRaw } = afterSnapshot;
 
   return {
     txHash: receipt.hash,

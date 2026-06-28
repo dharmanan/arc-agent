@@ -21,6 +21,7 @@ describe('getCirclePaidCatalog', () => {
     expect(liveItemIds).toEqual([
       'ARC_EVENT_ODDS_COMPARE',
       'ARC_PREDICTION_MARKET_CHECK',
+      'ARC_WALLET_ASSET_SNAPSHOT',
     ]);
   });
 
