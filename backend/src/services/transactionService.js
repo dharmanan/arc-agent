@@ -477,6 +477,7 @@ async function bridgeTokens({ agent, fromChain, toChain, amountUsdc, mode = 'aut
     // Redis aktivite güncelle
     const current = await bridgeActivityService.getActivity(txId).catch(() => actBase);
     const actUpdate = { ...(current || actBase) };
+    actUpdate.bridgeStep = step;
     const stepToStatus = {
       approving: bridgeActivityService.STATUS.AWAITING_APPROVE,
       approved:  bridgeActivityService.STATUS.AWAITING_BURN,
@@ -499,6 +500,17 @@ async function bridgeTokens({ agent, fromChain, toChain, amountUsdc, mode = 'aut
     agent: rawAgent, fromChain, toChain, amountUsdc, onStep,
   }).catch(err => {
     console.error('[AGENTIC BRIDGE]', err.message);
+
+    const resolveFailedStep = (activity) => {
+      const explicitStep = String(err?.bridgeStep || activity?.bridgeStep || '').trim().toLowerCase();
+      if (explicitStep) return explicitStep;
+
+      const status = String(activity?.status || '').trim().toLowerCase();
+      if (status === bridgeActivityService.STATUS.AWAITING_BURN) return 'burning';
+      if (status === bridgeActivityService.STATUS.PENDING_ATTESTATION) return 'attesting';
+      if (status === bridgeActivityService.STATUS.READY_TO_MINT) return 'minting';
+      return 'approving';
+    };
 
     const isInsufficientFunds = err.code === 'INSUFFICIENT_FUNDS'
       || err.code === 'INSUFFICIENT_DESTINATION_GAS'
@@ -534,12 +546,23 @@ async function bridgeTokens({ agent, fromChain, toChain, amountUsdc, mode = 'aut
           if (act?.status === bridgeActivityService.STATUS.READY_TO_MINT) return;
           updateTxStatus(txId, 'failed').catch(() => {});
           rollbackDailyLimit(agent.id, amountUsdc).catch(() => {});
-          bridgeActivityService.upsertActivity({ ...(act || actBase), status: bridgeActivityService.STATUS.FAILED, error: err.message }).catch(() => {});
+          const current = act || actBase;
+          bridgeActivityService.upsertActivity({
+            ...current,
+            status: bridgeActivityService.STATUS.FAILED,
+            failedStep: resolveFailedStep(current),
+            error: err.message,
+          }).catch(() => {});
         })
         .catch(() => {
           updateTxStatus(txId, 'failed').catch(() => {});
           rollbackDailyLimit(agent.id, amountUsdc).catch(() => {});
-          bridgeActivityService.upsertActivity({ ...actBase, status: bridgeActivityService.STATUS.FAILED, error: err.message }).catch(() => {});
+          bridgeActivityService.upsertActivity({
+            ...actBase,
+            status: bridgeActivityService.STATUS.FAILED,
+            failedStep: resolveFailedStep(actBase),
+            error: err.message,
+          }).catch(() => {});
         });
       return;
     }
@@ -565,7 +588,15 @@ async function bridgeTokens({ agent, fromChain, toChain, amountUsdc, mode = 'aut
     // Redis aktiviteyi failed yap — getActivity başarısız olursa actBase fallback kullan
     bridgeActivityService.getActivity(txId)
       .catch(() => null)
-      .then(act => bridgeActivityService.upsertActivity({ ...(act || actBase), status: bridgeActivityService.STATUS.FAILED, error: err.message }).catch(() => {}));
+      .then(act => {
+        const current = act || actBase;
+        return bridgeActivityService.upsertActivity({
+          ...current,
+          status: bridgeActivityService.STATUS.FAILED,
+          failedStep: resolveFailedStep(current),
+          error: err.message,
+        }).catch(() => {});
+      });
   });
 
   return { txId, status: 'executing', mode: 'agentic', isAgentic: true };

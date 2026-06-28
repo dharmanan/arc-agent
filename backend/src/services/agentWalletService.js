@@ -217,6 +217,26 @@ function readPositiveNumberEnv(name, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function readPositiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const parsed = Number.parseInt(String(raw), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeChainEnvSuffix(chainName) {
+  return String(chainName || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_');
+}
+
+function getCctpMinFinalityThreshold(chainName) {
+  const defaultThreshold = readPositiveIntegerEnv('CCTP_MIN_FINALITY_THRESHOLD', 1000);
+  const perChainEnvName = `CCTP_MIN_FINALITY_THRESHOLD_${normalizeChainEnvSuffix(chainName)}`;
+  return readPositiveIntegerEnv(perChainEnvName, defaultThreshold);
+}
+
 function getCirbtcInputLimit(fromToken) {
   if (fromToken === 'EURC') {
     return readPositiveNumberEnv('CIRBTC_SWAP_MAX_EURC_IN', DEFAULT_CIRBTC_MAX_EURC_IN);
@@ -971,30 +991,64 @@ async function cctpBurn({ agent, fromChain, toChain, amountUsdc }) {
   const signer    = getAgentSigner(agent, fromChain);
   const amount    = ethers.parseUnits(String(amountUsdc), 6);
   const messenger = new ethers.Contract(srcCfg.tokenMessenger, TOKEN_MESSENGER_ABI, signer);
+  const destinationCaller = ethers.ZeroHash;
+  const maxFee = 0n;
+  const minFinalityThreshold = getCctpMinFinalityThreshold(fromChain);
 
   // mintRecipient: 32 byte'a padlenmiş ajan adresi
   const mintRecipient = ethers.zeroPadValue(signer.address, 32);
 
   console.log(`[CCTP-BURN] ${amountUsdc} USDC: ${fromChain}(domain ${srcCfg.domain}) → ${toChain}(domain ${dstCfg.domain})`);
 
-  const { receipt } = await sendProtectedContractTx({
-    contract: messenger,
-    methodName: 'depositForBurn',
-    args: [
-      amount,
-      dstCfg.domain,
-      mintRecipient,
-      srcCfg.usdcAddress,
-      ethers.ZeroHash,
-      0n,
-      1000,
-    ],
-    txOptions: await buildTxOverrides(fromChain),
-    chainName: fromChain,
-    ...getAgentIdentity(agent, signer.address),
-    operation: 'cctp_burn',
-    replayFingerprint: [fromChain, toChain, amount.toString(), signer.address],
-  });
+  let receipt;
+  try {
+    const burnResult = await sendProtectedContractTx({
+      contract: messenger,
+      methodName: 'depositForBurn',
+      args: [
+        amount,
+        dstCfg.domain,
+        mintRecipient,
+        srcCfg.usdcAddress,
+        destinationCaller,
+        maxFee,
+        minFinalityThreshold,
+      ],
+      txOptions: await buildTxOverrides(fromChain),
+      chainName: fromChain,
+      ...getAgentIdentity(agent, signer.address),
+      operation: 'cctp_burn',
+      replayFingerprint: [fromChain, toChain, amount.toString(), signer.address],
+    });
+    receipt = burnResult.receipt;
+  } catch (error) {
+    console.error('[CCTP-BURN] depositForBurn failed', {
+      fromChain,
+      toChain,
+      amountUsdc,
+      sourceDomain: srcCfg.domain,
+      destinationDomain: dstCfg.domain,
+      burnToken: srcCfg.usdcAddress,
+      tokenMessenger: srcCfg.tokenMessenger,
+      maxFee: maxFee.toString(),
+      minFinalityThreshold,
+      errorCode: error?.code || null,
+      errorShortMessage: error?.shortMessage || null,
+      errorReason: error?.reason || null,
+      errorName: error?.name || null,
+    });
+
+    if (error && typeof error === 'object') {
+      error.bridgeStep = error.bridgeStep || 'burning';
+      error.bridgeOperation = error.bridgeOperation || 'depositForBurn';
+      throw error;
+    }
+
+    const wrappedError = new Error(error?.message || 'CCTP burn failed');
+    wrappedError.bridgeStep = 'burning';
+    wrappedError.bridgeOperation = 'depositForBurn';
+    throw wrappedError;
+  }
 
   // MessageSent event'inden message bytes'ını çıkar
   const transmitter = new ethers.Contract(srcCfg.msgTransmitter, MSG_TRANSMITTER_ABI, getProvider(fromChain));

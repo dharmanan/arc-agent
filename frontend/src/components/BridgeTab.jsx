@@ -102,6 +102,20 @@ function getProgressStatus(act) {
     return status;
   }
   if (status === 'failed') {
+    const failedStep = String(act.failedStep || act.bridgeStep || '').trim().toLowerCase();
+    if (failedStep === 'burning' || failedStep === 'burned') {
+      return 'awaiting_burn';
+    }
+    if (failedStep === 'attesting' || failedStep === 'attested') {
+      return 'pending_attestation';
+    }
+    if (failedStep === 'minting' || failedStep === 'complete') {
+      return 'ready_to_mint';
+    }
+    if (failedStep === 'approving' || failedStep === 'approved') {
+      return 'awaiting_approve';
+    }
+
     if (act.attestation || act.attestedMessage || act.autoRetryReason === 'destination_gas_low') {
       return 'ready_to_mint';
     }
