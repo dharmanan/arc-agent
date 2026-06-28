@@ -207,7 +207,7 @@ function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
       if (excluded.has(candidate)) continue;
       selectedIndex = index;
       fallbackUsed = true;
-      console.info(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
+      console.warn(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
       break;
     }
   }
@@ -215,7 +215,7 @@ function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
   if (selectedIndex < 0) {
     selectedIndex = startIndex;
     fallbackUsed = true;
-    console.info(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
+    console.warn(`[ARC_RPC] no healthy endpoint available label=${label} fallback=true`);
   }
 
   if (pool.length > 1 && (fallbackUsed || selectedIndex !== startIndex)) {
@@ -265,6 +265,13 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
   }
 
   if (arguments.length >= 3) {
+    if (lastError) {
+      if (isArcRpcRateLimitError(lastError)) {
+        console.warn(`[ARC_RPC] no healthy endpoint available label=${label} fallback=true`);
+      } else {
+        console.error(`[ARC_RPC] rpc call failed label=${label} fallback=true`, lastError?.message || lastError);
+      }
+    }
     return fallbackValue;
   }
 
