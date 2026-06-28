@@ -8,6 +8,15 @@ const oracle = require('./oracle');
 const positionsService = require('./positionsService');
 const { buildCarryOpportunitySnapshot } = require('./carryAutomationPolicy');
 const { getLendingPriceSnapshot } = require('./lendingOracleService');
+const {
+  SNAPSHOT_KINDS,
+  getUserReadCacheTtlMs,
+  getUserReadStaleTtlMs,
+  getBackgroundRefreshTimeoutMs,
+  loadAgentReadSnapshot,
+  saveAgentReadSnapshot,
+  withTimeout,
+} = require('./agentReadSnapshotService');
 
 const ERC20_BALANCE_ABI = ['function balanceOf(address) view returns (uint256)'];
 const HEALTH_FACTOR_WARNING = 1.2;
@@ -25,6 +34,148 @@ const MIN_AUTOMATION_ACTION_USD = (() => {
   const numeric = Number(process.env.LENDING_AUTOMATION_MIN_ACTION_USD || '1');
   return Number.isFinite(numeric) && numeric > 0 ? numeric : 1;
 })();
+const lendingSurfaceCache = new Map();
+const lendingSurfaceRefreshInflight = new Map();
+
+function _clonePayload(value) {
+  return JSON.parse(JSON.stringify(value || {}));
+}
+
+function _readLendingSurfaceCache(agentId) {
+  const entry = lendingSurfaceCache.get(agentId);
+  if (!entry) return null;
+
+  const now = Date.now();
+  if (entry.staleExpiresAt <= now) {
+    lendingSurfaceCache.delete(agentId);
+    return null;
+  }
+
+  return {
+    payload: _clonePayload(entry.payload),
+    stale: entry.liveExpiresAt <= now,
+    cacheAgeMs: Math.max(now - entry.savedAt, 0),
+  };
+}
+
+function _writeLendingSurfaceCache(agentId, payload) {
+  const now = Date.now();
+  const freshTtlMs = getUserReadCacheTtlMs();
+  const staleTtlMs = getUserReadStaleTtlMs();
+
+  lendingSurfaceCache.set(agentId, {
+    savedAt: now,
+    liveExpiresAt: now + freshTtlMs,
+    staleExpiresAt: now + staleTtlMs,
+    payload: _clonePayload(payload),
+  });
+}
+
+function _buildWarmupSurface(agent) {
+  const nowIso = new Date().toISOString();
+
+  return {
+    walletAddress: agent.walletAddress || null,
+    execution: {
+      source: 'arc_native_scaffold',
+      contractAddress: nativeLending.getArcLendingPoolAddress(),
+      buildState: 'snapshot_warming',
+      globalPaused: false,
+      ready: false,
+      notes: ['Lending snapshot is warming up in the background.'],
+      live: false,
+      actions: ['supply', 'withdraw', 'borrow', 'repay', 'deleverage', 'liquidate'],
+    },
+    prices: {
+      source: 'snapshot_warming',
+      assets: [],
+      updatedAt: nowIso,
+    },
+    account: {
+      liquidity: null,
+      positions: [],
+    },
+    assets: [],
+    risk: {
+      totalSuppliedUsd: 0,
+      totalBorrowUsd: 0,
+      collateralSuppliedUsd: 0,
+      collateralCapacityUsd: 0,
+      liquidationCapacityUsd: 0,
+      availableBorrowUsd: 0,
+      ltvPct: 0,
+      healthFactor: null,
+      band: 'idle',
+      label: 'Warming',
+      detail: 'Lending snapshot is being refreshed.',
+    },
+    yield: {
+      grossSupplyUsdPerYear: 0,
+      grossBorrowCostUsdPerYear: 0,
+      netLendingUsdPerYear: 0,
+    },
+    actionGuards: {},
+    recovery: {
+      execute: false,
+      status: 'warming',
+      reason: 'lending_snapshot_warming',
+      detail: 'Emergency recovery guards are warming up.',
+      steps: [],
+    },
+    collateralTopUp: {
+      execute: false,
+      status: 'warming',
+      reason: 'lending_snapshot_warming',
+      detail: 'Collateral top-up guards are warming up.',
+      steps: [],
+    },
+    safeExit: {
+      execute: false,
+      status: 'warming',
+      reason: 'lending_snapshot_warming',
+      detail: 'Safe-exit guards are warming up.',
+      steps: [],
+    },
+    liquidation: {
+      liquidatable: false,
+      status: 'unknown',
+      reason: 'lending_snapshot_warming',
+      detail: 'Liquidation status is warming up.',
+      healthFactor: null,
+    },
+    carry: {
+      lane: 'carry_stable_lp',
+      policyId: 'carry_stable_lp_v1',
+      carryState: 'warming',
+      exclusiveMode: true,
+      error: null,
+    },
+    automation: {
+      carryEnabled: agent.features?.carryAutomationEnabled === true,
+    },
+    updatedAt: nowIso,
+  };
+}
+
+function _buildLendingSurfaceResponse(agentId, payload, {
+  stale = false,
+  dataFreshness = 'live',
+  cacheAgeMs = 0,
+  degraded = false,
+  refreshInProgress = false,
+} = {}) {
+  const normalized = _clonePayload(payload);
+
+  return {
+    ...normalized,
+    agentId,
+    stale,
+    dataFreshness,
+    cacheAgeMs,
+    degraded,
+    refreshInProgress,
+  };
+}
 
 function _getArcRpcUrl() {
   return process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
@@ -1396,13 +1547,7 @@ async function guardAgentLiquidationAction({ agent, borrower, debtAsset, collate
   };
 }
 
-async function getAgentLendingSurface(agentId, userId) {
-  const agent = await agentService.getAgent(agentId, userId);
-  if (!agent) return null;
-
-  const surface = await buildLendingSurfaceForWallet(agent.walletAddress);
-  let carry = null;
-
+async function _buildCarrySnapshotForAgent(agent, surface) {
   try {
     const stablePool = oracle.resolveCurvePool('USDC-EURC');
     const stablePricingPool = oracle.resolveCurvePool('EURC-USDC');
@@ -1422,7 +1567,7 @@ async function getAgentLendingSurface(agentId, userId) {
       : oracle.getMockPoolState('EURC-USDC', forexRate.rate);
     const assetMap = new Map((surface.assets || []).map((assetEntry) => [String(assetEntry.symbol || '').toUpperCase(), assetEntry]));
 
-    carry = buildCarryOpportunitySnapshot({
+    return buildCarryOpportunitySnapshot({
       lendingSurface: surface,
       stablePoolState,
       stableCurvePosition: stablePosition,
@@ -1434,7 +1579,7 @@ async function getAgentLendingSurface(agentId, userId) {
       walletReserveUsdc: agent.settings?.defiWalletReserveUsdc || 0,
     });
   } catch (error) {
-    carry = {
+    return {
       lane: 'carry_stable_lp',
       policyId: 'carry_stable_lp_v1',
       carryState: 'unavailable',
@@ -1442,15 +1587,95 @@ async function getAgentLendingSurface(agentId, userId) {
       error: error.message,
     };
   }
+}
+
+async function _buildAgentLendingSurfacePayload(agent) {
+  const surface = await buildLendingSurfaceForWallet(agent.walletAddress);
+  const carry = await _buildCarrySnapshotForAgent(agent, surface);
 
   return {
-    agentId: agent.id,
     ...surface,
     carry,
     automation: {
       carryEnabled: agent.features?.carryAutomationEnabled === true,
     },
+    updatedAt: new Date().toISOString(),
   };
+}
+
+function _scheduleLendingSurfaceRefresh(agent) {
+  if (!agent?.id || !agent?.walletAddress) return false;
+  if (lendingSurfaceRefreshInflight.has(agent.id)) return true;
+
+  const refreshPromise = (async () => {
+    const payload = await withTimeout(
+      _buildAgentLendingSurfacePayload(agent),
+      getBackgroundRefreshTimeoutMs(),
+      'lending surface refresh timed out',
+    );
+    _writeLendingSurfaceCache(agent.id, payload);
+    await saveAgentReadSnapshot(agent.id, SNAPSHOT_KINDS.LENDING, payload);
+  })()
+    .catch((error) => {
+      console.warn('[LENDING] background refresh failed:', error?.message || error);
+    })
+    .finally(() => {
+      lendingSurfaceRefreshInflight.delete(agent.id);
+    });
+
+  lendingSurfaceRefreshInflight.set(agent.id, refreshPromise);
+  return true;
+}
+
+async function getAgentLendingSurface(agentId, userId) {
+  const agent = await agentService.getAgent(agentId, userId);
+  if (!agent) return null;
+
+  const cached = _readLendingSurfaceCache(agent.id);
+  if (cached) {
+    const refreshInProgress = cached.stale
+      ? _scheduleLendingSurfaceRefresh(agent)
+      : lendingSurfaceRefreshInflight.has(agent.id);
+
+    return _buildLendingSurfaceResponse(agent.id, cached.payload, {
+      stale: cached.stale,
+      dataFreshness: 'cached',
+      cacheAgeMs: cached.cacheAgeMs,
+      degraded: cached.stale,
+      refreshInProgress,
+    });
+  }
+
+  const persisted = await loadAgentReadSnapshot(agent.id, SNAPSHOT_KINDS.LENDING, {
+    freshTtlMs: getUserReadCacheTtlMs(),
+    staleTtlMs: getUserReadStaleTtlMs(),
+  });
+
+  if (persisted?.payload) {
+    _writeLendingSurfaceCache(agent.id, persisted.payload);
+    const refreshInProgress = persisted.stale
+      ? _scheduleLendingSurfaceRefresh(agent)
+      : lendingSurfaceRefreshInflight.has(agent.id);
+
+    return _buildLendingSurfaceResponse(agent.id, persisted.payload, {
+      stale: persisted.stale,
+      dataFreshness: 'snapshot',
+      cacheAgeMs: persisted.ageMs,
+      degraded: persisted.stale,
+      refreshInProgress,
+    });
+  }
+
+  const refreshInProgress = _scheduleLendingSurfaceRefresh(agent);
+  const warmup = _buildWarmupSurface(agent);
+
+  return _buildLendingSurfaceResponse(agent.id, warmup, {
+    stale: true,
+    dataFreshness: 'empty',
+    cacheAgeMs: 0,
+    degraded: true,
+    refreshInProgress,
+  });
 }
 
 module.exports = {

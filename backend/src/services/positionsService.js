@@ -5,6 +5,15 @@ const db = require('../db');
 const oracle = require('./oracle');
 const { resolveCurvePool, resolveDirectSwapFallbackPool } = require('./oracle/pools');
 const { getHealthyArcRpcProvider, safeArcRpcCall } = require('./arcProvider');
+const {
+  SNAPSHOT_KINDS,
+  getUserReadCacheTtlMs,
+  getUserReadStaleTtlMs,
+  getBackgroundRefreshTimeoutMs,
+  loadAgentReadSnapshot,
+  saveAgentReadSnapshot,
+  withTimeout,
+} = require('./agentReadSnapshotService');
 
 const CURVE_POSITION_ABI = [
   'function balanceOf(address account) view returns (uint256)',
@@ -63,6 +72,8 @@ const POSITION_STALE_CACHE_TTL_MS = (() => {
 })();
 const positionSnapshotCache = new Map();
 const inflightPositionReads = new Map();
+const agentPositionResponseCache = new Map();
+const agentPositionRefreshInflight = new Map();
 const SUPPRESSED_POSITION_WARNING_TERMS = [
   'arc rpc unavailable for curve position read',
   'arc rpc unavailable for direct-pair position read',
@@ -165,6 +176,90 @@ function writeCachedPositionSnapshot(cacheKey, payload) {
     staleExpiresAt: now + POSITION_STALE_CACHE_TTL_MS,
     payload: cloneSnapshot(payload),
   });
+}
+
+function buildAgentPositionSnapshotPayload(walletAddress, snapshot = {}) {
+  return {
+    walletAddress: walletAddress || snapshot.walletAddress || null,
+    positions: Array.isArray(snapshot.positions) ? snapshot.positions : [],
+    warnings: Array.isArray(snapshot.warnings) ? snapshot.warnings : [],
+    updatedAt: snapshot.updatedAt || new Date().toISOString(),
+  };
+}
+
+function readAgentPositionResponseCache(agentId) {
+  const entry = agentPositionResponseCache.get(agentId);
+  if (!entry) return null;
+
+  const now = Date.now();
+  if (entry.staleExpiresAt <= now) {
+    agentPositionResponseCache.delete(agentId);
+    return null;
+  }
+
+  return {
+    payload: cloneSnapshot(entry.payload),
+    stale: entry.liveExpiresAt <= now,
+    cacheAgeMs: Math.max(now - entry.savedAt, 0),
+  };
+}
+
+function writeAgentPositionResponseCache(agentId, payload) {
+  const now = Date.now();
+  const freshTtlMs = getUserReadCacheTtlMs();
+  const staleTtlMs = getUserReadStaleTtlMs();
+
+  agentPositionResponseCache.set(agentId, {
+    savedAt: now,
+    liveExpiresAt: now + freshTtlMs,
+    staleExpiresAt: now + staleTtlMs,
+    payload: cloneSnapshot(payload),
+  });
+}
+
+function buildAgentPositionResponse(agentId, payload, {
+  stale = false,
+  dataFreshness = 'live',
+  cacheAgeMs = 0,
+  degraded = false,
+  refreshInProgress = false,
+} = {}) {
+  const normalizedPayload = buildAgentPositionSnapshotPayload(payload?.walletAddress, payload);
+
+  return {
+    agentId,
+    ...normalizedPayload,
+    stale,
+    dataFreshness,
+    cacheAgeMs,
+    degraded,
+    refreshInProgress,
+  };
+}
+
+function scheduleAgentPositionRefresh(agent) {
+  if (!agent?.id || !agent?.wallet_address) return false;
+  if (agentPositionRefreshInflight.has(agent.id)) return true;
+
+  const refreshPromise = (async () => {
+    const refreshedSnapshot = await withTimeout(
+      getWalletPositions(agent.wallet_address),
+      getBackgroundRefreshTimeoutMs(),
+      'positions refresh timed out',
+    );
+    const payload = buildAgentPositionSnapshotPayload(agent.wallet_address, refreshedSnapshot);
+    writeAgentPositionResponseCache(agent.id, payload);
+    await saveAgentReadSnapshot(agent.id, SNAPSHOT_KINDS.POSITIONS, payload);
+  })()
+    .catch((error) => {
+      console.warn('[POSITIONS] background refresh failed:', error?.message || error);
+    })
+    .finally(() => {
+      agentPositionRefreshInflight.delete(agent.id);
+    });
+
+  agentPositionRefreshInflight.set(agent.id, refreshPromise);
+  return true;
 }
 
 async function runWalletPositionsRead(walletAddress, { poolKeys } = {}) {
@@ -634,12 +729,56 @@ async function getAgentPositions(agentId, userId) {
   if (!rows.length) return null;
 
   const agent = rows[0];
-  const snapshot = await getWalletPositions(agent.wallet_address);
+  const cached = readAgentPositionResponseCache(agent.id);
+  if (cached) {
+    const refreshInProgress = cached.stale
+      ? scheduleAgentPositionRefresh(agent)
+      : agentPositionRefreshInflight.has(agent.id);
 
-  return {
-    agentId: agent.id,
-    ...snapshot,
-  };
+    return buildAgentPositionResponse(agent.id, cached.payload, {
+      stale: cached.stale,
+      dataFreshness: 'cached',
+      cacheAgeMs: cached.cacheAgeMs,
+      degraded: cached.stale,
+      refreshInProgress,
+    });
+  }
+
+  const persisted = await loadAgentReadSnapshot(agent.id, SNAPSHOT_KINDS.POSITIONS, {
+    freshTtlMs: getUserReadCacheTtlMs(),
+    staleTtlMs: getUserReadStaleTtlMs(),
+  });
+
+  if (persisted?.payload) {
+    const payload = buildAgentPositionSnapshotPayload(agent.wallet_address, persisted.payload);
+    writeAgentPositionResponseCache(agent.id, payload);
+
+    const refreshInProgress = persisted.stale
+      ? scheduleAgentPositionRefresh(agent)
+      : agentPositionRefreshInflight.has(agent.id);
+
+    return buildAgentPositionResponse(agent.id, payload, {
+      stale: persisted.stale,
+      dataFreshness: 'snapshot',
+      cacheAgeMs: persisted.ageMs,
+      degraded: persisted.stale,
+      refreshInProgress,
+    });
+  }
+
+  const refreshInProgress = scheduleAgentPositionRefresh(agent);
+  const emptyPayload = buildAgentPositionSnapshotPayload(agent.wallet_address, {
+    positions: [],
+    warnings: [],
+  });
+
+  return buildAgentPositionResponse(agent.id, emptyPayload, {
+    stale: true,
+    dataFreshness: 'empty',
+    cacheAgeMs: 0,
+    degraded: true,
+    refreshInProgress,
+  });
 }
 
 module.exports = {

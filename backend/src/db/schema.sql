@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id);
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 4.1 AGENT READ SNAPSHOTS (persistent stale-while-revalidate payloads)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_read_snapshots (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id    UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL,
+  payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT agent_read_snapshots_kind_check CHECK (kind IN ('positions', 'lending', 'status')),
+  CONSTRAINT agent_read_snapshots_unique_agent_kind UNIQUE (agent_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_read_snapshots_agent_kind_updated
+  ON agent_read_snapshots(agent_id, kind, updated_at DESC);
+
 -- ── Migrations (idempotent) ───────────────────────────────────────────────────
 -- Add private_key_encrypted if the column was missing from an earlier schema
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_key_encrypted TEXT;

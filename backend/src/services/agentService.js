@@ -4,6 +4,13 @@ const db = require('../db');
 const { encrypt, decrypt } = require('./cryptoService');
 const { getDailyLimitBypass } = require('./dailyLimitBypass');
 const { assertAgentOperational } = require('./securityEventService');
+const {
+  SNAPSHOT_KINDS,
+  getUserReadCacheTtlMs,
+  getUserReadStaleTtlMs,
+  loadAgentReadSnapshot,
+  saveAgentReadSnapshot,
+} = require('./agentReadSnapshotService');
 
 const DEFAULT_PERMISSIONS = [
   'defi_scan',
@@ -27,16 +34,22 @@ const DEFAULT_STABLE_TARGET_LP_MIN_ALLOCATION_PCT = 20;
 const DEFAULT_STABLE_TARGET_LP_MAX_ALLOCATION_PCT = 30;
 const DAILY_ORACLE_CAP = Math.max(Number.parseInt(process.env.DAILY_ORACLE_CAP || '48', 10) || 48, 1);
 const DAILY_DEFI_LOOP_CAP = Math.max(Number.parseInt(process.env.DAILY_DEFI_LOOP_CAP || '24', 10) || 24, 1);
-const AGENT_STATUS_CACHE_TTL_MS = (() => {
-  const numeric = Number(process.env.ARC_RPC_USER_READ_CACHE_TTL_MS || '15000');
-  return Number.isFinite(numeric) && numeric > 0 ? numeric : 15000;
-})();
 
 const agentStatusCache = new Map();
 const agentStatusInflight = new Map();
 
 function cloneStatusPayload(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function normalizeAgentStatusPayload(value) {
+  const normalized = cloneStatusPayload(value || {});
+  delete normalized.stale;
+  delete normalized.dataFreshness;
+  delete normalized.cacheAgeMs;
+  delete normalized.degraded;
+  delete normalized.refreshInProgress;
+  return normalized;
 }
 
 function getAgentStatusCacheKey(agentId, userId) {
@@ -46,23 +59,30 @@ function getAgentStatusCacheKey(agentId, userId) {
 function readAgentStatusCache(cacheKey) {
   const cached = agentStatusCache.get(cacheKey);
   if (!cached) return null;
-  if (cached.expiresAt <= Date.now()) {
+
+  const now = Date.now();
+  if (cached.staleExpiresAt <= now) {
     agentStatusCache.delete(cacheKey);
     return null;
   }
 
   return {
     value: cloneStatusPayload(cached.value),
-    cacheAgeMs: Math.max(Date.now() - cached.savedAt, 0),
+    stale: cached.liveExpiresAt <= now,
+    cacheAgeMs: Math.max(now - cached.savedAt, 0),
   };
 }
 
 function writeAgentStatusCache(cacheKey, value) {
   const now = Date.now();
+  const freshTtlMs = getUserReadCacheTtlMs();
+  const staleTtlMs = getUserReadStaleTtlMs();
+
   agentStatusCache.set(cacheKey, {
     savedAt: now,
-    expiresAt: now + AGENT_STATUS_CACHE_TTL_MS,
-    value: cloneStatusPayload(value),
+    liveExpiresAt: now + freshTtlMs,
+    staleExpiresAt: now + staleTtlMs,
+    value: normalizeAgentStatusPayload(value),
   });
 }
 
@@ -589,24 +609,7 @@ async function updatePermissions(agentId, userId, permsMap) {
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
-async function getAgentStatus(agentId, userId) {
-  const cacheKey = getAgentStatusCacheKey(agentId, userId);
-  const cached = readAgentStatusCache(cacheKey);
-  if (cached) {
-    return {
-      ...cached.value,
-      stale: false,
-      dataFreshness: 'cached',
-      cacheAgeMs: cached.cacheAgeMs,
-    };
-  }
-
-  const inflight = agentStatusInflight.get(cacheKey);
-  if (inflight) {
-    return inflight;
-  }
-
-  const loadPromise = (async () => {
+async function loadAgentStatusLive(agentId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
             a.llm_model, a.wallet_address, a.last_reset_day, a.daily_limit_reset_at,
@@ -786,10 +789,89 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: a.reputation_last_status || 'idle',
       },
     },
-    stale: false,
-    dataFreshness: 'live',
-    cacheAgeMs: 0,
   };
+}
+
+async function getAgentStatus(agentId, userId) {
+  const cacheKey = getAgentStatusCacheKey(agentId, userId);
+  const cached = readAgentStatusCache(cacheKey);
+  if (cached && !cached.stale) {
+    return {
+      ...cached.value,
+      stale: false,
+      dataFreshness: 'cached',
+      cacheAgeMs: cached.cacheAgeMs,
+      degraded: false,
+      refreshInProgress: false,
+    };
+  }
+
+  const persisted = await loadAgentReadSnapshot(agentId, SNAPSHOT_KINDS.STATUS, {
+    freshTtlMs: getUserReadCacheTtlMs(),
+    staleTtlMs: getUserReadStaleTtlMs(),
+  });
+
+  if (persisted?.payload) {
+    writeAgentStatusCache(cacheKey, persisted.payload);
+
+    const refreshInProgress = persisted.stale && !agentStatusInflight.has(cacheKey);
+    if (refreshInProgress) {
+      const refreshPromise = (async () => {
+        const liveStatus = await loadAgentStatusLive(agentId, userId);
+        if (liveStatus == null) return null;
+
+        writeAgentStatusCache(cacheKey, liveStatus);
+        await saveAgentReadSnapshot(agentId, SNAPSHOT_KINDS.STATUS, normalizeAgentStatusPayload(liveStatus));
+        return {
+          ...liveStatus,
+          stale: false,
+          dataFreshness: 'live',
+          cacheAgeMs: 0,
+          degraded: false,
+          refreshInProgress: false,
+        };
+      })()
+        .catch((error) => {
+          console.warn('[STATUS] background refresh failed:', error?.message || error);
+          return null;
+        })
+        .finally(() => {
+          agentStatusInflight.delete(cacheKey);
+        });
+
+      agentStatusInflight.set(cacheKey, refreshPromise);
+    }
+
+    return {
+      ...normalizeAgentStatusPayload(persisted.payload),
+      stale: persisted.stale,
+      dataFreshness: 'snapshot',
+      cacheAgeMs: persisted.ageMs,
+      degraded: persisted.stale,
+      refreshInProgress: persisted.stale,
+    };
+  }
+
+  const inflight = agentStatusInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const loadPromise = (async () => {
+    const status = await loadAgentStatusLive(agentId, userId);
+    if (status == null) return null;
+
+    writeAgentStatusCache(cacheKey, status);
+    await saveAgentReadSnapshot(agentId, SNAPSHOT_KINDS.STATUS, normalizeAgentStatusPayload(status));
+
+    return {
+      ...status,
+      stale: false,
+      dataFreshness: 'live',
+      cacheAgeMs: 0,
+      degraded: false,
+      refreshInProgress: false,
+    };
   })();
 
   agentStatusInflight.set(cacheKey, loadPromise);
