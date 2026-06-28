@@ -53,6 +53,16 @@ const LP_MAX_APR_PCT = {
   constant_product: 24,
 };
 
+const POSITION_SNAPSHOT_CACHE_TTL_MS = 10 * 60 * 1000;
+const positionSnapshotCache = new Map();
+const SUPPRESSED_POSITION_WARNING_TERMS = [
+  'arc rpc unavailable for curve position read',
+  'arc rpc unavailable for direct-pair position read',
+  'rate limit',
+  'too many requests',
+  'exceeded maximum retry limit',
+];
+
 function getProvider() {
   return getHealthyArcRpcProvider('positions_provider');
 }
@@ -108,6 +118,45 @@ function getPoolStateForPosition(position) {
   const directPair = resolveDirectSwapFallbackPool(position?.poolKey);
   if (!directPair?.address) return null;
   return oracle.getConstantProductPoolState(directPair);
+}
+
+function buildPositionSnapshotCacheKey(walletAddress, poolKeys = []) {
+  const normalizedWallet = String(walletAddress || '').toLowerCase();
+  const normalizedPools = Array.isArray(poolKeys) && poolKeys.length
+    ? poolKeys.map(key => String(key || '').trim().toUpperCase()).sort().join(',')
+    : 'ALL_POOLS';
+
+  return `${normalizedWallet}|${normalizedPools}`;
+}
+
+function cloneSnapshot(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function readCachedPositionSnapshot(cacheKey) {
+  const cached = positionSnapshotCache.get(cacheKey);
+  if (!cached) return null;
+
+  if (cached.expiresAt <= Date.now()) {
+    positionSnapshotCache.delete(cacheKey);
+    return null;
+  }
+
+  return cloneSnapshot(cached.payload);
+}
+
+function writeCachedPositionSnapshot(cacheKey, payload) {
+  positionSnapshotCache.set(cacheKey, {
+    expiresAt: Date.now() + POSITION_SNAPSHOT_CACHE_TTL_MS,
+    payload: cloneSnapshot(payload),
+  });
+}
+
+function shouldSuppressUserFacingPositionWarning(message) {
+  const normalizedMessage = String(message || '').toLowerCase();
+  if (!normalizedMessage) return false;
+
+  return SUPPRESSED_POSITION_WARNING_TERMS.some(term => normalizedMessage.includes(term));
 }
 
 function getTurnoverDepthModifier(priceImpact10kPct) {
@@ -285,6 +334,7 @@ async function getWalletPositions(walletAddress, { poolKeys } = {}) {
     };
   }
 
+  const snapshotCacheKey = buildPositionSnapshotCacheKey(walletAddress, poolKeys);
   const provider = getProvider();
   const trackedPools = dedupeTrackedCurvePools(poolKeys);
   const trackedDirectPairs = filterTrackedDirectPairPools(poolKeys);
@@ -333,14 +383,40 @@ async function getWalletPositions(walletAddress, { poolKeys } = {}) {
         })
         .filter(Boolean),
     )
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter(warning => !shouldSuppressUserFacingPositionWarning(warning.message));
 
-  return {
+  const liveSnapshot = {
     walletAddress,
     positions,
     warnings,
     updatedAt: new Date().toISOString(),
+    stale: false,
+    dataFreshness: 'live',
   };
+
+  if (positions.length > 0) {
+    writeCachedPositionSnapshot(snapshotCacheKey, {
+      walletAddress,
+      positions,
+      updatedAt: liveSnapshot.updatedAt,
+    });
+    return liveSnapshot;
+  }
+
+  const cachedSnapshot = readCachedPositionSnapshot(snapshotCacheKey);
+  if (cachedSnapshot) {
+    return {
+      walletAddress,
+      positions: cachedSnapshot.positions || [],
+      warnings: [],
+      updatedAt: cachedSnapshot.updatedAt || liveSnapshot.updatedAt,
+      stale: true,
+      dataFreshness: 'cached',
+    };
+  }
+
+  return liveSnapshot;
 }
 
 function getTokenMetaForAddress(pool, address) {
@@ -369,7 +445,7 @@ async function readDirectPairPosition(provider, walletAddress, pool) {
   }, null);
 
   if (!readResult) {
-    throw new Error('Arc RPC unavailable for direct-pair position read');
+    return null;
   }
 
   const { lpBalanceRaw, totalSupplyRaw, token0, token1, reserves } = readResult;
@@ -437,7 +513,7 @@ async function readCurvePosition(provider, walletAddress, pool) {
   }, null);
 
   if (!readResult) {
-    throw new Error('Arc RPC unavailable for curve position read');
+    return null;
   }
 
   const { lpBalanceRaw, totalSupplyRaw, reserve0Raw, reserve1Raw, virtualPriceRaw } = readResult;

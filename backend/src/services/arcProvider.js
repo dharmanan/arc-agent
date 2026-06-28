@@ -207,7 +207,7 @@ function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
       if (excluded.has(candidate)) continue;
       selectedIndex = index;
       fallbackUsed = true;
-      console.warn(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
+      console.info(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
       break;
     }
   }
@@ -215,11 +215,11 @@ function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
   if (selectedIndex < 0) {
     selectedIndex = startIndex;
     fallbackUsed = true;
-    console.warn(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
+    console.info(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
   }
 
   if (pool.length > 1 && (fallbackUsed || selectedIndex !== startIndex)) {
-    console.warn(`[ARC_RPC] using fallback endpoint label=${label}`);
+    console.info(`[ARC_RPC] using fallback endpoint label=${label}`);
   }
 
   endpointCursor = (selectedIndex + 1) % pool.length;
