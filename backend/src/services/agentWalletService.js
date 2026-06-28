@@ -91,7 +91,7 @@ const CCTP_CHAINS = {
   },
   'Optimism Sepolia': {
     chainId:       11155420,
-    rpc:           'https://sepolia.optimism.io',
+    rpc:           process.env.OPTIMISM_SEPOLIA_RPC || 'https://optimism-sepolia-rpc.publicnode.com',
     domain:        2,
     usdcAddress:   '0x5fd84259d66Cd46123540766Be93DFE6D43130D7',
     tokenMessenger:'0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa',
