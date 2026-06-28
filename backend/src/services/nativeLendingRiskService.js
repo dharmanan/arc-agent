@@ -1671,7 +1671,7 @@ async function getAgentLendingSurface(agentId, userId) {
 
   return _buildLendingSurfaceResponse(agent.id, warmup, {
     stale: true,
-    dataFreshness: 'empty',
+    dataFreshness: 'empty_fallback',
     cacheAgeMs: 0,
     degraded: true,
     refreshInProgress,

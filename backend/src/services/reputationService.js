@@ -14,6 +14,7 @@ const {
   createArcRpcProvider,
   isArcRpcRateLimitError,
 } = require('./arcProvider');
+const { getUserReadTimeoutMs } = require('./agentReadSnapshotService');
 const db          = require('../db');
 const { sendProtectedContractTx } = require('./txSecurityService');
 
@@ -66,6 +67,10 @@ const REPUTATION_CHAIN_REPLAY_EVENTS = new Set([
   EVENT_TYPES.DEFI_LOOP,
   EVENT_TYPES.DAILY_TASK,
 ]);
+const REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS = readPositiveIntegerEnv(
+  'REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS',
+  getUserReadTimeoutMs(),
+);
 const ARC_TESTNET_NETWORK = { chainId: 5042002, name: 'Arc Testnet' };
 const REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS = (() => {
   const parsed = Number.parseInt(process.env.REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS || '', 10);
@@ -89,6 +94,34 @@ function describeRpcUrl(rpcUrl) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(Number(ms) || 0, 0)));
+}
+
+async function withSoftTimeout(promise, timeoutMs, fallbackValue = null) {
+  const durationMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : getUserReadTimeoutMs();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(fallbackValue);
+    }, durationMs);
+
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(fallbackValue);
+      },
+    );
+  });
 }
 
 async function reserveReputationOnchainWriteDispatchSlot() {
@@ -480,13 +513,18 @@ async function getReputationOverview(agentId, userId, limit = 10) {
 
   if (onchain.configured && onchain.identityRegistered && onchain.tokenId) {
     try {
-      const score = await withArcRpcFailover(
-        `on-chain read agent=${agentId}`,
-        async ({ provider }) => {
-          const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
-          return registry.getScore(BigInt(onchain.tokenId));
-        },
+      const score = await withSoftTimeout(
+        withArcRpcFailover(
+          `on-chain read agent=${agentId}`,
+          async ({ provider }) => {
+            const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
+            return registry.getScore(BigInt(onchain.tokenId));
+          },
+        ),
+        REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS,
+        null,
       );
+
       if (score == null) {
         onchain.status = 'read_error';
       } else {

@@ -205,6 +205,91 @@ const LENDING_MANUAL_ACTIONS = [
 
 const LENDING_ASSET_ACTION_IDS = new Set(['supply', 'withdraw', 'borrow', 'repay']);
 
+const DEFI_READ_TIMEOUT_MS = 1500;
+
+function withClientTimeout(promise, timeoutMs, fallbackValue) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(fallbackValue);
+    }, timeoutMs);
+
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(fallbackValue);
+      },
+    );
+  });
+}
+
+function createEmptyPoolSnapshot(poolConfig) {
+  return {
+    venue: poolConfig?.venue || null,
+    poolKey: poolConfig?.key || null,
+    note: 'Live pool state is still warming up.',
+    pool: {
+      address: null,
+      protocol: poolConfig?.venue || null,
+      venue: poolConfig?.venue || null,
+      source: 'empty_fallback',
+      liquidityState: 'unknown',
+      baseToken: poolConfig?.key?.split('-')?.[0] || 'TOKEN0',
+      quoteToken: poolConfig?.key?.split('-')?.[1] || 'TOKEN1',
+    },
+    state: {
+      source: 'empty_fallback',
+      liquidityState: 'unknown',
+      impliedRate: null,
+      inverseRate: null,
+      fee: 0,
+      priceImpact: {
+        swap1k: null,
+        swap10k: null,
+        swap50k: null,
+      },
+      reserves: {
+        token0: 0,
+        token1: 0,
+      },
+      isFallback: true,
+      fallbackReason: 'pool_state_timeout',
+      fetchedAt: new Date().toISOString(),
+    },
+    isFallback: true,
+    dataFreshness: 'empty_fallback',
+  };
+}
+
+function normalizePoolSnapshotResponse(poolConfig, response) {
+  if (response?.state && typeof response.state === 'object') {
+    return {
+      ...createEmptyPoolSnapshot(poolConfig),
+      ...response,
+      pool: {
+        ...createEmptyPoolSnapshot(poolConfig).pool,
+        ...(response.pool || {}),
+      },
+      state: {
+        ...createEmptyPoolSnapshot(poolConfig).state,
+        ...(response.state || {}),
+      },
+    };
+  }
+
+  return createEmptyPoolSnapshot(poolConfig);
+}
+
 function createEmptyLendingSnapshot() {
   return {
     assets: [...LENDING_WATCH_ASSETS],
@@ -212,6 +297,19 @@ function createEmptyLendingSnapshot() {
     summary: null,
     isFallback: true,
     fetchedAt: null,
+  };
+}
+
+function normalizeLendingSnapshotResponse(response) {
+  const base = createEmptyLendingSnapshot();
+  if (!response || typeof response !== 'object') return base;
+
+  return {
+    ...base,
+    ...response,
+    assets: Array.isArray(response.assets) ? response.assets : base.assets,
+    reserves: Array.isArray(response.reserves) ? response.reserves : base.reserves,
+    summary: response.summary && typeof response.summary === 'object' ? response.summary : base.summary,
   };
 }
 
@@ -271,6 +369,67 @@ function createEmptyLendingSurface() {
       carryEnabled: false,
     },
     actionGuards: {},
+  };
+}
+
+function normalizeLendingSurfaceResponse(response) {
+  const base = createEmptyLendingSurface();
+  if (!response || typeof response !== 'object') return base;
+
+  return {
+    ...base,
+    ...response,
+    execution: {
+      ...base.execution,
+      ...(response.execution || {}),
+      actions: Array.isArray(response?.execution?.actions)
+        ? response.execution.actions
+        : base.execution.actions,
+      notes: Array.isArray(response?.execution?.notes)
+        ? response.execution.notes
+        : base.execution.notes,
+    },
+    prices: {
+      ...base.prices,
+      ...(response.prices || {}),
+      assets: Array.isArray(response?.prices?.assets)
+        ? response.prices.assets
+        : base.prices.assets,
+    },
+    account: {
+      ...base.account,
+      ...(response.account || {}),
+      positions: Array.isArray(response?.account?.positions)
+        ? response.account.positions
+        : base.account.positions,
+    },
+    assets: Array.isArray(response.assets) ? response.assets : base.assets,
+    risk: {
+      ...base.risk,
+      ...(response.risk || {}),
+    },
+    yield: {
+      ...base.yield,
+      ...(response.yield || {}),
+    },
+    carry: {
+      ...base.carry,
+      ...(response.carry || {}),
+      checks: response?.carry?.checks && typeof response.carry.checks === 'object'
+        ? response.carry.checks
+        : base.carry.checks,
+      lpYield: {
+        ...base.carry.lpYield,
+        ...(response?.carry?.lpYield || {}),
+      },
+    },
+    automation: {
+      ...base.automation,
+      ...(response.automation || {}),
+    },
+    actionGuards: response.actionGuards && typeof response.actionGuards === 'object'
+      ? response.actionGuards
+      : base.actionGuards,
   };
 }
 
@@ -2261,6 +2420,8 @@ function PoolPositionSnapshot({ position }) {
 }
 
 function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface, lendingSurfaceError, agentId, onRunQueued }) {
+  const lendingSurfaceFreshness = String(lendingSurface?.dataFreshness || '').trim().toLowerCase();
+  const lendingIsEmptyFallback = lendingSurfaceFreshness === 'empty_fallback';
   const reserves = Array.isArray(lendingSnapshot?.reserves) ? lendingSnapshot.reserves : [];
   const hasLiveMarket = reserves.some(reserve => reserve?.source === 'aave_onchain' && reserve?.isFallback !== true);
   const hasFallbackData = reserves.some(reserve => reserve?.isFallback);
@@ -2568,6 +2729,12 @@ function LendingSection({ loading, lendingSnapshot, lendingError, lendingSurface
           </div>
         </div>
 
+        {lendingIsEmptyFallback && (
+          <Alert type="warning" className="mt-4">
+            No live lending snapshot yet. Showing a safe monitor surface while background refresh continues.
+          </Alert>
+        )}
+
         <div className="mt-4 grid gap-3 lg:grid-cols-2">
           <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
             <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">How To Read This</p>
@@ -2684,7 +2851,7 @@ export default function DeFiTab() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [poolSnapshots, setPoolSnapshots] = useState({});
-  const [positionSnapshot, setPositionSnapshot] = useState({ positions: [], warnings: [] });
+  const [positionSnapshot, setPositionSnapshot] = useState({ positions: [], warnings: [], dataFreshness: 'empty_fallback' });
   const [lendingSnapshot, setLendingSnapshot] = useState(() => createEmptyLendingSnapshot());
   const [lendingSurface, setLendingSurface] = useState(() => createEmptyLendingSurface());
   const [lendingError, setLendingError] = useState('');
@@ -2700,16 +2867,32 @@ export default function DeFiTab() {
 
     try {
       const [positionsRes, lendingRes, lendingSurfaceRes, ...snapshotResults] = await Promise.all([
-        agentsApi.positions(agent.id).catch(() => ({ positions: [], warnings: [] })),
-        oracleApi.reserveState(LENDING_WATCH_ASSETS)
-          .then(data => ({ data }))
+        withClientTimeout(
+          agentsApi.positions(agent.id),
+          DEFI_READ_TIMEOUT_MS,
+          { positions: [], warnings: [], dataFreshness: 'empty_fallback' },
+        ).catch(() => ({ positions: [], warnings: [], dataFreshness: 'empty_fallback' })),
+        withClientTimeout(
+          oracleApi.reserveState(LENDING_WATCH_ASSETS),
+          DEFI_READ_TIMEOUT_MS,
+          createEmptyLendingSnapshot(),
+        )
+          .then(data => ({ data: normalizeLendingSnapshotResponse(data) }))
           .catch(loadError => ({ error: loadError.message || 'Reserve watch data is unavailable right now.' })),
-        agentsApi.lending(agent.id)
-          .then(data => ({ data }))
+        withClientTimeout(
+          agentsApi.lending(agent.id),
+          DEFI_READ_TIMEOUT_MS,
+          createEmptyLendingSurface(),
+        )
+          .then(data => ({ data: normalizeLendingSurfaceResponse(data) }))
           .catch(loadError => ({ error: loadError.message || 'Native lending surface is unavailable right now.' })),
         ...DEFI_POOL_CONFIG.map(pool => (
-          oracleApi.poolState(pool.key, pool.venue)
-            .then(data => ({ key: pool.key, data }))
+          withClientTimeout(
+            oracleApi.poolState(pool.key, pool.venue),
+            DEFI_READ_TIMEOUT_MS,
+            createEmptyPoolSnapshot(pool),
+          )
+            .then(data => ({ key: pool.key, data: normalizePoolSnapshotResponse(pool, data) }))
             .catch(poolError => ({ key: pool.key, error: poolError.message || 'Pool state is unavailable right now.' }))
         )),
       ]);
@@ -2717,10 +2900,11 @@ export default function DeFiTab() {
       setPositionSnapshot({
         positions: positionsRes?.positions || [],
         warnings: positionsRes?.warnings || [],
+        dataFreshness: positionsRes?.dataFreshness || 'empty_fallback',
       });
-      setLendingSnapshot(lendingRes?.data || createEmptyLendingSnapshot());
+      setLendingSnapshot(normalizeLendingSnapshotResponse(lendingRes?.data));
       setLendingError(lendingRes?.error || '');
-      setLendingSurface(lendingSurfaceRes?.data || createEmptyLendingSurface());
+      setLendingSurface(normalizeLendingSurfaceResponse(lendingSurfaceRes?.data));
       setLendingSurfaceError(lendingSurfaceRes?.error || '');
       setPoolSnapshots(Object.fromEntries(snapshotResults.map(result => [result.key, result])));
     } catch (loadError) {
@@ -2744,6 +2928,7 @@ export default function DeFiTab() {
 
   const positionsByPool = useMemo(() => new Map((positionSnapshot.positions || []).map(position => [position.poolKey, position])), [positionSnapshot.positions]);
   const activeSectionExplanation = DEFI_SECTION_EXPLANATIONS[activeSection] || DEFI_SECTION_EXPLANATIONS.liquidity;
+  const liquidityIsEmptyFallback = String(positionSnapshot?.dataFreshness || '').trim().toLowerCase() === 'empty_fallback';
 
   if (!agent) {
     return (
@@ -2813,6 +2998,10 @@ export default function DeFiTab() {
         <div className="flex justify-center py-10"><Spinner /></div>
       ) : (
         <div className="space-y-4">
+          {liquidityIsEmptyFallback && (
+            <Alert type="warning">No live LP snapshot yet. Showing an empty monitor state while background refresh continues.</Alert>
+          )}
+
           {positionSnapshot.warnings?.length > 0 && (
             <Alert type="warning">{positionSnapshot.warnings[0].message}</Alert>
           )}

@@ -250,6 +250,58 @@ function _roundTo(value, digits) {
   return Math.round(value * scale) / scale;
 }
 
+function _derivePoolFallbackRate(baseSymbol, quoteSymbol) {
+  const base = String(baseSymbol || '').toUpperCase();
+  const quote = String(quoteSymbol || '').toUpperCase();
+
+  if (base === 'EURC' && (quote === 'USDC' || quote === 'WUSDC')) return 1.08;
+  if ((base === 'USDC' || base === 'WUSDC') && quote === 'EURC') return 0.9259;
+  return 1;
+}
+
+function _buildOraclePoolStateFallback(pool, {
+  fallbackReason = 'pool_state_unavailable',
+  source = 'empty_fallback',
+} = {}) {
+  const baseSymbol = pool?.baseToken?.symbol || 'TOKEN0';
+  const quoteSymbol = pool?.quoteToken?.symbol || 'TOKEN1';
+  const impliedRate = _derivePoolFallbackRate(baseSymbol, quoteSymbol);
+
+  const mock = oracle.getMockPoolState(pool?.key || `${baseSymbol}-${quoteSymbol}`, impliedRate);
+
+  return {
+    ...mock,
+    poolAddress: pool?.address || mock.poolAddress,
+    protocol: pool?.protocol || mock.protocol,
+    venue: pool?.venue || pool?.protocol || mock.protocol,
+    baseToken: {
+      symbol: baseSymbol,
+      address: pool?.baseToken?.address || null,
+      decimals: Number(pool?.baseToken?.decimals || 18),
+    },
+    quoteToken: {
+      symbol: quoteSymbol,
+      address: pool?.quoteToken?.address || null,
+      decimals: Number(pool?.quoteToken?.decimals || 18),
+    },
+    reserves: {
+      token0: Number(mock?.reserves?.token0 || 0),
+      token1: Number(mock?.reserves?.token1 || 0),
+    },
+    priceImpact: {
+      swap1k: Number(mock?.priceImpact?.swap1k || 0),
+      swap10k: Number(mock?.priceImpact?.swap10k || 0),
+      swap50k: Number(mock?.priceImpact?.swap50k || 0),
+    },
+    source,
+    isFallback: true,
+    fallbackReason,
+    liquidityState: pool?.liquidityState || 'unknown',
+    rateUnit: `${quoteSymbol} per ${baseSymbol}`,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
 function _normalizeCsvValues(value, fallbackValues) {
   const rawValues = Array.isArray(value)
     ? value.flatMap(item => String(item).split(','))
@@ -1047,14 +1099,32 @@ async function _getOracleCurvePoolSnapshot(poolKey = 'USDC-EURC', fallbackRate) 
     };
   }
 
-  return {
-    poolKey: normalizedPoolKey,
-    pool,
-    note: pool.liquidityState === 'empty'
-      ? 'Verified Arc pool found, but current on-chain liquidity is empty'
-      : null,
-    state: await oracle.getCurvePoolState(pool),
-  };
+  try {
+    return {
+      poolKey: normalizedPoolKey,
+      pool,
+      note: pool.liquidityState === 'empty'
+        ? 'Verified Arc pool found, but current on-chain liquidity is empty'
+        : null,
+      state: await oracle.getCurvePoolState(pool),
+    };
+  } catch (error) {
+    oracle.recordOracleFallback('curve_pool_state', {
+      poolKey: normalizedPoolKey,
+      reason: 'arc_rpc_unavailable',
+      detail: error?.message || null,
+    });
+
+    return {
+      poolKey: normalizedPoolKey,
+      pool,
+      note: 'Live Arc pool state is temporarily unavailable — returning fallback snapshot',
+      state: _buildOraclePoolStateFallback(pool, {
+        fallbackReason: 'arc_rpc_unavailable',
+        source: 'empty_fallback',
+      }),
+    };
+  }
 }
 
 async function _getOraclePoolStateSnapshot(poolKey = 'USDC-EURC', venue = 'curve') {
@@ -1088,7 +1158,23 @@ async function _getOraclePoolStateSnapshot(poolKey = 'USDC-EURC', venue = 'curve
     poolKey: pool.key,
     note: pool.note || null,
     pool,
-    state: await oracle.getConstantProductPoolState(pool),
+    state: await (async () => {
+      try {
+        return await oracle.getConstantProductPoolState(pool);
+      } catch (error) {
+        oracle.recordOracleFallback('external_pool_state', {
+          poolKey: pool.key,
+          venue: normalizedVenue,
+          reason: 'arc_rpc_unavailable',
+          detail: error?.message || null,
+        });
+
+        return _buildOraclePoolStateFallback(pool, {
+          fallbackReason: 'arc_rpc_unavailable',
+          source: 'empty_fallback',
+        });
+      }
+    })(),
   };
 }
 

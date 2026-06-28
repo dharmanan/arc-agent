@@ -37,6 +37,15 @@ const DAILY_DEFI_LOOP_CAP = Math.max(Number.parseInt(process.env.DAILY_DEFI_LOOP
 
 const agentStatusCache = new Map();
 const agentStatusInflight = new Map();
+const REQUIRED_AUTOMATION_STATUS_KEYS = [
+  'marketAnalysis',
+  'oracle',
+  'defiLoop',
+  'lendingAutomation',
+  'carryAutomation',
+  'cirbtcLp',
+  'reputation',
+];
 
 function cloneStatusPayload(value) {
   return JSON.parse(JSON.stringify(value));
@@ -54,6 +63,16 @@ function normalizeAgentStatusPayload(value) {
 
 function getAgentStatusCacheKey(agentId, userId) {
   return `${String(agentId || '')}:${String(userId || '')}`;
+}
+
+function hasCompleteAutomationStatusPayload(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (!payload.automation || typeof payload.automation !== 'object') return false;
+
+  return REQUIRED_AUTOMATION_STATUS_KEYS.every((key) => {
+    const lane = payload.automation[key];
+    return lane && typeof lane === 'object' && typeof lane.enabled === 'boolean';
+  });
 }
 
 function readAgentStatusCache(cacheKey) {
@@ -795,7 +814,7 @@ async function loadAgentStatusLive(agentId, userId) {
 async function getAgentStatus(agentId, userId) {
   const cacheKey = getAgentStatusCacheKey(agentId, userId);
   const cached = readAgentStatusCache(cacheKey);
-  if (cached && !cached.stale) {
+  if (cached && !cached.stale && hasCompleteAutomationStatusPayload(cached.value)) {
     return {
       ...cached.value,
       stale: false,
@@ -811,7 +830,7 @@ async function getAgentStatus(agentId, userId) {
     staleTtlMs: getUserReadStaleTtlMs(),
   });
 
-  if (persisted?.payload) {
+  if (persisted?.payload && hasCompleteAutomationStatusPayload(persisted.payload)) {
     writeAgentStatusCache(cacheKey, persisted.payload);
 
     const refreshInProgress = persisted.stale && !agentStatusInflight.has(cacheKey);
@@ -877,7 +896,9 @@ async function getAgentStatus(agentId, userId) {
   agentStatusInflight.set(cacheKey, loadPromise);
   try {
     const status = await loadPromise;
-    writeAgentStatusCache(cacheKey, status);
+    if (status) {
+      writeAgentStatusCache(cacheKey, status);
+    }
     return status;
   } finally {
     agentStatusInflight.delete(cacheKey);

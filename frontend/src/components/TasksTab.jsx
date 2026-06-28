@@ -3755,6 +3755,8 @@ function getReputationSetupToneClasses(tone) {
   switch (tone) {
     case 'green':
       return 'border-green-200 bg-green-50 text-green-700';
+    case 'slate':
+      return 'border-slate-200 bg-slate-50 text-slate-600';
     case 'red':
       return 'border-red-200 bg-red-50 text-red-700';
     case 'amber':
@@ -3763,7 +3765,67 @@ function getReputationSetupToneClasses(tone) {
   }
 }
 
+function hasReputationOverviewPayload(value) {
+  if (!value || typeof value !== 'object') return false;
+
+  const localScore = Number(value.localScore);
+  const totalEvents = Number(value.totalEvents);
+  return typeof value.reputationEnabled === 'boolean'
+    && Number.isFinite(localScore)
+    && Number.isFinite(totalEvents);
+}
+
+function normalizeReputationOverview(value, fallbackEnabled = null) {
+  if (!value || typeof value !== 'object') return null;
+
+  const localScore = Number(value.localScore);
+  const totalEvents = Number(value.totalEvents);
+  const enabled = typeof value.reputationEnabled === 'boolean'
+    ? value.reputationEnabled
+    : (typeof fallbackEnabled === 'boolean' ? fallbackEnabled : null);
+
+  if (enabled == null || !Number.isFinite(localScore) || !Number.isFinite(totalEvents)) {
+    return null;
+  }
+
+  return {
+    ...value,
+    reputationEnabled: enabled,
+    localScore,
+    totalEvents,
+    breakdown: Array.isArray(value.breakdown) ? value.breakdown : [],
+    recentEvents: Array.isArray(value.recentEvents) ? value.recentEvents : [],
+    onchain: value.onchain && typeof value.onchain === 'object' ? value.onchain : {},
+  };
+}
+
 function getReputationSetupItems(reputationOverview) {
+  if (!hasReputationOverviewPayload(reputationOverview)) {
+    return [
+      {
+        key: 'tracking',
+        title: 'Tracking switch',
+        status: 'Loading',
+        tone: 'slate',
+        detail: 'Reputation settings are loading.',
+      },
+      {
+        key: 'identity',
+        title: 'Identity link',
+        status: 'Loading',
+        tone: 'slate',
+        detail: 'Identity status is loading.',
+      },
+      {
+        key: 'registry',
+        title: 'Registry relay',
+        status: 'Loading',
+        tone: 'slate',
+        detail: 'Registry status is loading.',
+      },
+    ];
+  }
+
   const onchain = reputationOverview?.onchain || {};
 
   return [
@@ -3799,12 +3861,15 @@ function getReputationSetupItems(reputationOverview) {
   ];
 }
 
-function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking, agentId }) {
+function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking, agentId, isLoading = false, fetchError = '' }) {
   const [proofOpen, setProofOpen] = useState(false);
   const setupItems = getReputationSetupItems(reputationOverview);
   const onchain = reputationOverview?.onchain || {};
-  const modeLabel = reputationOverview?.mode === 'hybrid' ? 'Local + On-Chain' : 'Local Only';
-  const trackingEnabled = Boolean(reputationOverview?.reputationEnabled);
+  const hasOverview = hasReputationOverviewPayload(reputationOverview);
+  const modeLabel = hasOverview
+    ? (reputationOverview?.mode === 'hybrid' ? 'Local + On-Chain' : 'Local Only')
+    : 'Loading';
+  const trackingEnabled = hasOverview ? Boolean(reputationOverview?.reputationEnabled) : null;
   const registryExplorerUrl = onchain.contractAddress
     ? getTaskExplorerAddressUrl('Arc Testnet', onchain.contractAddress)
     : null;
@@ -3818,7 +3883,7 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
             <ShieldCheck size={18} className="text-blue-600" />
             <h2 className="text-xl font-bold text-slate-900">Agent Reputation</h2>
             <span className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700">
-              {getOnchainReputationLabel(onchain)}
+              {hasOverview ? getOnchainReputationLabel(onchain) : 'Loading'}
             </span>
             <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
               {modeLabel}
@@ -3837,44 +3902,50 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
         </div>
       </div>
 
-      <div className={`rounded-xl border px-4 py-3 ${trackingEnabled ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
+      <div className={`rounded-xl border px-4 py-3 ${trackingEnabled === null ? 'border-slate-200 bg-slate-50' : trackingEnabled ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div className={`text-sm ${trackingEnabled ? 'text-green-800' : 'text-amber-800'}`}>
-            <strong>{trackingEnabled ? 'Reputation tracking is live.' : 'Reputation tracking is currently off.'}</strong>{' '}
+          <div className={`text-sm ${trackingEnabled === null ? 'text-slate-700' : trackingEnabled ? 'text-green-800' : 'text-amber-800'}`}>
+            <strong>{trackingEnabled === null ? 'Reputation tracking status is loading.' : trackingEnabled ? 'Reputation tracking is live.' : 'Reputation tracking is currently off.'}</strong>{' '}
             {trackingEnabled
               ? 'New task, oracle and transaction events can now contribute to the visible score.'
-              : 'Enable it here so new task, oracle and transaction events start creating score immediately.'}
+              : (hasOverview
+                ? 'Enable it here so new task, oracle and transaction events start creating score immediately.'
+                : (fetchError || isLoading
+                  ? 'Waiting for the latest reputation snapshot before showing live tracking status.'
+                  : 'Reputation snapshot is not available right now.'))}
           </div>
-          <button
-            type="button"
-            onClick={() => onToggleTracking?.(!trackingEnabled)}
-            disabled={trackingBusy}
-            className={`shrink-0 inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition disabled:opacity-60 ${trackingEnabled ? 'bg-white text-slate-700 border border-green-200 hover:border-green-300' : 'bg-amber-500 text-white hover:bg-amber-600'}`}
-          >
-            {trackingBusy ? <Spinner size={12} /> : <ShieldCheck size={14} />}
-            {trackingEnabled ? 'Disable Tracking' : 'Enable Tracking'}
-          </button>
+          {hasOverview && (
+            <button
+              type="button"
+              onClick={() => onToggleTracking?.(!trackingEnabled)}
+              disabled={trackingBusy}
+              className={`shrink-0 inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition disabled:opacity-60 ${trackingEnabled ? 'bg-white text-slate-700 border border-green-200 hover:border-green-300' : 'bg-amber-500 text-white hover:bg-amber-600'}`}
+            >
+              {trackingBusy ? <Spinner size={12} /> : <ShieldCheck size={14} />}
+              {trackingEnabled ? 'Disable Tracking' : 'Enable Tracking'}
+            </button>
+          )}
         </div>
       </div>
 
       <div className="grid gap-3 md:grid-cols-4">
         <div className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Local Score</p>
-          <p className="mt-1 text-2xl font-semibold text-slate-900">{Number(reputationOverview?.localScore || 0)}</p>
+          <p className="mt-1 text-2xl font-semibold text-slate-900">{hasOverview ? Number(reputationOverview?.localScore || 0) : '—'}</p>
           <p className="text-xs text-slate-500">Score recorded inside Arc Machina.</p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Recent Events</p>
-          <p className="mt-1 text-2xl font-semibold text-slate-900">{Number(reputationOverview?.totalEvents || 0)}</p>
+          <p className="mt-1 text-2xl font-semibold text-slate-900">{hasOverview ? Number(reputationOverview?.totalEvents || 0) : '—'}</p>
           <p className="text-xs text-slate-500">Completed actions currently contributing to trust.</p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">On-Chain Score</p>
           <p className="mt-1 text-2xl font-semibold text-slate-900">
-            {onchain.status === 'live' ? Number(onchain.score || 0) : '—'}
+            {hasOverview && onchain.status === 'live' ? Number(onchain.score || 0) : '—'}
           </p>
-          <p className="text-xs text-slate-500">{getOnchainReputationMessage(onchain)}</p>
-          {onchain.status === 'live' && agentId && (
+          <p className="text-xs text-slate-500">{hasOverview ? getOnchainReputationMessage(onchain) : (fetchError || (isLoading ? 'Reputation snapshot is loading.' : 'Reputation snapshot is unavailable right now.'))}</p>
+          {hasOverview && onchain.status === 'live' && agentId && (
             <button
               type="button"
               onClick={() => setProofOpen(true)}
@@ -3888,14 +3959,18 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
         <div className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Identity Link</p>
           <p className="mt-1 text-sm font-semibold text-slate-900">
-            {onchain.identityRegistered ? `ERC-8004 #${onchain.tokenId || '—'}` : 'Not registered'}
+            {hasOverview
+              ? (onchain.identityRegistered ? `ERC-8004 #${onchain.tokenId || '—'}` : 'Not registered')
+              : 'Loading'}
           </p>
           <p className="text-xs text-slate-500">
-            {onchain.identityRegistered
+            {hasOverview && onchain.identityRegistered
               ? 'This agent is linked to an ERC-8004 identity token for reputation sync.'
-              : 'On-chain reputation becomes portable only after identity registration.'}
+              : (hasOverview
+                ? 'On-chain reputation becomes portable only after identity registration.'
+                : 'Identity status appears once the reputation snapshot loads.')}
           </p>
-          {registryExplorerUrl && (
+          {hasOverview && registryExplorerUrl && (
             <a
               href={registryExplorerUrl}
               target="_blank"
@@ -3954,12 +4029,12 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
         </div>
       </div>
 
-      {onchain.configured && onchain.contractAddress && (
+      {hasOverview && onchain.configured && onchain.contractAddress && (
         <AddressBox address={onchain.contractAddress} label="Reputation Registry Contract" compact />
       )}
     </Card>
 
-    {proofOpen && agentId && (
+    {proofOpen && hasOverview && agentId && (
       <ReputationProofModal agentId={agentId} onClose={() => setProofOpen(false)} />
     )}
   </>);
@@ -4792,6 +4867,8 @@ export default function TasksTab() {
   const [agentStatus, setAgentStatus] = useState(null);
   const [carryLiveSurface, setCarryLiveSurface] = useState(null);
   const [reputationOverview, setReputationOverview] = useState(null);
+  const [reputationLoading, setReputationLoading] = useState(false);
+  const [reputationFetchError, setReputationFetchError] = useState('');
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState('');
   const [activeGroup, setActiveGroup] = useState('free');
@@ -4848,6 +4925,8 @@ export default function TasksTab() {
 
   const load = useCallback(async () => {
     setLoading(true); setError('');
+    setReputationLoading(Boolean(agent?.id));
+    setReputationFetchError('');
     try {
       const [catRes, circlePaidRes, poolRes, statusRes, carryRes, reputationRes, resultsRes, runsRes] = await Promise.all([
         tasksApi.catalog(),
@@ -4885,13 +4964,24 @@ export default function TasksTab() {
         setCarryLiveSurface(null);
       }
       if (reputationRes?.data) {
-        setReputationOverview(reputationRes.data);
+        const normalizedOverview = normalizeReputationOverview(
+          reputationRes.data,
+          agent?.features?.reputationEnabled,
+        );
+        if (normalizedOverview) {
+          setReputationOverview(normalizedOverview);
+        } else if (agent?.id) {
+          setReputationFetchError('Reputation snapshot is temporarily incomplete. Retaining the latest known local summary.');
+        }
+      } else if (agent?.id && reputationRes?.error) {
+        setReputationFetchError(reputationRes.error);
       } else if (agent?.id) {
         setReputationOverview(null);
       }
     } catch (e) {
       setError(e.message);
     } finally {
+      setReputationLoading(false);
       setLoading(false);
     }
   }, [agent?.id]);
@@ -4986,7 +5076,14 @@ export default function TasksTab() {
         },
       }));
       if (latestStatus) setAgentStatus(latestStatus);
-      if (latestReputation) setReputationOverview(latestReputation);
+      const normalizedOverview = normalizeReputationOverview(latestReputation, nextValue);
+      if (normalizedOverview) {
+        setReputationOverview(normalizedOverview);
+      } else if (featureKey === 'reputationEnabled') {
+        setReputationOverview(current => (hasReputationOverviewPayload(current)
+          ? { ...current, reputationEnabled: nextValue }
+          : current));
+      }
       setAutomationMsg(`${feature?.title || 'Automation'} ${nextValue ? 'enabled' : 'disabled'}.`);
       setTimeout(() => setAutomationMsg(''), 3000);
     } catch (e) {
@@ -5019,7 +5116,14 @@ export default function TasksTab() {
       }));
 
       if (latestStatus) setAgentStatus(latestStatus);
-      if (latestReputation) setReputationOverview(latestReputation);
+      const normalizedOverview = normalizeReputationOverview(latestReputation, payload.reputationEnabled);
+      if (normalizedOverview) {
+        setReputationOverview(normalizedOverview);
+      } else if (typeof payload.reputationEnabled === 'boolean') {
+        setReputationOverview(current => (hasReputationOverviewPayload(current)
+          ? { ...current, reputationEnabled: payload.reputationEnabled }
+          : current));
+      }
 
       setAutomationMsg(nextValue ? 'Full Autonomous mode enabled.' : 'Full Autonomous mode disabled.');
       setTimeout(() => setAutomationMsg(''), 3000);
@@ -5732,6 +5836,8 @@ export default function TasksTab() {
         trackingBusy={automationSavingKey === 'reputationEnabled'}
         onToggleTracking={(nextValue) => handleAutomationToggle('reputationEnabled', nextValue)}
         agentId={agent?.id}
+        isLoading={reputationLoading}
+        fetchError={reputationFetchError}
       />
 
       <Card>

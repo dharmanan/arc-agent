@@ -774,7 +774,7 @@ async function getAgentPositions(agentId, userId) {
 
   return buildAgentPositionResponse(agent.id, emptyPayload, {
     stale: true,
-    dataFreshness: 'empty',
+    dataFreshness: 'empty_fallback',
     cacheAgeMs: 0,
     degraded: true,
     refreshInProgress,
