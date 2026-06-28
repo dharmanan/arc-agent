@@ -53,8 +53,16 @@ const LP_MAX_APR_PCT = {
   constant_product: 24,
 };
 
-const POSITION_SNAPSHOT_CACHE_TTL_MS = 10 * 60 * 1000;
+const POSITION_SNAPSHOT_CACHE_TTL_MS = (() => {
+  const numeric = Number(process.env.ARC_RPC_USER_READ_CACHE_TTL_MS || '15000');
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 15000;
+})();
+const POSITION_STALE_CACHE_TTL_MS = (() => {
+  const numeric = Number(process.env.ARC_RPC_USER_READ_STALE_TTL_MS || '300000');
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 300000;
+})();
 const positionSnapshotCache = new Map();
+const inflightPositionReads = new Map();
 const SUPPRESSED_POSITION_WARNING_TERMS = [
   'arc rpc unavailable for curve position read',
   'arc rpc unavailable for direct-pair position read',
@@ -137,19 +145,115 @@ function readCachedPositionSnapshot(cacheKey) {
   const cached = positionSnapshotCache.get(cacheKey);
   if (!cached) return null;
 
-  if (cached.expiresAt <= Date.now()) {
+  if (cached.staleExpiresAt <= Date.now()) {
     positionSnapshotCache.delete(cacheKey);
     return null;
   }
 
-  return cloneSnapshot(cached.payload);
+  return {
+    payload: cloneSnapshot(cached.payload),
+    stale: cached.liveExpiresAt <= Date.now(),
+    cacheAgeMs: Math.max(Date.now() - cached.savedAt, 0),
+  };
 }
 
 function writeCachedPositionSnapshot(cacheKey, payload) {
+  const now = Date.now();
   positionSnapshotCache.set(cacheKey, {
-    expiresAt: Date.now() + POSITION_SNAPSHOT_CACHE_TTL_MS,
+    savedAt: now,
+    liveExpiresAt: now + POSITION_SNAPSHOT_CACHE_TTL_MS,
+    staleExpiresAt: now + POSITION_STALE_CACHE_TTL_MS,
     payload: cloneSnapshot(payload),
   });
+}
+
+async function runWalletPositionsRead(walletAddress, { poolKeys } = {}) {
+  const snapshotCacheKey = buildPositionSnapshotCacheKey(walletAddress, poolKeys);
+  const provider = getProvider();
+  const trackedPools = dedupeTrackedCurvePools(poolKeys);
+  const trackedDirectPairs = filterTrackedDirectPairPools(poolKeys);
+
+  const settled = await Promise.allSettled(
+    trackedPools.map(pool => readCurvePosition(provider, walletAddress, pool)),
+  );
+
+  const directSettled = await Promise.allSettled(
+    trackedDirectPairs.map(pool => readDirectPairPosition(provider, walletAddress, pool)),
+  );
+
+  const rawPositions = settled
+    .filter(result => result.status === 'fulfilled' && result.value)
+    .map(result => result.value)
+    .concat(
+      directSettled
+        .filter(result => result.status === 'fulfilled' && result.value)
+        .map(result => result.value),
+    );
+
+  const priceLookup = await getTokenPriceLookup(
+    rawPositions.flatMap(position => (position.underlying || []).map(asset => asset.symbol)),
+  ).catch(() => ({}));
+
+  const positions = await Promise.all(
+    rawPositions.map(position => enrichPosition(position, priceLookup).catch(() => position)),
+  );
+
+  const warnings = settled
+    .map((result, index) => {
+      if (result.status === 'fulfilled') return null;
+      return {
+        poolKey: trackedPools[index]?.key || 'unknown',
+        message: result.reason?.message || 'position_read_failed',
+      };
+    })
+    .concat(
+      directSettled
+        .map((result, index) => {
+          if (result.status === 'fulfilled') return null;
+          return {
+            poolKey: trackedDirectPairs[index]?.key || 'unknown_direct_pair',
+            message: result.reason?.message || 'position_read_failed',
+          };
+        })
+        .filter(Boolean),
+    )
+    .filter(Boolean)
+    .filter(warning => !shouldSuppressUserFacingPositionWarning(warning.message));
+
+  const liveSnapshot = {
+    walletAddress,
+    positions,
+    warnings,
+    updatedAt: new Date().toISOString(),
+    stale: false,
+    dataFreshness: 'live',
+    cacheAgeMs: 0,
+  };
+
+  if (positions.length > 0) {
+    writeCachedPositionSnapshot(snapshotCacheKey, {
+      walletAddress,
+      positions,
+      warnings: [],
+      updatedAt: liveSnapshot.updatedAt,
+    });
+    return liveSnapshot;
+  }
+
+  const cachedSnapshot = readCachedPositionSnapshot(snapshotCacheKey);
+  if (cachedSnapshot) {
+    return {
+      walletAddress,
+      positions: cachedSnapshot.payload.positions || [],
+      warnings: [],
+      updatedAt: cachedSnapshot.payload.updatedAt || liveSnapshot.updatedAt,
+      stale: true,
+      dataFreshness: 'cached',
+      cacheAgeMs: cachedSnapshot.cacheAgeMs,
+    };
+  }
+
+  return liveSnapshot;
 }
 
 function shouldSuppressUserFacingPositionWarning(message) {
@@ -335,88 +439,47 @@ async function getWalletPositions(walletAddress, { poolKeys } = {}) {
   }
 
   const snapshotCacheKey = buildPositionSnapshotCacheKey(walletAddress, poolKeys);
-  const provider = getProvider();
-  const trackedPools = dedupeTrackedCurvePools(poolKeys);
-  const trackedDirectPairs = filterTrackedDirectPairPools(poolKeys);
-
-  const settled = await Promise.allSettled(
-    trackedPools.map(pool => readCurvePosition(provider, walletAddress, pool)),
-  );
-
-  const directSettled = await Promise.allSettled(
-    trackedDirectPairs.map(pool => readDirectPairPosition(provider, walletAddress, pool)),
-  );
-
-  const rawPositions = settled
-    .filter(result => result.status === 'fulfilled' && result.value)
-    .map(result => result.value)
-    .concat(
-      directSettled
-        .filter(result => result.status === 'fulfilled' && result.value)
-        .map(result => result.value),
-    );
-
-  const priceLookup = await getTokenPriceLookup(
-    rawPositions.flatMap(position => (position.underlying || []).map(asset => asset.symbol)),
-  ).catch(() => ({}));
-
-  const positions = await Promise.all(
-    rawPositions.map(position => enrichPosition(position, priceLookup).catch(() => position)),
-  );
-
-  const warnings = settled
-    .map((result, index) => {
-      if (result.status === 'fulfilled') return null;
-      return {
-        poolKey: trackedPools[index]?.key || 'unknown',
-        message: result.reason?.message || 'position_read_failed',
-      };
-    })
-    .concat(
-      directSettled
-        .map((result, index) => {
-          if (result.status === 'fulfilled') return null;
-          return {
-            poolKey: trackedDirectPairs[index]?.key || 'unknown_direct_pair',
-            message: result.reason?.message || 'position_read_failed',
-          };
-        })
-        .filter(Boolean),
-    )
-    .filter(Boolean)
-    .filter(warning => !shouldSuppressUserFacingPositionWarning(warning.message));
-
-  const liveSnapshot = {
-    walletAddress,
-    positions,
-    warnings,
-    updatedAt: new Date().toISOString(),
-    stale: false,
-    dataFreshness: 'live',
-  };
-
-  if (positions.length > 0) {
-    writeCachedPositionSnapshot(snapshotCacheKey, {
-      walletAddress,
-      positions,
-      updatedAt: liveSnapshot.updatedAt,
-    });
-    return liveSnapshot;
-  }
-
-  const cachedSnapshot = readCachedPositionSnapshot(snapshotCacheKey);
-  if (cachedSnapshot) {
+  const hotCache = readCachedPositionSnapshot(snapshotCacheKey);
+  if (hotCache && !hotCache.stale) {
     return {
       walletAddress,
-      positions: cachedSnapshot.positions || [],
+      positions: hotCache.payload.positions || [],
       warnings: [],
-      updatedAt: cachedSnapshot.updatedAt || liveSnapshot.updatedAt,
-      stale: true,
+      updatedAt: hotCache.payload.updatedAt || new Date().toISOString(),
+      stale: false,
       dataFreshness: 'cached',
+      cacheAgeMs: hotCache.cacheAgeMs,
     };
   }
 
-  return liveSnapshot;
+  const inflight = inflightPositionReads.get(snapshotCacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const readPromise = runWalletPositionsRead(walletAddress, { poolKeys })
+    .catch((error) => {
+      const staleCache = readCachedPositionSnapshot(snapshotCacheKey);
+      if (staleCache) {
+        return {
+          walletAddress,
+          positions: staleCache.payload.positions || [],
+          warnings: [],
+          updatedAt: staleCache.payload.updatedAt || new Date().toISOString(),
+          stale: true,
+          dataFreshness: 'cached',
+          cacheAgeMs: staleCache.cacheAgeMs,
+        };
+      }
+
+      throw error;
+    })
+    .finally(() => {
+      inflightPositionReads.delete(snapshotCacheKey);
+    });
+
+  inflightPositionReads.set(snapshotCacheKey, readPromise);
+  return readPromise;
 }
 
 function getTokenMetaForAddress(pool, address) {

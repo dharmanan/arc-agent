@@ -43,6 +43,14 @@ const RESERVE_SNAPSHOT_CACHE_TTL_MS = (() => {
   const numeric = Number(process.env.ARC_LENDING_RESERVE_CACHE_TTL_MS || '5000');
   return Number.isFinite(numeric) && numeric >= 0 ? numeric : 5000;
 })();
+const USER_READ_CACHE_TTL_MS = (() => {
+  const numeric = Number(process.env.ARC_RPC_USER_READ_CACHE_TTL_MS || '15000');
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 15000;
+})();
+const USER_READ_STALE_TTL_MS = (() => {
+  const numeric = Number(process.env.ARC_RPC_USER_READ_STALE_TTL_MS || '300000');
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 300000;
+})();
 
 let reserveSnapshotCache = {
   contractAddress: null,
@@ -50,6 +58,57 @@ let reserveSnapshotCache = {
   value: null,
   inflight: null,
 };
+const nativeLendingOverviewCache = new Map();
+const nativeLendingOverviewInflight = new Map();
+const nativeLendingAccountCache = new Map();
+const nativeLendingAccountInflight = new Map();
+
+function cloneForCache(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function readUserReadCache(cacheMap, key) {
+  const entry = cacheMap.get(key);
+  if (!entry) return null;
+
+  const now = Date.now();
+  if (entry.staleExpiresAt <= now) {
+    cacheMap.delete(key);
+    return null;
+  }
+
+  return {
+    value: cloneForCache(entry.value),
+    stale: entry.liveExpiresAt <= now,
+    cacheAgeMs: Math.max(now - entry.savedAt, 0),
+  };
+}
+
+function writeUserReadCache(cacheMap, key, value) {
+  const now = Date.now();
+  cacheMap.set(key, {
+    savedAt: now,
+    liveExpiresAt: now + USER_READ_CACHE_TTL_MS,
+    staleExpiresAt: now + USER_READ_STALE_TTL_MS,
+    value: cloneForCache(value),
+  });
+}
+
+function makeRequestCycleState() {
+  return {
+    memo: new Map(),
+  };
+}
+
+async function memoizedRead(state, key, loader) {
+  if (state.memo.has(key)) {
+    return state.memo.get(key);
+  }
+
+  const promise = Promise.resolve().then(loader);
+  state.memo.set(key, promise);
+  return promise;
+}
 
 function getArcRpcUrl() {
   return process.env.ARC_RPC_URL || process.env.ARC_TESTNET_RPC || 'https://rpc.testnet.arc.network';
@@ -106,7 +165,7 @@ async function approveIfNeeded(tokenAddress, signer, spender, amountRaw, txSecur
   }
 }
 
-async function readConfiguredReserveSnapshots(contract) {
+async function readConfiguredReserveSnapshots(contract, requestState = makeRequestCycleState()) {
   const contractAddress = getArcLendingPoolAddress();
   const now = Date.now();
 
@@ -126,9 +185,11 @@ async function readConfiguredReserveSnapshots(contract) {
   }
 
   const loadPromise = (async () => {
-  const count = await safeArcRpcCall('native_lending_supported_asset_count', async () => (
-    contract.supportedAssetCount()
-  ), null);
+  const count = await memoizedRead(requestState, 'native_lending_supported_asset_count', () => (
+    safeArcRpcCall('native_lending_supported_asset_count', async () => (
+      contract.supportedAssetCount()
+    ), null)
+  ));
   if (count == null) {
     throw new Error('Arc RPC unavailable for supportedAssetCount');
   }
@@ -136,19 +197,25 @@ async function readConfiguredReserveSnapshots(contract) {
   const reserves = [];
 
   for (let index = 0; index < Number(count); index += 1) {
-    const assetAddress = await safeArcRpcCall('native_lending_supported_asset_at', async () => (
-      contract.supportedAssetAt(index)
-    ), null);
+    const assetAddress = await memoizedRead(requestState, `native_lending_supported_asset_at:${index}`, () => (
+      safeArcRpcCall('native_lending_supported_asset_at', async () => (
+        contract.supportedAssetAt(index)
+      ), null)
+    ));
     if (!assetAddress) {
       throw new Error('Arc RPC unavailable for supportedAssetAt');
     }
     const knownAsset = resolveLendingAsset(assetAddress);
-    const config = await safeArcRpcCall('native_lending_reserve_config', async () => (
-      contract.getReserveConfig(assetAddress)
-    ), null);
-    const state = await safeArcRpcCall('native_lending_reserve_state', async () => (
-      contract.getReserveState(assetAddress)
-    ), null);
+    const config = await memoizedRead(requestState, `native_lending_reserve_config:${assetAddress.toLowerCase()}`, () => (
+      safeArcRpcCall('native_lending_reserve_config', async () => (
+        contract.getReserveConfig(assetAddress)
+      ), null)
+    ));
+    const state = await memoizedRead(requestState, `native_lending_reserve_state:${assetAddress.toLowerCase()}`, () => (
+      safeArcRpcCall('native_lending_reserve_state', async () => (
+        contract.getReserveState(assetAddress)
+      ), null)
+    ));
     if (!config || !state) {
       throw new Error('Arc RPC unavailable for reserve snapshot');
     }
@@ -207,8 +274,19 @@ async function readConfiguredReserveSnapshots(contract) {
 
 async function getNativeLendingOverview() {
   const contractAddress = getArcLendingPoolAddress();
-  if (!contractAddress) {
+  const cacheKey = `overview:${contractAddress || 'none'}`;
+
+  const cached = readUserReadCache(nativeLendingOverviewCache, cacheKey);
+  if (cached && !cached.stale) {
     return {
+      ...cached.value,
+      stale: false,
+      dataFreshness: 'cached',
+      cacheAgeMs: cached.cacheAgeMs,
+    };
+  }
+  if (!contractAddress) {
+    const scaffold = {
       source: 'arc_native_scaffold',
       live: false,
       contractAddress: null,
@@ -221,44 +299,97 @@ async function getNativeLendingOverview() {
         'No live lending contract address is configured yet.',
       ],
     };
-  }
-
-  const provider = getReadProvider();
-  const contract = getNativeLendingContract(provider);
-  const [treasury, globalPaused, buildState, reserves] = await Promise.all([
-    safeArcRpcCall('native_lending_treasury', async () => contract.treasury(), null),
-    safeArcRpcCall('native_lending_global_paused', async () => contract.globalPaused(), null),
-    safeArcRpcCall('native_lending_status', async () => contract.implementationStatus(), null),
-    readConfiguredReserveSnapshots(contract),
-  ]);
-
-  if (treasury == null || globalPaused == null || buildState == null) {
+    writeUserReadCache(nativeLendingOverviewCache, cacheKey, scaffold);
     return {
-      source: 'arc_native_lending_contract',
-      live: false,
-      contractAddress,
-      buildState: 'rpc_unavailable',
-      actions: ['supply', 'withdraw', 'borrow', 'repay', 'deleverage', 'liquidate'],
-      reserves: [],
+      ...scaffold,
+      stale: false,
+      dataFreshness: 'live',
+      cacheAgeMs: 0,
     };
   }
 
-  return {
-    source: 'arc_native_lending_contract',
-    live: buildState !== 'scaffold_only',
-    contractAddress,
-    treasury,
-    globalPaused,
-    buildState,
-    actions: ['supply', 'withdraw', 'borrow', 'repay', 'deleverage', 'liquidate'],
-    reserves,
-  };
+  const inflight = nativeLendingOverviewInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const loadPromise = (async () => {
+    const requestState = makeRequestCycleState();
+    const provider = getReadProvider();
+    const contract = getNativeLendingContract(provider);
+    const [treasury, globalPaused, buildState, reserves] = await Promise.all([
+      memoizedRead(requestState, 'native_lending_treasury', () => safeArcRpcCall('native_lending_treasury', async () => contract.treasury(), null)),
+      memoizedRead(requestState, 'native_lending_global_paused', () => safeArcRpcCall('native_lending_global_paused', async () => contract.globalPaused(), null)),
+      memoizedRead(requestState, 'native_lending_status', () => safeArcRpcCall('native_lending_status', async () => contract.implementationStatus(), null)),
+      readConfiguredReserveSnapshots(contract, requestState),
+    ]);
+
+    if (treasury == null || globalPaused == null || buildState == null) {
+      return {
+        source: 'arc_native_lending_contract',
+        live: false,
+        contractAddress,
+        buildState: 'rpc_unavailable',
+        actions: ['supply', 'withdraw', 'borrow', 'repay', 'deleverage', 'liquidate'],
+        reserves: [],
+      };
+    }
+
+    return {
+      source: 'arc_native_lending_contract',
+      live: buildState !== 'scaffold_only',
+      contractAddress,
+      treasury,
+      globalPaused,
+      buildState,
+      actions: ['supply', 'withdraw', 'borrow', 'repay', 'deleverage', 'liquidate'],
+      reserves,
+    };
+  })();
+
+  nativeLendingOverviewInflight.set(cacheKey, loadPromise);
+  try {
+    const liveOverview = await loadPromise;
+    writeUserReadCache(nativeLendingOverviewCache, cacheKey, liveOverview);
+    return {
+      ...liveOverview,
+      stale: false,
+      dataFreshness: 'live',
+      cacheAgeMs: 0,
+    };
+  } catch (error) {
+    const staleCached = readUserReadCache(nativeLendingOverviewCache, cacheKey);
+    if (staleCached) {
+      return {
+        ...staleCached.value,
+        stale: true,
+        dataFreshness: 'cached',
+        cacheAgeMs: staleCached.cacheAgeMs,
+      };
+    }
+    throw error;
+  } finally {
+    nativeLendingOverviewInflight.delete(cacheKey);
+  }
 }
 
 async function getNativeLendingAccountOverview(account) {
   const contractAddress = getArcLendingPoolAddress();
-  if (!contractAddress) {
+  const normalizedAccount = String(account || '').toLowerCase();
+  const cacheKey = `account:${contractAddress || 'none'}:${normalizedAccount}`;
+
+  const cached = readUserReadCache(nativeLendingAccountCache, cacheKey);
+  if (cached && !cached.stale) {
     return {
+      ...cached.value,
+      stale: false,
+      dataFreshness: 'cached',
+      cacheAgeMs: cached.cacheAgeMs,
+    };
+  }
+
+  if (!contractAddress) {
+    const scaffold = {
       source: 'arc_native_scaffold',
       live: false,
       contractAddress: null,
@@ -266,58 +397,102 @@ async function getNativeLendingAccountOverview(account) {
       liquidity: null,
       positions: [],
     };
+    writeUserReadCache(nativeLendingAccountCache, cacheKey, scaffold);
+    return {
+      ...scaffold,
+      stale: false,
+      dataFreshness: 'live',
+      cacheAgeMs: 0,
+    };
   }
 
-  const provider = getReadProvider();
-  const contract = getNativeLendingContract(provider);
-  const reserves = await readConfiguredReserveSnapshots(contract);
-  const liquidity = await safeArcRpcCall('native_lending_account_liquidity', async () => (
-    contract.previewAccountLiquidity(account)
-  ), null);
-  if (!liquidity) {
+  const inflight = nativeLendingAccountInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const loadPromise = (async () => {
+    const requestState = makeRequestCycleState();
+    const provider = getReadProvider();
+    const contract = getNativeLendingContract(provider);
+    const reserves = await readConfiguredReserveSnapshots(contract, requestState);
+    const liquidity = await memoizedRead(requestState, `native_lending_account_liquidity:${normalizedAccount}`, () => (
+      safeArcRpcCall('native_lending_account_liquidity', async () => (
+        contract.previewAccountLiquidity(account)
+      ), null)
+    ));
+    if (!liquidity) {
+      return {
+        source: 'arc_native_lending_contract',
+        live: true,
+        contractAddress,
+        account,
+        liquidity: null,
+        positions: [],
+      };
+    }
+    const positions = await Promise.all(reserves.map(async reserve => {
+      const position = await memoizedRead(requestState, `native_lending_user_position:${normalizedAccount}:${String(reserve.assetAddress || '').toLowerCase()}`, () => (
+        safeArcRpcCall('native_lending_user_position', async () => (
+          contract.getUserPosition(account, reserve.assetAddress)
+        ), null)
+      ));
+      if (!position) {
+        return {
+          symbol: reserve.symbol,
+          assetAddress: reserve.assetAddress,
+          suppliedPrincipal: null,
+          borrowPrincipal: null,
+          useAsCollateral: false,
+        };
+      }
+      return {
+        symbol: reserve.symbol,
+        assetAddress: reserve.assetAddress,
+        suppliedPrincipal: formatUnits(position.suppliedPrincipal, reserve.decimals),
+        borrowPrincipal: formatUnits(position.borrowPrincipal, reserve.decimals),
+        useAsCollateral: Boolean(position.useAsCollateral),
+      };
+    }));
+
     return {
       source: 'arc_native_lending_contract',
       live: true,
       contractAddress,
       account,
-      liquidity: null,
-      positions: [],
+      liquidity: {
+        collateralValueUsd18: ethers.formatUnits(liquidity.collateralValueUsd18, 18),
+        borrowValueUsd18: ethers.formatUnits(liquidity.borrowValueUsd18, 18),
+        availableBorrowUsd18: ethers.formatUnits(liquidity.availableBorrowUsd18, 18),
+      },
+      positions,
     };
-  }
-  const positions = await Promise.all(reserves.map(async reserve => {
-    const position = await safeArcRpcCall('native_lending_user_position', async () => (
-      contract.getUserPosition(account, reserve.assetAddress)
-    ), null);
-    if (!position) {
+  })();
+
+  nativeLendingAccountInflight.set(cacheKey, loadPromise);
+  try {
+    const liveAccountOverview = await loadPromise;
+    writeUserReadCache(nativeLendingAccountCache, cacheKey, liveAccountOverview);
+    return {
+      ...liveAccountOverview,
+      stale: false,
+      dataFreshness: 'live',
+      cacheAgeMs: 0,
+    };
+  } catch (error) {
+    const staleCached = readUserReadCache(nativeLendingAccountCache, cacheKey);
+    if (staleCached) {
       return {
-        symbol: reserve.symbol,
-        assetAddress: reserve.assetAddress,
-        suppliedPrincipal: null,
-        borrowPrincipal: null,
-        useAsCollateral: false,
+        ...staleCached.value,
+        stale: true,
+        dataFreshness: 'cached',
+        cacheAgeMs: staleCached.cacheAgeMs,
       };
     }
-    return {
-      symbol: reserve.symbol,
-      assetAddress: reserve.assetAddress,
-      suppliedPrincipal: formatUnits(position.suppliedPrincipal, reserve.decimals),
-      borrowPrincipal: formatUnits(position.borrowPrincipal, reserve.decimals),
-      useAsCollateral: Boolean(position.useAsCollateral),
-    };
-  }));
-
-  return {
-    source: 'arc_native_lending_contract',
-    live: true,
-    contractAddress,
-    account,
-    liquidity: {
-      collateralValueUsd18: ethers.formatUnits(liquidity.collateralValueUsd18, 18),
-      borrowValueUsd18: ethers.formatUnits(liquidity.borrowValueUsd18, 18),
-      availableBorrowUsd18: ethers.formatUnits(liquidity.availableBorrowUsd18, 18),
-    },
-    positions,
-  };
+    throw error;
+  } finally {
+    nativeLendingAccountInflight.delete(cacheKey);
+  }
 }
 
 async function executeNativeLendingSupply({ assetAddress, amount, agentPrivateKey, onBehalfOf, decimals }) {

@@ -27,6 +27,44 @@ const DEFAULT_STABLE_TARGET_LP_MIN_ALLOCATION_PCT = 20;
 const DEFAULT_STABLE_TARGET_LP_MAX_ALLOCATION_PCT = 30;
 const DAILY_ORACLE_CAP = Math.max(Number.parseInt(process.env.DAILY_ORACLE_CAP || '48', 10) || 48, 1);
 const DAILY_DEFI_LOOP_CAP = Math.max(Number.parseInt(process.env.DAILY_DEFI_LOOP_CAP || '24', 10) || 24, 1);
+const AGENT_STATUS_CACHE_TTL_MS = (() => {
+  const numeric = Number(process.env.ARC_RPC_USER_READ_CACHE_TTL_MS || '15000');
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 15000;
+})();
+
+const agentStatusCache = new Map();
+const agentStatusInflight = new Map();
+
+function cloneStatusPayload(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getAgentStatusCacheKey(agentId, userId) {
+  return `${String(agentId || '')}:${String(userId || '')}`;
+}
+
+function readAgentStatusCache(cacheKey) {
+  const cached = agentStatusCache.get(cacheKey);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    agentStatusCache.delete(cacheKey);
+    return null;
+  }
+
+  return {
+    value: cloneStatusPayload(cached.value),
+    cacheAgeMs: Math.max(Date.now() - cached.savedAt, 0),
+  };
+}
+
+function writeAgentStatusCache(cacheKey, value) {
+  const now = Date.now();
+  agentStatusCache.set(cacheKey, {
+    savedAt: now,
+    expiresAt: now + AGENT_STATUS_CACHE_TTL_MS,
+    value: cloneStatusPayload(value),
+  });
+}
 
 function parseTimestampMs(value) {
   const timestamp = Date.parse(value || '');
@@ -552,6 +590,23 @@ async function updatePermissions(agentId, userId, permsMap) {
 
 // ── Status ────────────────────────────────────────────────────────────────────
 async function getAgentStatus(agentId, userId) {
+  const cacheKey = getAgentStatusCacheKey(agentId, userId);
+  const cached = readAgentStatusCache(cacheKey);
+  if (cached) {
+    return {
+      ...cached.value,
+      stale: false,
+      dataFreshness: 'cached',
+      cacheAgeMs: cached.cacheAgeMs,
+    };
+  }
+
+  const inflight = agentStatusInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const loadPromise = (async () => {
   const { rows } = await db.query(
     `SELECT a.id, a.status, a.daily_spent_usdc, a.daily_limit_usdc, a.is_smart_mode,
             a.llm_model, a.wallet_address, a.last_reset_day, a.daily_limit_reset_at,
@@ -731,7 +786,20 @@ async function getAgentStatus(agentId, userId) {
         lastStatus: a.reputation_last_status || 'idle',
       },
     },
+    stale: false,
+    dataFreshness: 'live',
+    cacheAgeMs: 0,
   };
+  })();
+
+  agentStatusInflight.set(cacheKey, loadPromise);
+  try {
+    const status = await loadPromise;
+    writeAgentStatusCache(cacheKey, status);
+    return status;
+  } finally {
+    agentStatusInflight.delete(cacheKey);
+  }
 }
 
 // ── Deactivate ────────────────────────────────────────────────────────────────

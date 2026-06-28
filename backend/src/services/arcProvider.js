@@ -3,7 +3,11 @@
 const { ethers } = require('ethers');
 
 const DEFAULT_ARC_RPC_URL = 'https://rpc.testnet.arc.network';
-const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 120000;
+const DEFAULT_ENDPOINT_ERROR_COOLDOWN_MS = 120000;
+const DEFAULT_BATCH_LIMIT_COOLDOWN_MS = 600000;
+const DEFAULT_LOG_THROTTLE_MS = 60000;
+const DEFAULT_BATCH_MAX_COUNT = 1;
+const DEFAULT_BATCH_STALL_TIME_MS = 10;
 
 const ARC_TESTNET_NETWORK = Object.freeze({
   chainId: 5042002,
@@ -12,13 +16,34 @@ const ARC_TESTNET_NETWORK = Object.freeze({
 const ARC_TESTNET_STATIC_NETWORK = ethers.Network.from(ARC_TESTNET_NETWORK);
 
 const providerCache = new Map();
-const endpointCooldownUntil = new Map();
+const endpointHealthState = new Map();
+const throttledLogState = new Map();
 
 let endpointCursor = 0;
 
 function readPositiveIntegerEnv(name, fallback) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getLogThrottleMs() {
+  return readPositiveIntegerEnv('ARC_RPC_LOG_THROTTLE_MS', DEFAULT_LOG_THROTTLE_MS);
+}
+
+function getBatchMaxCount() {
+  return readPositiveIntegerEnv('ARC_RPC_BATCH_MAX_COUNT', DEFAULT_BATCH_MAX_COUNT);
+}
+
+function getBatchStallTimeMs() {
+  return readPositiveIntegerEnv('ARC_RPC_BATCH_STALL_TIME_MS', DEFAULT_BATCH_STALL_TIME_MS);
+}
+
+function getEndpointErrorCooldownMs() {
+  return readPositiveIntegerEnv('ARC_RPC_ENDPOINT_ERROR_COOLDOWN_MS', DEFAULT_ENDPOINT_ERROR_COOLDOWN_MS);
+}
+
+function getBatchLimitCooldownMs() {
+  return readPositiveIntegerEnv('ARC_RPC_BATCH_LIMIT_COOLDOWN_MS', DEFAULT_BATCH_LIMIT_COOLDOWN_MS);
 }
 
 function parseArcRpcUrlList(value) {
@@ -53,6 +78,14 @@ function normalizeRpcUrl(rpcUrl = getArcRpcUrl()) {
   return String(rpcUrl || '').trim() || getArcRpcUrl();
 }
 
+function getProviderOptions() {
+  return {
+    staticNetwork: ARC_TESTNET_STATIC_NETWORK,
+    batchMaxCount: getBatchMaxCount(),
+    batchStallTime: getBatchStallTimeMs(),
+  };
+}
+
 function createArcRpcProvider(rpcUrl = getArcRpcUrl()) {
   const normalizedRpcUrl = normalizeRpcUrl(rpcUrl);
   let provider = providerCache.get(normalizedRpcUrl);
@@ -61,16 +94,12 @@ function createArcRpcProvider(rpcUrl = getArcRpcUrl()) {
     provider = new ethers.JsonRpcProvider(
       normalizedRpcUrl,
       ARC_TESTNET_NETWORK,
-      { staticNetwork: ARC_TESTNET_STATIC_NETWORK },
+      getProviderOptions(),
     );
     providerCache.set(normalizedRpcUrl, provider);
   }
 
   return provider;
-}
-
-function getCooldownMs() {
-  return readPositiveIntegerEnv('ARC_RPC_RATE_LIMIT_COOLDOWN_MS', DEFAULT_RATE_LIMIT_COOLDOWN_MS);
 }
 
 function getEndpointLabel(rpcUrl) {
@@ -99,18 +128,34 @@ function maskRpcUrl(rpcUrl) {
   }
 }
 
-function isArcRpcRateLimitError(error) {
-  const text = [
+function extractArcRpcErrorText(error) {
+  return [
     error?.message,
     error?.shortMessage,
     error?.code,
     error?.info?.responseStatus,
     error?.info?.responseBody,
     error?.error?.message,
+    error?.cause?.message,
   ]
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
+}
+
+function isArcRpcBatchLimitError(error) {
+  const text = extractArcRpcErrorText(error);
+  return text.includes('batch of more than 3 requests are not allowed')
+    || text.includes('batch of more than')
+    || text.includes('code=31');
+}
+
+function isArcRpcRateLimitError(error) {
+  const text = extractArcRpcErrorText(error);
+
+  if (isArcRpcBatchLimitError(error)) {
+    return true;
+  }
 
   return text.includes('429')
     || text.includes('too many requests')
@@ -131,16 +176,7 @@ function isArcRpcTransientError(error) {
     return true;
   }
 
-  const text = [
-    error?.message,
-    error?.shortMessage,
-    error?.error?.message,
-    error?.info?.error?.message,
-    error?.cause?.message,
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
+  const text = extractArcRpcErrorText(error);
 
   return text.includes('timeout')
     || text.includes('temporarily unavailable')
@@ -150,85 +186,188 @@ function isArcRpcTransientError(error) {
     || text.includes('bad gateway')
     || text.includes('gateway timeout')
     || text.includes('503')
-    || text.includes('504');
+    || text.includes('504')
+    || text.includes('500 internal server error');
+}
+
+function getEndpointState(rpcUrl) {
+  const normalized = normalizeRpcUrl(rpcUrl);
+  const existing = endpointHealthState.get(normalized);
+  if (existing) return existing;
+
+  const initial = {
+    cooldownUntil: 0,
+    lastErrorCode: null,
+    lastErrorReason: null,
+    lastErrorAt: null,
+  };
+  endpointHealthState.set(normalized, initial);
+  return initial;
 }
 
 function getCooldownRemainingMs(rpcUrl, now = Date.now()) {
-  const until = Number(endpointCooldownUntil.get(normalizeRpcUrl(rpcUrl)) || 0);
+  const until = Number(getEndpointState(rpcUrl).cooldownUntil || 0);
   return Math.max(until - now, 0);
 }
 
+function getSuppressionKey({ level, kind, label, endpoint, errorCode }) {
+  return [
+    level || 'info',
+    kind || 'generic',
+    label || 'unknown',
+    endpoint || 'unknown',
+    errorCode || 'none',
+  ].join('|');
+}
+
+function logWithThrottle({ level = 'info', kind = 'generic', label = 'unknown', endpoint = null, errorCode = null, message }) {
+  const windowMs = getLogThrottleMs();
+  const key = getSuppressionKey({ level, kind, label, endpoint, errorCode });
+  const now = Date.now();
+  const state = throttledLogState.get(key) || {
+    windowStart: now,
+    count: 0,
+    suppressed: 0,
+  };
+
+  if (now - state.windowStart >= windowMs) {
+    if (state.suppressed > 0) {
+      console.info(`[ARC_RPC] suppressed repeated rpc logs label=${label} count=${state.suppressed} window=${Math.round(windowMs / 1000)}s`);
+    }
+    state.windowStart = now;
+    state.count = 0;
+    state.suppressed = 0;
+  }
+
+  if (state.count > 0) {
+    state.suppressed += 1;
+    throttledLogState.set(key, state);
+    return;
+  }
+
+  if (level === 'error') {
+    console.error(message);
+  } else if (level === 'warn') {
+    console.warn(message);
+  } else if (level === 'info') {
+    console.info(message);
+  } else {
+    console.log(message);
+  }
+
+  state.count += 1;
+  throttledLogState.set(key, state);
+}
+
 function markArcRpcEndpointUnhealthy(rpcUrl, error, label = 'unknown') {
-  if (!isArcRpcRateLimitError(error)) {
+  if (!isArcRpcRateLimitError(error) && !isArcRpcBatchLimitError(error)) {
     return false;
   }
 
-  const cooldownMs = getCooldownMs();
+  const isBatchLimit = isArcRpcBatchLimitError(error);
+  const cooldownMs = isBatchLimit
+    ? getBatchLimitCooldownMs()
+    : getEndpointErrorCooldownMs();
   const now = Date.now();
   const targets = rpcUrl
     ? [normalizeRpcUrl(rpcUrl)]
     : getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
 
   for (const endpoint of [...new Set(targets)]) {
-    endpointCooldownUntil.set(endpoint, now + cooldownMs);
-    console.warn(
-      `[ARC_RPC] rate limited endpoint=${getEndpointLabel(endpoint)} label=${label} cooldown=${Math.round(cooldownMs / 1000)}s`,
-    );
+    const state = getEndpointState(endpoint);
+    state.cooldownUntil = now + cooldownMs;
+    state.lastErrorCode = String(error?.code || error?.info?.responseStatus || 'unknown');
+    state.lastErrorReason = isBatchLimit ? 'batch_limit' : 'rate_limit';
+    state.lastErrorAt = new Date(now).toISOString();
+
+    const kind = isBatchLimit ? 'batch_limit' : 'rate_limit';
+    logWithThrottle({
+      level: 'warn',
+      kind,
+      label,
+      endpoint: getEndpointLabel(endpoint),
+      errorCode: state.lastErrorCode,
+      message: `[ARC_RPC] ${isBatchLimit ? 'batch limited' : 'rate limited'} endpoint=${getEndpointLabel(endpoint)} label=${label} cooldown=${Math.round(cooldownMs / 1000)}s`,
+    });
   }
 
   return true;
 }
 
-function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
-  const pool = getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
-
-  if (pool.length === 0) {
-    return normalizeRpcUrl(DEFAULT_ARC_RPC_URL);
-  }
+function pickHealthyEndpoint(pool, excluded = new Set()) {
+  if (!pool.length) return null;
 
   const now = Date.now();
   const startIndex = endpointCursor % pool.length;
-  let selectedIndex = -1;
 
   for (let offset = 0; offset < pool.length; offset += 1) {
     const index = (startIndex + offset) % pool.length;
     const candidate = pool[index];
     if (excluded.has(candidate)) continue;
     if (getCooldownRemainingMs(candidate, now) > 0) continue;
-    selectedIndex = index;
-    break;
+
+    endpointCursor = (index + 1) % pool.length;
+    return {
+      rpcUrl: candidate,
+      usedFallbackEndpoint: index !== startIndex,
+    };
   }
 
-  let fallbackUsed = false;
-  if (selectedIndex < 0) {
-    for (let offset = 0; offset < pool.length; offset += 1) {
-      const index = (startIndex + offset) % pool.length;
-      const candidate = pool[index];
-      if (excluded.has(candidate)) continue;
-      selectedIndex = index;
-      fallbackUsed = true;
-      console.warn(`[ARC_RPC] all endpoints cooling down label=${label} fallback=true`);
-      break;
-    }
+  return null;
+}
+
+function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
+  const pool = getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
+  if (pool.length === 0) {
+    return {
+      rpcUrl: normalizeRpcUrl(DEFAULT_ARC_RPC_URL),
+      usedFallbackEndpoint: false,
+      unavailable: false,
+    };
   }
 
-  if (selectedIndex < 0) {
-    selectedIndex = startIndex;
-    fallbackUsed = true;
-    console.warn(`[ARC_RPC] no healthy endpoint available label=${label} fallback=true`);
+  const selected = pickHealthyEndpoint(pool, excluded);
+  if (!selected) {
+    logWithThrottle({
+      level: 'warn',
+      kind: 'all_cooling',
+      label,
+      endpoint: 'pool',
+      errorCode: 'cooldown',
+      message: `[ARC_RPC] all endpoints cooling down label=${label} fallback=true`,
+    });
+
+    return {
+      rpcUrl: null,
+      usedFallbackEndpoint: false,
+      unavailable: true,
+    };
   }
 
-  if (pool.length > 1 && (fallbackUsed || selectedIndex !== startIndex)) {
-    console.info(`[ARC_RPC] using fallback endpoint label=${label}`);
+  if (pool.length > 1 && selected.usedFallbackEndpoint) {
+    logWithThrottle({
+      level: 'info',
+      kind: 'using_fallback',
+      label,
+      endpoint: getEndpointLabel(selected.rpcUrl),
+      errorCode: 'fallback',
+      message: `[ARC_RPC] using fallback endpoint label=${label}`,
+    });
   }
 
-  endpointCursor = (selectedIndex + 1) % pool.length;
-  return pool[selectedIndex];
+  return {
+    rpcUrl: selected.rpcUrl,
+    usedFallbackEndpoint: selected.usedFallbackEndpoint,
+    unavailable: false,
+  };
 }
 
 function getHealthyArcRpcProvider(label = 'arc_rpc') {
-  const rpcUrl = selectArcRpcUrl(label);
-  return createArcRpcProvider(rpcUrl);
+  const selected = selectArcRpcUrl(label);
+  if (!selected.rpcUrl) {
+    return null;
+  }
+  return createArcRpcProvider(selected.rpcUrl);
 }
 
 async function safeArcRpcCall(label, fn, fallbackValue) {
@@ -242,7 +381,12 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
   let lastError = null;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const rpcUrl = selectArcRpcUrl(label, excluded);
+    const selected = selectArcRpcUrl(label, excluded);
+    if (!selected.rpcUrl) {
+      break;
+    }
+
+    const rpcUrl = selected.rpcUrl;
     excluded.add(rpcUrl);
     const provider = createArcRpcProvider(rpcUrl);
 
@@ -251,12 +395,20 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
     } catch (error) {
       lastError = error;
 
-      if (isArcRpcRateLimitError(error)) {
+      if (isArcRpcBatchLimitError(error) || isArcRpcRateLimitError(error)) {
         markArcRpcEndpointUnhealthy(rpcUrl, error, label);
         continue;
       }
 
       if (isArcRpcTransientError(error) && excluded.size < pool.length) {
+        logWithThrottle({
+          level: 'warn',
+          kind: 'transient',
+          label,
+          endpoint: getEndpointLabel(rpcUrl),
+          errorCode: String(error?.code || 'transient'),
+          message: `[ARC_RPC] rpc transient error label=${label} endpoint=${getEndpointLabel(rpcUrl)} retrying_next=true`,
+        });
         continue;
       }
 
@@ -266,12 +418,27 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
 
   if (arguments.length >= 3) {
     if (lastError) {
-      if (isArcRpcRateLimitError(lastError)) {
-        console.warn(`[ARC_RPC] no healthy endpoint available label=${label} fallback=true`);
+      if (isArcRpcRateLimitError(lastError) || isArcRpcBatchLimitError(lastError)) {
+        logWithThrottle({
+          level: 'warn',
+          kind: 'no_healthy',
+          label,
+          endpoint: 'pool',
+          errorCode: String(lastError?.code || lastError?.info?.responseStatus || 'rate_limit'),
+          message: `[ARC_RPC] no healthy endpoint available label=${label} fallback=true`,
+        });
       } else {
-        console.error(`[ARC_RPC] rpc call failed label=${label} fallback=true`, lastError?.message || lastError);
+        logWithThrottle({
+          level: 'error',
+          kind: 'rpc_failed',
+          label,
+          endpoint: 'pool',
+          errorCode: String(lastError?.code || 'unknown'),
+          message: `[ARC_RPC] rpc call failed label=${label} fallback=true error=${lastError?.message || lastError}`,
+        });
       }
     }
+
     return fallbackValue;
   }
 
@@ -280,9 +447,9 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
 
 function getArcRpcHealthSnapshot() {
   const now = Date.now();
-
-  return getArcRpcUrlPool().map((rpcUrl) => {
+  const endpoints = getArcRpcUrlPool().map((rpcUrl) => {
     const normalized = normalizeRpcUrl(rpcUrl);
+    const state = getEndpointState(normalized);
     const cooldownRemainingMs = getCooldownRemainingMs(normalized, now);
 
     return {
@@ -290,13 +457,32 @@ function getArcRpcHealthSnapshot() {
       maskedUrl: maskRpcUrl(normalized),
       healthy: cooldownRemainingMs <= 0,
       cooldownRemainingMs,
+      lastErrorCode: state.lastErrorCode,
+      lastErrorReason: state.lastErrorReason,
+      lastErrorAt: state.lastErrorAt,
     };
   });
+
+  const suppressedLogCounts = {};
+  for (const [key, state] of throttledLogState.entries()) {
+    if (state.suppressed > 0) {
+      suppressedLogCounts[key] = state.suppressed;
+    }
+  }
+
+  return {
+    endpointCount: endpoints.length,
+    healthyCount: endpoints.filter((entry) => entry.healthy).length,
+    coolingDownCount: endpoints.filter((entry) => !entry.healthy).length,
+    endpoints,
+    suppressedLogCounts,
+  };
 }
 
 function clearArcRpcProviderCache() {
   providerCache.clear();
-  endpointCooldownUntil.clear();
+  endpointHealthState.clear();
+  throttledLogState.clear();
   endpointCursor = 0;
 }
 
