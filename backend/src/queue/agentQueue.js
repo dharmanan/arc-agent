@@ -1821,6 +1821,29 @@ async function pauseLocalWorkers(force = true) {
   console.log(`[QUEUE] Local workers paused${force ? ' (forced)' : ''}`);
 }
 
+const JOB_DISPATCH_LOCK_TTL_MS = Math.max(parseInt(process.env.JOB_DISPATCH_LOCK_TTL_MS || '30000', 10) || 30000, 1000);
+
+// Guards against the same Bull job being delivered to more than one concurrent
+// worker at once. Observed in production: an entire just-enqueued scheduler
+// batch (e.g. ORACLE_QUERY + MARKET_ANALYSIS for every agent) can occasionally
+// get dispatched twice within milliseconds — not a retry, a genuine duplicate
+// delivery. This is a cheap short-lived Redis lock keyed by job.id: the first
+// delivery wins the lock and proceeds, the duplicate delivery is skipped
+// without side effects (no duplicate on-chain writes, no duplicate reputation
+// events).
+async function acquireJobDispatchLock(job) {
+  if (!job?.id) return true;
+
+  const key = `agent-jobs:dispatch-lock:${job.id}`;
+  try {
+    const result = await queue.client.set(key, '1', 'NX', 'PX', JOB_DISPATCH_LOCK_TTL_MS);
+    return result === 'OK';
+  } catch (err) {
+    console.error('[QUEUE] dispatch lock error:', err.message);
+    return true;
+  }
+}
+
 const REGISTERED_MANUAL_TASK_PROCESSORS = new Map();
 const REGISTERED_PAID_TASK_PROCESSORS = new Set();
 const PAID_TASK_ACTIVITY_SUPPORTED_IDS = new Set([
@@ -1996,6 +2019,11 @@ async function _refreshStableManualAddAutomationState(agentId, payload = {}) {
 
 function registerTaskProcessor(name, concurrency, handler) {
   const wrappedHandler = async (job) => {
+    if (!(await acquireJobDispatchLock(job))) {
+      console.warn(`[QUEUE] ${name} duplicate dispatch skipped job=${job.id}`);
+      return { ok: false, reason: 'duplicate_dispatch_skipped' };
+    }
+
     const taskRunId = job?.data?.taskRunId || null;
     const agentId = job?.data?.agentId || null;
 
@@ -2635,6 +2663,11 @@ async function _setAutomationDecision(agentId, automationKey, decision) {
 
 // ── Job processor ─────────────────────────────────────────────────────────────
 queue.process('INCOMING_TRANSFER', 5, async (job) => {
+  if (!(await acquireJobDispatchLock(job))) {
+    console.warn(`[QUEUE] INCOMING_TRANSFER duplicate dispatch skipped job=${job.id}`);
+    return { ok: false, reason: 'duplicate_dispatch_skipped' };
+  }
+
   const {
     agentId,
     chain,
@@ -2749,6 +2782,11 @@ queue.process('INCOMING_TRANSFER', 5, async (job) => {
 });
 
 queue.process('MARKET_ANALYSIS', 2, async (job) => {
+  if (!(await acquireJobDispatchLock(job))) {
+    console.warn(`[QUEUE] MARKET_ANALYSIS duplicate dispatch skipped job=${job.id}`);
+    return { ok: false, reason: 'duplicate_dispatch_skipped' };
+  }
+
   const { agentId, chain, token } = job.data;
   console.log(`[QUEUE] MARKET_ANALYSIS agent=${agentId}`);
   await _setAutomationState(agentId, 'marketAnalysis', 'running');
@@ -4117,6 +4155,11 @@ async function executeCirbtcLpAutomationTask({ agent, operationType, actionParam
 }
 
 queue.process('ORACLE_QUERY', 2, async (job) => {
+  if (!(await acquireJobDispatchLock(job))) {
+    console.warn(`[QUEUE] ORACLE_QUERY duplicate dispatch skipped job=${job.id}`);
+    return { ok: false, reason: 'duplicate_dispatch_skipped' };
+  }
+
   const { agentId } = job.data;
   console.log(`[QUEUE] ORACLE_QUERY agent=${agentId}`);
   await _setAutomationState(agentId, 'oracle', 'running');
@@ -4386,6 +4429,11 @@ async function scheduleMarketAnalysisLoop() {
 // Hard cap: 10 runs per agent per day (daily_defi_loop_count).
 
 queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
+  if (!(await acquireJobDispatchLock(job))) {
+    console.warn(`[QUEUE] DEFI_LOOP duplicate dispatch skipped job=${job.id}`);
+    return { ok: false, reason: 'duplicate_dispatch_skipped' };
+  }
+
   const { agentId } = job.data;
   const carryTaskRunId = job?.data?.taskRunId || null;
   const carrySourceTaskId = String(job?.data?.sourceTaskId || '').trim().toUpperCase();
