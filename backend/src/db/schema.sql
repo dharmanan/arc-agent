@@ -724,3 +724,23 @@ CREATE INDEX IF NOT EXISTS idx_bridge_activities_status ON bridge_activities(sta
 CREATE INDEX IF NOT EXISTS idx_bridge_activities_source_tx_hash ON bridge_activities(source_tx_hash);
 CREATE INDEX IF NOT EXISTS idx_bridge_activities_native_pending
   ON bridge_activities(bridge_type, status) WHERE bridge_type = 'native';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 23. LLM CACHE (shared market-analysis decision cache — replaces Redis)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS llm_cache (
+  cache_key           TEXT PRIMARY KEY,
+  decision            TEXT NOT NULL,
+  expires_at          TIMESTAMPTZ NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_llm_cache_expires_at ON llm_cache(expires_at);
+
+-- Auto-clean expired cache entries (same pattern as passkey_challenges / revoked_tokens above)
+CREATE OR REPLACE FUNCTION delete_expired_llm_cache() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN DELETE FROM llm_cache WHERE expires_at < NOW(); RETURN NULL; END; $$;
+
+DROP TRIGGER IF EXISTS trg_clean_llm_cache ON llm_cache;
+CREATE TRIGGER trg_clean_llm_cache
+  AFTER INSERT ON llm_cache
+  EXECUTE FUNCTION delete_expired_llm_cache();

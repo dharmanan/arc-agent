@@ -3,7 +3,7 @@
  * LLM Service — wraps Anthropic / OpenAI / Gemini.
  *
  * Key design decisions:
- *  1. Market analysis results are cached in Redis (TTL = LLM_CACHE_TTL, default 5 min)
+ *  1. Market analysis results are cached in Postgres (TTL = LLM_CACHE_TTL, default 5 min)
  *     so 100 agents asking the same question only costs ONE LLM call.
  *  2. All decisions are written to llm_audit for transparency.
  *  3. Users supply their own API keys (decrypted in-flight, never logged).
@@ -12,7 +12,6 @@ const crypto    = require('crypto');
 const Anthropic  = require('@anthropic-ai/sdk');
 const OpenAI     = require('openai');
 const db         = require('../db');
-const redis      = require('./redisClient');
 const { decrypt } = require('./cryptoService');
 
 const CACHE_TTL = parseInt(process.env.LLM_CACHE_TTL || '300', 10); // seconds
@@ -66,13 +65,17 @@ function buildClient(model, apiKey) {
   return new OpenAI({ apiKey });
 }
 
-// ── Core call (with Redis caching) ────────────────────────────────────────────
+// ── Core call (with Postgres caching) ─────────────────────────────────────────
 async function callLlm({ model, apiKey, systemPrompt, userPrompt, agentId }) {
   if (!ALLOWED_MODELS.has(model)) {
     throw new Error(`Model "${model}" is not allowed on testnet. Allowed: ${[...ALLOWED_MODELS].join(', ')}`);
   }
   const cacheKey = `llm:${crypto.createHash('sha256').update(model + systemPrompt + userPrompt).digest('hex')}`;
-  const cached = await redis.get(cacheKey);
+  const { rows: cacheRows } = await db.query(
+    'SELECT decision FROM llm_cache WHERE cache_key = $1 AND expires_at > NOW()',
+    [cacheKey],
+  );
+  const cached = cacheRows[0]?.decision || null;
 
   if (cached) {
     await auditLog(agentId, model, userPrompt, cached, 0, true);
@@ -105,7 +108,14 @@ async function callLlm({ model, apiKey, systemPrompt, userPrompt, agentId }) {
   }
 
   const latency = Date.now() - t0;
-  await redis.setex(cacheKey, CACHE_TTL, decision);
+  await db.query(
+    `INSERT INTO llm_cache (cache_key, decision, expires_at)
+     VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 second'))
+     ON CONFLICT (cache_key) DO UPDATE SET
+       decision   = EXCLUDED.decision,
+       expires_at = EXCLUDED.expires_at`,
+    [cacheKey, decision, CACHE_TTL],
+  ).catch(err => console.error('[LLM CACHE]', err.message));
   await auditLog(agentId, model, userPrompt, decision, latency, false);
   return { decision, fromCache: false, latencyMs: latency };
 }
