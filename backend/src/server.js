@@ -1,7 +1,6 @@
 'use strict';
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env'), quiet: true });
 
-const { once }   = require('events');
 const fs           = require('fs');
 const path         = require('path');
 const express      = require('express');
@@ -195,7 +194,6 @@ const BOOT_FLAGS = Object.freeze({
   DRY_RUN: process.env.DRY_RUN === 'true',
 });
 const HEALTHCHECK_DB_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_DB_PROBE_ENABLED', true);
-const HEALTHCHECK_REDIS_PROBE_ENABLED = isEnvEnabled('HEALTHCHECK_REDIS_PROBE_ENABLED', true);
 const QUEUE_WORKER_STARTUP_DELAY_MS = parseInt(process.env.QUEUE_WORKER_STARTUP_DELAY_MS || '60000', 10);
 
 function formatBootFlagSummary(flags) {
@@ -324,7 +322,6 @@ app.get('/health', async (_req, res) => {
   const health = {
     status: 'ok',
     db: HEALTHCHECK_DB_PROBE_ENABLED ? 'ok' : 'skipped',
-    redis: HEALTHCHECK_REDIS_PROBE_ENABLED ? 'ok' : 'skipped',
     ts: new Date().toISOString(),
   };
   let httpStatus = 200;
@@ -335,18 +332,6 @@ app.get('/health', async (_req, res) => {
     } catch (err) {
       health.db = 'error';
       health.dbError = err.message;
-      health.status = 'degraded';
-      httpStatus = 503;
-    }
-  }
-
-  if (HEALTHCHECK_REDIS_PROBE_ENABLED) {
-    try {
-      const redisClient = await ensureRedisReady();
-      await redisClient.ping();
-    } catch (err) {
-      health.redis = 'error';
-      health.redisError = err.message;
       health.status = 'degraded';
       httpStatus = 503;
     }
@@ -391,29 +376,6 @@ async function runMigrations() {
   }
 }
 
-async function ensureRedisReady() {
-  const redisClient = require('./services/redisClient');
-
-  if (redisClient.status === 'wait') {
-    await redisClient.connect();
-    return redisClient;
-  }
-
-  if (redisClient.status === 'connecting' || redisClient.status === 'reconnecting') {
-    await Promise.race([
-      once(redisClient, 'ready'),
-      once(redisClient, 'end').then(() => {
-        throw new Error('Redis connection ended before becoming ready');
-      }),
-      once(redisClient, 'error').then(([error]) => {
-        throw error;
-      }),
-    ]);
-  }
-
-  return redisClient;
-}
-
 async function bootstrap() {
   // Run schema migrations (all statements are idempotent — IF NOT EXISTS)
   await runMigrations();
@@ -421,13 +383,6 @@ async function bootstrap() {
   // Verify DB connectivity
   await db.query('SELECT 1');
   console.log('[DB] PostgreSQL connected');
-
-  try {
-    await ensureRedisReady();
-    console.log('[REDIS] ready');
-  } catch (err) {
-    console.error('[REDIS] startup warning:', err.message);
-  }
 
   console.log(`[BOOT] Background flags: ${formatBootFlagSummary(BOOT_FLAGS)}`);
 
