@@ -2,6 +2,7 @@
 
 const EventEmitter = require('events');
 const PgBoss = require('pg-boss');
+const { Pool } = require('pg');
 
 const DEFAULT_SCHEMA = process.env.PGBOSS_SCHEMA || 'pgboss';
 const DEFAULT_QUEUE_NAME = process.env.PGBOSS_QUEUE_NAME || 'agent-jobs';
@@ -9,6 +10,20 @@ const DEFAULT_JOB_RETENTION_DAYS = Math.max(
   Number.parseInt(process.env.PGBOSS_JOB_RETENTION_DAYS || '7', 10) || 7,
   1,
 );
+
+function isFalseLike(value) {
+  return ['0', 'false', 'no', 'off'].includes(String(value || '').trim().toLowerCase());
+}
+
+function resolveSslConfig() {
+  if (process.env.NODE_ENV !== 'production') {
+    return false;
+  }
+
+  return {
+    rejectUnauthorized: !isFalseLike(process.env.DATABASE_SSL_REJECT_UNAUTHORIZED),
+  };
+}
 
 function normalizeQueueBackend(value) {
   return String(value || '').trim().toLowerCase();
@@ -99,6 +114,7 @@ class PgBossBullCompatQueue extends EventEmitter {
     this._jobOptionsById = new Map();
     this._jobDataById = new Map();
     this._workSubscriptions = [];
+    this._ensuredQueues = new Set();
 
     this.boss = new PgBoss({
       connectionString,
@@ -106,6 +122,20 @@ class PgBossBullCompatQueue extends EventEmitter {
       archiveCompletedAfterSeconds: DEFAULT_JOB_RETENTION_DAYS * 24 * 60 * 60,
       deleteAfterDays: DEFAULT_JOB_RETENTION_DAYS,
       monitorStateIntervalSeconds: Number(process.env.PGBOSS_MONITOR_INTERVAL_SECONDS || 60),
+    });
+
+    // pg-boss v10 no longer exposes a public db.executeSql() helper. Use a
+    // dedicated pg Pool (same connection string) for our own lock-table and
+    // job-lookup SQL, and keep `this.boss` strictly for pg-boss queue ops.
+    this.pool = new Pool({
+      connectionString,
+      max: Number(process.env.PGBOSS_POOL_MAX || 5),
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000,
+      ssl: resolveSslConfig(),
+    });
+    this.pool.on('error', (error) => {
+      this.emit('error', error);
     });
 
     this.boss.on('error', (error) => {
@@ -128,6 +158,14 @@ class PgBossBullCompatQueue extends EventEmitter {
     return `pgboss:${this.name}:${key}`;
   }
 
+  /**
+   * pg-boss v10 does not publicly expose `boss.db.executeSql()`. Run our own
+   * lock-table / job-lookup SQL through the dedicated Pool instead.
+   */
+  async _query(sql, params) {
+    return this.pool.query(sql, params);
+  }
+
   async isReady() {
     await this._ensureStarted();
     return true;
@@ -148,7 +186,7 @@ class PgBossBullCompatQueue extends EventEmitter {
   }
 
   async _ensureLockTable() {
-    await this.boss.db.executeSql(`
+    await this._query(`
       CREATE TABLE IF NOT EXISTS ${DEFAULT_SCHEMA}.arc_queue_locks (
         key text PRIMARY KEY,
         value text NOT NULL,
@@ -164,7 +202,7 @@ class PgBossBullCompatQueue extends EventEmitter {
     const ttl = normalizedTtlMode === 'PX' ? Math.max(Number(ttlMs) || 0, 1) : 30000;
 
     if (normalizedMode === 'NX') {
-      const result = await this.boss.db.executeSql(`
+      const result = await this._query(`
         INSERT INTO ${DEFAULT_SCHEMA}.arc_queue_locks (key, value, expires_at)
         VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond'))
         ON CONFLICT (key) DO UPDATE
@@ -176,7 +214,7 @@ class PgBossBullCompatQueue extends EventEmitter {
       return result?.rows?.length ? 'OK' : null;
     }
 
-    await this.boss.db.executeSql(`
+    await this._query(`
       INSERT INTO ${DEFAULT_SCHEMA}.arc_queue_locks (key, value, expires_at)
       VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond'))
       ON CONFLICT (key) DO UPDATE
@@ -188,7 +226,7 @@ class PgBossBullCompatQueue extends EventEmitter {
 
   async _getLock(key) {
     await this._ensureStarted();
-    const result = await this.boss.db.executeSql(`
+    const result = await this._query(`
       SELECT value
         FROM ${DEFAULT_SCHEMA}.arc_queue_locks
        WHERE key = $1
@@ -202,7 +240,7 @@ class PgBossBullCompatQueue extends EventEmitter {
     await this._ensureStarted();
     const cleanKeys = keys.flat().filter(Boolean).map(String);
     if (cleanKeys.length === 0) return 0;
-    const result = await this.boss.db.executeSql(`
+    const result = await this._query(`
       DELETE FROM ${DEFAULT_SCHEMA}.arc_queue_locks
        WHERE key = ANY($1::text[])
     `, [cleanKeys]);
@@ -235,6 +273,7 @@ class PgBossBullCompatQueue extends EventEmitter {
     if (this._workSubscriptions.includes(name)) return;
     this._workSubscriptions.push(name);
 
+    await this._ensureQueueExists(name);
     await this.boss.work(name, { teamSize: concurrency, teamConcurrency: concurrency }, async (jobs) => {
       const batch = Array.isArray(jobs) ? jobs : [jobs];
       for (const rawJob of batch) {
@@ -257,9 +296,20 @@ class PgBossBullCompatQueue extends EventEmitter {
     });
   }
 
+  async _ensureQueueExists(name) {
+    if (this._ensuredQueues.has(name)) return;
+    // pg-boss v10 partitions the `job` table per queue and requires an
+    // explicit createQueue() before send()/work() will persist/consume jobs
+    // for that name. createQueue() is `ON CONFLICT DO NOTHING`, so this is
+    // safe to call once per queue name per process.
+    await this.boss.createQueue(name);
+    this._ensuredQueues.add(name);
+  }
+
   async add(name, data = {}, opts = {}) {
     await this._ensureStarted();
     const normalizedName = String(name || '').trim();
+    await this._ensureQueueExists(normalizedName);
     const jobId = normalizeJobId(opts.jobId) || `${normalizedName}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const startAfter = Number(opts.delay || 0) > 0
       ? new Date(Date.now() + Number(opts.delay))
@@ -272,15 +322,23 @@ class PgBossBullCompatQueue extends EventEmitter {
       __bullOpts: opts || {},
     };
 
-    const pgBossJobId = await this.boss.send(normalizedName, payload, {
+    const sendOptions = {
       singletonKey: jobId,
       retryLimit,
       retryDelay,
       retryBackoff: String(opts?.backoff?.type || '').toLowerCase() === 'exponential',
       startAfter,
-      priority: Number.isFinite(Number(opts.priority)) ? Number(opts.priority) : undefined,
-      expireInSeconds: Number(opts.timeout) > 0 ? Math.ceil(Number(opts.timeout) / 1000) : undefined,
-    });
+    };
+    // pg-boss asserts on these keys whenever they are present, even if the
+    // value is `undefined`, so only set them when we have a real value.
+    if (Number.isInteger(Math.trunc(Number(opts.priority)))) {
+      sendOptions.priority = Math.trunc(Number(opts.priority));
+    }
+    if (Number(opts.timeout) > 0) {
+      sendOptions.expireInSeconds = Math.ceil(Number(opts.timeout) / 1000);
+    }
+
+    const pgBossJobId = await this.boss.send(normalizedName, payload, sendOptions);
 
     const resolvedId = normalizeJobId(pgBossJobId || jobId);
     this._jobOptionsById.set(resolvedId, opts || {});
@@ -294,7 +352,7 @@ class PgBossBullCompatQueue extends EventEmitter {
     const normalizedId = normalizeJobId(id);
     if (!normalizedId) return null;
 
-    const result = await this.boss.db.executeSql(`
+    const result = await this._query(`
       SELECT id::text, name, data, state, created_on, started_on, completed_on, retry_count
         FROM ${DEFAULT_SCHEMA}.job
        WHERE id::text = $1
@@ -319,10 +377,10 @@ class PgBossBullCompatQueue extends EventEmitter {
     };
     const pgStates = [...new Set((states || []).flatMap((state) => stateMap[state] || [state]))];
     const limit = Math.max((Number(end) || 0) - (Number(start) || 0) + 1, 1);
-    const result = await this.boss.db.executeSql(`
+    const result = await this._query(`
       SELECT id::text, name, data, state, created_on, started_on, completed_on, retry_count
         FROM ${DEFAULT_SCHEMA}.job
-       WHERE state = ANY($1::text[])
+       WHERE state::text = ANY($1::text[])
        ORDER BY created_on ASC
        OFFSET $2
        LIMIT $3
@@ -341,8 +399,31 @@ class PgBossBullCompatQueue extends EventEmitter {
     await this._ensureStarted();
     const normalizedId = normalizeJobId(id);
     if (!normalizedId) return false;
-    await this.boss.cancel(normalizedId).catch(() => null);
-    await this.boss.deleteJob(normalizedId).catch(() => null);
+
+    const lookup = await this._query(`
+      SELECT id::text, name
+        FROM ${DEFAULT_SCHEMA}.job
+       WHERE id::text = $1
+          OR data->>'__bullJobId' = $1
+       LIMIT 1
+    `, [normalizedId]).catch(() => ({ rows: [] }));
+    const row = lookup?.rows?.[0];
+
+    if (row && typeof this.boss.cancel === 'function' && typeof this.boss.deleteJob === 'function') {
+      // pg-boss v10 requires the owning queue name alongside the job id for
+      // both cancel() and deleteJob(); pass both explicitly.
+      await this.boss.cancel(row.name, row.id).catch(() => null);
+      await this.boss.deleteJob(row.name, row.id).catch(() => null);
+    } else {
+      // Safe SQL fallback through the Pool if pg-boss does not expose a
+      // matching public cancel()/deleteJob() API for this job/version.
+      await this._query(`
+        DELETE FROM ${DEFAULT_SCHEMA}.job
+         WHERE id::text = $1
+            OR data->>'__bullJobId' = $1
+      `, [normalizedId]).catch(() => null);
+    }
+
     this._jobOptionsById.delete(normalizedId);
     this._jobDataById.delete(normalizedId);
     return true;
@@ -362,6 +443,7 @@ class PgBossBullCompatQueue extends EventEmitter {
       await this.boss.stop({ graceful: true, timeout: 5000 }).catch(() => null);
     }
     this._started = false;
+    await this.pool.end().catch(() => null);
   }
 }
 
