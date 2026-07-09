@@ -14,6 +14,7 @@
 const Bull        = require('bull');
 const Redis       = require('ioredis');
 const os          = require('os');
+const { createPgBossQueue, shouldUsePgBossQueue } = require('./pgBossQueueAdapter');
 const { ethers }  = require('ethers');
 const db          = require('../db');
 const llmService  = require('../services/llmService');
@@ -1776,8 +1777,7 @@ const QUEUE_DEFAULT_BACKOFF_DELAY_MS = Math.max(
   250,
 );
 
-const queue = new Bull('agent-jobs', {
-  createClient: createBullRedisClient,
+const queueOptions = {
   defaultJobOptions: {
     attempts:    QUEUE_DEFAULT_MAX_ATTEMPTS,
     backoff:     { type: 'exponential', delay: QUEUE_DEFAULT_BACKOFF_DELAY_MS },
@@ -1792,7 +1792,16 @@ const queue = new Bull('agent-jobs', {
     lockRenewTime:    150_000, // renew lock at half lockDuration
     maxStalledCount:  2,
   },
-});
+};
+
+const queue = shouldUsePgBossQueue()
+  ? createPgBossQueue('agent-jobs', queueOptions)
+  : new Bull('agent-jobs', {
+      createClient: createBullRedisClient,
+      ...queueOptions,
+    });
+
+console.log(`[QUEUE] Backend=${shouldUsePgBossQueue() ? 'pgboss' : 'redis'}`);
 
 let localWorkersPaused = true;
 const initialLocalWorkerPause = queue.pause(true, true)
@@ -1823,14 +1832,11 @@ async function pauseLocalWorkers(force = true) {
 
 const JOB_DISPATCH_LOCK_TTL_MS = Math.max(parseInt(process.env.JOB_DISPATCH_LOCK_TTL_MS || '30000', 10) || 30000, 1000);
 
-// Guards against the same Bull job being delivered to more than one concurrent
-// worker at once. Observed in production: an entire just-enqueued scheduler
-// batch (e.g. ORACLE_QUERY + MARKET_ANALYSIS for every agent) can occasionally
-// get dispatched twice within milliseconds — not a retry, a genuine duplicate
-// delivery. This is a cheap short-lived Redis lock keyed by job.id: the first
-// delivery wins the lock and proceeds, the duplicate delivery is skipped
-// without side effects (no duplicate on-chain writes, no duplicate reputation
-// events).
+// Guards against the same job being delivered to more than one concurrent
+// worker at once. On Redis/Bull this uses Redis locks; on pg-boss it uses a
+// tiny Postgres-backed lock table exposed through the adapter's compatible
+// queue.client surface. The first delivery wins and duplicate delivery is
+// skipped without side effects.
 async function acquireJobDispatchLock(job) {
   if (!job?.id) return true;
 
@@ -8385,11 +8391,13 @@ async function scheduleDailyTasks() {
 
 // ── Event listeners ────────────────────────────────────────────────────────────
 const registeredQueueHandlers = Object.keys(queue.handlers || {}).sort();
-console.log(`[QUEUE] Registered Bull handlers (${registeredQueueHandlers.length})`);
+console.log(`[QUEUE] Registered handlers (${registeredQueueHandlers.length}) backend=${shouldUsePgBossQueue() ? 'pgboss' : 'redis'}`);
 if (VERBOSE_QUEUE_LOGS) {
-  console.log(`[QUEUE] Registered Bull handler names: ${registeredQueueHandlers.join(', ')}`);
+  console.log(`[QUEUE] Registered handler names: ${registeredQueueHandlers.join(', ')}`);
 }
-syncBullRedisListenerCaps(registeredQueueHandlers.length);
+if (!shouldUsePgBossQueue()) {
+  syncBullRedisListenerCaps(registeredQueueHandlers.length);
+}
 queue.on('failed',    (job, err) => console.error(`[QUEUE] Job ${job.id} failed:`, err.message));
 if (VERBOSE_QUEUE_LOGS) {
   queue.on('completed', (job) => console.log(`[QUEUE] Job ${job.id} completed`));

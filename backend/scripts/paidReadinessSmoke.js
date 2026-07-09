@@ -15,7 +15,7 @@ const CORE_TASK_RULES = {
   EXEC_CURVE_LIQUIDITY_ADD: { mode: 'ready' },
   EXEC_CURVE_LIQUIDITY_REMOVE: {
     mode: 'ready_or_guarded',
-    allowedReasons: new Set(['insufficient_lp_position']),
+    allowedReasons: new Set(['insufficient_lp_position', 'lp_position_not_found']),
   },
   EXEC_ARB: { mode: 'ready' },
   EXEC_REBALANCE: {
