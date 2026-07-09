@@ -700,3 +700,27 @@ DROP TRIGGER IF EXISTS trg_clean_revoked_tokens ON revoked_tokens;
 CREATE TRIGGER trg_clean_revoked_tokens
   AFTER INSERT ON revoked_tokens
   EXECUTE FUNCTION delete_expired_revoked_tokens();
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 22. BRIDGE ACTIVITIES (CCTP / native bridge tracking — replaces Redis)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Full activity record lives in `data` (JSONB); the plain columns below just
+-- mirror the fields the old Redis set/sorted-set indexes used to filter on
+-- (wallet lookup, pending/auto-mint/native-pending queues, burn-hash lookup).
+CREATE TABLE IF NOT EXISTS bridge_activities (
+  id                  UUID PRIMARY KEY,
+  wallet_address      VARCHAR(42) NOT NULL,
+  status              VARCHAR(30) NOT NULL,
+  mode                VARCHAR(20),
+  bridge_type         VARCHAR(20),
+  source_tx_hash      TEXT,
+  data                JSONB NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bridge_activities_wallet_updated
+  ON bridge_activities(wallet_address, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bridge_activities_status ON bridge_activities(status);
+CREATE INDEX IF NOT EXISTS idx_bridge_activities_source_tx_hash ON bridge_activities(source_tx_hash);
+CREATE INDEX IF NOT EXISTS idx_bridge_activities_native_pending
+  ON bridge_activities(bridge_type, status) WHERE bridge_type = 'native';

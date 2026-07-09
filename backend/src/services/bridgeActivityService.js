@@ -1,15 +1,12 @@
 'use strict';
 /**
- * Bridge Activity Service — Paralel köprü takibi (Redis tabanlı)
+ * Bridge Activity Service — Paralel köprü takibi (Postgres tabanlı)
  *
  * Eski repo (Arc-Testnet-Bridge-Swap) mimarisinden adapte edildi.
- * Her bridge aktivitesi Redis'te tutulur; PostgreSQL sadece muhasebe içindir.
- *
- * Key şeması:
- *   bridge:activity:{uuid}              → JSON (ETTi bilgisi)
- *   bridge:activity:wallet:{address}    → Sorted Set (score=updatedAt, member=uuid)
- *   bridge:pending                      → Set (pending_attestation UUID'leri)
- *   bridge:burn:{sourceTxHash_lower}    → String (activity UUID — reverse lookup)
+ * Her bridge aktivitesi `bridge_activities` tablosunda JSONB olarak tutulur;
+ * wallet/status/mode/bridge_type/source_tx_hash kolonları eski Redis
+ * set/sorted-set indekslerinin (wallet lookup, pending/auto-mint/native-pending
+ * kuyrukları, burn-hash reverse lookup) yerini alan sorgulanabilir alanlardır.
  *
  * State machine:
  *   awaiting_approve → awaiting_burn → pending_attestation → ready_to_mint → minted
@@ -18,12 +15,10 @@
 const { ethers }     = require('ethers');
 const { v4: uuidv4 } = require('uuid');
 const https          = require('https');
-const redis          = require('./redisClient');
+const db             = require('../db');
 const agentWalletService = require('./agentWalletService');
 
 // ── Sabitler ──────────────────────────────────────────────────────────────────
-const TTL_ACTIVE = 30 * 24 * 3600; // 30 gün (aktif aktiviteler)
-const TTL_DONE   = 7  * 24 * 3600; // 7 gün (tamamlananlar / başarısızlar)
 const IRIS_API   = 'https://iris-api-sandbox.circle.com';
 
 // ── CCTP zincir domain haritası ───────────────────────────────────────────────
@@ -60,12 +55,8 @@ function normalizeActivity(data) {
 }
 
 // ── Key üreticiler ────────────────────────────────────────────────────────────
-const actKey    = id   => `bridge:activity:${id}`;
-const walletKey = addr => `bridge:activity:wallet:${addr.toLowerCase()}`;
-const pendKey   = ()   => 'bridge:pending';
-const autoMintKey = () => 'bridge:auto-mint';
-const nativePendingKey = () => 'bridge:native-pending';
-const burnKey   = hash => `bridge:burn:${hash.toLowerCase()}`;
+const normalizeWallet = addr => String(addr || '').toLowerCase();
+const normalizeTxHash = hash => (hash ? String(hash).toLowerCase() : null);
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
@@ -82,65 +73,56 @@ async function upsertActivity(data) {
     createdAt: data.createdAt || now,
   });
 
-  const isDone = TERMINAL_STATUSES.has(rec.status);
-  const ttl    = isDone ? TTL_DONE : TTL_ACTIVE;
-
-  // Kayıt
-  await redis.set(actKey(rec.id), JSON.stringify(rec), 'EX', ttl);
-
-  // Wallet index: score = updatedAt (sıralamayı taze tutar)
-  // EXPIRE sadece ilk ekleme'de → her upsert'te EXPIRE atmıyoruz (Upstash komut tasarrufu)
-  const added = await redis.zadd(walletKey(rec.walletAddress), now, rec.id);
-  if (added) await redis.expire(walletKey(rec.walletAddress), TTL_ACTIVE);
-
-  // Pending set yönetimi
-  if (rec.status === STATUS.PENDING_ATTESTATION && rec.messageHash) {
-    await redis.sadd(pendKey(), rec.id);
-  } else {
-    await redis.srem(pendKey(), rec.id);
-  }
-
-  if (rec.status === STATUS.READY_TO_MINT && rec.mode === 'auto') {
-    await redis.sadd(autoMintKey(), rec.id);
-  } else {
-    await redis.srem(autoMintKey(), rec.id);
-  }
-
-  if (rec.bridgeType === 'native' && !isDone) {
-    await redis.sadd(nativePendingKey(), rec.id);
-  } else {
-    await redis.srem(nativePendingKey(), rec.id);
-  }
-
-  // Burn hash reverse lookup
-  if (rec.sourceTxHash) {
-    await redis.set(burnKey(rec.sourceTxHash), rec.id, 'EX', ttl);
-  }
+  await db.query(
+    `INSERT INTO bridge_activities (id, wallet_address, status, mode, bridge_type, source_tx_hash, data, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8 / 1000.0), to_timestamp($9 / 1000.0))
+     ON CONFLICT (id) DO UPDATE SET
+       wallet_address = EXCLUDED.wallet_address,
+       status         = EXCLUDED.status,
+       mode           = EXCLUDED.mode,
+       bridge_type    = EXCLUDED.bridge_type,
+       source_tx_hash = EXCLUDED.source_tx_hash,
+       data           = EXCLUDED.data,
+       updated_at     = EXCLUDED.updated_at`,
+    [
+      rec.id,
+      normalizeWallet(rec.walletAddress),
+      rec.status,
+      rec.mode || null,
+      rec.bridgeType || null,
+      normalizeTxHash(rec.sourceTxHash),
+      JSON.stringify(rec),
+      rec.createdAt,
+      rec.updatedAt,
+    ],
+  );
 
   return rec;
 }
 
 async function getActivity(id) {
-  const raw = await redis.get(actKey(id));
-  return normalizeActivity(raw ? JSON.parse(raw) : null);
+  try {
+    const { rows } = await db.query('SELECT data FROM bridge_activities WHERE id = $1', [id]);
+    return normalizeActivity(rows[0]?.data || null);
+  } catch (err) {
+    // Malformed / non-UUID ids (e.g. arbitrary route params) should behave
+    // like a Redis cache miss, not a 500 — same as the old key-lookup did.
+    if (err.code === '22P02') return null;
+    throw err;
+  }
 }
 
 async function getActivitiesForWallet(walletAddress, limit = 30) {
-  const ids = await redis.zrevrange(walletKey(walletAddress), 0, limit - 1);
-  if (!ids.length) return [];
-  // MGET: N key → 1 Redis command instead of N
-  const raws = await redis.mget(...ids.map(actKey));
-  const activities = raws
-    .map(r => normalizeActivity(r ? JSON.parse(r) : null))
-    .filter(Boolean)
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const { rows } = await db.query(
+    'SELECT data FROM bridge_activities WHERE wallet_address = $1 ORDER BY updated_at DESC LIMIT $2',
+    [normalizeWallet(walletAddress), limit],
+  );
+  const activities = rows
+    .map(r => normalizeActivity(r.data))
+    .filter(Boolean);
 
-  const autoReadyIds = activities
-    .filter(act => act.status === STATUS.READY_TO_MINT && act.mode === 'auto')
-    .map(act => act.id);
-
-  if (autoReadyIds.length) {
-    await redis.sadd(autoMintKey(), ...autoReadyIds);
+  const hasAutoReady = activities.some(act => act.status === STATUS.READY_TO_MINT && act.mode === 'auto');
+  if (hasAutoReady) {
     setImmediate(() => {
       pollOnce().catch(e => console.error('[BRIDGE-POLL]', e.message));
     });
@@ -150,31 +132,31 @@ async function getActivitiesForWallet(walletAddress, limit = 30) {
 }
 
 async function getPendingActivities() {
-  const ids = await redis.smembers(pendKey());
-  if (!ids.length) return [];
-  // MGET: 1 command for all pending
-  const raws = await redis.mget(...ids.map(actKey));
-  return raws
-    .map(r => normalizeActivity(r ? JSON.parse(r) : null))
-    .filter(act => act && act.status === STATUS.PENDING_ATTESTATION);
+  const { rows } = await db.query(
+    `SELECT data FROM bridge_activities
+      WHERE status = $1
+        AND data ? 'messageHash'`,
+    [STATUS.PENDING_ATTESTATION],
+  );
+  return rows.map(r => normalizeActivity(r.data)).filter(Boolean);
 }
 
 async function getAutoMintActivities() {
-  const ids = await redis.smembers(autoMintKey());
-  if (!ids.length) return [];
-  const raws = await redis.mget(...ids.map(actKey));
-  return raws
-    .map(r => normalizeActivity(r ? JSON.parse(r) : null))
-    .filter(act => act && act.status === STATUS.READY_TO_MINT && act.mode === 'auto');
+  const { rows } = await db.query(
+    'SELECT data FROM bridge_activities WHERE status = $1 AND mode = $2',
+    [STATUS.READY_TO_MINT, 'auto'],
+  );
+  return rows.map(r => normalizeActivity(r.data)).filter(Boolean);
 }
 
 async function getPendingNativeActivities() {
-  const ids = await redis.smembers(nativePendingKey());
-  if (!ids.length) return [];
-  const raws = await redis.mget(...ids.map(actKey));
-  return raws
-    .map(r => normalizeActivity(r ? JSON.parse(r) : null))
-    .filter(act => act && act.bridgeType === 'native' && !TERMINAL_STATUSES.has(act.status));
+  const { rows } = await db.query(
+    `SELECT data FROM bridge_activities
+      WHERE bridge_type = 'native'
+        AND status NOT IN ($1, $2, $3)`,
+    [STATUS.MINTED, STATUS.FAILED, STATUS.DISMISSED],
+  );
+  return rows.map(r => normalizeActivity(r.data)).filter(Boolean);
 }
 
 async function dismissActivity(id, walletAddress) {
