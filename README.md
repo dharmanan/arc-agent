@@ -611,7 +611,7 @@ Arc Machina is a three-layer system.
 
 1. The frontend is a React application that explains the product and gives users a clear control surface.
 
-2. The backend is an Express API plus Bull queue workers that decide, execute, record, and expose status.
+2. The backend is an Express API plus queue workers that decide, execute, record, and expose status. The queue runs on pg-boss (PostgreSQL-backed) in production, with a legacy Bull/Redis code path still present but inactive.
 
 3. Contracts and protocol adapters provide the actual onchain rails.
 
@@ -719,14 +719,14 @@ UI state and product surfaces
 	 PostgreSQL schema and migration bootstrap.
 
 12. Health is split cleanly.
-	 `/readyz` is the lightweight readiness endpoint for platform health checks. `/health` is the heavier manual diagnostic endpoint that can probe DB and Redis.
+	 `/readyz` is the lightweight readiness endpoint for platform health checks. `/health` is the heavier manual diagnostic endpoint that probes DB connectivity.
 
 ### 11. Queue and Automation Model
 
 1. `backend/src/queue/agentQueue.js` is the center of the runtime automation model.
 
-2. The queue is Bull over Redis.
-	That choice matters because the product needs persistence, retries, delayed execution, and worker control across bridge flows, task flows, and automation loops.
+2. The queue runs on pg-boss, backed directly by PostgreSQL.
+	That choice matters because the product needs persistence, retries, delayed execution, and worker control across bridge flows, task flows, and automation loops, without an extra Redis dependency. The queue was originally built on Bull over Redis; that code path is still present behind a `QUEUE_BACKEND` flag but is not the active production backend. Other former Redis-backed stores (JWT revocation, chain-write locking/replay/rate-limiting, bridge activity tracking, LLM decision caching) have also moved to PostgreSQL.
 
 3. The queue coordinates more than one kind of automation.
 	It is not just a generic job runner. It carries incoming transfer reactions, market analysis, Oracle checks, stable LP decisions, lending safety actions, carry decisions, cirBTC LP management, and paid execution work.
@@ -894,7 +894,6 @@ The project is easiest to understand when you run frontend and backend separatel
 ```text
 Node.js 20+
 PostgreSQL
-Redis
 Configured env files for backend and frontend
 ```
 
