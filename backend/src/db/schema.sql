@@ -681,3 +681,22 @@ CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_claims_program_created
   ON agent_lp_reward_claims(program_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_lp_reward_claims_accrual_created
   ON agent_lp_reward_claims(accrual_id, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 21. REVOKED TOKENS (JWT session invalidation / logout)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+  jti                 TEXT PRIMARY KEY,
+  expires_at          TIMESTAMPTZ NOT NULL,
+  revoked_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
+
+-- Auto-clean expired revoked tokens (same pattern as passkey_challenges above)
+CREATE OR REPLACE FUNCTION delete_expired_revoked_tokens() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN DELETE FROM revoked_tokens WHERE expires_at < NOW(); RETURN NULL; END; $$;
+
+DROP TRIGGER IF EXISTS trg_clean_revoked_tokens ON revoked_tokens;
+CREATE TRIGGER trg_clean_revoked_tokens
+  AFTER INSERT ON revoked_tokens
+  EXECUTE FUNCTION delete_expired_revoked_tokens();

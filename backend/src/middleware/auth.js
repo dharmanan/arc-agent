@@ -1,35 +1,18 @@
 'use strict';
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const redis = require('../services/redisClient');
+const db = require('../db');
 
 const SECRET = process.env.JWT_SECRET;
-const REVOKED_TOKEN_PREFIX = 'jwt:revoked:';
 const TEST_REVOKED_TOKENS = new Map();
 if (!SECRET || SECRET.length < 32) {
   throw new Error('JWT_SECRET must be at least 32 characters');
-}
-
-function buildRevokedTokenKey(jti) {
-  return `${REVOKED_TOKEN_PREFIX}${jti}`;
 }
 
 function getTokenTtlSeconds(exp) {
   const expiresAt = Number(exp);
   if (!Number.isFinite(expiresAt)) return 0;
   return Math.max(1, expiresAt - Math.floor(Date.now() / 1000));
-}
-
-async function ensureSessionStoreReady() {
-  if (process.env.NODE_ENV === 'test') {
-    return null;
-  }
-
-  if (redis.status === 'wait') {
-    await redis.connect();
-  }
-
-  return redis;
 }
 
 async function isTokenRevoked(jti) {
@@ -45,9 +28,11 @@ async function isTokenRevoked(jti) {
     return true;
   }
 
-  const client = await ensureSessionStoreReady();
-  const cached = await client.get(buildRevokedTokenKey(jti));
-  return cached === '1';
+  const { rows } = await db.query(
+    'SELECT 1 FROM revoked_tokens WHERE jti = $1 AND expires_at > NOW() LIMIT 1',
+    [jti],
+  );
+  return rows.length > 0;
 }
 
 async function revokeToken({ jti, exp }) {
@@ -65,8 +50,12 @@ async function revokeToken({ jti, exp }) {
     return ttlSeconds;
   }
 
-  const client = await ensureSessionStoreReady();
-  await client.set(buildRevokedTokenKey(jti), '1', 'EX', ttlSeconds);
+  await db.query(
+    `INSERT INTO revoked_tokens (jti, expires_at)
+     VALUES ($1, to_timestamp($2))
+     ON CONFLICT (jti) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+    [jti, Number(exp)],
+  );
   return ttlSeconds;
 }
 
@@ -89,7 +78,7 @@ async function requireAuth(req, res, next) {
         return res.status(401).json({ error: 'Session expired' });
       }
     } catch (storeError) {
-      console.error('[AUTH] session store check failed:', storeError.message || storeError);
+      console.error('[AUTH] revoked-token store check failed:', storeError.message || storeError);
       return res.status(503).json({ error: 'Auth session store unavailable' });
     }
 
