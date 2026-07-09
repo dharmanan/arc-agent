@@ -2,7 +2,6 @@
 
 const crypto = require('crypto');
 const { ethers } = require('ethers');
-const redis = require('./redisClient');
 const { recordSecurityEvent, recordSuspiciousAgentActivity } = require('./securityEventService');
 
 const DEFAULT_TX_RATE_LIMIT_WINDOW_SEC = readPositiveIntegerEnv('AGENT_TX_RATE_LIMIT_WINDOW_SEC', 60);
@@ -131,19 +130,6 @@ function buildSimulationError(methodName, error) {
   });
 }
 
-async function getRedisClient() {
-  if (process.env.NODE_ENV === 'test') return null;
-
-  try {
-    if (redis.status === 'wait') {
-      await redis.connect();
-    }
-    return redis;
-  } catch {
-    return null;
-  }
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -158,24 +144,8 @@ function pruneMemoryMap(map) {
 }
 
 async function tryAcquireChainLock({ agentKey, chainKey, lockTtlSec }) {
-  const client = await getRedisClient();
   const key = buildLockKey(agentKey, chainKey);
   const token = crypto.randomUUID();
-
-  if (client) {
-    const result = await client.set(key, token, 'NX', 'EX', lockTtlSec).catch(() => null);
-    if (result !== 'OK') return null;
-
-    return async () => {
-      const releaseScript = `
-        if redis.call('GET', KEYS[1]) == ARGV[1] then
-          return redis.call('DEL', KEYS[1])
-        end
-        return 0
-      `;
-      await client.eval(releaseScript, 1, key, token).catch(() => {});
-    };
-  }
 
   pruneMemoryMap(memoryLocks);
   const existing = memoryLocks.get(key);
@@ -211,13 +181,6 @@ async function acquireChainLock({ agentKey, chainKey, chainName, lockTtlSec, wai
 async function assertReplayNotSeen(replayKey) {
   if (!replayKey) return;
 
-  const client = await getRedisClient();
-  if (client) {
-    const existing = await client.get(replayKey).catch(() => null);
-    if (existing) throw buildReplayError();
-    return;
-  }
-
   pruneMemoryMap(memoryReplays);
   if (memoryReplays.has(replayKey)) {
     throw buildReplayError();
@@ -226,12 +189,6 @@ async function assertReplayNotSeen(replayKey) {
 
 async function rememberReplay(replayKey, replayTtlSec, txHash = null) {
   if (!replayKey) return;
-
-  const client = await getRedisClient();
-  if (client) {
-    await client.set(replayKey, txHash || '1', 'EX', replayTtlSec).catch(() => {});
-    return;
-  }
 
   pruneMemoryMap(memoryReplays);
   memoryReplays.set(replayKey, {
@@ -245,22 +202,6 @@ async function consumeRateLimit(agentKey, cost = 1, rateLimitMax = DEFAULT_TX_RA
 
   const bucketId = Math.floor(Date.now() / (windowSec * 1000));
   const key = buildRateBucketKey(agentKey, bucketId);
-  const client = await getRedisClient();
-
-  if (client) {
-    const nextCount = await client.incrby(key, cost).catch(() => null);
-    if (nextCount == null) {
-      return;
-    }
-    if (Number(nextCount) === Number(cost)) {
-      await client.expire(key, Math.max(windowSec + 5, 10)).catch(() => {});
-    }
-    if (Number(nextCount) > rateLimitMax) {
-      await client.decrby(key, cost).catch(() => {});
-      throw buildRateLimitError(rateLimitMax, windowSec);
-    }
-    return;
-  }
 
   pruneMemoryMap(memoryCounters);
   const current = memoryCounters.get(key);
