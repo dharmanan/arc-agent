@@ -160,6 +160,7 @@ function isArcRpcRateLimitError(error) {
   return text.includes('429')
     || text.includes('too many requests')
     || text.includes('rate limit')
+    || text.includes('request limit reached')
     || text.includes('exceeded maximum retry limit');
 }
 
