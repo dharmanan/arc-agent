@@ -363,12 +363,17 @@ function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
   };
 }
 
-function getHealthyArcRpcProvider(label = 'arc_rpc') {
+function getHealthyArcRpcUrl(label = 'arc_rpc') {
   const selected = selectArcRpcUrl(label);
-  if (!selected.rpcUrl) {
+  return selected.rpcUrl || null;
+}
+
+function getHealthyArcRpcProvider(label = 'arc_rpc') {
+  const rpcUrl = getHealthyArcRpcUrl(label);
+  if (!rpcUrl) {
     return null;
   }
-  return createArcRpcProvider(selected.rpcUrl);
+  return createArcRpcProvider(rpcUrl);
 }
 
 async function safeArcRpcCall(label, fn, fallbackValue) {
@@ -491,6 +496,7 @@ module.exports = {
   ARC_TESTNET_NETWORK,
   createArcRpcProvider,
   getArcRpcUrl,
+  getHealthyArcRpcUrl,
   getHealthyArcRpcProvider,
   safeArcRpcCall,
   isArcRpcRateLimitError,

@@ -35,7 +35,7 @@ const { evaluateOracleStrategyPolicy } = require('../services/oracleStrategyPoli
 const { evaluateCirbtcLpAutomationPolicy } = require('../services/cirbtcLpAutomationPolicy');
 const bridgeActivityService = require('../services/bridgeActivityService');
 const taskRunService = require('../services/taskRunService');
-const { ensureGatewayWarmBalance } = require('../services/agenticEconomy/gatewayBuyer');
+const { maybeWarmAgentGatewayBalance, isArcRpcCooldownError } = require('./gatewayAutoWarmService');
 const { shouldTrackAutoCarryStartHandoff } = require('../services/autoCarryTaskRunPolicy');
 const { safeArcRpcCall } = require('../services/arcProvider');
 
@@ -44,15 +44,9 @@ const ARC_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || process.env.EURC_ADDRES
 const ERC20_BALANCE_ABI = ['function balanceOf(address account) view returns (uint256)'];
 const PAID_GAS_FANOUT_AMOUNT_ETH = String(process.env.SEPOLIA_GAS_FANOUT_AMOUNT_ETH || '0.01');
 const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC = 1;
-const DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC = 3;
-const GATEWAY_AUTO_WARM_DEBOUNCE_MS = Math.max(
-  Number.parseInt(process.env.GATEWAY_AUTO_WARM_DEBOUNCE_MS || '15000', 10) || 15000,
-  5000,
-);
 const LOG_LLM_AUTH_FALLBACKS = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.LOG_LLM_AUTH_FALLBACKS || '').trim().toLowerCase(),
 );
-const gatewayAutoWarmDebounceByAgent = new Map();
 
 const CIRBTC_GLOBAL_GUARD_WINDOW_MINUTES = Math.max(
   Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_WINDOW_MINUTES || '30', 10) || 30,
@@ -209,120 +203,6 @@ function normalizeUsdcAmount(amount) {
 function normalizeOptionalUsdcAmount(amount) {
   if (amount === null || amount === undefined || amount === '') return null;
   return normalizeUsdcAmount(amount);
-}
-
-function getAgentGatewayAutoTopupConfig(agent) {
-  const minAvailableUsdc = normalizeUsdcAmount(
-    agent?.gateway_auto_topup_min_usdc ?? DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC,
-  ) || DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_MIN_USDC;
-  const targetAvailableUsdc = normalizeUsdcAmount(
-    agent?.gateway_auto_topup_target_usdc ?? DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC,
-  ) || DEFAULT_AGENT_GATEWAY_AUTO_TOPUP_TARGET_USDC;
-
-  return {
-    enabled: agent?.gateway_auto_topup_enabled !== false,
-    minAvailableUsdc,
-    targetAvailableUsdc: Math.max(targetAvailableUsdc, minAvailableUsdc),
-  };
-}
-
-function pruneGatewayAutoWarmDebounce(now = Date.now()) {
-  for (const [agentId, expiresAt] of gatewayAutoWarmDebounceByAgent.entries()) {
-    if (!agentId || !Number.isFinite(expiresAt) || expiresAt <= now) {
-      gatewayAutoWarmDebounceByAgent.delete(agentId);
-    }
-  }
-}
-
-function getGatewayAutoWarmDebounceRemainingMs(agentId, now = Date.now()) {
-  if (!agentId) return 0;
-  pruneGatewayAutoWarmDebounce(now);
-  const expiresAt = Number(gatewayAutoWarmDebounceByAgent.get(agentId) || 0);
-  if (!Number.isFinite(expiresAt) || expiresAt <= now) return 0;
-  return Math.max(Math.ceil(expiresAt - now), 0);
-}
-
-function markGatewayAutoWarmDebounce(agentId, now = Date.now()) {
-  if (!agentId) return;
-  gatewayAutoWarmDebounceByAgent.set(agentId, now + GATEWAY_AUTO_WARM_DEBOUNCE_MS);
-}
-
-function isGatewayAutoWarmExpectedSkipError(error) {
-  const code = String(error?.code || '').trim().toUpperCase();
-  if (code === 'AGENT_TX_BUSY' || code === 'TX_REPLAY_BLOCKED' || code === 'AGENT_TX_RATE_LIMITED') {
-    return true;
-  }
-
-  const status = Number.parseInt(String(error?.status || error?.statusCode || ''), 10);
-  if (status === 409 || status === 429) return true;
-
-  const message = String(error?.message || error?.cause?.message || '').trim();
-  return /another transaction is already executing|matching transaction was already submitted|rate limit/i.test(message);
-}
-
-async function maybeWarmAgentGatewayBalance(agent, trigger, overrides = {}) {
-  const baseConfig = getAgentGatewayAutoTopupConfig(agent);
-  const config = {
-    ...baseConfig,
-    minAvailableUsdc: normalizeUsdcAmount(
-      overrides.minAvailableUsdc == null ? baseConfig.minAvailableUsdc : overrides.minAvailableUsdc,
-    ) || baseConfig.minAvailableUsdc,
-    targetAvailableUsdc: Math.max(
-      normalizeUsdcAmount(
-        overrides.targetAvailableUsdc == null ? baseConfig.targetAvailableUsdc : overrides.targetAvailableUsdc,
-      ) || baseConfig.targetAvailableUsdc,
-      normalizeUsdcAmount(
-        overrides.minAvailableUsdc == null ? baseConfig.minAvailableUsdc : overrides.minAvailableUsdc,
-      ) || baseConfig.minAvailableUsdc,
-    ),
-  };
-  if (!config.enabled || !agent?.private_key_encrypted) {
-    return {
-      attempted: false,
-      deposited: false,
-      reason: config.enabled ? 'signer_unavailable' : 'disabled',
-    };
-  }
-
-  const debounceRemainingMs = getGatewayAutoWarmDebounceRemainingMs(agent?.id);
-  if (debounceRemainingMs > 0) {
-    return {
-      attempted: false,
-      deposited: false,
-      reason: 'debounced',
-      retryAfterMs: debounceRemainingMs,
-    };
-  }
-  markGatewayAutoWarmDebounce(agent?.id);
-
-  try {
-    const result = await ensureGatewayWarmBalance(agent, {
-      chainName: 'Arc Testnet',
-      minAvailableUsdc: config.minAvailableUsdc,
-      targetAvailableUsdc: config.targetAvailableUsdc,
-    });
-
-    if (result?.deposited) {
-      console.log(
-        `[GATEWAY] Auto-warmed agent=${agent.id} trigger=${trigger} amount=${result.amountUsdc} available=${result?.balancesAfter?.gateway?.formattedAvailable || '0'}`,
-      );
-    }
-
-    return result;
-  } catch (error) {
-    if (isGatewayAutoWarmExpectedSkipError(error)) {
-      console.log(`[GATEWAY] Auto-warm deferred agent=${agent?.id || 'unknown'} trigger=${trigger}: ${error.message}`);
-    } else {
-      console.warn(`[GATEWAY] Auto-warm skipped agent=${agent?.id || 'unknown'} trigger=${trigger}: ${error.message}`);
-    }
-    return {
-      attempted: false,
-      deposited: false,
-      reason: isGatewayAutoWarmExpectedSkipError(error) ? 'deferred' : 'error',
-      error: error.message,
-      errorCode: error?.code || null,
-    };
-  }
 }
 
 async function getArcTokenBalance(walletAddress, tokenAddress, decimals = 6) {
@@ -6039,6 +5919,7 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
         rail: 'agentic_automation_economy',
       });
     } catch (err) {
+      const deferred = isArcRpcCooldownError(err);
       economy = {
         mode: 'circle_gateway_automation_fee',
         rail: 'agentic_automation_economy',
@@ -6047,10 +5928,27 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
         feeUsdc: AUTOMATION_EXECUTION_FEE_USDC,
         sourceChain: 'Arc Testnet',
         destinationChain: 'Arc Testnet',
-        status: 'failed',
+        status: deferred ? 'deferred' : 'failed',
+        reason: deferred ? 'arc_rpc_cooldown' : 'settlement_failed',
+        deferred,
+        retryable: deferred,
+        errorCode: err?.code || null,
         error: err.message,
+        retryIntent: deferred ? {
+          mode: 'circle_gateway_automation_fee',
+          rail: 'agentic_automation_economy',
+          referenceType: 'automation',
+          referenceId: txResult.txHash || null,
+          feeUsdc: AUTOMATION_EXECUTION_FEE_USDC,
+          fromChain: 'Arc Testnet',
+          toChain: 'Arc Testnet',
+        } : undefined,
       };
-      console.warn('[AUTOMATION_ECONOMY] DEFI_LOOP fee settlement failed:', err.message);
+        if (deferred) {
+          console.log('[AUTOMATION_ECONOMY] DEFI_LOOP fee settlement deferred:', err.message);
+        } else {
+          console.warn('[AUTOMATION_ECONOMY] DEFI_LOOP fee settlement failed:', err.message);
+        }
     }
 
     // Increment auto-tx counter
@@ -7523,6 +7421,7 @@ async function _savePaidTaskResult(agentId, taskId, payload, agent, options = {}
       toChain,
     });
   } catch (err) {
+    const deferred = isArcRpcCooldownError(err);
     economy = {
       mode: 'circle_gateway_task_fee',
       rail: 'agentic_task_economy',
@@ -7530,10 +7429,27 @@ async function _savePaidTaskResult(agentId, taskId, payload, agent, options = {}
       feeUsdc,
       sourceChain: fromChain,
       destinationChain: toChain,
-      status: 'failed',
+      status: deferred ? 'deferred' : 'failed',
+      reason: deferred ? 'arc_rpc_cooldown' : 'settlement_failed',
+      deferred,
+      retryable: deferred,
+      errorCode: err?.code || null,
       error: err.message,
+      retryIntent: deferred ? {
+        mode: 'circle_gateway_task_fee',
+        rail: 'agentic_task_economy',
+        referenceType: 'task',
+        referenceId: taskId,
+        feeUsdc,
+        fromChain,
+        toChain,
+      } : undefined,
     };
-    console.warn(`[TASK_ECONOMY] ${taskId} fee settlement failed:`, err.message);
+    if (deferred) {
+      console.log(`[TASK_ECONOMY] ${taskId} fee settlement deferred:`, err.message);
+    } else {
+      console.warn(`[TASK_ECONOMY] ${taskId} fee settlement failed:`, err.message);
+    }
   }
 
   const resultPayload = { ...payload, economy };

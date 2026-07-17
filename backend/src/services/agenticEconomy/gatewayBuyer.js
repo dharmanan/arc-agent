@@ -4,6 +4,7 @@ const { ethers } = require('ethers');
 const { GatewayClient } = require('@circle-fin/x402-batching/client');
 const { decrypt } = require('../cryptoService');
 const { runProtectedWrite } = require('../txSecurityService');
+const { getHealthyArcRpcUrl, isArcRpcRateLimitError } = require('../arcProvider');
 const { logGateway } = require('./logger');
 
 const DEFAULT_GATEWAY_TRANSFER_MAX_FEE_USDC = process.env.GATEWAY_TRANSFER_MAX_FEE_USDC || '0.005';
@@ -13,6 +14,8 @@ const DEFAULT_GATEWAY_WARM_MIN_AVAILABLE_USDC = process.env.GATEWAY_WARM_MIN_AVA
 const DEFAULT_GATEWAY_WARM_TARGET_USDC = process.env.GATEWAY_WARM_TARGET_USDC || '3';
 const DEFAULT_GATEWAY_TX_LOCK_TTL_SEC = readPositiveIntegerEnv('GATEWAY_TX_LOCK_TTL_SEC', 180);
 const DEFAULT_GATEWAY_AUTO_WARM_LOCK_WAIT_MS = readNonNegativeIntegerEnv('GATEWAY_AUTO_WARM_LOCK_WAIT_MS', 0);
+const ARC_RPC_COOLDOWN_CODE = 'ARC_RPC_COOLDOWN';
+const ARC_RPC_COOLDOWN_MESSAGE = 'Arc RPC is cooling down';
 
 const GATEWAY_CHAIN_MAP = {
   'Arc Testnet': {
@@ -134,6 +137,63 @@ function resolveGatewayChainConfig(chainName = 'Arc Testnet') {
   return config;
 }
 
+function isArcTestnetChain(chainName = 'Arc Testnet') {
+  return String(chainName || '').trim().toLowerCase() === 'arc testnet';
+}
+
+function extractGatewayErrorText(error) {
+  return [
+    error?.message,
+    error?.shortMessage,
+    error?.code,
+    error?.cause?.message,
+    error?.error?.message,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+function isGatewayRateLimitError(error) {
+  if (isArcRpcRateLimitError(error)) {
+    return true;
+  }
+
+  const status = Number.parseInt(String(error?.statusCode || error?.status || ''), 10);
+  if (status === 429) {
+    return true;
+  }
+
+  const text = extractGatewayErrorText(error);
+  return text.includes('request limit reached')
+    || text.includes('rate limit')
+    || text.includes('too many requests')
+    || text.includes('exceeded maximum retry limit')
+    || text.includes('batch of more than');
+}
+
+function buildArcRpcCooldownError(error = null, chainName = 'Arc Testnet') {
+  const cooldownError = new Error(ARC_RPC_COOLDOWN_MESSAGE);
+  cooldownError.code = ARC_RPC_COOLDOWN_CODE;
+  cooldownError.chainName = chainName;
+  cooldownError.retryable = true;
+  cooldownError.deferred = true;
+  cooldownError.status = 'deferred';
+  if (error) {
+    cooldownError.cause = error;
+    cooldownError.causeMessage = error.message || String(error);
+  }
+  return cooldownError;
+}
+
+function toRetryableGatewayError(error, chainName = 'Arc Testnet') {
+  if (isArcTestnetChain(chainName) && isGatewayRateLimitError(error)) {
+    return buildArcRpcCooldownError(error, chainName);
+  }
+
+  return error;
+}
+
 function getAgentGatewayPrivateKey(agent) {
   const encrypted = agent?.private_key_encrypted || agent?.encrypted_private_key;
   if (!encrypted) {
@@ -147,19 +207,34 @@ function getAgentGatewayPrivateKey(agent) {
 function createGatewayClientForAgent(agent, options = {}) {
   const { chainName = 'Arc Testnet' } = options;
   const chainConfig = resolveGatewayChainConfig(chainName);
+  let rpcUrl = options.rpcUrl || chainConfig.rpcUrl;
+
+  if (isArcTestnetChain(chainName)) {
+    const healthyArcRpcUrl = getHealthyArcRpcUrl('gateway_client');
+    if (!healthyArcRpcUrl) {
+      throw buildArcRpcCooldownError(null, chainName);
+    }
+    rpcUrl = healthyArcRpcUrl;
+  }
 
   return new GatewayClient({
     chain: chainConfig.chain,
     privateKey: getAgentGatewayPrivateKey(agent),
-    rpcUrl: options.rpcUrl || chainConfig.rpcUrl,
+    rpcUrl,
   });
 }
 
-async function readGatewayBalances(client, address) {
-  const [wallet, gateway] = await Promise.all([
-    client.getUsdcBalance(address),
-    client.getGatewayBalance(address),
-  ]);
+async function readGatewayBalances(client, address, options = {}) {
+  let wallet;
+  let gateway;
+  try {
+    [wallet, gateway] = await Promise.all([
+      client.getUsdcBalance(address),
+      client.getGatewayBalance(address),
+    ]);
+  } catch (error) {
+    throw toRetryableGatewayError(error, options.chainName || 'Arc Testnet');
+  }
 
   return {
     wallet: {
@@ -179,8 +254,14 @@ async function readGatewayBalances(client, address) {
 }
 
 async function getAgentGatewayBalances(agent, options = {}) {
-  const client = createGatewayClientForAgent(agent, options);
-  return readGatewayBalances(client, options.address);
+  try {
+    const client = createGatewayClientForAgent(agent, options);
+    return readGatewayBalances(client, options.address, {
+      chainName: options.chainName || 'Arc Testnet',
+    });
+  } catch (error) {
+    throw toRetryableGatewayError(error, options.chainName || 'Arc Testnet');
+  }
 }
 
 function sleep(ms) {
@@ -391,7 +472,9 @@ async function ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options
   const transferAmountAtomic = getAtomicUsdc(amountUsdc);
   const maxFee = resolveGatewayTransferMaxFee(options.maxFee);
   const requiredAtomic = transferAmountAtomic + getAtomicUsdc(maxFee);
-  const balances = await readGatewayBalances(client, options.address);
+  const balances = await readGatewayBalances(client, options.address, {
+    chainName: options.chainName || 'Arc Testnet',
+  });
 
   if (balances.gateway.available >= requiredAtomic) {
     return {
@@ -407,7 +490,10 @@ async function ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options
   const shortfallAtomic = requiredAtomic - balances.gateway.available;
   const shortfall = ethers.formatUnits(shortfallAtomic, 6);
   const depositResult = await client.deposit(shortfall);
-  const updatedBalances = await waitForGatewayAvailableBalance(client, requiredAtomic, options);
+  const updatedBalances = await waitForGatewayAvailableBalance(client, requiredAtomic, {
+    ...options,
+    chainName: options.chainName || 'Arc Testnet',
+  });
 
   return {
     deposited: true,
@@ -421,19 +507,30 @@ async function ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options
 
 async function ensureGatewayAvailableBalance(client, amountUsdc, options = {}) {
   const walletAddress = normalizeGatewayWalletAddress(options.walletAddress || options.address);
-  return runGatewayProtectedWrite({
-    chainName: options.chainName || 'Arc Testnet',
-    walletAddress,
-    operation: options.operation || 'gateway_available_balance',
-    replayFingerprint: options.replayFingerprint || null,
-    waitForLockMs: options.waitForLockMs,
-    protectedWrite: options.protectedWrite !== false,
-  }, () => ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options));
+  const chainName = options.chainName || 'Arc Testnet';
+
+  try {
+    return await runGatewayProtectedWrite({
+      chainName,
+      walletAddress,
+      operation: options.operation || 'gateway_available_balance',
+      replayFingerprint: options.replayFingerprint || null,
+      waitForLockMs: options.waitForLockMs,
+      protectedWrite: options.protectedWrite !== false,
+    }, () => ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, {
+      ...options,
+      chainName,
+    }));
+  } catch (error) {
+    throw toRetryableGatewayError(error, chainName);
+  }
 }
 
 async function ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options = {}) {
   const requiredAtomic = getAtomicUsdc(amountUsdc);
-  const balances = await readGatewayBalances(client, options.address);
+  const balances = await readGatewayBalances(client, options.address, {
+    chainName: options.chainName || 'Arc Testnet',
+  });
 
   if (balances.gateway.available >= requiredAtomic) {
     return {
@@ -448,7 +545,10 @@ async function ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options =
   const shortfallAtomic = requiredAtomic - balances.gateway.available;
   const shortfall = ethers.formatUnits(shortfallAtomic, 6);
   const depositResult = await client.deposit(shortfall);
-  const updatedBalances = await waitForGatewayAvailableBalance(client, requiredAtomic, options);
+  const updatedBalances = await waitForGatewayAvailableBalance(client, requiredAtomic, {
+    ...options,
+    chainName: options.chainName || 'Arc Testnet',
+  });
 
   return {
     deposited: true,
@@ -461,20 +561,31 @@ async function ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options =
 
 async function ensureGatewayPaymentBalance(client, amountUsdc, options = {}) {
   const walletAddress = normalizeGatewayWalletAddress(options.walletAddress || options.address);
-  return runGatewayProtectedWrite({
-    chainName: options.chainName || 'Arc Testnet',
-    walletAddress,
-    operation: options.operation || 'gateway_payment_balance',
-    replayFingerprint: options.replayFingerprint || null,
-    waitForLockMs: options.waitForLockMs,
-    protectedWrite: options.protectedWrite !== false,
-  }, () => ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options));
+  const chainName = options.chainName || 'Arc Testnet';
+
+  try {
+    return await runGatewayProtectedWrite({
+      chainName,
+      walletAddress,
+      operation: options.operation || 'gateway_payment_balance',
+      replayFingerprint: options.replayFingerprint || null,
+      waitForLockMs: options.waitForLockMs,
+      protectedWrite: options.protectedWrite !== false,
+    }, () => ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, {
+      ...options,
+      chainName,
+    }));
+  } catch (error) {
+    throw toRetryableGatewayError(error, chainName);
+  }
 }
 
 async function depositGatewayBalanceUnlocked(client, amountUsdc, options = {}) {
   const amount = normalizeUsdcAmount(amountUsdc);
   const depositAtomic = getAtomicUsdc(amount);
-  const balancesBefore = await readGatewayBalances(client, options.address);
+  const balancesBefore = await readGatewayBalances(client, options.address, {
+    chainName: options.chainName || 'Arc Testnet',
+  });
 
   if (balancesBefore.wallet.available < depositAtomic) {
     const error = new Error('insufficient_wallet_balance_for_gateway_deposit');
@@ -488,7 +599,10 @@ async function depositGatewayBalanceUnlocked(client, amountUsdc, options = {}) {
 
   const depositResult = await client.deposit(amount);
   const targetAvailableAtomic = balancesBefore.gateway.available + depositAtomic;
-  const balancesAfter = await waitForGatewayAvailableBalance(client, targetAvailableAtomic, options);
+  const balancesAfter = await waitForGatewayAvailableBalance(client, targetAvailableAtomic, {
+    ...options,
+    chainName: options.chainName || 'Arc Testnet',
+  });
 
   return {
     amountUsdc: amount,
@@ -501,14 +615,23 @@ async function depositGatewayBalanceUnlocked(client, amountUsdc, options = {}) {
 
 async function depositGatewayBalance(client, amountUsdc, options = {}) {
   const walletAddress = normalizeGatewayWalletAddress(options.walletAddress || options.address);
-  return runGatewayProtectedWrite({
-    chainName: options.chainName || 'Arc Testnet',
-    walletAddress,
-    operation: options.operation || 'gateway_deposit',
-    replayFingerprint: options.replayFingerprint || null,
-    waitForLockMs: options.waitForLockMs,
-    protectedWrite: options.protectedWrite !== false,
-  }, () => depositGatewayBalanceUnlocked(client, amountUsdc, options));
+  const chainName = options.chainName || 'Arc Testnet';
+
+  try {
+    return await runGatewayProtectedWrite({
+      chainName,
+      walletAddress,
+      operation: options.operation || 'gateway_deposit',
+      replayFingerprint: options.replayFingerprint || null,
+      waitForLockMs: options.waitForLockMs,
+      protectedWrite: options.protectedWrite !== false,
+    }, () => depositGatewayBalanceUnlocked(client, amountUsdc, {
+      ...options,
+      chainName,
+    }));
+  } catch (error) {
+    throw toRetryableGatewayError(error, chainName);
+  }
 }
 
 async function ensureGatewayWarmBalance(agent, options = {}) {
@@ -538,18 +661,19 @@ async function ensureGatewayWarmBalance(agent, options = {}) {
 
   const walletAddress = resolveAgentGatewayWalletAddress(agent, options.walletAddress || options.address);
   const balanceAddress = options.address || walletAddress;
-  const client = createGatewayClientForAgent(agent, { chainName });
+  try {
+    const client = createGatewayClientForAgent(agent, { chainName });
 
-  return runGatewayProtectedWrite({
-    chainName,
-    walletAddress,
-    operation: options.operation || 'gateway_warm_balance',
-    replayFingerprint: options.replayFingerprint || null,
-    waitForLockMs: options.waitForLockMs == null ? DEFAULT_GATEWAY_AUTO_WARM_LOCK_WAIT_MS : options.waitForLockMs,
-    protectedWrite: options.protectedWrite !== false,
-  }, async () => {
-    const balancesBefore = await readGatewayBalances(client, balanceAddress);
-    const currentAvailableUsdc = Number(balancesBefore.gateway?.formattedAvailable || 0);
+    return await runGatewayProtectedWrite({
+      chainName,
+      walletAddress,
+      operation: options.operation || 'gateway_warm_balance',
+      replayFingerprint: options.replayFingerprint || null,
+      waitForLockMs: options.waitForLockMs == null ? DEFAULT_GATEWAY_AUTO_WARM_LOCK_WAIT_MS : options.waitForLockMs,
+      protectedWrite: options.protectedWrite !== false,
+    }, async () => {
+      const balancesBefore = await readGatewayBalances(client, balanceAddress, { chainName });
+      const currentAvailableUsdc = Number(balancesBefore.gateway?.formattedAvailable || 0);
 
     if (Number.isFinite(currentAvailableUsdc) && currentAvailableUsdc >= minAvailableUsdc) {
       return {
@@ -592,23 +716,27 @@ async function ensureGatewayWarmBalance(agent, options = {}) {
       };
     }
 
-    const funding = await depositGatewayBalanceUnlocked(client, depositAmountUsdc, {
-      ...options,
-      address: balanceAddress,
+      const funding = await depositGatewayBalanceUnlocked(client, depositAmountUsdc, {
+        ...options,
+        address: balanceAddress,
+        chainName,
+      });
+      return {
+        attempted: true,
+        deposited: true,
+        reason: 'funded',
+        minAvailableUsdc,
+        targetAvailableUsdc,
+        balancesBefore: funding.balancesBefore,
+        balancesAfter: funding.balancesAfter,
+        amountUsdc: funding.amountUsdc,
+        depositResult: funding.depositResult,
+        funded: funding.funded,
+      };
     });
-    return {
-      attempted: true,
-      deposited: true,
-      reason: 'funded',
-      minAvailableUsdc,
-      targetAvailableUsdc,
-      balancesBefore: funding.balancesBefore,
-      balancesAfter: funding.balancesAfter,
-      amountUsdc: funding.amountUsdc,
-      depositResult: funding.depositResult,
-      funded: funding.funded,
-    };
-  });
+  } catch (error) {
+    throw toRetryableGatewayError(error, chainName);
+  }
 }
 
 async function payGatewayProtectedResource({
@@ -627,30 +755,35 @@ async function payGatewayProtectedResource({
 
   const amount = normalizeUsdcAmount(amountUsdc);
   const walletAddress = resolveAgentGatewayWalletAddress(agent);
-  const client = createGatewayClientForAgent(agent, { chainName });
+  try {
+    const client = createGatewayClientForAgent(agent, { chainName });
 
-  return runGatewayProtectedWrite({
-    chainName,
-    walletAddress,
-    operation: 'gateway_protected_resource_pay',
-    replayFingerprint,
-    waitForLockMs,
-    protectedWrite,
-  }, async () => {
-    const funding = await ensureGatewayPaymentBalanceUnlocked(client, amount, {
-      address: walletAddress,
+    return await runGatewayProtectedWrite({
+      chainName,
+      walletAddress,
+      operation: 'gateway_protected_resource_pay',
+      replayFingerprint,
+      waitForLockMs,
+      protectedWrite,
+    }, async () => {
+      const funding = await ensureGatewayPaymentBalanceUnlocked(client, amount, {
+        address: walletAddress,
+        chainName,
+      });
+      const payResult = await executeGatewayProtectedPayment(client, url, requestOptions);
+
+      return {
+        mode: 'circle_gateway_resource_pay',
+        sourceChain: chainName,
+        amountUsdc: amount,
+        deposited: funding.deposited,
+        depositResult: funding.depositResult,
+        payResult,
+      };
     });
-    const payResult = await executeGatewayProtectedPayment(client, url, requestOptions);
-
-    return {
-      mode: 'circle_gateway_resource_pay',
-      sourceChain: chainName,
-      amountUsdc: amount,
-      deposited: funding.deposited,
-      depositResult: funding.depositResult,
-      payResult,
-    };
-  });
+  } catch (error) {
+    throw toRetryableGatewayError(error, chainName);
+  }
 }
 
 async function executeGatewayTransfer({
@@ -671,38 +804,43 @@ async function executeGatewayTransfer({
   const amount = normalizeUsdcAmount(amountUsdc);
   const resolvedMaxFee = resolveGatewayTransferMaxFee(maxFee);
   const walletAddress = resolveAgentGatewayWalletAddress(agent);
-  const client = createGatewayClientForAgent(agent, { chainName: fromChain });
-  const destination = resolveGatewayChainConfig(toChain);
+  try {
+    const client = createGatewayClientForAgent(agent, { chainName: fromChain });
+    const destination = resolveGatewayChainConfig(toChain);
 
-  return runGatewayProtectedWrite({
-    chainName: fromChain,
-    walletAddress,
-    operation: 'gateway_transfer',
-    replayFingerprint,
-    waitForLockMs,
-    protectedWrite,
-  }, async () => {
-    const funding = await ensureGatewayAvailableBalanceUnlocked(client, amount, {
-      maxFee: resolvedMaxFee,
-      address: walletAddress,
+    return await runGatewayProtectedWrite({
+      chainName: fromChain,
+      walletAddress,
+      operation: 'gateway_transfer',
+      replayFingerprint,
+      waitForLockMs,
+      protectedWrite,
+    }, async () => {
+      const funding = await ensureGatewayAvailableBalanceUnlocked(client, amount, {
+        maxFee: resolvedMaxFee,
+        address: walletAddress,
+        chainName: fromChain,
+      });
+
+      const transferResult = await client.withdraw(amount, {
+        chain: destination.chain,
+        recipient,
+        maxFee: resolvedMaxFee,
+      });
+
+      return {
+        mode: 'circle_gateway_buyer',
+        sourceChain: fromChain,
+        destinationChain: toChain,
+        deposited: funding.deposited,
+        maxFee: resolvedMaxFee,
+        depositResult: funding.depositResult,
+        transferResult,
+      };
     });
-
-    const transferResult = await client.withdraw(amount, {
-      chain: destination.chain,
-      recipient,
-      maxFee: resolvedMaxFee,
-    });
-
-    return {
-      mode: 'circle_gateway_buyer',
-      sourceChain: fromChain,
-      destinationChain: toChain,
-      deposited: funding.deposited,
-      maxFee: resolvedMaxFee,
-      depositResult: funding.depositResult,
-      transferResult,
-    };
-  });
+  } catch (error) {
+    throw toRetryableGatewayError(error, fromChain);
+  }
 }
 
 module.exports = {

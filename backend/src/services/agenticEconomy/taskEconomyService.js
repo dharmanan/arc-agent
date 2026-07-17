@@ -8,6 +8,7 @@ const { getRevenuePoolAddress, getRevenuePoolSource } = require('./revenuePoolCo
 const DRY_RUN = process.env.DRY_RUN === 'true';
 const TASK_ECONOMY_CHAIN = process.env.TASK_ECONOMY_CHAIN || 'Arc Testnet';
 const TASK_ECONOMY_PAY_ADDRESS = process.env.TASK_ECONOMY_PAY_ADDRESS || null;
+const ARC_RPC_COOLDOWN_CODE = 'ARC_RPC_COOLDOWN';
 
 function getTaskEconomyRecipientConfig() {
   if (TASK_ECONOMY_PAY_ADDRESS) {
@@ -44,6 +45,32 @@ function getTaskEconomyConfigSummary() {
   };
 }
 
+function extractEconomyErrorText(error) {
+  return [
+    error?.message,
+    error?.shortMessage,
+    error?.code,
+    error?.cause?.message,
+    error?.causeMessage,
+    error?.error?.message,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+function isArcRpcCooldownDeferral(error) {
+  const code = String(error?.code || '').trim().toUpperCase();
+  if (code === ARC_RPC_COOLDOWN_CODE) {
+    return true;
+  }
+
+  const text = extractEconomyErrorText(error);
+  return text.includes('request limit reached')
+    || text.includes('rate limit')
+    || text.includes('arc rpc is cooling down');
+}
+
 async function finalizeExecutionEconomyResult(result, { agentId, referenceId, referenceType }) {
   const logMeta = {
     agentId,
@@ -54,10 +81,13 @@ async function finalizeExecutionEconomyResult(result, { agentId, referenceId, re
     referenceId,
     referenceType,
     txHash: result.gatewayMintTxHash || null,
+    errorCode: result.errorCode || null,
   };
 
   if (result.status === 'confirmed') {
     logTaskEconomy('info', 'Execution fee settlement confirmed', logMeta);
+  } else if (result.status === 'deferred') {
+    logTaskEconomy('info', 'Execution fee settlement deferred', logMeta);
   } else if (result.status === 'failed') {
     logTaskEconomy('warn', 'Execution fee settlement failed', logMeta);
   } else {
@@ -140,13 +170,54 @@ async function settleExecutionFee({
     }, { agentId: null, referenceId, referenceType });
   }
 
-  const result = await gatewayBuyerService.executeGatewayTransfer({
-    agent,
-    amountUsdc: normalizedFeeUsdc,
-    recipient: summary.sellerAddress,
-    fromChain,
-    toChain,
-  });
+  let result;
+  try {
+    result = await gatewayBuyerService.executeGatewayTransfer({
+      agent,
+      amountUsdc: normalizedFeeUsdc,
+      recipient: summary.sellerAddress,
+      fromChain,
+      toChain,
+    });
+  } catch (error) {
+    if (isArcRpcCooldownDeferral(error)) {
+      return finalizeExecutionEconomyResult({
+        ...base,
+        status: 'deferred',
+        reason: 'arc_rpc_cooldown',
+        deferred: true,
+        retryable: true,
+        errorCode: String(error?.code || ARC_RPC_COOLDOWN_CODE),
+        error: error?.message || 'Arc RPC is cooling down',
+        retryIntent: {
+          mode,
+          rail,
+          referenceId,
+          referenceType,
+          feeUsdc: normalizedFeeUsdc,
+          fromChain,
+          toChain,
+          recipient: summary.sellerAddress,
+          retryReason: 'arc_rpc_cooldown',
+        },
+      }, { agentId: agent.id, referenceId, referenceType });
+    }
+
+    throw error;
+  }
+
+  const gatewayMintTxHash = result.transferResult?.mintTxHash || null;
+  if (!gatewayMintTxHash) {
+    return finalizeExecutionEconomyResult({
+      ...base,
+      status: 'failed',
+      reason: 'gateway_transfer_unconfirmed',
+      error: 'Gateway transfer confirmation is missing',
+      deposited: result.deposited,
+      gatewayApprovalTxHash: result.depositResult?.approvalTxHash || null,
+      gatewayDepositTxHash: result.depositResult?.depositTxHash || null,
+    }, { agentId: agent.id, referenceId, referenceType });
+  }
 
   return finalizeExecutionEconomyResult({
     ...base,
@@ -154,7 +225,7 @@ async function settleExecutionFee({
     deposited: result.deposited,
     gatewayApprovalTxHash: result.depositResult?.approvalTxHash || null,
     gatewayDepositTxHash: result.depositResult?.depositTxHash || null,
-    gatewayMintTxHash: result.transferResult?.mintTxHash || null,
+    gatewayMintTxHash,
     formattedAmount: result.transferResult?.formattedAmount || String(normalizedFeeUsdc),
     recipient: result.transferResult?.recipient || summary.sellerAddress,
   }, { agentId: agent.id, referenceId, referenceType });

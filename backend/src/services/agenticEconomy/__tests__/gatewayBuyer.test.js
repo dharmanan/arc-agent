@@ -6,6 +6,7 @@ const TEST_WALLET_ADDRESS = '0xFCAd0B19bB29D4674531d6f115237E16AfCE377c';
 function loadHarness() {
   jest.resetModules();
 
+  const gatewayClientCtor = jest.fn();
   const client = {
     getUsdcBalance: jest.fn(),
     getGatewayBalance: jest.fn(),
@@ -44,9 +45,13 @@ function loadHarness() {
   });
 
   const runProtectedWrite = jest.fn(async (options, execute) => execute());
+  const arcProvider = {
+    getHealthyArcRpcUrl: jest.fn(() => 'https://rpc.testnet.arc.network'),
+    isArcRpcRateLimitError: jest.fn((error) => /request limit reached|rate limit|too many requests/i.test(String(error?.message || ''))),
+  };
 
   jest.doMock('@circle-fin/x402-batching/client', () => ({
-    GatewayClient: jest.fn(() => client),
+    GatewayClient: gatewayClientCtor.mockImplementation(() => client),
   }));
   jest.doMock('../../cryptoService', () => ({
     decrypt: jest.fn(() => TEST_PRIVATE_KEY),
@@ -54,12 +59,19 @@ function loadHarness() {
   jest.doMock('../../txSecurityService', () => ({
     runProtectedWrite,
   }));
+  jest.doMock('../../arcProvider', () => arcProvider);
   jest.doMock('../logger', () => ({
     logGateway: jest.fn(),
   }));
 
   const gatewayBuyer = require('../gatewayBuyer');
-  return { gatewayBuyer, client, runProtectedWrite };
+  return {
+    gatewayBuyer,
+    client,
+    runProtectedWrite,
+    arcProvider,
+    gatewayClientCtor,
+  };
 }
 
 describe('gatewayBuyer', () => {
@@ -93,5 +105,52 @@ describe('gatewayBuyer', () => {
       }),
       expect.any(Function),
     );
+  });
+
+  test('does not construct Gateway client or read balances when Arc RPC is cooling down', async () => {
+    const {
+      gatewayBuyer,
+      client,
+      arcProvider,
+      gatewayClientCtor,
+    } = loadHarness();
+    arcProvider.getHealthyArcRpcUrl.mockReturnValue(null);
+
+    await expect(gatewayBuyer.ensureGatewayWarmBalance({
+      id: 'agent-2',
+      wallet_address: TEST_WALLET_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    }, {
+      chainName: 'Arc Testnet',
+      minAvailableUsdc: 1,
+      targetAvailableUsdc: 3,
+    })).rejects.toMatchObject({
+      code: 'ARC_RPC_COOLDOWN',
+      message: 'Arc RPC is cooling down',
+      retryable: true,
+    });
+
+    expect(gatewayClientCtor).not.toHaveBeenCalled();
+    expect(client.getUsdcBalance).not.toHaveBeenCalled();
+    expect(client.getGatewayBalance).not.toHaveBeenCalled();
+  });
+
+  test('classifies request limit reached as retryable Arc cooldown', async () => {
+    const { gatewayBuyer, client } = loadHarness();
+    client.getGatewayBalance.mockRejectedValue(new Error('request limit reached'));
+
+    await expect(gatewayBuyer.getAgentGatewayBalances({
+      id: 'agent-3',
+      wallet_address: TEST_WALLET_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    }, {
+      chainName: 'Arc Testnet',
+      address: TEST_WALLET_ADDRESS,
+    })).rejects.toMatchObject({
+      code: 'ARC_RPC_COOLDOWN',
+      message: 'Arc RPC is cooling down',
+      retryable: true,
+      deferred: true,
+    });
   });
 });
