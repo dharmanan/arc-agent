@@ -15,6 +15,11 @@ const Bull        = require('bull');
 const Redis       = require('ioredis');
 const os          = require('os');
 const { createPgBossQueue, shouldUsePgBossQueue } = require('./pgBossQueueAdapter');
+const {
+  buildFeeSettlementRetryJobId,
+  canEnqueueRetryJobState,
+  ensureRetryJobVisible,
+} = require('./paymentRetryQueueUtils');
 const { ethers }  = require('ethers');
 const db          = require('../db');
 const llmService  = require('../services/llmService');
@@ -33,11 +38,19 @@ const { evaluateLendingAutomationPolicy } = require('../services/lendingAutomati
 const { evaluateCarryAutomationPolicy } = require('../services/carryAutomationPolicy');
 const { evaluateOracleStrategyPolicy } = require('../services/oracleStrategyPolicy');
 const { evaluateCirbtcLpAutomationPolicy } = require('../services/cirbtcLpAutomationPolicy');
+const paymentRetryService = require('../services/agenticEconomy/paymentRetryService');
 const bridgeActivityService = require('../services/bridgeActivityService');
 const taskRunService = require('../services/taskRunService');
 const { maybeWarmAgentGatewayBalance, isArcRpcCooldownError } = require('./gatewayAutoWarmService');
 const { shouldTrackAutoCarryStartHandoff } = require('../services/autoCarryTaskRunPolicy');
 const { safeArcRpcCall } = require('../services/arcProvider');
+const {
+  readStableLpExitFailureCooldownMs,
+  buildStableLpExitFailureFingerprint,
+  buildFailureMeta,
+  registerStableLpExitFailureCooldownHit,
+  findActiveStableLpExitFailureCooldownForAgent,
+} = require('./stableLpExitFailureCooldown');
 
 const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
 const ARC_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || process.env.EURC_ADDRESS || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
@@ -1549,12 +1562,137 @@ function getErrorText(value) {
   return value == null ? '' : String(value).trim();
 }
 
+const STABLE_LP_EXIT_FAILURE_COOLDOWN_MS = readStableLpExitFailureCooldownMs();
+
+function isStableLpExitExecution({ automationType, operationType, transactionType }) {
+  return String(automationType || '').toLowerCase() === 'stable'
+    && String(operationType || '').toLowerCase() === 'remove_liquidity'
+    && String(transactionType || '').toLowerCase() === 'curve_lp_remove';
+}
+
+function buildStableLpExitFailureContext({
+  agentId,
+  operationType,
+  transactionType,
+  defaultToToken,
+  errorDetails,
+  executionPayload,
+} = {}) {
+  const deterministicPreBroadcastFailure = Boolean(errorDetails?.deterministicPreBroadcastFailure);
+  const errorCode = String(errorDetails?.errorCode || '').trim().toUpperCase();
+  const simulationFingerprint = String(
+    errorDetails?.simulationFingerprint
+      || executionPayload?.simulationFingerprint
+      || '',
+  ).trim();
+  const calldataHash = String(
+    errorDetails?.simulationCalldataHash
+      || executionPayload?.calldataHash
+      || '',
+  ).trim();
+
+  if (!deterministicPreBroadcastFailure || errorCode !== 'TX_SIMULATION_FAILED') {
+    return null;
+  }
+
+  const poolAddress = String(
+    errorDetails?.simulationPoolAddress
+      || executionPayload?.poolAddress
+      || executionPayload?.routeAddress
+      || '',
+  ).trim();
+  const liveLpBalance = String(
+    errorDetails?.liveLpBalance
+      || executionPayload?.liveLpBalance
+      || '',
+  ).trim();
+  const tokenOut = String(
+    errorDetails?.tokenOut
+      || executionPayload?.tokenOut
+      || defaultToToken
+      || 'USDC',
+  ).trim().toUpperCase();
+
+  if (!poolAddress || !liveLpBalance || (!simulationFingerprint && !calldataHash)) {
+    return null;
+  }
+
+  const fingerprint = buildStableLpExitFailureFingerprint({
+    agentId,
+    operationType,
+    poolAddress,
+    liveLpBalance,
+    tokenOut,
+    errorCode,
+    simulationFingerprint,
+    calldataHash,
+  });
+
+  if (!fingerprint) return null;
+
+  return {
+    fingerprint,
+    poolAddress,
+    liveLpBalance,
+    tokenOut,
+    errorCode,
+    simulationFingerprint: simulationFingerprint || null,
+    calldataHash: calldataHash || null,
+    cooldownMs: STABLE_LP_EXIT_FAILURE_COOLDOWN_MS,
+    deterministicPreBroadcastFailure: true,
+    transactionType,
+  };
+}
+
+async function registerStableLpExitFailureCooldown({
+  agentId,
+  fingerprint,
+}) {
+  return registerStableLpExitFailureCooldownHit(db, {
+    agentId,
+    fingerprint,
+    cooldownMs: STABLE_LP_EXIT_FAILURE_COOLDOWN_MS,
+  });
+}
+
+function isStableLpExitGuardSkipResult(executionResult = {}) {
+  const normalizedReason = String(executionResult?.reason || '').trim().toLowerCase();
+  const normalizedStatus = String(executionResult?.status || '').trim().toLowerCase();
+  const normalizedErrorCode = String(executionResult?.errorCode || '').trim().toUpperCase();
+
+  if (normalizedReason === 'live_lp_balance_unavailable' && normalizedErrorCode === 'ARC_RPC_COOLDOWN') {
+    return {
+      status: 'deferred',
+      reason: 'live_lp_balance_unavailable',
+    };
+  }
+
+  if (normalizedReason === 'no_live_lp_position') {
+    return {
+      status: 'skipped',
+      reason: 'no_live_lp_position',
+    };
+  }
+
+  if (normalizedReason === 'stable_lp_exit_failure_cooldown' || normalizedStatus === 'skipped') {
+    return {
+      status: 'skipped',
+      reason: normalizedReason || 'stable_lp_exit_failure_cooldown',
+    };
+  }
+
+  return null;
+}
+
 function buildExecutionErrorDetails(err) {
   const rawMessage = getErrorText(err?.message || err);
   const reason = getErrorText(err?.reason);
   const providerMessage = getErrorText(err?.info?.error?.message);
   const shortMessage = getErrorText(err?.shortMessage);
   const code = getErrorText(err?.code);
+  const simulationContext = err?.simulationContext && typeof err.simulationContext === 'object'
+    ? err.simulationContext
+    : null;
   const haystack = [rawMessage, reason, providerMessage, shortMessage, code].filter(Boolean).join(' ');
 
   let summary = reason || providerMessage || shortMessage || rawMessage || 'Transaction failed before confirmation.';
@@ -1568,6 +1706,8 @@ function buildExecutionErrorDetails(err) {
     summary = 'The on-chain swap reverted, but the RPC node did not return a decoded contract reason.';
   }
 
+  const errorTxHash = err?.receipt?.hash || err?.transactionHash || null;
+
   return {
     error: rawMessage || providerMessage || shortMessage || 'Unknown execution error',
     errorSummary: summary,
@@ -1575,8 +1715,26 @@ function buildExecutionErrorDetails(err) {
     errorReason: reason || null,
     errorProviderMessage: providerMessage || null,
     errorShortMessage: shortMessage || null,
-    errorTxHash: err?.receipt?.hash || err?.transactionHash || null,
+    errorTxHash,
     errorReceiptStatus: err?.receipt?.status ?? null,
+    deterministicPreBroadcastFailure: code === 'TX_SIMULATION_FAILED' && !errorTxHash,
+    simulationPoolAddress: getErrorText(simulationContext?.poolAddress) || null,
+    simulationWalletAddress: getErrorText(simulationContext?.walletAddress) || null,
+    simulationTokenAmount: getErrorText(simulationContext?.tokenAmount) || null,
+    simulationTokenAmountRaw: getErrorText(simulationContext?.tokenAmountRaw) || null,
+    simulationCoinIndex: simulationContext?.indexOut ?? null,
+    simulationMinAmountOut: getErrorText(simulationContext?.minAmountOut) || null,
+    simulationMinAmountOutRaw: getErrorText(simulationContext?.minAmountOutRaw) || null,
+    simulationCalldata: getErrorText(simulationContext?.calldata) || null,
+    simulationCalldataHash: getErrorText(simulationContext?.calldataHash) || null,
+    simulationFingerprint: getErrorText(simulationContext?.simulationFingerprint) || null,
+    snapshotLpBalance: getErrorText(simulationContext?.snapshotLpBalance) || null,
+    liveLpBalance: getErrorText(simulationContext?.liveLpBalance) || null,
+    tokenOut: getErrorText(simulationContext?.tokenOut) || null,
+    positionDataFreshness: getErrorText(simulationContext?.positionDataFreshness) || null,
+    positionCheckedAt: getErrorText(simulationContext?.positionCheckedAt) || null,
+    executionRead: simulationContext?.executionRead || null,
+    snapshotExecutionRead: simulationContext?.snapshotExecutionRead || null,
   };
 }
 
@@ -1596,6 +1754,12 @@ const VERBOSE_QUEUE_LOGS = process.env.NODE_ENV !== 'production'
 function logQueueVerbose(message, ...args) {
   if (!VERBOSE_QUEUE_LOGS) return;
   console.log(message, ...args);
+}
+
+function isEnvEnabled(name, defaultValue = true) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+  return !['0', 'false', 'no', 'off'].includes(String(raw).trim().toLowerCase());
 }
 
 const bullRedisClients = new Set();
@@ -2774,12 +2938,23 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
 
     if (shouldTriggerDefiReviewFromMarketAnalysis(decisionSnapshot, agent)) {
       try {
-        const enqueueResult = await queueDefiLoopForAgent(agentId, {
-          reason: 'market-analysis',
-          trigger: 'market_analysis',
-          priority: DEFI_LOOP_PRIORITY_MARKET,
+        const stableLpExitCooldown = await findActiveStableLpExitFailureCooldownForAgent(db, {
+          agentId,
+          cooldownMs: STABLE_LP_EXIT_FAILURE_COOLDOWN_MS,
         });
-        queuedDefiReview = enqueueResult.queued === true;
+
+        if (stableLpExitCooldown.active) {
+          queuedDefiReview = false;
+          decisionSnapshot.defiReviewBlockedBy = 'stable_lp_exit_failure_cooldown';
+          decisionSnapshot.defiReviewRetryAfterMs = stableLpExitCooldown.retryAfterMs;
+        } else {
+          const enqueueResult = await queueDefiLoopForAgent(agentId, {
+            reason: 'market-analysis',
+            trigger: 'market_analysis',
+            priority: DEFI_LOOP_PRIORITY_MARKET,
+          });
+          queuedDefiReview = enqueueResult.queued === true;
+        }
       } catch (queueErr) {
         console.error(`[QUEUE] MARKET_ANALYSIS enqueue DEFI_LOOP error agent=${agentId}:`, queueErr.message);
       }
@@ -2841,6 +3016,41 @@ const DAILY_DEFI_LOOP_CAP     = Math.max(parseInt(process.env.DAILY_DEFI_LOOP_CA
 const DAILY_ORACLE_CAP        = Math.max(parseInt(process.env.DAILY_ORACLE_CAP || '48', 10) || 48, 1);
 const SUSPEND_CAP_REACHED_SCAN_JOBS = String(process.env.SUSPEND_CAP_REACHED_SCAN_JOBS || '').trim().toLowerCase() === 'true';
 const GLOBAL_DRY_RUN          = process.env.DRY_RUN === 'true';
+const PAYMENT_RETRY_ENABLED = isEnvEnabled('PAYMENT_RETRY_ENABLED', true);
+const PAYMENT_RETRY_INTERVAL_MS = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_INTERVAL_MS || '300000', 10) || 300000,
+  60000,
+);
+const PAYMENT_RETRY_BATCH_SIZE = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_BATCH_SIZE || '10', 10) || 10,
+  1,
+);
+const PAYMENT_RETRY_MAX_ATTEMPTS = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_MAX_ATTEMPTS || '10', 10) || 10,
+  1,
+);
+const PAYMENT_RETRY_BASE_DELAY_MS = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_BASE_DELAY_MS || '900000', 10) || 900000,
+  1000,
+);
+const PAYMENT_RETRY_MAX_DELAY_MS = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_MAX_DELAY_MS || '21600000', 10) || 21600000,
+  PAYMENT_RETRY_BASE_DELAY_MS,
+);
+const PAYMENT_RETRY_LOCK_TIMEOUT_MS = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_LOCK_TIMEOUT_MS || '900000', 10) || 900000,
+  1000,
+);
+const PAYMENT_RETRY_STARTUP_DELAY_MS = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_STARTUP_DELAY_MS || '180000', 10) || 180000,
+  0,
+);
+const PAYMENT_RETRY_WORKER_CONCURRENCY = Math.max(
+  parseInt(process.env.PAYMENT_RETRY_WORKER_CONCURRENCY || '2', 10) || 2,
+  1,
+);
+const PAYMENT_RETRY_SCHEDULER_WORKER_ID = process.env.PAYMENT_RETRY_SCHEDULER_WORKER_ID
+  || `payment-retry-scheduler:${os.hostname()}:${process.pid}`;
 const DEFAULT_ORACLE_SAME_CHAIN_MIN_PROFIT_USDC = 0.01;
 
 function getDefiLoopOrphanJobAgeMs(job) {
@@ -3859,6 +4069,12 @@ async function readStableCurvePositionContext(walletAddress) {
     ok: true,
     snapshot,
     position,
+    executionRead: {
+      source: 'position_snapshot',
+      stale: Boolean(snapshot?.stale),
+      executable: false,
+      checkedAt: snapshot?.updatedAt || new Date().toISOString(),
+    },
   };
 }
 
@@ -3962,7 +4178,13 @@ async function loadCirbtcDirectPairPoolContexts() {
   });
 }
 
-async function executeStableAutomationTask({ agent, operationType, actionParams, dryRunEnabled }) {
+async function executeStableAutomationTask({
+  agent,
+  operationType,
+  actionParams,
+  dryRunEnabled,
+  beforeCurveRemoveExecute = null,
+}) {
   if (operationType === 'add_liquidity') {
     if (String(actionParams?.mode || '').toLowerCase() === 'balanced') {
       return agenticTaskExecutionService.executeCurveLiquidityAddBalancedTask({
@@ -3985,6 +4207,7 @@ async function executeStableAutomationTask({ agent, operationType, actionParams,
         agent,
         params: { lpAmount: actionParams.lpAmount },
         dryRun: dryRunEnabled,
+        beforeExecute: beforeCurveRemoveExecute,
       });
     }
 
@@ -3995,6 +4218,7 @@ async function executeStableAutomationTask({ agent, operationType, actionParams,
         tokenOut: actionParams.tokenOut || 'USDC',
       },
       dryRun: dryRunEnabled,
+      beforeExecute: beforeCurveRemoveExecute,
     });
   }
 
@@ -5266,6 +5490,11 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
     : automationType === 'oracle'
       ? getOracleStrategyTransactionType(operationType)
       : getStableAutomationTransactionType(operationType);
+  const isStableLpExit = isStableLpExitExecution({
+    automationType,
+    operationType,
+    transactionType,
+  });
   const transactionToken = automationType === 'lending'
     ? getLendingAutomationTransactionToken(actionParams, automationPolicy)
     : automationType === 'carry'
@@ -5855,13 +6084,58 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
         amountOut: executionPayload.amountOut || null,
       };
     } else {
+      const beforeCurveRemoveExecute = isStableLpExit
+        ? async (executionGuard) => {
+            const fingerprint = buildStableLpExitFailureFingerprint({
+              agentId,
+              operationType,
+              poolAddress: executionGuard?.poolAddress,
+              liveLpBalance: executionGuard?.liveLpBalance,
+              tokenOut: executionGuard?.tokenOut || defaultToToken || 'USDC',
+              errorCode: executionGuard?.errorCode || 'TX_SIMULATION_FAILED',
+              simulationFingerprint: executionGuard?.simulationFingerprint,
+              calldataHash: executionGuard?.calldataHash,
+            });
+
+            const cooldown = await registerStableLpExitFailureCooldown({
+              agentId,
+              fingerprint,
+            });
+            if (!cooldown.active) return { skip: false };
+
+            return {
+              skip: true,
+              reason: 'stable_lp_exit_failure_cooldown',
+              retryAfterMs: cooldown.retryAfterMs,
+              cooldown,
+            };
+          }
+        : null;
+
       const executionResult = await executeStableAutomationTask({
         agent,
         operationType,
         actionParams,
         dryRunEnabled: false,
+        beforeCurveRemoveExecute,
       });
       if (!executionResult.ok) {
+        const skipResult = isStableLpExit ? isStableLpExitGuardSkipResult(executionResult) : null;
+        if (skipResult) {
+          return finishDefi('policy_hold', {
+            ok: true,
+            action: 'hold',
+            status: skipResult.status,
+            reason: skipResult.reason,
+            errorCode: executionResult.errorCode || null,
+            retryAfterMs: Number(executionResult.retryAfterMs || 0),
+            operationType,
+            summary: executionResult?.payload?.summary || executionResult?.reason,
+            stablePolicy: automationPolicy,
+            executionGuard: executionResult?.payload || null,
+          });
+        }
+
         await db.query(
           `INSERT INTO transactions
              (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
@@ -5885,9 +6159,11 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
             walletReserveUsdc,
             availableToTradeUsdc,
             positionBefore: positionSummary,
+            ...(executionResult.payload || {}),
             summary: `${automationType === 'cirbtc' ? 'cirBTC LP automation' : 'Stable automation'} could not execute ${operationType.replace(/_/g, ' ')}: ${executionResult.error || executionResult.reason}`,
             reason: executionResult.reason,
             error: executionResult.error || null,
+            errorCode: executionResult.errorCode || null,
           })],
         );
 
@@ -6007,12 +6283,57 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
   } catch (err) {
     const errorDetails = buildExecutionErrorDetails(err);
     console.error(`[QUEUE] DEFI_LOOP ${operationType} error agent=${agentId}:`, errorDetails.error);
+
+    const stableLpExitFailureContext = isStableLpExit
+      ? buildStableLpExitFailureContext({
+          agentId,
+          operationType,
+          transactionType,
+          defaultToToken,
+          errorDetails,
+          executionPayload,
+        })
+      : null;
+
+    let stableLpExitFailureMeta = null;
+    if (stableLpExitFailureContext?.fingerprint) {
+      const cooldownHit = await registerStableLpExitFailureCooldown({
+        agentId,
+        fingerprint: stableLpExitFailureContext.fingerprint,
+      });
+
+      if (cooldownHit.active) {
+        return finishDefi('policy_hold', {
+          ok: true,
+          action: 'hold',
+          status: 'skipped',
+          reason: 'stable_lp_exit_failure_cooldown',
+          retryAfterMs: cooldownHit.retryAfterMs,
+          operationType,
+          errorCode: errorDetails.errorCode || null,
+          summary: 'Skipped repeating identical stable LP exit simulation failure while cooldown is active.',
+        });
+      }
+
+      stableLpExitFailureMeta = buildFailureMeta({
+        poolAddress: stableLpExitFailureContext.poolAddress,
+        liveLpBalance: stableLpExitFailureContext.liveLpBalance,
+        tokenOut: stableLpExitFailureContext.tokenOut,
+        simulationFingerprint: stableLpExitFailureContext.simulationFingerprint,
+        simulationCalldataHash: stableLpExitFailureContext.calldataHash,
+      }, {
+        fingerprint: stableLpExitFailureContext.fingerprint,
+        cooldownMs: STABLE_LP_EXIT_FAILURE_COOLDOWN_MS,
+      });
+    }
+
     await db.query(
       `INSERT INTO transactions
          (agent_id, type, from_chain, to_chain, token, amount_usdc, status, tx_hash, meta)
        VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, 'failed', $5, $6::jsonb)`,
       [agentId, transactionType, transactionToken, nominalActionAmountUsdc || executionAmount, errorDetails.errorTxHash, JSON.stringify({
         ...errorDetails,
+        ...(stableLpExitFailureMeta || {}),
         signal,
         executionGate,
         automationPolicy,
@@ -6042,6 +6363,139 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
     });
   }
 });
+
+async function queueClaimedPaymentRetryIntent(intent) {
+  const intentId = String(intent?.id || '').trim();
+  if (!intentId) return false;
+
+  const jobId = buildFeeSettlementRetryJobId(intentId);
+  const existingJob = await queue.getJob(jobId).catch(() => null);
+  if (existingJob) {
+    const state = await existingJob.getState().catch(() => null);
+    if (!canEnqueueRetryJobState(state)) {
+      console.log(`[PAYMENT_RETRY] Intent=${intentId} already queued state=${state || 'unknown'}`);
+      return true;
+    }
+    if ((state === 'completed' || state === 'failed') && typeof existingJob.remove === 'function') {
+      await existingJob.remove().catch(() => {});
+    }
+  }
+
+  const enqueueResult = await ensureRetryJobVisible(queue, {
+    jobId,
+    name: 'FEE_SETTLEMENT_RETRY',
+    data: {
+      intentId,
+      lockOwner: intent.locked_by || null,
+      attemptCount: Number(intent.attempt_count || 0),
+    },
+    opts: {
+      jobId,
+      attempts: 1,
+      removeOnComplete: 200,
+      removeOnFail: 200,
+    },
+  });
+
+  if (enqueueResult.queued) {
+    console.log(`[PAYMENT_RETRY] Queued intent=${intentId} attempt=${Number(intent.attempt_count || 0)} source=${enqueueResult.reason}`);
+    return true;
+  }
+
+  await paymentRetryService.releaseIntentAfterEnqueueFailure(intentId, {
+    lockOwner: intent.locked_by || null,
+    attemptCount: Number(intent.attempt_count || 0),
+    lastError: enqueueResult.addError?.message || `Retry enqueue verification failed (${enqueueResult.reason})`,
+    payload: {
+      enqueueFailureReason: enqueueResult.reason,
+      queueBackend: process.env.QUEUE_BACKEND || 'redis',
+      jobId,
+    },
+  });
+
+  if (enqueueResult.addError) {
+    console.error(`[PAYMENT_RETRY] Queue add failed intent=${intentId}:`, enqueueResult.addError.message);
+  } else {
+    console.error(`[PAYMENT_RETRY] Queue verify failed intent=${intentId} reason=${enqueueResult.reason}`);
+  }
+
+  return false;
+}
+
+queue.process('FEE_SETTLEMENT_RETRY', PAYMENT_RETRY_WORKER_CONCURRENCY, async (job) => {
+  if (!(await acquireJobDispatchLock(job))) {
+    console.warn(`[QUEUE] FEE_SETTLEMENT_RETRY duplicate dispatch skipped job=${job.id}`);
+    return { ok: false, reason: 'duplicate_dispatch_skipped' };
+  }
+
+  const intentId = String(job?.data?.intentId || '').trim();
+  if (!intentId) {
+    return { ok: false, reason: 'intent_id_missing' };
+  }
+
+  return paymentRetryService.processRetryIntent({
+    intentId,
+    lockOwner: job?.data?.lockOwner || null,
+    settleExecutionFee: taskEconomyService.settleExecutionFee,
+  });
+});
+
+let paymentRetryLoopStarted = false;
+
+async function schedulePaymentRetryLoop() {
+  if (!PAYMENT_RETRY_ENABLED) {
+    return;
+  }
+
+  if (paymentRetryLoopStarted) {
+    return;
+  }
+  paymentRetryLoopStarted = true;
+
+  await paymentRetryService.backfillDeferredPaymentEvents().catch((error) => {
+    console.error('[PAYMENT_RETRY] Backfill startup error:', error.message);
+  });
+
+  if (!isEnvEnabled('QUEUE_WORKERS_ENABLED', true)) {
+    console.log('[PAYMENT_RETRY] Scheduler disabled because QUEUE_WORKERS_ENABLED=false');
+    return;
+  }
+
+  const queueDuePaymentRetries = async () => {
+    await paymentRetryService.releaseExpiredLocks({
+      lockTimeoutMs: PAYMENT_RETRY_LOCK_TIMEOUT_MS,
+      limit: PAYMENT_RETRY_BATCH_SIZE * 4,
+    }).catch((error) => {
+      console.error('[PAYMENT_RETRY] Lock recovery error:', error.message);
+    });
+
+    const claimedIntents = await paymentRetryService.claimDueRetryIntents({
+      batchSize: PAYMENT_RETRY_BATCH_SIZE,
+      workerId: PAYMENT_RETRY_SCHEDULER_WORKER_ID,
+      lockTimeoutMs: PAYMENT_RETRY_LOCK_TIMEOUT_MS,
+    });
+
+    for (const intent of claimedIntents) {
+      await queueClaimedPaymentRetryIntent(intent).catch((error) => {
+        console.error(`[PAYMENT_RETRY] Queue enqueue error intent=${intent.id}:`, error.message);
+      });
+    }
+  };
+
+  setTimeout(() => {
+    queueDuePaymentRetries().catch((error) => {
+      console.error('[PAYMENT_RETRY] Startup sweep error:', error.message);
+    });
+  }, PAYMENT_RETRY_STARTUP_DELAY_MS);
+
+  setInterval(() => {
+    queueDuePaymentRetries().catch((error) => {
+      console.error('[PAYMENT_RETRY] Scheduler error:', error.message);
+    });
+  }, PAYMENT_RETRY_INTERVAL_MS);
+
+  console.log(`[PAYMENT_RETRY] Started interval=${Math.round(PAYMENT_RETRY_INTERVAL_MS / 1000)}s batch=${PAYMENT_RETRY_BATCH_SIZE} maxAttempts=${PAYMENT_RETRY_MAX_ATTEMPTS}`);
+}
 
 // ── Schedule DeFi loop for all eligible agents ────────────────────────────────
 async function scheduleDefiLoop() {
@@ -8325,6 +8779,7 @@ module.exports.scheduleMarketAnalysisLoop = scheduleMarketAnalysisLoop;
 module.exports.scheduleOracleLoop = scheduleOracleLoop;
 module.exports.scheduleDefiLoop   = scheduleDefiLoop;
 module.exports.scheduleDailyTasks = scheduleDailyTasks;
+module.exports.schedulePaymentRetryLoop = schedulePaymentRetryLoop;
 module.exports.canQueueManualTasks = canQueueManualTasks;
 module.exports.queueManualTask = queueManualTask;
 module.exports.runTaskInline = runTaskInline;
@@ -8334,3 +8789,4 @@ module.exports.pauseLocalWorkers = pauseLocalWorkers;
 module.exports.cleanupMalformedActiveDefiLoopJobs = cleanupMalformedActiveDefiLoopJobs;
 module.exports.recoverMissingAutoCarryHandoffRuns = recoverMissingAutoCarryHandoffRuns;
 module.exports.queueDefiLoopForAgent = queueDefiLoopForAgent;
+module.exports.__buildFeeSettlementRetryJobId = buildFeeSettlementRetryJobId;

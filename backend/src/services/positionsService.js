@@ -4,7 +4,12 @@ const { ethers } = require('ethers');
 const db = require('../db');
 const oracle = require('./oracle');
 const { resolveCurvePool, resolveDirectSwapFallbackPool } = require('./oracle/pools');
-const { getHealthyArcRpcProvider, safeArcRpcCall } = require('./arcProvider');
+const {
+  getHealthyArcRpcProvider,
+  safeArcRpcCall,
+  isArcRpcRateLimitError,
+  markArcRpcEndpointUnhealthy,
+} = require('./arcProvider');
 const {
   SNAPSHOT_KINDS,
   getUserReadCacheTtlMs,
@@ -81,6 +86,20 @@ const SUPPRESSED_POSITION_WARNING_TERMS = [
   'too many requests',
   'exceeded maximum retry limit',
 ];
+
+function buildExecutionReadState({
+  source = 'live_rpc',
+  stale = false,
+  executable = false,
+  checkedAt = new Date().toISOString(),
+} = {}) {
+  return {
+    source,
+    stale: Boolean(stale),
+    executable: Boolean(executable),
+    checkedAt,
+  };
+}
 
 function getProvider() {
   return getHealthyArcRpcProvider('positions_provider');
@@ -215,6 +234,127 @@ function writeAgentPositionResponseCache(agentId, payload) {
     staleExpiresAt: now + staleTtlMs,
     payload: cloneSnapshot(payload),
   });
+}
+
+function invalidateWalletPositionCache(walletAddress, {
+  poolKeys = [],
+} = {}) {
+  const normalizedWallet = String(walletAddress || '').trim().toLowerCase();
+  if (!normalizedWallet) return { removedSnapshotKeys: 0, removedAgentCaches: 0 };
+
+  const normalizedPoolKeys = new Set(
+    Array.isArray(poolKeys)
+      ? poolKeys
+        .map((key) => String(key || '').trim().toUpperCase())
+        .filter(Boolean)
+      : [],
+  );
+
+  let removedSnapshotKeys = 0;
+  for (const cacheKey of positionSnapshotCache.keys()) {
+    const [walletPart = '', poolsPart = ''] = String(cacheKey || '').split('|');
+    if (walletPart !== normalizedWallet) continue;
+
+    if (!normalizedPoolKeys.size || poolsPart === 'ALL_POOLS') {
+      positionSnapshotCache.delete(cacheKey);
+      inflightPositionReads.delete(cacheKey);
+      removedSnapshotKeys += 1;
+      continue;
+    }
+
+    const pools = poolsPart
+      .split(',')
+      .map((entry) => String(entry || '').trim().toUpperCase())
+      .filter(Boolean);
+    const shouldRemove = pools.some((entry) => normalizedPoolKeys.has(entry));
+    if (!shouldRemove) continue;
+
+    positionSnapshotCache.delete(cacheKey);
+    inflightPositionReads.delete(cacheKey);
+    removedSnapshotKeys += 1;
+  }
+
+  let removedAgentCaches = 0;
+  for (const [agentId, cacheEntry] of agentPositionResponseCache.entries()) {
+    const cachedWallet = String(cacheEntry?.payload?.walletAddress || '').trim().toLowerCase();
+    if (cachedWallet !== normalizedWallet) continue;
+    agentPositionResponseCache.delete(agentId);
+    removedAgentCaches += 1;
+  }
+
+  return {
+    removedSnapshotKeys,
+    removedAgentCaches,
+  };
+}
+
+async function readCurveLiveLpBalance(walletAddress, poolAddress, {
+  decimals = 18,
+  label = 'positions_curve_live_lp',
+} = {}) {
+  const checkedAt = new Date().toISOString();
+  const baseExecutionRead = buildExecutionReadState({
+    source: 'live_rpc',
+    stale: false,
+    executable: false,
+    checkedAt,
+  });
+
+  if (!walletAddress || !poolAddress) {
+    return {
+      ok: false,
+      reason: 'live_lp_balance_unavailable',
+      errorCode: 'LIVE_LP_READ_INVALID_INPUT',
+      error: 'wallet_or_pool_missing',
+      executionRead: baseExecutionRead,
+    };
+  }
+
+  const provider = getHealthyArcRpcProvider(label);
+  if (!provider) {
+    return {
+      ok: false,
+      reason: 'live_lp_balance_unavailable',
+      errorCode: 'ARC_RPC_COOLDOWN',
+      error: 'Arc RPC is cooling down',
+      executionRead: baseExecutionRead,
+    };
+  }
+
+  try {
+    const contract = new ethers.Contract(poolAddress, CURVE_POSITION_ABI, provider);
+    const balanceRaw = await contract.balanceOf(walletAddress);
+
+    return {
+      ok: true,
+      balanceRaw,
+      balanceRawText: balanceRaw.toString(),
+      balance: ethers.formatUnits(balanceRaw, decimals),
+      executionRead: {
+        ...baseExecutionRead,
+        executable: true,
+      },
+    };
+  } catch (error) {
+    if (isArcRpcRateLimitError(error)) {
+      markArcRpcEndpointUnhealthy(null, error, label);
+      return {
+        ok: false,
+        reason: 'live_lp_balance_unavailable',
+        errorCode: 'ARC_RPC_COOLDOWN',
+        error: error?.message || 'Arc RPC rate limit reached',
+        executionRead: baseExecutionRead,
+      };
+    }
+
+    return {
+      ok: false,
+      reason: 'live_lp_balance_unavailable',
+      errorCode: String(error?.code || 'LIVE_LP_READ_FAILED').trim() || 'LIVE_LP_READ_FAILED',
+      error: error?.message || 'curve_live_lp_read_failed',
+      executionRead: baseExecutionRead,
+    };
+  }
 }
 
 function buildAgentPositionResponse(agentId, payload, {
@@ -784,4 +924,6 @@ async function getAgentPositions(agentId, userId) {
 module.exports = {
   getAgentPositions,
   getWalletPositions,
+  invalidateWalletPositionCache,
+  readCurveLiveLpBalance,
 };

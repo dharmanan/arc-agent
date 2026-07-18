@@ -169,6 +169,10 @@ async function waitForRevenueUpdate(before, expectedAmountUsdc) {
 }
 
 async function main() {
+  if (String(process.env.ALLOW_LIVE_PAID_SMOKE || '').trim().toLowerCase() !== 'true') {
+    throw new Error('Live paid smoke is disabled. Set ALLOW_LIVE_PAID_SMOKE=true explicitly.');
+  }
+
   const privateKey = getSmokePrivateKey();
   const walletAddress = getSmokeWalletAddress(privateKey);
 

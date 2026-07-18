@@ -16,6 +16,7 @@ module.exports = {
   executeCurveAddLiquidityBalanced: curveSwap.executeCurveAddLiquidityBalanced,
   executeCurveRemoveLiquidity: curveSwap.executeCurveRemoveLiquidity,
   executeCurveRemoveLiquidityOneCoin: curveSwap.executeCurveRemoveLiquidityOneCoin,
+  buildCurveRemoveLiquidityOneCoinPreflight: curveSwap.buildCurveRemoveLiquidityOneCoinPreflight,
 
   // V2-style constant-product pools
   getConstantProductQuote: constantProductSwap.getConstantProductQuote,

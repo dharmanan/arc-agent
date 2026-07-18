@@ -553,6 +553,151 @@ CREATE INDEX IF NOT EXISTS idx_agentic_payment_events_rail
   ON agentic_payment_events(rail, created_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 16.1 AGENTIC PAYMENT RETRY INTENTS (durable deferred fee retry queue)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agentic_payment_retry_intents (
+  id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idempotency_key          TEXT NOT NULL UNIQUE,
+  agent_id                 UUID REFERENCES agents(id) ON DELETE SET NULL,
+  event_type               TEXT NOT NULL,
+  rail                     TEXT NOT NULL,
+  reference_type           TEXT NOT NULL,
+  reference_id             TEXT,
+  fee_usdc                 NUMERIC(20,6) NOT NULL,
+  token                    TEXT NOT NULL DEFAULT 'USDC',
+  source_chain             TEXT NOT NULL,
+  destination_chain        TEXT NOT NULL,
+  recipient_address        TEXT,
+  status                   TEXT NOT NULL,
+  attempt_count            INTEGER NOT NULL DEFAULT 0,
+  max_attempts             INTEGER NOT NULL,
+  next_attempt_at          TIMESTAMPTZ,
+  locked_at                TIMESTAMPTZ,
+  locked_by                TEXT,
+  last_error_code          TEXT,
+  last_error               TEXT,
+  gateway_approval_tx_hash TEXT,
+  gateway_deposit_tx_hash  TEXT,
+  gateway_mint_tx_hash     TEXT,
+  payload                  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS agent_id UUID REFERENCES agents(id) ON DELETE SET NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS event_type TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS rail TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS reference_type TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS reference_id TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS fee_usdc NUMERIC(20,6);
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS token TEXT NOT NULL DEFAULT 'USDC';
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS source_chain TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS destination_chain TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS recipient_address TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS max_attempts INTEGER;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS locked_by TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS last_error_code TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS gateway_approval_tx_hash TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS gateway_deposit_tx_hash TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS gateway_mint_tx_hash TEXT;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE agentic_payment_retry_intents
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+UPDATE agentic_payment_retry_intents
+SET token = 'USDC'
+WHERE token IS NULL;
+
+UPDATE agentic_payment_retry_intents
+SET attempt_count = 0
+WHERE attempt_count IS NULL;
+
+UPDATE agentic_payment_retry_intents
+SET payload = '{}'::jsonb
+WHERE payload IS NULL;
+
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN idempotency_key SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN event_type SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN rail SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN reference_type SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN fee_usdc SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN source_chain SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN destination_chain SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN status SET NOT NULL;
+ALTER TABLE agentic_payment_retry_intents
+  ALTER COLUMN max_attempts SET NOT NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint
+     WHERE conname = 'agentic_payment_retry_intents_status_check'
+  ) THEN
+    ALTER TABLE agentic_payment_retry_intents
+      ADD CONSTRAINT agentic_payment_retry_intents_status_check
+      CHECK (
+        status IN ('pending', 'processing', 'deferred', 'confirmed', 'failed', 'manual_review', 'cancelled')
+      );
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agentic_payment_retry_intents_idempotency_key
+  ON agentic_payment_retry_intents(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_agentic_payment_retry_intents_status_next_attempt
+  ON agentic_payment_retry_intents(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_agentic_payment_retry_intents_agent
+  ON agentic_payment_retry_intents(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agentic_payment_retry_intents_reference
+  ON agentic_payment_retry_intents(reference_type, reference_id);
+CREATE INDEX IF NOT EXISTS idx_agentic_payment_retry_intents_locked_at
+  ON agentic_payment_retry_intents(locked_at);
+
+DROP TRIGGER IF EXISTS trg_agentic_payment_retry_intents_updated_at ON agentic_payment_retry_intents;
+CREATE TRIGGER trg_agentic_payment_retry_intents_updated_at
+  BEFORE UPDATE ON agentic_payment_retry_intents
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- 17. LP REWARD PROGRAMS (claimable incentive emissions, separate from LP fees)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS lp_reward_programs (

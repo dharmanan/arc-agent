@@ -309,6 +309,64 @@ async function executeCurveRemoveLiquidityOneCoin({
   agentPrivateKey,
   decimalsOut = 6,
   lpDecimals = 18,
+  preflight = null,
+  simulationContext = null,
+}) {
+  const prepared = preflight || await buildCurveRemoveLiquidityOneCoinPreflight({
+    poolAddress,
+    indexOut,
+    lpAmount,
+    slippagePct,
+    agentPrivateKey,
+    lpDecimals,
+  });
+
+  const { pool, signer, lpAmountRaw, amountOutRaw, minAmountOut, args, calldata, calldataHash, simulationFingerprint } = prepared;
+
+  let receipt;
+  try {
+    ({ receipt } = await sendProtectedContractTx({
+      contract: pool,
+      methodName: 'remove_liquidity_one_coin',
+      args,
+      chainName: 'Arc Testnet',
+      walletAddress: signer.address,
+      operation: 'curve_remove_liquidity_one_coin',
+      replayFingerprint: [poolAddress, lpAmountRaw.toString(), indexOut, minAmountOut.toString()],
+    }));
+  } catch (error) {
+    error.simulationContext = {
+      poolAddress,
+      walletAddress: signer.address,
+      tokenAmount: ethers.formatUnits(lpAmountRaw, lpDecimals),
+      tokenAmountRaw: lpAmountRaw.toString(),
+      indexOut,
+      minAmountOut: amountOutRaw ? ethers.formatUnits(minAmountOut, decimalsOut) : null,
+      minAmountOutRaw: minAmountOut.toString(),
+      calldata,
+      calldataHash,
+      simulationFingerprint,
+      ...(simulationContext && typeof simulationContext === 'object' ? simulationContext : {}),
+    };
+    throw error;
+  }
+
+  return {
+    txHash: receipt.hash,
+    amountOut: amountOutRaw ? ethers.formatUnits(amountOutRaw, decimalsOut) : null,
+    minAmountOut: amountOutRaw ? ethers.formatUnits(minAmountOut, decimalsOut) : null,
+    calldataHash,
+    simulationFingerprint,
+  };
+}
+
+async function buildCurveRemoveLiquidityOneCoinPreflight({
+  poolAddress,
+  indexOut,
+  lpAmount,
+  slippagePct = 0.5,
+  agentPrivateKey,
+  lpDecimals = 18,
 }) {
   const rpcUrl = getArcRpcUrl();
   if (!agentPrivateKey) throw new Error('agentPrivateKey is required');
@@ -322,21 +380,28 @@ async function executeCurveRemoveLiquidityOneCoin({
     pool.calc_withdraw_one_coin(lpAmountRaw, indexOut)
   ), null);
   const minAmountOut = amountOutRaw ? applySlippageFloor(amountOutRaw, slippagePct) : 0n;
-
-  const { receipt } = await sendProtectedContractTx({
-    contract: pool,
-    methodName: 'remove_liquidity_one_coin',
-    args: [lpAmountRaw, indexOut, minAmountOut],
-    chainName: 'Arc Testnet',
-    walletAddress: signer.address,
-    operation: 'curve_remove_liquidity_one_coin',
-    replayFingerprint: [poolAddress, lpAmountRaw.toString(), indexOut, minAmountOut.toString()],
-  });
+  const args = [lpAmountRaw, indexOut, minAmountOut];
+  const calldata = pool.interface.encodeFunctionData('remove_liquidity_one_coin', args);
+  const calldataHash = ethers.keccak256(calldata);
+  const simulationFingerprint = ethers.keccak256(ethers.toUtf8Bytes([
+    String(poolAddress || '').toLowerCase(),
+    String(signer.address || '').toLowerCase(),
+    lpAmountRaw.toString(),
+    String(indexOut),
+    minAmountOut.toString(),
+    calldataHash,
+  ].join('|')));
 
   return {
-    txHash: receipt.hash,
-    amountOut: amountOutRaw ? ethers.formatUnits(amountOutRaw, decimalsOut) : null,
-    minAmountOut: amountOutRaw ? ethers.formatUnits(minAmountOut, decimalsOut) : null,
+    pool,
+    signer,
+    lpAmountRaw,
+    amountOutRaw,
+    minAmountOut,
+    args,
+    calldata,
+    calldataHash,
+    simulationFingerprint,
   };
 }
 
@@ -442,4 +507,5 @@ module.exports = {
   executeCurveAddLiquidityBalanced,
   executeCurveRemoveLiquidity,
   executeCurveRemoveLiquidityOneCoin,
+  buildCurveRemoveLiquidityOneCoinPreflight,
 };

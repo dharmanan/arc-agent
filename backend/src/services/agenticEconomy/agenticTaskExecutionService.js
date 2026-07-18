@@ -524,10 +524,19 @@ async function _readCurvePositionGuard(agent, curvePool) {
     };
   }
 
+  const snapshotCheckedAt = snapshot?.updatedAt || new Date().toISOString();
+  const snapshotExecutionRead = {
+    source: 'position_snapshot',
+    stale: Boolean(snapshot?.stale),
+    executable: false,
+    checkedAt: snapshotCheckedAt,
+  };
+
   return {
     ok: true,
     snapshot,
     position: _findPoolPosition(snapshot, curvePool?.address),
+    executionRead: snapshotExecutionRead,
   };
 }
 
@@ -669,7 +678,7 @@ async function executeCurveLiquidityAddBalancedTask({ agent, params = {}, dryRun
   };
 }
 
-async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = false }) {
+async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = false, beforeExecute = null }) {
   const tokenOut = params.tokenOut || 'USDC';
   const requestedLpAmount = String(params.lpAmount ?? '1');
   const curvePool = _resolveStableCurvePoolForToken(tokenOut);
@@ -682,15 +691,119 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
   const positionGuard = await _readCurvePositionGuard(agent, curvePool);
   if (!positionGuard.ok) return positionGuard;
 
-  const currentLpBalance = positionGuard.position?.lpToken?.balance || '0';
-  if (!positionGuard.position || !(Number(currentLpBalance) > 0)) {
-    return { ok: false, reason: 'lp_position_not_found' };
+  const snapshotLpBalance = positionGuard.position?.lpToken?.balance || '0';
+  const liveBalanceRead = await positionsService.readCurveLiveLpBalance(agent?.wallet_address, curvePool.address, {
+    decimals: CURVE_LP_DECIMALS,
+    label: 'curve_remove_live_lp_balance',
+  });
+  if (!liveBalanceRead?.ok) {
+    return {
+      ok: false,
+      reason: 'live_lp_balance_unavailable',
+      status: liveBalanceRead?.errorCode === 'ARC_RPC_COOLDOWN' ? 'deferred' : 'failed',
+      errorCode: liveBalanceRead?.errorCode || null,
+      error: liveBalanceRead?.error || null,
+      payload: {
+        poolAddress: curvePool.address,
+        tokenOut,
+        snapshotLpBalance,
+        liveLpBalance: null,
+        positionDataFreshness: positionGuard.snapshot?.dataFreshness || 'unknown',
+        positionCheckedAt: liveBalanceRead?.executionRead?.checkedAt || new Date().toISOString(),
+        executionRead: liveBalanceRead?.executionRead || null,
+        snapshotExecutionRead: positionGuard.executionRead || null,
+      },
+    };
   }
 
-  const resolvedLpAmount = _resolveRequestedCurveLpAmount(requestedLpAmount, currentLpBalance);
+  const liveLpBalance = String(liveBalanceRead.balance || '0');
+  if (!(Number(liveLpBalance) > 0)) {
+    positionsService.invalidateWalletPositionCache(agent?.wallet_address, {
+      poolKeys: [curvePool?.key].filter(Boolean),
+    });
+    return {
+      ok: false,
+      reason: 'no_live_lp_position',
+      status: 'skipped',
+      payload: {
+        poolAddress: curvePool.address,
+        tokenOut,
+        snapshotLpBalance,
+        liveLpBalance,
+        positionDataFreshness: positionGuard.snapshot?.dataFreshness || 'unknown',
+        positionCheckedAt: liveBalanceRead?.executionRead?.checkedAt || new Date().toISOString(),
+        executionRead: {
+          ...(liveBalanceRead?.executionRead || {}),
+          executable: false,
+        },
+        snapshotExecutionRead: positionGuard.executionRead || null,
+      },
+    };
+  }
+
+  let resolvedLpAmount = _resolveRequestedCurveLpAmount(requestedLpAmount, liveLpBalance);
+  if (!resolvedLpAmount.ok && resolvedLpAmount.reason === 'insufficient_lp_position') {
+    try {
+      const requestedRaw = ethers.parseUnits(String(requestedLpAmount), CURVE_LP_DECIMALS);
+      const snapshotRaw = ethers.parseUnits(String(snapshotLpBalance || '0'), CURVE_LP_DECIMALS);
+      if (snapshotRaw > 0n && requestedRaw === snapshotRaw) {
+        const liveRaw = ethers.parseUnits(String(liveLpBalance), CURVE_LP_DECIMALS);
+        resolvedLpAmount = {
+          ok: true,
+          lpAmount: String(liveLpBalance),
+          lpAmountRaw: liveRaw,
+          clampedToCurrentBalance: true,
+          clampedFromSnapshotFullExit: true,
+        };
+      }
+    } catch {
+      // Fall through to the original validation failure.
+    }
+  }
   if (!resolvedLpAmount.ok) return resolvedLpAmount;
 
   const lpAmount = resolvedLpAmount.lpAmount;
+  const preflight = await protocols.buildCurveRemoveLiquidityOneCoinPreflight({
+    poolAddress: curvePool.address,
+    indexOut: poolCoin?.index,
+    lpAmount,
+    slippagePct: parseFloat(agent.slippage_percent) || 0.5,
+    agentPrivateKey: decrypt(agent.private_key_encrypted),
+  });
+
+  const guardDiagnostics = {
+    poolAddress: curvePool.address,
+    tokenOut,
+    snapshotLpBalance,
+    liveLpBalance,
+    positionDataFreshness: positionGuard.snapshot?.dataFreshness || 'unknown',
+    positionCheckedAt: liveBalanceRead?.executionRead?.checkedAt || new Date().toISOString(),
+    executionRead: liveBalanceRead?.executionRead || null,
+    snapshotExecutionRead: positionGuard.executionRead || null,
+    simulationFingerprint: preflight?.simulationFingerprint || null,
+    calldataHash: preflight?.calldataHash || null,
+  };
+
+  if (typeof beforeExecute === 'function') {
+    const gate = await beforeExecute({
+      ...guardDiagnostics,
+      operationType: 'remove_liquidity',
+      errorCode: 'TX_SIMULATION_FAILED',
+    });
+
+    if (gate?.skip === true) {
+      return {
+        ok: false,
+        reason: gate.reason || 'stable_lp_exit_failure_cooldown',
+        status: 'skipped',
+        retryAfterMs: Number(gate.retryAfterMs || 0),
+        payload: {
+          ...guardDiagnostics,
+          cooldown: gate.cooldown || null,
+        },
+      };
+    }
+  }
 
   if (dryRun) {
     return {
@@ -702,6 +815,7 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
         poolAddress: curvePool.address,
         poolSource: curvePool.source || 'verified_default',
         positionBefore: _summarizePoolPosition(positionGuard.position),
+        ...guardDiagnostics,
       }),
     };
   }
@@ -712,6 +826,8 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
     lpAmount,
     agentPrivateKey: decrypt(agent.private_key_encrypted),
     decimalsOut: poolCoin?.decimals || 6,
+    preflight,
+    simulationContext: guardDiagnostics,
   });
 
   return {
@@ -724,6 +840,7 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
       poolSource: curvePool.source || 'verified_default',
       executionRail: 'curve_liquidity_remove',
       summary: `Removed ${lpAmount} Curve LP into ${tokenOut}.`,
+      ...guardDiagnostics,
     }),
   };
 }
@@ -743,12 +860,73 @@ async function executeCurveLiquidityRemoveBalancedTask({ agent, params = {}, dry
   const positionGuard = await _readCurvePositionGuard(agent, curvePool);
   if (!positionGuard.ok) return positionGuard;
 
-  const currentLpBalance = positionGuard.position?.lpToken?.balance || '0';
-  if (!positionGuard.position || !(Number(currentLpBalance) > 0)) {
-    return { ok: false, reason: 'lp_position_not_found' };
+  const snapshotLpBalance = positionGuard.position?.lpToken?.balance || '0';
+  const liveBalanceRead = await positionsService.readCurveLiveLpBalance(agent?.wallet_address, curvePool.address, {
+    decimals: CURVE_LP_DECIMALS,
+    label: 'curve_remove_balanced_live_lp_balance',
+  });
+  if (!liveBalanceRead?.ok) {
+    return {
+      ok: false,
+      reason: 'live_lp_balance_unavailable',
+      status: liveBalanceRead?.errorCode === 'ARC_RPC_COOLDOWN' ? 'deferred' : 'failed',
+      errorCode: liveBalanceRead?.errorCode || null,
+      error: liveBalanceRead?.error || null,
+      payload: {
+        poolAddress: curvePool.address,
+        snapshotLpBalance,
+        liveLpBalance: null,
+        positionDataFreshness: positionGuard.snapshot?.dataFreshness || 'unknown',
+        positionCheckedAt: liveBalanceRead?.executionRead?.checkedAt || new Date().toISOString(),
+        executionRead: liveBalanceRead?.executionRead || null,
+        snapshotExecutionRead: positionGuard.executionRead || null,
+      },
+    };
   }
 
-  const resolvedLpAmount = _resolveRequestedCurveLpAmount(requestedLpAmount, currentLpBalance);
+  const liveLpBalance = String(liveBalanceRead.balance || '0');
+  if (!(Number(liveLpBalance) > 0)) {
+    positionsService.invalidateWalletPositionCache(agent?.wallet_address, {
+      poolKeys: [curvePool?.key].filter(Boolean),
+    });
+    return {
+      ok: false,
+      reason: 'no_live_lp_position',
+      status: 'skipped',
+      payload: {
+        poolAddress: curvePool.address,
+        snapshotLpBalance,
+        liveLpBalance,
+        positionDataFreshness: positionGuard.snapshot?.dataFreshness || 'unknown',
+        positionCheckedAt: liveBalanceRead?.executionRead?.checkedAt || new Date().toISOString(),
+        executionRead: {
+          ...(liveBalanceRead?.executionRead || {}),
+          executable: false,
+        },
+        snapshotExecutionRead: positionGuard.executionRead || null,
+      },
+    };
+  }
+
+  let resolvedLpAmount = _resolveRequestedCurveLpAmount(requestedLpAmount, liveLpBalance);
+  if (!resolvedLpAmount.ok && resolvedLpAmount.reason === 'insufficient_lp_position') {
+    try {
+      const requestedRaw = ethers.parseUnits(String(requestedLpAmount), CURVE_LP_DECIMALS);
+      const snapshotRaw = ethers.parseUnits(String(snapshotLpBalance || '0'), CURVE_LP_DECIMALS);
+      if (snapshotRaw > 0n && requestedRaw === snapshotRaw) {
+        const liveRaw = ethers.parseUnits(String(liveLpBalance), CURVE_LP_DECIMALS);
+        resolvedLpAmount = {
+          ok: true,
+          lpAmount: String(liveLpBalance),
+          lpAmountRaw: liveRaw,
+          clampedToCurrentBalance: true,
+          clampedFromSnapshotFullExit: true,
+        };
+      }
+    } catch {
+      // Fall through to the original validation failure.
+    }
+  }
   if (!resolvedLpAmount.ok) return resolvedLpAmount;
 
   const lpAmount = resolvedLpAmount.lpAmount;

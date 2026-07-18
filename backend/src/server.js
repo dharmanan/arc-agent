@@ -190,6 +190,7 @@ const BOOT_FLAGS = Object.freeze({
   MARKET_ANALYSIS_LOOP_ENABLED: isEnvEnabled('MARKET_ANALYSIS_LOOP_ENABLED', true),
   DEFI_LOOP_ENABLED: isEnvEnabled('DEFI_LOOP_ENABLED', true),
   DAILY_TASKS_ENABLED: isEnvEnabled('DAILY_TASKS_ENABLED', true),
+  PAYMENT_RETRY_ENABLED: isEnvEnabled('PAYMENT_RETRY_ENABLED', true),
   QUEUE_WORKERS_ENABLED: isEnvEnabled('QUEUE_WORKERS_ENABLED', true),
   DRY_RUN: process.env.DRY_RUN === 'true',
 });
@@ -407,6 +408,7 @@ async function bootstrap() {
     startOptionalAsyncBackgroundJob('MARKET_ANALYSIS_LOOP_ENABLED', 'MARKET_ANALYSIS_LOOP', () => agentQueue.scheduleMarketAnalysisLoop());
     startOptionalAsyncBackgroundJob('DEFI_LOOP_ENABLED', 'DEFI_LOOP', () => agentQueue.scheduleDefiLoop());
     startOptionalAsyncBackgroundJob('DAILY_TASKS_ENABLED', 'DAILY_TASKS', () => agentQueue.scheduleDailyTasks());
+    startOptionalAsyncBackgroundJob('PAYMENT_RETRY_ENABLED', 'PAYMENT_RETRY', () => agentQueue.schedulePaymentRetryLoop());
 
     if (BOOT_FLAGS.QUEUE_WORKERS_ENABLED) {
       setTimeout(() => {
