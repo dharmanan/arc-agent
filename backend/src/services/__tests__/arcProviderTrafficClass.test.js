@@ -73,6 +73,24 @@ describe('arcProvider traffic class isolation', () => {
 
     expect(reputationUrl).toBe(ENDPOINT);
   });
+
+  test('gateway_read cooldown does not block gateway_write', () => {
+    const arcProvider = loadProvider();
+    const rateLimitError = new Error('429 request limit reached');
+
+    arcProvider.markArcRpcEndpointUnhealthy(
+      ENDPOINT,
+      rateLimitError,
+      'gateway_read_rate_limit_test',
+      { trafficClass: 'gateway_read' },
+    );
+
+    const gatewayWriteUrl = arcProvider.getHealthyArcRpcUrl('gateway_write_probe', {
+      trafficClass: 'gateway_write',
+    });
+
+    expect(gatewayWriteUrl).toBe(ENDPOINT);
+  });
 });
 
 describe('arcProvider safeArcRpcCall fallback semantics', () => {

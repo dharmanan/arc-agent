@@ -20,6 +20,12 @@ function formatUsdcBalance(value) {
   return Number.isFinite(amount) ? `${amount.toFixed(6)} USDC` : `${value} USDC`;
 }
 
+function parseUsdcAmount(value) {
+  if (value == null || value === '') return null;
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount : null;
+}
+
 function humanizeGatewayRail(rail) {
   const normalized = String(rail || '').trim().toLowerCase();
 
@@ -449,11 +455,15 @@ export default function OracleTab() {
   const recentFallbacks = recentFallbackEntries.slice(0, 3);
   const recentAlertDeliveries = (oracleAlerting?.recentDeliveries || []).slice(0, 3);
   const configuredAlertSinks = (oracleAlerting?.sinks || []).slice(0, 3);
-  const walletAvailableForManualFund = Number(gatewayBalance?.wallet?.availableUsdc || 0);
+  const gatewayAvailability = String(gatewayBalance?.availability || '').trim().toLowerCase();
+  const gatewayBalanceTemporarilyUnavailable = gatewayAvailability === 'temporarily_unavailable'
+    || (Boolean(gatewayBalance) && gatewayBalance.wallet == null && gatewayBalance.gateway == null);
+  const walletAvailableForManualFund = parseUsdcAmount(gatewayBalance?.wallet?.availableUsdc);
   const gatewayUsageSummary = Array.isArray(gatewayBalance?.usage?.summary) ? gatewayBalance.usage.summary : [];
   const gatewayRecentUsage = Array.isArray(gatewayBalance?.usage?.recent) ? gatewayBalance.usage.recent : [];
-  const canManualFundGateway = Number.isFinite(walletAvailableForManualFund)
-    && walletAvailableForManualFund >= Number(MANUAL_GATEWAY_FUND_USDC);
+  const canManualFundGateway = walletAvailableForManualFund != null
+    && walletAvailableForManualFund >= Number(MANUAL_GATEWAY_FUND_USDC)
+    && !gatewayBalanceTemporarilyUnavailable;
   const statusLabel = oracleError ? 'Needs attention' : hasWarnings ? 'Warnings' : 'Live';
   const statusClasses = oracleError
     ? 'border-red-200 bg-red-50 text-red-700'
@@ -468,6 +478,12 @@ export default function OracleTab() {
         title: 'No agent selected',
         body: 'Connect or reconnect an agent to inspect wallet USDC and Gateway available balance for buyer-side payments.',
       }
+    : gatewayBalanceTemporarilyUnavailable
+      ? {
+          tone: 'border-amber-200 bg-amber-50 text-amber-800',
+          title: 'Gateway balance temporarily unavailable',
+          body: 'Arc RPC is cooling down, so wallet and Gateway balances cannot be confirmed right now. Retry shortly; do not treat this as a wallet funding failure.',
+        }
     : gatewayBalance?.funded
       ? {
           tone: 'border-green-200 bg-green-50 text-green-700',
@@ -489,9 +505,11 @@ export default function OracleTab() {
               ? `Auto-topup is on, but the selected agent still needs wallet USDC before it can warm Gateway back above ${gatewayAutoTopupMinUsdc} USDC.`
               : `The selected agent needs at least ${MANUAL_GATEWAY_FUND_USDC} USDC in the wallet before manual Gateway funding can run.`,
           };
-  const operatorNote = gatewayBalance?.funded
-    ? 'Buyers can use the normal 402 -> pay -> retry flow. Keep an eye on fallback warnings and settlement failures.'
-    : 'If this agent will buy oracle data, keep wallet USDC and ARC gas ready.';
+  const operatorNote = gatewayBalanceTemporarilyUnavailable
+    ? 'Balance reads are temporarily unavailable while Arc RPC cools down. Keep usage history visible and retry shortly.'
+    : gatewayBalance?.funded
+      ? 'Buyers can use the normal 402 -> pay -> retry flow. Keep an eye on fallback warnings and settlement failures.'
+      : 'If this agent will buy oracle data, keep wallet USDC and ARC gas ready.';
   const curveConfigured = Boolean(oracleOverview?.config?.pools?.usdcEurcConfigured);
   const productMatrix = useMemo(() => ORACLE_PRODUCT_GROUPS.map((group) => {
     const endpoints = (oracleOverview?.publicEndpoints || []).filter(endpoint => getOracleProductMeta(endpoint.key).group === group.key);
@@ -1046,7 +1064,9 @@ export default function OracleTab() {
                     </div>
                     {!canManualFundGateway && (
                       <p className="mt-2 text-xs text-amber-700">
-                        The selected agent wallet needs at least {MANUAL_GATEWAY_FUND_USDC} USDC available before a manual Gateway top-up can run.
+                        {gatewayBalanceTemporarilyUnavailable
+                          ? 'Gateway balances are temporarily unavailable while Arc RPC cools down. Manual pre-fund is disabled until balance reads recover.'
+                          : `The selected agent wallet needs at least ${MANUAL_GATEWAY_FUND_USDC} USDC available before a manual Gateway top-up can run.`}
                       </p>
                     )}
                   </div>
@@ -1121,12 +1141,14 @@ export default function OracleTab() {
                     </Alert>
                   )}
 
-                  <div className={`rounded-xl border px-4 py-3 text-xs ${gatewayBalance.funded ? 'border-green-200 bg-green-50 text-green-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>
-                    <strong>{gatewayBalance.funded ? 'Gateway funded.' : 'Gateway not funded yet.'}</strong>
+                  <div className={`rounded-xl border px-4 py-3 text-xs ${gatewayBalanceTemporarilyUnavailable ? 'border-amber-200 bg-amber-50 text-amber-800' : gatewayBalance.funded ? 'border-green-200 bg-green-50 text-green-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>
+                    <strong>{gatewayBalanceTemporarilyUnavailable ? 'Gateway balance temporarily unavailable.' : gatewayBalance.funded ? 'Gateway funded.' : 'Gateway not funded yet.'}</strong>
                     {' '}
-                    {gatewayBalance.funded
-                      ? 'This agent currently has a warm Gateway balance, but that balance can still be spent by public x402 payments, task fees, automation fees, and other buyer-side Gateway flows.'
-                      : 'The wallet holds USDC, but Circle Gateway available balance is currently empty and the buyer helper can refill it on demand when the next supported payment runs.'}
+                    {gatewayBalanceTemporarilyUnavailable
+                      ? 'Arc RPC is cooling down, so this view cannot confirm wallet or Gateway amounts right now. Retry shortly before making funding decisions.'
+                      : gatewayBalance.funded
+                        ? 'This agent currently has a warm Gateway balance, but that balance can still be spent by public x402 payments, task fees, automation fees, and other buyer-side Gateway flows.'
+                        : 'The wallet holds USDC, but Circle Gateway available balance is currently empty and the buyer helper can refill it on demand when the next supported payment runs.'}
                   </div>
                 </>
               )}

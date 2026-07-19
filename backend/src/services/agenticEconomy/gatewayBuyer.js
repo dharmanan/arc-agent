@@ -16,6 +16,9 @@ const DEFAULT_GATEWAY_TX_LOCK_TTL_SEC = readPositiveIntegerEnv('GATEWAY_TX_LOCK_
 const DEFAULT_GATEWAY_AUTO_WARM_LOCK_WAIT_MS = readNonNegativeIntegerEnv('GATEWAY_AUTO_WARM_LOCK_WAIT_MS', 0);
 const ARC_RPC_COOLDOWN_CODE = 'ARC_RPC_COOLDOWN';
 const ARC_RPC_COOLDOWN_MESSAGE = 'Arc RPC is cooling down';
+const GATEWAY_TRAFFIC_CLASS_DEFAULT = 'gateway';
+const GATEWAY_TRAFFIC_CLASS_READ = 'gateway_read';
+const GATEWAY_TRAFFIC_CLASS_WRITE = 'gateway_write';
 
 const GATEWAY_CHAIN_MAP = {
   'Arc Testnet': {
@@ -207,6 +210,7 @@ function buildArcRpcCooldownError(error = null, chainName = 'Arc Testnet') {
   cooldownError.retryable = true;
   cooldownError.deferred = true;
   cooldownError.status = 'deferred';
+  cooldownError.statusCode = 503;
   if (error) {
     cooldownError.cause = error;
     cooldownError.causeMessage = error.message || String(error);
@@ -237,9 +241,11 @@ function toRetryableGatewayError(error, chainName = 'Arc Testnet') {
 
 async function withGatewayClientFailover(agent, options = {}, execute) {
   const chainName = options.chainName || 'Arc Testnet';
+  const trafficClass = options.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT;
   if (!isArcTestnetChain(chainName)) {
     const client = createGatewayClientForAgent(agent, {
       ...options,
+      trafficClass,
       bypassHealthCheck: true,
     });
     return execute(client, options.rpcUrl || null);
@@ -251,12 +257,13 @@ async function withGatewayClientFailover(agent, options = {}, execute) {
       const client = createGatewayClientForAgent(agent, {
         ...options,
         rpcUrl,
+        trafficClass,
         bypassHealthCheck: true,
       });
       return execute(client, rpcUrl);
     },
     {
-      trafficClass: 'gateway',
+      trafficClass,
     },
   );
 }
@@ -273,12 +280,13 @@ function getAgentGatewayPrivateKey(agent) {
 
 function createGatewayClientForAgent(agent, options = {}) {
   const { chainName = 'Arc Testnet' } = options;
+  const trafficClass = options.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT;
   const chainConfig = resolveGatewayChainConfig(chainName);
   let rpcUrl = options.rpcUrl || chainConfig.rpcUrl;
   const bypassHealthCheck = options.bypassHealthCheck === true;
 
   if (isArcTestnetChain(chainName) && !bypassHealthCheck) {
-    const healthyArcRpcUrl = getHealthyArcRpcUrl('gateway_client', { trafficClass: 'gateway' });
+    const healthyArcRpcUrl = getHealthyArcRpcUrl('gateway_client', { trafficClass });
     if (!healthyArcRpcUrl) {
       throw buildArcRpcCooldownError(null, chainName);
     }
@@ -296,10 +304,8 @@ async function readGatewayBalances(client, address, options = {}) {
   let wallet;
   let gateway;
   try {
-    [wallet, gateway] = await Promise.all([
-      client.getUsdcBalance(address),
-      client.getGatewayBalance(address),
-    ]);
+    wallet = await client.getUsdcBalance(address);
+    gateway = await client.getGatewayBalance(address);
   } catch (error) {
     throw toRetryableGatewayError(error, options.chainName || 'Arc Testnet');
   }
@@ -328,6 +334,7 @@ async function getAgentGatewayBalances(agent, options = {}) {
       ...options,
       chainName,
       operationLabel: 'balances',
+      trafficClass: GATEWAY_TRAFFIC_CLASS_READ,
     }, async (client) => readGatewayBalances(client, options.address, {
       chainName,
     }));
@@ -352,6 +359,7 @@ async function depositGatewayBalanceForAgent(agent, amountUsdc, options = {}) {
       ...options,
       chainName,
       operationLabel: options.operation || 'gateway_deposit',
+      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
     }, async (client) => depositGatewayBalanceUnlocked(client, amountUsdc, {
       ...options,
       chainName,
@@ -771,6 +779,7 @@ async function ensureGatewayWarmBalance(agent, options = {}) {
       ...options,
       chainName,
       operationLabel: options.operation || 'gateway_warm_balance',
+      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
     }, async (client) => {
       const balancesBefore = await readGatewayBalances(client, balanceAddress, { chainName });
       const currentAvailableUsdc = Number(balancesBefore.gateway?.formattedAvailable || 0);
@@ -866,6 +875,7 @@ async function payGatewayProtectedResource({
     }, async () => withGatewayClientFailover(agent, {
       chainName,
       operationLabel: 'gateway_protected_resource_pay',
+      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
     }, async (client) => {
       const funding = await ensureGatewayPaymentBalanceUnlocked(client, amount, {
         address: walletAddress,
@@ -921,6 +931,7 @@ async function executeGatewayTransfer({
     }, async () => withGatewayClientFailover(agent, {
       chainName: fromChain,
       operationLabel: 'gateway_transfer',
+      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
     }, async (client) => {
       const funding = await ensureGatewayAvailableBalanceUnlocked(client, amount, {
         maxFee: resolvedMaxFee,

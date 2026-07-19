@@ -1770,10 +1770,32 @@ router.get('/debug/gateway-balance', requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'agent_signer_not_found' });
     }
 
-    const [balances, usage] = await Promise.all([
-      getAgentGatewayBalances(rawAgent, { chainName }),
-      _getAgentGatewayUsage(agentId),
-    ]);
+    const usagePromise = _getAgentGatewayUsage(agentId);
+    let balances;
+    try {
+      balances = await getAgentGatewayBalances(rawAgent, { chainName });
+    } catch (error) {
+      if (String(error?.code || '').trim().toUpperCase() === 'ARC_RPC_COOLDOWN') {
+        const usage = await usagePromise.catch(() => null);
+        return res.status(200).json({
+          agentId,
+          chainName,
+          status: 'deferred',
+          availability: 'temporarily_unavailable',
+          retryable: true,
+          errorCode: 'ARC_RPC_COOLDOWN',
+          walletAddress: String(agent.walletAddress || rawAgent.wallet_address || '').toLowerCase(),
+          wallet: null,
+          gateway: null,
+          usage,
+          funded: null,
+          fetchedAt: new Date().toISOString(),
+        });
+      }
+      throw error;
+    }
+
+    const usage = await usagePromise;
 
     res.json({
       agentId,

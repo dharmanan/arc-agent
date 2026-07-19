@@ -2,6 +2,7 @@
 
 const request = require('supertest');
 const { Wallet } = require('ethers');
+const { resolveErrorHttpStatus } = require('../../utils/httpStatus');
 
 const TEST_USER_ID = 'user-123';
 const TEST_AGENT_ID = 'agent-123';
@@ -15,7 +16,8 @@ function buildTestApp(router, mountPath) {
   app.use(express.json());
   app.use(mountPath, router);
   app.use((err, _req, res, _next) => {
-    res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
+    const status = resolveErrorHttpStatus(err, 500);
+    res.status(status).json({ error: err.message || 'Internal server error' });
   });
 
   return app;
@@ -258,6 +260,10 @@ function loadOracleHarness() {
   process.env.ORACLE_PAY_ADDRESS = '0x00000000000000000000000000000000000000BB';
 
   const db = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+  const getAgent = jest.fn();
+  const getAgentWithKey = jest.fn();
+  const depositGatewayBalanceForAgent = jest.fn();
+  const getAgentGatewayBalances = jest.fn();
   const gatewayMiddleware = jest.fn((req, res) => {
     res
       .status(402)
@@ -278,7 +284,10 @@ function loadOracleHarness() {
   }));
   jest.doMock('../../services/protocols', () => ({}));
   jest.doMock('../../services/agentWalletService', () => ({}));
-  jest.doMock('../../services/agentService', () => ({}));
+  jest.doMock('../../services/agentService', () => ({
+    getAgent,
+    getAgentWithKey,
+  }));
   jest.doMock('../../services/predictionMarketService', () => ({
     getPredictionMarketPulse: jest.fn(),
   }));
@@ -291,8 +300,8 @@ function loadOracleHarness() {
     getGatewayFacilitatorSummary: jest.fn(() => ({ configured: true })),
   }));
   jest.doMock('../../services/agenticEconomy/gatewayBuyer', () => ({
-    depositGatewayBalanceForAgent: jest.fn(),
-    getAgentGatewayBalances: jest.fn(),
+    depositGatewayBalanceForAgent,
+    getAgentGatewayBalances,
     getGatewayBuyerSummary: jest.fn(() => ({ configured: true })),
   }));
   jest.doMock('../../services/agenticEconomy/taskEconomyService', () => ({
@@ -306,12 +315,20 @@ function loadOracleHarness() {
   }));
 
   let router;
+  let signToken;
   jest.isolateModules(() => {
     router = require('../oracle');
+    ({ signToken } = require('../../middleware/auth'));
   });
 
   return {
     app: buildTestApp(router, '/api/oracle'),
+    db,
+    getAgent,
+    getAgentWithKey,
+    getAgentGatewayBalances,
+    depositGatewayBalanceForAgent,
+    signToken,
     gatewayMiddleware,
     recordOracleSignal,
   };
@@ -1176,5 +1193,85 @@ describe('oracle public payment guard smoke', () => {
     expect(response.headers['payment-required']).toBe('amount=5000');
     expect(gatewayMiddleware).toHaveBeenCalled();
     expect(recordOracleSignal).toHaveBeenCalledWith('payment_challenge', expect.any(Object));
+  });
+});
+
+describe('oracle gateway balance debug route', () => {
+  test('returns degraded 200 payload on ARC_RPC_COOLDOWN', async () => {
+    const {
+      app,
+      getAgent,
+      getAgentWithKey,
+      getAgentGatewayBalances,
+      signToken,
+    } = loadOracleHarness();
+
+    const token = signToken(TEST_USER_ID, TEST_OWNER_ADDRESS.toLowerCase());
+    const rawAgent = {
+      id: TEST_AGENT_ID,
+      wallet_address: TEST_OWNER_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    };
+
+    getAgent.mockResolvedValueOnce({ id: TEST_AGENT_ID, walletAddress: TEST_OWNER_ADDRESS });
+    getAgentWithKey.mockResolvedValueOnce(rawAgent);
+
+    const cooldownError = new Error('Arc RPC is cooling down');
+    cooldownError.code = 'ARC_RPC_COOLDOWN';
+    cooldownError.status = 'deferred';
+    cooldownError.statusCode = 503;
+    cooldownError.retryable = true;
+    cooldownError.deferred = true;
+    getAgentGatewayBalances.mockRejectedValueOnce(cooldownError);
+
+    const response = await request(app)
+      .get(`/api/oracle/debug/gateway-balance?agentId=${TEST_AGENT_ID}`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('deferred');
+    expect(response.body.availability).toBe('temporarily_unavailable');
+    expect(response.body.retryable).toBe(true);
+    expect(response.body.errorCode).toBe('ARC_RPC_COOLDOWN');
+    expect(response.body.wallet).toBeNull();
+    expect(response.body.gateway).toBeNull();
+    expect(response.body.funded).toBeNull();
+    expect(response.body.usage).toMatchObject({
+      sharedBalance: true,
+      summary: [],
+      recent: [],
+    });
+  });
+
+  test('uses numeric statusCode for unexpected gateway errors', async () => {
+    const {
+      app,
+      getAgent,
+      getAgentWithKey,
+      getAgentGatewayBalances,
+      signToken,
+    } = loadOracleHarness();
+
+    const token = signToken(TEST_USER_ID, TEST_OWNER_ADDRESS.toLowerCase());
+    const rawAgent = {
+      id: TEST_AGENT_ID,
+      wallet_address: TEST_OWNER_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    };
+
+    getAgent.mockResolvedValueOnce({ id: TEST_AGENT_ID, walletAddress: TEST_OWNER_ADDRESS });
+    getAgentWithKey.mockResolvedValueOnce(rawAgent);
+
+    const unexpectedError = new Error('gateway_backend_unavailable');
+    unexpectedError.statusCode = 503;
+    unexpectedError.status = 'deferred';
+    getAgentGatewayBalances.mockRejectedValueOnce(unexpectedError);
+
+    const response = await request(app)
+      .get(`/api/oracle/debug/gateway-balance?agentId=${TEST_AGENT_ID}`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toBe('gateway_backend_unavailable');
   });
 });

@@ -20,6 +20,8 @@ const SUPPORTED_TRAFFIC_CLASSES = new Set([
   'background_read',
   'reputation_read',
   'reputation_write',
+  'gateway_read',
+  'gateway_write',
   'gateway',
   'transaction',
 ]);

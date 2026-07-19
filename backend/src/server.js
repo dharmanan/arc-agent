@@ -32,6 +32,7 @@ const {
   isArcRpcRateLimitError,
   markArcRpcEndpointUnhealthy,
 } = require('./services/arcProvider');
+const { resolveErrorHttpStatus } = require('./utils/httpStatus');
 const db                   = require('./db');
 
 const app  = express();
@@ -352,7 +353,7 @@ app.use((err, _req, res, _next) => {
     const msg = err.errors?.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
     return res.status(400).json({ error: msg || 'Invalid request body' });
   }
-  const status = err.status || 500;
+  const status = resolveErrorHttpStatus(err, 500);
   if (status >= 500) console.error('[ERROR]', sanitizeErrorForLog(err));
   // Never leak stack traces or internal messages to clients in production
   const isProd = process.env.NODE_ENV === 'production';

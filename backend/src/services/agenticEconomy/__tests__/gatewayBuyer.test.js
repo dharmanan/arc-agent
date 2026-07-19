@@ -110,7 +110,7 @@ describe('gatewayBuyer', () => {
     expect(safeArcRpcCall).toHaveBeenCalledWith(
       expect.stringContaining('gateway_'),
       expect.any(Function),
-      expect.objectContaining({ trafficClass: 'gateway' }),
+      expect.objectContaining({ trafficClass: 'gateway_write' }),
     );
     expect(runProtectedWrite).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -159,7 +159,7 @@ describe('gatewayBuyer', () => {
     });
 
     safeArcRpcCall.mockImplementation(async (_label, fn, options) => {
-      expect(options).toMatchObject({ trafficClass: 'gateway' });
+      expect(options).toMatchObject({ trafficClass: 'gateway_read' });
       const endpoints = [ENDPOINT_A, ENDPOINT_B];
       let lastError = null;
 
@@ -193,7 +193,7 @@ describe('gatewayBuyer', () => {
     const { gatewayBuyer, safeArcRpcCall } = loadHarness();
 
     safeArcRpcCall.mockImplementation(async (_label, fn, options) => {
-      expect(options).toMatchObject({ trafficClass: 'gateway' });
+      expect(options).toMatchObject({ trafficClass: 'gateway_read' });
       const endpoints = [ENDPOINT_A, ENDPOINT_B];
 
       for (const endpoint of endpoints) {
@@ -217,6 +217,7 @@ describe('gatewayBuyer', () => {
     })).rejects.toMatchObject({
       code: 'ARC_RPC_COOLDOWN',
       message: 'Arc RPC is cooling down',
+      statusCode: 503,
       retryable: true,
       deferred: true,
     });
