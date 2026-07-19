@@ -1274,4 +1274,87 @@ describe('oracle gateway balance debug route', () => {
     expect(response.status).toBe(503);
     expect(response.body.error).toBe('gateway_backend_unavailable');
   });
+
+  test('returns structured deferred 503 for manual Gateway funding cooldown', async () => {
+    const {
+      app,
+      getAgent,
+      getAgentWithKey,
+      depositGatewayBalanceForAgent,
+      signToken,
+    } = loadOracleHarness();
+
+    const token = signToken(TEST_USER_ID, TEST_OWNER_ADDRESS.toLowerCase());
+    const rawAgent = {
+      id: TEST_AGENT_ID,
+      wallet_address: TEST_OWNER_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    };
+
+    getAgent.mockResolvedValueOnce({ id: TEST_AGENT_ID, walletAddress: TEST_OWNER_ADDRESS });
+    getAgentWithKey.mockResolvedValueOnce(rawAgent);
+
+    const cooldownError = new Error('Arc RPC is cooling down');
+    cooldownError.code = 'ARC_RPC_COOLDOWN';
+    cooldownError.status = 'deferred';
+    cooldownError.statusCode = 503;
+    cooldownError.retryable = true;
+    cooldownError.deferred = true;
+    cooldownError.retryAfterMs = 120000;
+    cooldownError.retryAt = '2026-07-19T12:00:00.000Z';
+    depositGatewayBalanceForAgent.mockRejectedValueOnce(cooldownError);
+
+    const response = await request(app)
+      .post('/api/oracle/gateway/fund')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ agentId: TEST_AGENT_ID, amountUsdc: '1' });
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      agentId: TEST_AGENT_ID,
+      chainName: 'Arc Testnet',
+      status: 'deferred',
+      availability: 'temporarily_unavailable',
+      retryable: true,
+      errorCode: 'ARC_RPC_COOLDOWN',
+      funded: false,
+      message: 'Gateway funding could not be submitted because the configured transaction endpoints are temporarily rate limited.',
+      retryAfterMs: 120000,
+      retryAt: '2026-07-19T12:00:00.000Z',
+    });
+    expect(response.body.deposit).toEqual({
+      approvalTxHash: null,
+      depositTxHash: null,
+    });
+  });
+
+  test('passes unexpected manual Gateway funding errors to global handler', async () => {
+    const {
+      app,
+      getAgent,
+      getAgentWithKey,
+      depositGatewayBalanceForAgent,
+      signToken,
+    } = loadOracleHarness();
+
+    const token = signToken(TEST_USER_ID, TEST_OWNER_ADDRESS.toLowerCase());
+    const rawAgent = {
+      id: TEST_AGENT_ID,
+      wallet_address: TEST_OWNER_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    };
+
+    getAgent.mockResolvedValueOnce({ id: TEST_AGENT_ID, walletAddress: TEST_OWNER_ADDRESS });
+    getAgentWithKey.mockResolvedValueOnce(rawAgent);
+
+    depositGatewayBalanceForAgent.mockRejectedValueOnce(new Error('manual_fund_unexpected_failure'));
+
+    const response = await request(app)
+      .post('/api/oracle/gateway/fund')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ agentId: TEST_AGENT_ID, amountUsdc: '1' });
+
+    expect(response.status).toBe(500);
+    expect(response.body.error).toBe('manual_fund_unexpected_failure');
+  });
 });

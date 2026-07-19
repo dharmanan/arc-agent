@@ -55,7 +55,11 @@ function markGatewayAutoWarmDebounce(agentId, now = Date.now()) {
 
 function isArcRpcCooldownError(error) {
   const code = String(error?.code || '').trim().toUpperCase();
-  if (code === 'ARC_RPC_COOLDOWN') {
+  if (
+    code === 'ARC_RPC_COOLDOWN'
+    || code === 'GATEWAY_SERVICE_RATE_LIMITED'
+    || code === 'GATEWAY_DEFERRED_UNKNOWN'
+  ) {
     return true;
   }
 

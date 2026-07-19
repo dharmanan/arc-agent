@@ -21,6 +21,8 @@ const SUPPORTED_TRAFFIC_CLASSES = new Set([
   'reputation_read',
   'reputation_write',
   'gateway_read',
+  'gateway_deposit',
+  'gateway_payment',
   'gateway_write',
   'gateway',
   'transaction',
@@ -113,7 +115,24 @@ function getEndpointHealthKey(rpcUrl, trafficClass = DEFAULT_TRAFFIC_CLASS) {
 function getArcRpcOptions(options = {}) {
   return {
     trafficClass: normalizeTrafficClass(options?.trafficClass),
+    strictRpcProvenance: options?.strictRpcProvenance === true,
   };
+}
+
+function isErrorProvenArcRpc(error) {
+  if (!error) return false;
+
+  if (error?.rpcEndpointProven === true || error?.isArcRpcEndpointError === true) {
+    return true;
+  }
+
+  const source = String(error?.failureSource || error?.meta?.failureSource || '')
+    .trim()
+    .toLowerCase();
+
+  return source === 'json_rpc'
+    || source === 'rpc_endpoint'
+    || source === 'rpc';
 }
 
 function getProviderOptions() {
@@ -454,7 +473,10 @@ async function safeArcRpcCall(label, fn, fallbackValueOrOptions, maybeOptions) {
       fallbackValueOrOptions
       && typeof fallbackValueOrOptions === 'object'
       && !Array.isArray(fallbackValueOrOptions)
-      && Object.prototype.hasOwnProperty.call(fallbackValueOrOptions, 'trafficClass')
+      && (
+        Object.prototype.hasOwnProperty.call(fallbackValueOrOptions, 'trafficClass')
+        || Object.prototype.hasOwnProperty.call(fallbackValueOrOptions, 'strictRpcProvenance')
+      )
       && arguments.length === 3
     );
 
@@ -474,7 +496,7 @@ async function safeArcRpcCall(label, fn, fallbackValueOrOptions, maybeOptions) {
     }
   }
 
-  const { trafficClass } = options;
+  const { trafficClass, strictRpcProvenance } = options;
 
   const pool = getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
   const attempts = Math.max(pool.length, 1);
@@ -497,13 +519,40 @@ async function safeArcRpcCall(label, fn, fallbackValueOrOptions, maybeOptions) {
       return result;
     } catch (error) {
       lastError = error;
+      const provenRpc = isErrorProvenArcRpc(error);
 
       if (isArcRpcBatchLimitError(error) || isArcRpcRateLimitError(error)) {
+        if (strictRpcProvenance && !provenRpc) {
+          logWithThrottle({
+            level: 'warn',
+            kind: 'unproven_rate_limit',
+            label,
+            trafficClass,
+            endpoint: getEndpointLabel(rpcUrl),
+            errorCode: String(error?.code || error?.statusCode || 'unproven_source'),
+            message: `[ARC_RPC] rate-limit-like error not mapped to endpoint cooldown class=${trafficClass} label=${label} endpoint=${getEndpointLabel(rpcUrl)} source=${String(error?.failureSource || 'unknown')}`,
+          });
+          break;
+        }
+
         markArcRpcEndpointUnhealthy(rpcUrl, error, label, options);
         continue;
       }
 
       if (isArcRpcTransientError(error) && excluded.size < pool.length) {
+        if (strictRpcProvenance && !provenRpc) {
+          logWithThrottle({
+            level: 'warn',
+            kind: 'unproven_transient',
+            label,
+            trafficClass,
+            endpoint: getEndpointLabel(rpcUrl),
+            errorCode: String(error?.code || 'unproven_source'),
+            message: `[ARC_RPC] transient-like error not mapped to endpoint cooldown class=${trafficClass} label=${label} endpoint=${getEndpointLabel(rpcUrl)} source=${String(error?.failureSource || 'unknown')}`,
+          });
+          break;
+        }
+
         markArcRpcEndpointUnhealthy(rpcUrl, error, label, {
           ...options,
           force: true,
@@ -609,6 +658,39 @@ function getArcRpcHealthSnapshot() {
   };
 }
 
+function getArcRpcTrafficClassCooldownState(trafficClass = DEFAULT_TRAFFIC_CLASS) {
+  const normalizedTrafficClass = normalizeTrafficClass(trafficClass);
+  const now = Date.now();
+  const pool = [...new Set(getArcRpcUrlPool().map((rpcUrl) => normalizeRpcUrl(rpcUrl)))];
+
+  if (pool.length === 0) {
+    return {
+      trafficClass: normalizedTrafficClass,
+      active: false,
+      retryAfterMs: null,
+      retryAt: null,
+      endpointCount: 0,
+      coolingEndpointCount: 0,
+    };
+  }
+
+  const cooldowns = pool.map((rpcUrl) => getCooldownRemainingMs(rpcUrl, now, normalizedTrafficClass));
+  const coolingEndpointCount = cooldowns.filter((remainingMs) => remainingMs > 0).length;
+  const allCooling = coolingEndpointCount === pool.length;
+  const retryAfterMs = allCooling
+    ? cooldowns.reduce((maxValue, remainingMs) => Math.max(maxValue, remainingMs), 0)
+    : 0;
+
+  return {
+    trafficClass: normalizedTrafficClass,
+    active: allCooling,
+    retryAfterMs,
+    retryAt: allCooling ? new Date(now + retryAfterMs).toISOString() : null,
+    endpointCount: pool.length,
+    coolingEndpointCount,
+  };
+}
+
 function clearArcRpcProviderCache() {
   providerCache.clear();
   endpointHealthState.clear();
@@ -625,6 +707,7 @@ module.exports = {
   safeArcRpcCall,
   isArcRpcRateLimitError,
   markArcRpcEndpointUnhealthy,
+  getArcRpcTrafficClassCooldownState,
   getArcRpcHealthSnapshot,
   clearArcRpcProviderCache,
 };

@@ -245,7 +245,7 @@ describe('paymentRetryService', () => {
 
   test('processRetryIntent defers on shared Arc cooldown without settlement attempt increment', async () => {
     const settleExecutionFee = jest.fn();
-    const { paymentRetryService, query } = loadHarness({
+    const { paymentRetryService, query, getHealthyArcRpcUrl } = loadHarness({
       healthyRpcUrl: null,
       queryImpl: async (sql) => {
         const normalized = String(sql).replace(/\s+/g, ' ').toLowerCase();
@@ -274,6 +274,9 @@ describe('paymentRetryService', () => {
 
     expect(result.status).toBe('deferred');
     expect(settleExecutionFee).not.toHaveBeenCalled();
+    expect(getHealthyArcRpcUrl).toHaveBeenCalledWith('payment_retry_preflight', {
+      trafficClass: 'gateway_payment',
+    });
     const attemptIncrementQueries = query.mock.calls.filter(([sql]) => String(sql).includes('attempt_count = attempt_count + 1'));
     expect(attemptIncrementQueries).toHaveLength(0);
   });

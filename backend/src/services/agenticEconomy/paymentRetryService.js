@@ -1193,7 +1193,7 @@ async function processRetryIntent(options = {}) {
   }
 
   const healthyArcRpcUrl = getHealthyArcRpcUrl('payment_retry_preflight', {
-    trafficClass: 'transaction',
+    trafficClass: 'gateway_payment',
   });
   if (!healthyArcRpcUrl) {
     const nextAttemptAt = computeNextAttemptAt(intent.attempt_count, {

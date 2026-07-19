@@ -74,7 +74,7 @@ describe('arcProvider traffic class isolation', () => {
     expect(reputationUrl).toBe(ENDPOINT);
   });
 
-  test('gateway_read cooldown does not block gateway_write', () => {
+  test('gateway_read cooldown does not block gateway_deposit', () => {
     const arcProvider = loadProvider();
     const rateLimitError = new Error('429 request limit reached');
 
@@ -85,11 +85,47 @@ describe('arcProvider traffic class isolation', () => {
       { trafficClass: 'gateway_read' },
     );
 
-    const gatewayWriteUrl = arcProvider.getHealthyArcRpcUrl('gateway_write_probe', {
-      trafficClass: 'gateway_write',
+    const gatewayDepositUrl = arcProvider.getHealthyArcRpcUrl('gateway_deposit_probe', {
+      trafficClass: 'gateway_deposit',
     });
 
-    expect(gatewayWriteUrl).toBe(ENDPOINT);
+    expect(gatewayDepositUrl).toBe(ENDPOINT);
+  });
+
+  test('gateway_deposit cooldown does not block gateway_payment', () => {
+    const arcProvider = loadProvider();
+    const rateLimitError = new Error('429 request limit reached');
+
+    arcProvider.markArcRpcEndpointUnhealthy(
+      ENDPOINT,
+      rateLimitError,
+      'gateway_deposit_rate_limit_test',
+      { trafficClass: 'gateway_deposit' },
+    );
+
+    const gatewayPaymentUrl = arcProvider.getHealthyArcRpcUrl('gateway_payment_probe', {
+      trafficClass: 'gateway_payment',
+    });
+
+    expect(gatewayPaymentUrl).toBe(ENDPOINT);
+  });
+
+  test('gateway_payment cooldown does not block gateway_deposit', () => {
+    const arcProvider = loadProvider();
+    const rateLimitError = new Error('429 request limit reached');
+
+    arcProvider.markArcRpcEndpointUnhealthy(
+      ENDPOINT,
+      rateLimitError,
+      'gateway_payment_rate_limit_test',
+      { trafficClass: 'gateway_payment' },
+    );
+
+    const gatewayDepositUrl = arcProvider.getHealthyArcRpcUrl('gateway_deposit_probe', {
+      trafficClass: 'gateway_deposit',
+    });
+
+    expect(gatewayDepositUrl).toBe(ENDPOINT);
   });
 });
 
@@ -169,5 +205,38 @@ describe('arcProvider safeArcRpcCall fallback semantics', () => {
       },
       undefined,
     )).rejects.toThrow('hard failure');
+  });
+
+  test('strict provenance mode does not mark endpoint unhealthy for gateway service 429', async () => {
+    const arcProvider = loadProvider();
+
+    const service429Error = new Error('Gateway API balance fetch failed: 429 Too Many Requests');
+    service429Error.statusCode = 429;
+    service429Error.failureSource = 'gateway_service';
+    service429Error.rpcEndpointProven = false;
+
+    await expect(arcProvider.safeArcRpcCall(
+      'strict_provenance_service_429_probe',
+      async () => {
+        throw service429Error;
+      },
+      {
+        trafficClass: 'gateway_deposit',
+        strictRpcProvenance: true,
+      },
+    )).rejects.toThrow('429 Too Many Requests');
+
+    const stillHealthy = arcProvider.getHealthyArcRpcUrl('strict_provenance_health_probe', {
+      trafficClass: 'gateway_deposit',
+    });
+    expect([ENDPOINT_A, ENDPOINT_B]).toContain(stillHealthy);
+
+    const cooldownState = arcProvider.getArcRpcTrafficClassCooldownState('gateway_deposit');
+    expect(cooldownState).toMatchObject({
+      trafficClass: 'gateway_deposit',
+      active: false,
+      coolingEndpointCount: 0,
+      endpointCount: 2,
+    });
   });
 });

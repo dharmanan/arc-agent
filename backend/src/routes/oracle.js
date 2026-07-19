@@ -1720,6 +1720,35 @@ router.post('/gateway/fund', requireAuth, async (req, res, next) => {
       fetchedAt: new Date().toISOString(),
     });
   } catch (err) {
+    const code = String(err?.code || '').trim().toUpperCase();
+    if (['ARC_RPC_COOLDOWN', 'GATEWAY_SERVICE_RATE_LIMITED', 'GATEWAY_DEFERRED_UNKNOWN'].includes(code)) {
+      const retryAfterMs = Number.isFinite(Number(err?.retryAfterMs)) ? Number(err.retryAfterMs) : null;
+      const retryAt = typeof err?.retryAt === 'string' && err.retryAt.trim() ? err.retryAt : null;
+
+      const deferredMessageByCode = {
+        ARC_RPC_COOLDOWN: 'Gateway funding could not be submitted because the configured transaction endpoints are temporarily rate limited.',
+        GATEWAY_SERVICE_RATE_LIMITED: 'Gateway funding could not be submitted because the shared Gateway service is temporarily rate limited.',
+        GATEWAY_DEFERRED_UNKNOWN: 'Gateway funding could not be submitted because the failure source could not be proven safely at this time.',
+      };
+
+      return res.status(503).json({
+        agentId: String(req.body?.agentId || '').trim(),
+        chainName: String(req.body?.chainName || 'Arc Testnet').trim() || 'Arc Testnet',
+        status: 'deferred',
+        availability: 'temporarily_unavailable',
+        retryable: true,
+        errorCode: code,
+        funded: false,
+        deposit: {
+          approvalTxHash: null,
+          depositTxHash: null,
+        },
+        message: deferredMessageByCode[code] || deferredMessageByCode.GATEWAY_DEFERRED_UNKNOWN,
+        retryAfterMs,
+        retryAt,
+      });
+    }
+
     if (err.statusCode && !err.status) {
       err.status = err.statusCode;
     }

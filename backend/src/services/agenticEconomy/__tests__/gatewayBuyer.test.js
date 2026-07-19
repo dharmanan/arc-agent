@@ -53,6 +53,14 @@ function loadHarness({ safeArcRpcCallImpl, clientFactory } = {}) {
     getHealthyArcRpcUrl: jest.fn(() => ENDPOINT_A),
     safeArcRpcCall,
     isArcRpcRateLimitError: jest.fn((error) => /request limit reached|rate limit|too many requests/i.test(String(error?.message || ''))),
+    getArcRpcTrafficClassCooldownState: jest.fn(() => ({
+      trafficClass: 'gateway_read',
+      active: true,
+      retryAfterMs: 900000,
+      retryAt: '2026-07-19T12:15:00.000Z',
+      endpointCount: 2,
+      coolingEndpointCount: 2,
+    })),
   };
 
   jest.doMock('@circle-fin/x402-batching/client', () => ({
@@ -110,7 +118,7 @@ describe('gatewayBuyer', () => {
     expect(safeArcRpcCall).toHaveBeenCalledWith(
       expect.stringContaining('gateway_'),
       expect.any(Function),
-      expect.objectContaining({ trafficClass: 'gateway_write' }),
+      expect.objectContaining({ trafficClass: 'gateway_deposit' }),
     );
     expect(runProtectedWrite).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -220,6 +228,127 @@ describe('gatewayBuyer', () => {
       statusCode: 503,
       retryable: true,
       deferred: true,
+      retryAfterMs: 900000,
+      retryAt: '2026-07-19T12:15:00.000Z',
+    });
+  });
+
+  test('classifies manual Gateway fund in gateway_deposit traffic class', async () => {
+    const { gatewayBuyer, safeArcRpcCall } = loadHarness();
+
+    await gatewayBuyer.depositGatewayBalanceForAgent({
+      id: 'agent-4',
+      wallet_address: TEST_WALLET_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    }, '1', {
+      chainName: 'Arc Testnet',
+      walletAddress: TEST_WALLET_ADDRESS,
+      operation: 'manual_gateway_fund',
+    });
+
+    expect(safeArcRpcCall).toHaveBeenCalledWith(
+      'gateway_manual_gateway_fund',
+      expect.any(Function),
+      expect.objectContaining({ trafficClass: 'gateway_deposit', strictRpcProvenance: true }),
+    );
+  });
+
+  test('classifies payment transfer in gateway_payment traffic class', async () => {
+    const { gatewayBuyer, safeArcRpcCall } = loadHarness();
+
+    await gatewayBuyer.executeGatewayTransfer({
+      agent: {
+        id: 'agent-5',
+        wallet_address: TEST_WALLET_ADDRESS,
+        private_key_encrypted: 'encrypted-key',
+      },
+      amountUsdc: '1',
+      recipient: '0x1111111111111111111111111111111111111111',
+      fromChain: 'Arc Testnet',
+      toChain: 'Arc Testnet',
+    });
+
+    expect(safeArcRpcCall).toHaveBeenCalledWith(
+      'gateway_gateway_transfer',
+      expect.any(Function),
+      expect.objectContaining({ trafficClass: 'gateway_payment', strictRpcProvenance: true }),
+    );
+  });
+
+  test('maps gateway service 429 to GATEWAY_SERVICE_RATE_LIMITED without RPC cooldown code', async () => {
+    const { gatewayBuyer, gatewayClientCtor, safeArcRpcCall } = loadHarness();
+
+    const serviceRateLimitError = new Error('Gateway API balance fetch failed: 429 Too Many Requests');
+    serviceRateLimitError.statusCode = 429;
+
+    gatewayClientCtor.mockImplementation(() => ({
+      getUsdcBalance: jest.fn().mockResolvedValue({ balance: 5_000_000n, formatted: '5' }),
+      getGatewayBalance: jest.fn().mockRejectedValue(serviceRateLimitError),
+      deposit: jest.fn(),
+      withdraw: jest.fn(),
+    }));
+
+    safeArcRpcCall.mockImplementation(async (_label, fn) => fn({}, ENDPOINT_A));
+
+    await expect(gatewayBuyer.getAgentGatewayBalances({
+      id: 'agent-6',
+      wallet_address: TEST_WALLET_ADDRESS,
+      private_key_encrypted: 'encrypted-key',
+    }, {
+      chainName: 'Arc Testnet',
+      address: TEST_WALLET_ADDRESS,
+    })).rejects.toMatchObject({
+      code: 'GATEWAY_SERVICE_RATE_LIMITED',
+      status: 'deferred',
+      statusCode: 503,
+      retryable: true,
+      deferred: true,
+      failureSource: 'gateway_service',
+      rpcEndpointProven: false,
+    });
+  });
+
+  test('maps unknown rate-limit provenance to conservative deferred code', async () => {
+    const { gatewayBuyer, gatewayClientCtor, safeArcRpcCall } = loadHarness();
+
+    const unknownRateLimitError = new Error('rate limit exceeded');
+
+    gatewayClientCtor.mockImplementation(() => ({
+      getUsdcBalance: jest.fn().mockResolvedValue({ balance: 5_000_000n, formatted: '5' }),
+      getGatewayBalance: jest.fn().mockResolvedValue({
+        available: 2_000_000n,
+        formattedAvailable: '2',
+        total: 2_000_000n,
+        formattedTotal: '2',
+        withdrawing: 0n,
+        formattedWithdrawing: '0',
+        withdrawable: 2_000_000n,
+        formattedWithdrawable: '2',
+      }),
+      deposit: jest.fn(),
+      withdraw: jest.fn().mockRejectedValue(unknownRateLimitError),
+    }));
+
+    safeArcRpcCall.mockImplementation(async (_label, fn) => fn({}, ENDPOINT_A));
+
+    await expect(gatewayBuyer.executeGatewayTransfer({
+      agent: {
+        id: 'agent-7',
+        wallet_address: TEST_WALLET_ADDRESS,
+        private_key_encrypted: 'encrypted-key',
+      },
+      amountUsdc: '1',
+      recipient: '0x1111111111111111111111111111111111111111',
+      fromChain: 'Arc Testnet',
+      toChain: 'Arc Testnet',
+    })).rejects.toMatchObject({
+      code: 'GATEWAY_DEFERRED_UNKNOWN',
+      status: 'deferred',
+      statusCode: 503,
+      retryable: true,
+      deferred: true,
+      failureSource: 'unknown',
+      rpcEndpointProven: false,
     });
   });
 });

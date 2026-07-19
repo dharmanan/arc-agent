@@ -4,7 +4,12 @@ const { ethers } = require('ethers');
 const { GatewayClient } = require('@circle-fin/x402-batching/client');
 const { decrypt } = require('../cryptoService');
 const { runProtectedWrite } = require('../txSecurityService');
-const { getHealthyArcRpcUrl, safeArcRpcCall, isArcRpcRateLimitError } = require('../arcProvider');
+const {
+  getHealthyArcRpcUrl,
+  safeArcRpcCall,
+  isArcRpcRateLimitError,
+  getArcRpcTrafficClassCooldownState,
+} = require('../arcProvider');
 const { logGateway } = require('./logger');
 
 const DEFAULT_GATEWAY_TRANSFER_MAX_FEE_USDC = process.env.GATEWAY_TRANSFER_MAX_FEE_USDC || '0.005';
@@ -14,11 +19,18 @@ const DEFAULT_GATEWAY_WARM_MIN_AVAILABLE_USDC = process.env.GATEWAY_WARM_MIN_AVA
 const DEFAULT_GATEWAY_WARM_TARGET_USDC = process.env.GATEWAY_WARM_TARGET_USDC || '3';
 const DEFAULT_GATEWAY_TX_LOCK_TTL_SEC = readPositiveIntegerEnv('GATEWAY_TX_LOCK_TTL_SEC', 180);
 const DEFAULT_GATEWAY_AUTO_WARM_LOCK_WAIT_MS = readNonNegativeIntegerEnv('GATEWAY_AUTO_WARM_LOCK_WAIT_MS', 0);
+const DEFAULT_GATEWAY_SERVICE_RATE_LIMIT_COOLDOWN_MS = readPositiveIntegerEnv('GATEWAY_SERVICE_RATE_LIMIT_COOLDOWN_MS', 900000);
 const ARC_RPC_COOLDOWN_CODE = 'ARC_RPC_COOLDOWN';
 const ARC_RPC_COOLDOWN_MESSAGE = 'Arc RPC is cooling down';
+const GATEWAY_SERVICE_RATE_LIMITED_CODE = 'GATEWAY_SERVICE_RATE_LIMITED';
+const GATEWAY_DEFERRED_UNKNOWN_CODE = 'GATEWAY_DEFERRED_UNKNOWN';
 const GATEWAY_TRAFFIC_CLASS_DEFAULT = 'gateway';
 const GATEWAY_TRAFFIC_CLASS_READ = 'gateway_read';
-const GATEWAY_TRAFFIC_CLASS_WRITE = 'gateway_write';
+const GATEWAY_TRAFFIC_CLASS_WRITE = 'gateway_write'; // legacy compatibility
+const GATEWAY_TRAFFIC_CLASS_DEPOSIT = 'gateway_deposit';
+const GATEWAY_TRAFFIC_CLASS_PAYMENT = 'gateway_payment';
+
+const gatewayServiceCooldownByTrafficClass = new Map();
 
 const GATEWAY_CHAIN_MAP = {
   'Arc Testnet': {
@@ -157,6 +169,178 @@ function extractGatewayErrorText(error) {
     .toLowerCase();
 }
 
+function getGatewayOperationLabel(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_') || 'gateway_operation';
+}
+
+function getRpcEndpointLabel(rpcUrl) {
+  try {
+    const hostname = new URL(String(rpcUrl || '').trim()).hostname;
+    const parts = hostname.split('.').filter(Boolean);
+    if (parts.length === 0) return 'unknown';
+    if (parts[0] === 'rpc' && parts.length > 1) return parts[1];
+    return parts[0];
+  } catch {
+    return 'unknown';
+  }
+}
+
+function normalizeGatewayTrafficClass(trafficClass) {
+  const normalized = String(trafficClass || '').trim().toLowerCase();
+  if (
+    normalized === GATEWAY_TRAFFIC_CLASS_READ
+    || normalized === GATEWAY_TRAFFIC_CLASS_DEPOSIT
+    || normalized === GATEWAY_TRAFFIC_CLASS_PAYMENT
+    || normalized === GATEWAY_TRAFFIC_CLASS_WRITE
+    || normalized === GATEWAY_TRAFFIC_CLASS_DEFAULT
+  ) {
+    return normalized;
+  }
+  return GATEWAY_TRAFFIC_CLASS_DEFAULT;
+}
+
+function parseErrorHttpStatus(error) {
+  const directStatus = Number.parseInt(String(error?.statusCode || error?.status || error?.httpStatus || ''), 10);
+  if (Number.isInteger(directStatus) && directStatus >= 100 && directStatus <= 599) {
+    return directStatus;
+  }
+
+  const text = extractGatewayErrorText(error);
+  const statusMatch = text.match(/\b(4\d\d|5\d\d)\b/);
+  if (!statusMatch) return null;
+
+  const parsed = Number.parseInt(statusMatch[1], 10);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+function parseErrorRpcCode(error) {
+  if (error?.code == null) return null;
+  return String(error.code).trim() || null;
+}
+
+function inferGatewayFailureSource(error, fallback = 'unknown') {
+  const text = extractGatewayErrorText(error);
+
+  if (
+    text.includes('gateway api balance fetch failed')
+    || text.includes('gateway api error')
+    || text.includes('payment failed:')
+  ) {
+    return 'gateway_service';
+  }
+
+  if (
+    text.includes('payment-required')
+    || text.includes('protected resource')
+    || text.includes('facilitator')
+  ) {
+    return 'facilitator_http';
+  }
+
+  if (
+    text.includes('json-rpc')
+    || text.includes('rpc')
+    || text.includes('request limit reached')
+    || text.includes('could not coalesce')
+    || text.includes('batch of more than')
+    || text.includes('-32603')
+    || text.includes('-32000')
+  ) {
+    return 'json_rpc';
+  }
+
+  return fallback;
+}
+
+function annotateGatewayFailure(error, metadata = {}) {
+  if (!error || typeof error !== 'object') return error;
+
+  const operation = getGatewayOperationLabel(metadata.operation || error.operation);
+  const fallbackSource = metadata.failureSource || 'unknown';
+  const source = String(error.failureSource || '').trim().toLowerCase() || inferGatewayFailureSource(error, fallbackSource);
+  const stage = String(metadata.failureStage || error.failureStage || '').trim() || null;
+  const httpStatus = parseErrorHttpStatus(error);
+  const rpcCode = parseErrorRpcCode(error);
+  const trafficClass = normalizeGatewayTrafficClass(metadata.trafficClass || error.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT);
+  const rpcEndpointLabel = metadata.rpcUrl ? getRpcEndpointLabel(metadata.rpcUrl) : (error.rpcEndpointLabel || null);
+  const rpcEndpointProven = source === 'json_rpc' || source === 'rpc_endpoint' || source === 'rpc';
+
+  error.operation = operation;
+  error.failureStage = stage;
+  error.failureSource = source;
+  error.trafficClass = trafficClass;
+  error.rpcEndpointLabel = rpcEndpointProven ? (rpcEndpointLabel || error.rpcEndpointLabel || 'unknown') : null;
+  error.rpcEndpointProven = rpcEndpointProven;
+  error.isArcRpcEndpointError = rpcEndpointProven;
+
+  if (httpStatus != null) {
+    error.httpStatus = httpStatus;
+  }
+  if (rpcCode != null) {
+    error.rpcCode = rpcCode;
+  }
+
+  const mergedMeta = {
+    ...(error.meta && typeof error.meta === 'object' ? error.meta : {}),
+    operation,
+    failureStage: stage,
+    failureSource: source,
+    rpcEndpointLabel: error.rpcEndpointLabel,
+    rpcEndpointProven,
+    httpStatus: error.httpStatus ?? null,
+    rpcCode: error.rpcCode ?? null,
+    trafficClass,
+  };
+
+  error.meta = mergedMeta;
+  return error;
+}
+
+function isGatewayServiceFailureSource(error) {
+  const source = String(error?.failureSource || error?.meta?.failureSource || '').trim().toLowerCase();
+  return source === 'gateway_service' || source === 'facilitator_http';
+}
+
+function isGatewayServiceRateLimitError(error) {
+  const status = parseErrorHttpStatus(error);
+  const text = extractGatewayErrorText(error);
+
+  if (!isGatewayServiceFailureSource(error)) {
+    return false;
+  }
+
+  return status === 429
+    || text.includes('429')
+    || text.includes('rate limit')
+    || text.includes('too many requests')
+    || text.includes('request limit reached');
+}
+
+function getGatewayServiceCooldownState(trafficClass, now = Date.now()) {
+  const normalizedClass = normalizeGatewayTrafficClass(trafficClass);
+  const cooldownUntil = Number(gatewayServiceCooldownByTrafficClass.get(normalizedClass) || 0);
+  const retryAfterMs = Number.isFinite(cooldownUntil) && cooldownUntil > now
+    ? Math.max(cooldownUntil - now, 0)
+    : 0;
+
+  return {
+    trafficClass: normalizedClass,
+    active: retryAfterMs > 0,
+    retryAfterMs: retryAfterMs > 0 ? retryAfterMs : null,
+    retryAt: retryAfterMs > 0 ? new Date(now + retryAfterMs).toISOString() : null,
+  };
+}
+
+function markGatewayServiceRateLimited(trafficClass, retryAfterMs = null, now = Date.now()) {
+  const normalizedClass = normalizeGatewayTrafficClass(trafficClass);
+  const normalizedRetryAfterMs = Number.isFinite(Number(retryAfterMs)) && Number(retryAfterMs) > 0
+    ? Number(retryAfterMs)
+    : DEFAULT_GATEWAY_SERVICE_RATE_LIMIT_COOLDOWN_MS;
+
+  gatewayServiceCooldownByTrafficClass.set(normalizedClass, now + normalizedRetryAfterMs);
+  return getGatewayServiceCooldownState(normalizedClass, now);
+}
+
 function isGatewayRateLimitError(error) {
   if (isArcRpcRateLimitError(error)) {
     return true;
@@ -203,7 +387,10 @@ function isGatewayTransientRpcError(error) {
     || text.includes('gateway timeout');
 }
 
-function buildArcRpcCooldownError(error = null, chainName = 'Arc Testnet') {
+function buildArcRpcCooldownError(error = null, chainName = 'Arc Testnet', options = {}) {
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || error?.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT);
+  const operation = getGatewayOperationLabel(options.operation || error?.operation);
+  const cooldownState = getArcRpcTrafficClassCooldownState(trafficClass);
   const cooldownError = new Error(ARC_RPC_COOLDOWN_MESSAGE);
   cooldownError.code = ARC_RPC_COOLDOWN_CODE;
   cooldownError.chainName = chainName;
@@ -211,29 +398,190 @@ function buildArcRpcCooldownError(error = null, chainName = 'Arc Testnet') {
   cooldownError.deferred = true;
   cooldownError.status = 'deferred';
   cooldownError.statusCode = 503;
+  cooldownError.operation = operation;
+  cooldownError.trafficClass = trafficClass;
+  cooldownError.failureStage = options.failureStage || error?.failureStage || null;
+  cooldownError.failureSource = 'json_rpc';
+  cooldownError.rpcEndpointLabel = error?.rpcEndpointLabel || null;
+  cooldownError.rpcEndpointProven = true;
+  cooldownError.isArcRpcEndpointError = true;
+  cooldownError.httpStatus = parseErrorHttpStatus(error);
+  cooldownError.rpcCode = parseErrorRpcCode(error);
+  cooldownError.retryAfterMs = cooldownState.active ? cooldownState.retryAfterMs : null;
+  cooldownError.retryAt = cooldownState.active ? cooldownState.retryAt : null;
   if (error) {
     cooldownError.cause = error;
     cooldownError.causeMessage = error.message || String(error);
   }
+  cooldownError.meta = {
+    operation,
+    failureStage: cooldownError.failureStage,
+    failureSource: cooldownError.failureSource,
+    trafficClass,
+    rpcEndpointLabel: cooldownError.rpcEndpointLabel,
+    rpcEndpointProven: true,
+    httpStatus: cooldownError.httpStatus,
+    rpcCode: cooldownError.rpcCode,
+    retryAfterMs: cooldownError.retryAfterMs,
+    retryAt: cooldownError.retryAt,
+  };
   return cooldownError;
 }
 
-function toRetryableGatewayError(error, chainName = 'Arc Testnet') {
-  if (String(error?.code || '').trim().toUpperCase() === ARC_RPC_COOLDOWN_CODE) {
+function buildGatewayServiceRateLimitedError(error = null, chainName = 'Arc Testnet', options = {}) {
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || error?.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT);
+  const operation = getGatewayOperationLabel(options.operation || error?.operation);
+  const cooldownState = markGatewayServiceRateLimited(trafficClass, options.retryAfterMs ?? error?.retryAfterMs ?? null);
+
+  const deferredError = new Error('Gateway service is temporarily rate limited');
+  deferredError.code = GATEWAY_SERVICE_RATE_LIMITED_CODE;
+  deferredError.chainName = chainName;
+  deferredError.retryable = true;
+  deferredError.deferred = true;
+  deferredError.status = 'deferred';
+  deferredError.statusCode = 503;
+  deferredError.operation = operation;
+  deferredError.trafficClass = trafficClass;
+  deferredError.failureStage = options.failureStage || error?.failureStage || null;
+  deferredError.failureSource = String(options.failureSource || error?.failureSource || 'gateway_service').trim().toLowerCase();
+  deferredError.rpcEndpointLabel = null;
+  deferredError.rpcEndpointProven = false;
+  deferredError.isArcRpcEndpointError = false;
+  deferredError.httpStatus = parseErrorHttpStatus(error);
+  deferredError.rpcCode = parseErrorRpcCode(error);
+  deferredError.retryAfterMs = cooldownState.retryAfterMs;
+  deferredError.retryAt = cooldownState.retryAt;
+
+  if (error) {
+    deferredError.cause = error;
+    deferredError.causeMessage = error.message || String(error);
+  }
+
+  deferredError.meta = {
+    operation,
+    failureStage: deferredError.failureStage,
+    failureSource: deferredError.failureSource,
+    trafficClass,
+    rpcEndpointLabel: null,
+    rpcEndpointProven: false,
+    httpStatus: deferredError.httpStatus,
+    rpcCode: deferredError.rpcCode,
+    retryAfterMs: deferredError.retryAfterMs,
+    retryAt: deferredError.retryAt,
+  };
+
+  return deferredError;
+}
+
+function buildGatewayConservativeDeferredError(error = null, chainName = 'Arc Testnet', options = {}) {
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || error?.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT);
+  const operation = getGatewayOperationLabel(options.operation || error?.operation);
+  const deferredError = new Error('Gateway operation deferred because failure provenance is unknown');
+  deferredError.code = GATEWAY_DEFERRED_UNKNOWN_CODE;
+  deferredError.chainName = chainName;
+  deferredError.retryable = true;
+  deferredError.deferred = true;
+  deferredError.status = 'deferred';
+  deferredError.statusCode = 503;
+  deferredError.operation = operation;
+  deferredError.trafficClass = trafficClass;
+  deferredError.failureStage = options.failureStage || error?.failureStage || null;
+  deferredError.failureSource = 'unknown';
+  deferredError.rpcEndpointLabel = null;
+  deferredError.rpcEndpointProven = false;
+  deferredError.isArcRpcEndpointError = false;
+  deferredError.httpStatus = parseErrorHttpStatus(error);
+  deferredError.rpcCode = parseErrorRpcCode(error);
+  deferredError.retryAfterMs = null;
+  deferredError.retryAt = null;
+
+  if (error) {
+    deferredError.cause = error;
+    deferredError.causeMessage = error.message || String(error);
+  }
+
+  deferredError.meta = {
+    operation,
+    failureStage: deferredError.failureStage,
+    failureSource: deferredError.failureSource,
+    trafficClass,
+    rpcEndpointLabel: null,
+    rpcEndpointProven: false,
+    httpStatus: deferredError.httpStatus,
+    rpcCode: deferredError.rpcCode,
+    retryAfterMs: null,
+    retryAt: null,
+  };
+
+  return deferredError;
+}
+
+function toRetryableGatewayError(error, chainName = 'Arc Testnet', context = {}) {
+  const trafficClass = normalizeGatewayTrafficClass(context.trafficClass || error?.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT);
+  const operation = getGatewayOperationLabel(context.operation || error?.operation);
+  const code = String(error?.code || '').trim().toUpperCase();
+
+  if (code === ARC_RPC_COOLDOWN_CODE) {
+    if (error.retryAfterMs == null || error.retryAt == null) {
+      const cooldownState = getArcRpcTrafficClassCooldownState(trafficClass);
+      error.retryAfterMs = cooldownState.active ? cooldownState.retryAfterMs : null;
+      error.retryAt = cooldownState.active ? cooldownState.retryAt : null;
+    }
+    return error;
+  }
+
+  if (code === GATEWAY_SERVICE_RATE_LIMITED_CODE || code === GATEWAY_DEFERRED_UNKNOWN_CODE) {
     return error;
   }
 
   const message = String(error?.message || '').trim();
   if (isArcTestnetChain(chainName) && /safeArcRpcCall failed label=gateway_/i.test(message)) {
-    return buildArcRpcCooldownError(error, chainName);
+    return buildArcRpcCooldownError(error, chainName, {
+      trafficClass,
+      operation,
+      failureStage: error?.failureStage || null,
+    });
   }
 
-  if (isArcTestnetChain(chainName) && isGatewayRateLimitError(error)) {
-    return buildArcRpcCooldownError(error, chainName);
+  const annotatedError = annotateGatewayFailure(error, {
+    operation,
+    failureStage: error?.failureStage || null,
+    failureSource: error?.failureSource || 'unknown',
+    trafficClass,
+  });
+
+  if (isArcTestnetChain(chainName) && isGatewayServiceRateLimitError(annotatedError)) {
+    return buildGatewayServiceRateLimitedError(annotatedError, chainName, {
+      trafficClass,
+      operation,
+      failureStage: annotatedError.failureStage || null,
+      failureSource: annotatedError.failureSource || 'gateway_service',
+      retryAfterMs: annotatedError.retryAfterMs ?? null,
+    });
   }
 
-  if (isArcTestnetChain(chainName) && isGatewayTransientRpcError(error)) {
-    return buildArcRpcCooldownError(error, chainName);
+  if (isArcTestnetChain(chainName) && annotatedError.rpcEndpointProven && isGatewayRateLimitError(annotatedError)) {
+    return buildArcRpcCooldownError(annotatedError, chainName, {
+      trafficClass,
+      operation,
+      failureStage: annotatedError.failureStage || null,
+    });
+  }
+
+  if (isArcTestnetChain(chainName) && annotatedError.rpcEndpointProven && isGatewayTransientRpcError(annotatedError)) {
+    return buildArcRpcCooldownError(annotatedError, chainName, {
+      trafficClass,
+      operation,
+      failureStage: annotatedError.failureStage || null,
+    });
+  }
+
+  if (isArcTestnetChain(chainName) && (isGatewayRateLimitError(annotatedError) || isGatewayTransientRpcError(annotatedError))) {
+    return buildGatewayConservativeDeferredError(annotatedError, chainName, {
+      trafficClass,
+      operation,
+      failureStage: annotatedError.failureStage || null,
+    });
   }
 
   return error;
@@ -241,7 +589,20 @@ function toRetryableGatewayError(error, chainName = 'Arc Testnet') {
 
 async function withGatewayClientFailover(agent, options = {}, execute) {
   const chainName = options.chainName || 'Arc Testnet';
-  const trafficClass = options.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT;
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT);
+  const operation = getGatewayOperationLabel(options.operationLabel || options.operation || 'gateway_operation');
+
+  const serviceCooldownState = getGatewayServiceCooldownState(trafficClass);
+  if (serviceCooldownState.active) {
+    throw buildGatewayServiceRateLimitedError(null, chainName, {
+      trafficClass,
+      operation,
+      failureStage: 'gateway_service_cooldown',
+      failureSource: 'gateway_service',
+      retryAfterMs: serviceCooldownState.retryAfterMs,
+    });
+  }
+
   if (!isArcTestnetChain(chainName)) {
     const client = createGatewayClientForAgent(agent, {
       ...options,
@@ -252,7 +613,7 @@ async function withGatewayClientFailover(agent, options = {}, execute) {
   }
 
   return safeArcRpcCall(
-    `gateway_${options.operationLabel || 'operation'}`,
+    `gateway_${operation}`,
     async (_provider, rpcUrl) => {
       const client = createGatewayClientForAgent(agent, {
         ...options,
@@ -260,10 +621,28 @@ async function withGatewayClientFailover(agent, options = {}, execute) {
         trafficClass,
         bypassHealthCheck: true,
       });
-      return execute(client, rpcUrl);
+
+      try {
+        return await execute(client, rpcUrl);
+      } catch (error) {
+        const annotatedError = annotateGatewayFailure(error, {
+          operation,
+          failureStage: error?.failureStage || 'gateway_operation',
+          failureSource: error?.failureSource || 'unknown',
+          trafficClass,
+          rpcUrl,
+        });
+
+        if (isGatewayServiceRateLimitError(annotatedError)) {
+          markGatewayServiceRateLimited(trafficClass, annotatedError.retryAfterMs ?? null);
+        }
+
+        throw annotatedError;
+      }
     },
     {
       trafficClass,
+      strictRpcProvenance: true,
     },
   );
 }
@@ -300,14 +679,40 @@ function createGatewayClientForAgent(agent, options = {}) {
   });
 }
 
+async function runGatewayStage(stageOptions, execute) {
+  try {
+    return await execute();
+  } catch (error) {
+    throw annotateGatewayFailure(error, stageOptions);
+  }
+}
+
 async function readGatewayBalances(client, address, options = {}) {
+  const operation = getGatewayOperationLabel(options.operation || 'gateway_balances');
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_READ);
   let wallet;
   let gateway;
   try {
-    wallet = await client.getUsdcBalance(address);
-    gateway = await client.getGatewayBalance(address);
+    wallet = await runGatewayStage({
+      operation,
+      failureStage: 'wallet_balance_read',
+      failureSource: 'json_rpc',
+      trafficClass,
+      rpcUrl: options.rpcUrl,
+    }, () => client.getUsdcBalance(address));
+
+    gateway = await runGatewayStage({
+      operation,
+      failureStage: 'gateway_balance_read_api',
+      failureSource: 'gateway_service',
+      trafficClass,
+      rpcUrl: options.rpcUrl,
+    }, () => client.getGatewayBalance(address));
   } catch (error) {
-    throw toRetryableGatewayError(error, options.chainName || 'Arc Testnet');
+    throw toRetryableGatewayError(error, options.chainName || 'Arc Testnet', {
+      operation,
+      trafficClass,
+    });
   }
 
   return {
@@ -329,44 +734,58 @@ async function readGatewayBalances(client, address, options = {}) {
 
 async function getAgentGatewayBalances(agent, options = {}) {
   const chainName = options.chainName || 'Arc Testnet';
+  const operation = 'gateway_balances';
   try {
     return await withGatewayClientFailover(agent, {
       ...options,
       chainName,
-      operationLabel: 'balances',
+      operationLabel: operation,
       trafficClass: GATEWAY_TRAFFIC_CLASS_READ,
-    }, async (client) => readGatewayBalances(client, options.address, {
+    }, async (client, rpcUrl) => readGatewayBalances(client, options.address, {
       chainName,
+      operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_READ,
+      rpcUrl,
     }));
   } catch (error) {
-    throw toRetryableGatewayError(error, chainName);
+    throw toRetryableGatewayError(error, chainName, {
+      operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_READ,
+    });
   }
 }
 
 async function depositGatewayBalanceForAgent(agent, amountUsdc, options = {}) {
   const chainName = options.chainName || 'Arc Testnet';
   const walletAddress = normalizeGatewayWalletAddress(options.walletAddress || options.address || resolveAgentGatewayWalletAddress(agent));
+  const operation = options.operation || 'gateway_deposit';
 
   try {
     return await runGatewayProtectedWrite({
       chainName,
       walletAddress,
-      operation: options.operation || 'gateway_deposit',
+      operation,
       replayFingerprint: options.replayFingerprint || null,
       waitForLockMs: options.waitForLockMs,
       protectedWrite: options.protectedWrite !== false,
     }, async () => withGatewayClientFailover(agent, {
       ...options,
       chainName,
-      operationLabel: options.operation || 'gateway_deposit',
-      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
-    }, async (client) => depositGatewayBalanceUnlocked(client, amountUsdc, {
+      operationLabel: operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_DEPOSIT,
+    }, async (client, rpcUrl) => depositGatewayBalanceUnlocked(client, amountUsdc, {
       ...options,
       chainName,
+      operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_DEPOSIT,
+      rpcUrl,
       address: options.address || walletAddress,
     })));
   } catch (error) {
-    throw toRetryableGatewayError(error, chainName);
+    throw toRetryableGatewayError(error, chainName, {
+      operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_DEPOSIT,
+    });
   }
 }
 
@@ -395,9 +814,29 @@ function buildGatewayRequestBody(requestOptions = {}) {
 function buildGatewayRateLimitError(status, attempt, retryAttempts) {
   const error = new Error(`Gateway protected resource request hit rate limit (${status})`);
   error.statusCode = status;
+  error.httpStatus = status;
   error.retryAttempt = attempt;
   error.retryAttempts = retryAttempts;
+  error.failureSource = 'facilitator_http';
+  error.failureStage = 'gateway_protected_resource_initial_request';
+  error.rpcEndpointProven = false;
+  error.isArcRpcEndpointError = false;
   return error;
+}
+
+function parseRetryAfterMs(headerValue) {
+  if (!headerValue) return null;
+
+  const numericSeconds = Number.parseInt(String(headerValue).trim(), 10);
+  if (Number.isFinite(numericSeconds) && numericSeconds >= 0) {
+    return numericSeconds * 1000;
+  }
+
+  const parsedDateMs = Date.parse(String(headerValue));
+  if (!Number.isFinite(parsedDateMs)) return null;
+
+  const remainingMs = parsedDateMs - Date.now();
+  return remainingMs > 0 ? remainingMs : 0;
 }
 
 function getGatewayTargetPath(url) {
@@ -457,7 +896,9 @@ async function executeGatewayProtectedPayment(client, url, requestOptions = {}, 
     });
 
     if (attempt >= retryAttempts) {
-      throw buildGatewayRateLimitError(initialResponse.status, attempt, retryAttempts);
+      const rateLimitError = buildGatewayRateLimitError(initialResponse.status, attempt, retryAttempts);
+      rateLimitError.retryAfterMs = parseRetryAfterMs(initialResponse.headers.get('retry-after'));
+      throw rateLimitError;
     }
 
     await sleep(retryBaseDelayMs * (2 ** attempt));
@@ -485,7 +926,15 @@ async function executeGatewayProtectedPayment(client, url, requestOptions = {}, 
       path: getGatewayTargetPath(url),
     });
 
-    throw new Error(`Request failed with status ${initialResponse.status}`);
+    const requestError = new Error(`Request failed with status ${initialResponse.status}`);
+    requestError.statusCode = initialResponse.status;
+    requestError.httpStatus = initialResponse.status;
+    requestError.failureSource = 'facilitator_http';
+    requestError.failureStage = 'gateway_protected_resource_initial_request';
+    requestError.retryAfterMs = parseRetryAfterMs(initialResponse.headers.get('retry-after'));
+    requestError.rpcEndpointProven = false;
+    requestError.isArcRpcEndpointError = false;
+    throw requestError;
   }
 
   const paymentRequiredHeader = initialResponse.headers.get('PAYMENT-REQUIRED');
@@ -495,7 +944,14 @@ async function executeGatewayProtectedPayment(client, url, requestOptions = {}, 
       method,
       path: getGatewayTargetPath(url),
     });
-    throw new Error('Missing PAYMENT-REQUIRED header in 402 response');
+    const missingHeaderError = new Error('Missing PAYMENT-REQUIRED header in 402 response');
+    missingHeaderError.statusCode = initialResponse.status;
+    missingHeaderError.httpStatus = initialResponse.status;
+    missingHeaderError.failureSource = 'facilitator_http';
+    missingHeaderError.failureStage = 'gateway_protected_resource_challenge';
+    missingHeaderError.rpcEndpointProven = false;
+    missingHeaderError.isArcRpcEndpointError = false;
+    throw missingHeaderError;
   }
 
   const paymentRequired = JSON.parse(Buffer.from(paymentRequiredHeader, 'base64').toString('utf-8'));
@@ -524,7 +980,15 @@ async function executeGatewayProtectedPayment(client, url, requestOptions = {}, 
       path: getGatewayTargetPath(url),
       error: errorPayload.error || paidResponse.statusText,
     });
-    throw new Error(`Payment failed: ${errorPayload.error || paidResponse.statusText}`);
+    const paymentError = new Error(`Payment failed: ${errorPayload.error || paidResponse.statusText}`);
+    paymentError.statusCode = paidResponse.status;
+    paymentError.httpStatus = paidResponse.status;
+    paymentError.failureSource = 'facilitator_http';
+    paymentError.failureStage = 'gateway_protected_resource_payment';
+    paymentError.retryAfterMs = parseRetryAfterMs(paidResponse.headers.get('retry-after'));
+    paymentError.rpcEndpointProven = false;
+    paymentError.isArcRpcEndpointError = false;
+    throw paymentError;
   }
 
   const data = await paidResponse.json();
@@ -564,22 +1028,37 @@ function getGatewayBuyerSummary() {
 async function waitForGatewayAvailableBalance(client, requiredAtomic, options = {}) {
   const { timeoutMs = 15000, pollIntervalMs = 400 } = options;
   const deadline = Date.now() + timeoutMs;
-  let balances = await readGatewayBalances(client, options.address);
+  let balances = await readGatewayBalances(client, options.address, {
+    chainName: options.chainName,
+    operation: options.operation,
+    trafficClass: options.trafficClass,
+    rpcUrl: options.rpcUrl,
+  });
 
   while (balances.gateway.available < requiredAtomic && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    balances = await readGatewayBalances(client, options.address);
+    balances = await readGatewayBalances(client, options.address, {
+      chainName: options.chainName,
+      operation: options.operation,
+      trafficClass: options.trafficClass,
+      rpcUrl: options.rpcUrl,
+    });
   }
 
   return balances;
 }
 
 async function ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options = {}) {
+  const operation = getGatewayOperationLabel(options.operation || 'gateway_available_balance');
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_PAYMENT);
   const transferAmountAtomic = getAtomicUsdc(amountUsdc);
   const maxFee = resolveGatewayTransferMaxFee(options.maxFee);
   const requiredAtomic = transferAmountAtomic + getAtomicUsdc(maxFee);
   const balances = await readGatewayBalances(client, options.address, {
     chainName: options.chainName || 'Arc Testnet',
+    operation,
+    trafficClass,
+    rpcUrl: options.rpcUrl,
   });
 
   if (balances.gateway.available >= requiredAtomic) {
@@ -595,10 +1074,18 @@ async function ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options
 
   const shortfallAtomic = requiredAtomic - balances.gateway.available;
   const shortfall = ethers.formatUnits(shortfallAtomic, 6);
-  const depositResult = await client.deposit(shortfall);
+  const depositResult = await runGatewayStage({
+    operation,
+    failureStage: 'gateway_available_balance_deposit',
+    failureSource: 'json_rpc',
+    trafficClass,
+    rpcUrl: options.rpcUrl,
+  }, () => client.deposit(shortfall));
   const updatedBalances = await waitForGatewayAvailableBalance(client, requiredAtomic, {
     ...options,
     chainName: options.chainName || 'Arc Testnet',
+    operation,
+    trafficClass,
   });
 
   return {
@@ -614,28 +1101,40 @@ async function ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options
 async function ensureGatewayAvailableBalance(client, amountUsdc, options = {}) {
   const walletAddress = normalizeGatewayWalletAddress(options.walletAddress || options.address);
   const chainName = options.chainName || 'Arc Testnet';
+  const operation = options.operation || 'gateway_available_balance';
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_PAYMENT);
 
   try {
     return await runGatewayProtectedWrite({
       chainName,
       walletAddress,
-      operation: options.operation || 'gateway_available_balance',
+      operation,
       replayFingerprint: options.replayFingerprint || null,
       waitForLockMs: options.waitForLockMs,
       protectedWrite: options.protectedWrite !== false,
     }, () => ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, {
       ...options,
       chainName,
+      operation,
+      trafficClass,
     }));
   } catch (error) {
-    throw toRetryableGatewayError(error, chainName);
+    throw toRetryableGatewayError(error, chainName, {
+      operation,
+      trafficClass,
+    });
   }
 }
 
 async function ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options = {}) {
+  const operation = getGatewayOperationLabel(options.operation || 'gateway_payment_balance');
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_PAYMENT);
   const requiredAtomic = getAtomicUsdc(amountUsdc);
   const balances = await readGatewayBalances(client, options.address, {
     chainName: options.chainName || 'Arc Testnet',
+    operation,
+    trafficClass,
+    rpcUrl: options.rpcUrl,
   });
 
   if (balances.gateway.available >= requiredAtomic) {
@@ -650,10 +1149,18 @@ async function ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options =
 
   const shortfallAtomic = requiredAtomic - balances.gateway.available;
   const shortfall = ethers.formatUnits(shortfallAtomic, 6);
-  const depositResult = await client.deposit(shortfall);
+  const depositResult = await runGatewayStage({
+    operation,
+    failureStage: 'gateway_payment_balance_deposit',
+    failureSource: 'json_rpc',
+    trafficClass,
+    rpcUrl: options.rpcUrl,
+  }, () => client.deposit(shortfall));
   const updatedBalances = await waitForGatewayAvailableBalance(client, requiredAtomic, {
     ...options,
     chainName: options.chainName || 'Arc Testnet',
+    operation,
+    trafficClass,
   });
 
   return {
@@ -668,29 +1175,41 @@ async function ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options =
 async function ensureGatewayPaymentBalance(client, amountUsdc, options = {}) {
   const walletAddress = normalizeGatewayWalletAddress(options.walletAddress || options.address);
   const chainName = options.chainName || 'Arc Testnet';
+  const operation = options.operation || 'gateway_payment_balance';
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_PAYMENT);
 
   try {
     return await runGatewayProtectedWrite({
       chainName,
       walletAddress,
-      operation: options.operation || 'gateway_payment_balance',
+      operation,
       replayFingerprint: options.replayFingerprint || null,
       waitForLockMs: options.waitForLockMs,
       protectedWrite: options.protectedWrite !== false,
     }, () => ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, {
       ...options,
       chainName,
+      operation,
+      trafficClass,
     }));
   } catch (error) {
-    throw toRetryableGatewayError(error, chainName);
+    throw toRetryableGatewayError(error, chainName, {
+      operation,
+      trafficClass,
+    });
   }
 }
 
 async function depositGatewayBalanceUnlocked(client, amountUsdc, options = {}) {
+  const operation = getGatewayOperationLabel(options.operation || 'gateway_deposit');
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_DEPOSIT);
   const amount = normalizeUsdcAmount(amountUsdc);
   const depositAtomic = getAtomicUsdc(amount);
   const balancesBefore = await readGatewayBalances(client, options.address, {
     chainName: options.chainName || 'Arc Testnet',
+    operation,
+    trafficClass,
+    rpcUrl: options.rpcUrl,
   });
 
   if (balancesBefore.wallet.available < depositAtomic) {
@@ -703,11 +1222,19 @@ async function depositGatewayBalanceUnlocked(client, amountUsdc, options = {}) {
     throw error;
   }
 
-  const depositResult = await client.deposit(amount);
+  const depositResult = await runGatewayStage({
+    operation,
+    failureStage: 'gateway_manual_deposit_submission',
+    failureSource: 'json_rpc',
+    trafficClass,
+    rpcUrl: options.rpcUrl,
+  }, () => client.deposit(amount));
   const targetAvailableAtomic = balancesBefore.gateway.available + depositAtomic;
   const balancesAfter = await waitForGatewayAvailableBalance(client, targetAvailableAtomic, {
     ...options,
     chainName: options.chainName || 'Arc Testnet',
+    operation,
+    trafficClass,
   });
 
   return {
@@ -722,21 +1249,28 @@ async function depositGatewayBalanceUnlocked(client, amountUsdc, options = {}) {
 async function depositGatewayBalance(client, amountUsdc, options = {}) {
   const walletAddress = normalizeGatewayWalletAddress(options.walletAddress || options.address);
   const chainName = options.chainName || 'Arc Testnet';
+  const operation = options.operation || 'gateway_deposit';
+  const trafficClass = normalizeGatewayTrafficClass(options.trafficClass || GATEWAY_TRAFFIC_CLASS_DEPOSIT);
 
   try {
     return await runGatewayProtectedWrite({
       chainName,
       walletAddress,
-      operation: options.operation || 'gateway_deposit',
+      operation,
       replayFingerprint: options.replayFingerprint || null,
       waitForLockMs: options.waitForLockMs,
       protectedWrite: options.protectedWrite !== false,
     }, () => depositGatewayBalanceUnlocked(client, amountUsdc, {
       ...options,
       chainName,
+      operation,
+      trafficClass,
     }));
   } catch (error) {
-    throw toRetryableGatewayError(error, chainName);
+    throw toRetryableGatewayError(error, chainName, {
+      operation,
+      trafficClass,
+    });
   }
 }
 
@@ -750,6 +1284,7 @@ async function ensureGatewayWarmBalance(agent, options = {}) {
   }
 
   const chainName = options.chainName || 'Arc Testnet';
+  const operation = options.operation || 'gateway_warm_balance';
   const minAvailableUsdc = normalizeUsdcAmount(
     options.minAvailableUsdc == null ? DEFAULT_GATEWAY_WARM_MIN_AVAILABLE_USDC : options.minAvailableUsdc,
   );
@@ -771,17 +1306,22 @@ async function ensureGatewayWarmBalance(agent, options = {}) {
     return await runGatewayProtectedWrite({
       chainName,
       walletAddress,
-      operation: options.operation || 'gateway_warm_balance',
+      operation,
       replayFingerprint: options.replayFingerprint || null,
       waitForLockMs: options.waitForLockMs == null ? DEFAULT_GATEWAY_AUTO_WARM_LOCK_WAIT_MS : options.waitForLockMs,
       protectedWrite: options.protectedWrite !== false,
     }, async () => withGatewayClientFailover(agent, {
       ...options,
       chainName,
-      operationLabel: options.operation || 'gateway_warm_balance',
-      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
-    }, async (client) => {
-      const balancesBefore = await readGatewayBalances(client, balanceAddress, { chainName });
+      operationLabel: operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_DEPOSIT,
+    }, async (client, rpcUrl) => {
+      const balancesBefore = await readGatewayBalances(client, balanceAddress, {
+        chainName,
+        operation,
+        trafficClass: GATEWAY_TRAFFIC_CLASS_DEPOSIT,
+        rpcUrl,
+      });
       const currentAvailableUsdc = Number(balancesBefore.gateway?.formattedAvailable || 0);
 
     if (Number.isFinite(currentAvailableUsdc) && currentAvailableUsdc >= minAvailableUsdc) {
@@ -829,6 +1369,9 @@ async function ensureGatewayWarmBalance(agent, options = {}) {
         ...options,
         address: balanceAddress,
         chainName,
+        operation,
+        trafficClass: GATEWAY_TRAFFIC_CLASS_DEPOSIT,
+        rpcUrl,
       });
       return {
         attempted: true,
@@ -844,7 +1387,10 @@ async function ensureGatewayWarmBalance(agent, options = {}) {
       };
     }));
   } catch (error) {
-    throw toRetryableGatewayError(error, chainName);
+    throw toRetryableGatewayError(error, chainName, {
+      operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_DEPOSIT,
+    });
   }
 }
 
@@ -864,22 +1410,26 @@ async function payGatewayProtectedResource({
 
   const amount = normalizeUsdcAmount(amountUsdc);
   const walletAddress = resolveAgentGatewayWalletAddress(agent);
+  const operation = 'gateway_protected_resource_pay';
   try {
     return await runGatewayProtectedWrite({
       chainName,
       walletAddress,
-      operation: 'gateway_protected_resource_pay',
+      operation,
       replayFingerprint,
       waitForLockMs,
       protectedWrite,
     }, async () => withGatewayClientFailover(agent, {
       chainName,
-      operationLabel: 'gateway_protected_resource_pay',
-      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
-    }, async (client) => {
+      operationLabel: operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_PAYMENT,
+    }, async (client, rpcUrl) => {
       const funding = await ensureGatewayPaymentBalanceUnlocked(client, amount, {
         address: walletAddress,
         chainName,
+        operation,
+        trafficClass: GATEWAY_TRAFFIC_CLASS_PAYMENT,
+        rpcUrl,
       });
       const payResult = await executeGatewayProtectedPayment(client, url, requestOptions);
 
@@ -893,7 +1443,10 @@ async function payGatewayProtectedResource({
       };
     }));
   } catch (error) {
-    throw toRetryableGatewayError(error, chainName);
+    throw toRetryableGatewayError(error, chainName, {
+      operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_PAYMENT,
+    });
   }
 }
 
@@ -918,32 +1471,42 @@ async function executeGatewayTransfer({
   const amount = normalizeUsdcAmount(amountUsdc);
   const resolvedMaxFee = resolveGatewayTransferMaxFee(maxFee);
   const walletAddress = resolveAgentGatewayWalletAddress(agent);
+  const operation = 'gateway_transfer';
   try {
     const destination = resolveGatewayChainConfig(toChain);
 
     return await runGatewayProtectedWrite({
       chainName: fromChain,
       walletAddress,
-      operation: 'gateway_transfer',
+      operation,
       replayFingerprint: replayFingerprint ?? idempotencyKey ?? null,
       waitForLockMs,
       protectedWrite,
     }, async () => withGatewayClientFailover(agent, {
       chainName: fromChain,
-      operationLabel: 'gateway_transfer',
-      trafficClass: GATEWAY_TRAFFIC_CLASS_WRITE,
-    }, async (client) => {
+      operationLabel: operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_PAYMENT,
+    }, async (client, rpcUrl) => {
       const funding = await ensureGatewayAvailableBalanceUnlocked(client, amount, {
         maxFee: resolvedMaxFee,
         address: walletAddress,
         chainName: fromChain,
+        operation,
+        trafficClass: GATEWAY_TRAFFIC_CLASS_PAYMENT,
+        rpcUrl,
       });
 
-      const transferResult = await client.withdraw(amount, {
+      const transferResult = await runGatewayStage({
+        operation,
+        failureStage: 'gateway_transfer_submission',
+        failureSource: 'unknown',
+        trafficClass: GATEWAY_TRAFFIC_CLASS_PAYMENT,
+        rpcUrl,
+      }, () => client.withdraw(amount, {
         chain: destination.chain,
         recipient,
         maxFee: resolvedMaxFee,
-      });
+      }));
 
       return {
         mode: 'circle_gateway_buyer',
@@ -959,7 +1522,10 @@ async function executeGatewayTransfer({
       };
     }));
   } catch (error) {
-    throw toRetryableGatewayError(error, fromChain);
+    throw toRetryableGatewayError(error, fromChain, {
+      operation,
+      trafficClass: GATEWAY_TRAFFIC_CLASS_PAYMENT,
+    });
   }
 }
 

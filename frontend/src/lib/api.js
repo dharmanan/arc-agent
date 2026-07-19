@@ -44,8 +44,12 @@ async function request(method, path, body) {
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(data.error || `HTTP ${res.status}`);
+    const err = new Error(data.error || data.message || `HTTP ${res.status}`);
     err.status = res.status;
+    err.code = data.errorCode || data.code || null;
+    err.retryAfterMs = data.retryAfterMs ?? null;
+    err.retryAt = data.retryAt ?? null;
+    err.responseStatus = data.status || null;
     err.data = data;
     throw err;
   }

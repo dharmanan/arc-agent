@@ -7,6 +7,12 @@ import { useAgent } from '../providers/AgentProvider.jsx';
 import {
   Card, Alert, AddressBox, Spinner, Button, SectionHeader,
 } from './ui/index.jsx';
+import {
+  parseDeferredManualGatewayFundError,
+  shouldRecordManualGatewayFundSuccess,
+  isRetryCooldownActive,
+  isArcRpcDeferredManualFund,
+} from '../lib/gatewayFundingState.js';
 
 function formatTimestamp(value) {
   if (!value) return '—';
@@ -360,6 +366,8 @@ export default function OracleTab() {
   const [gatewayFundLoading, setGatewayFundLoading] = useState(false);
   const [gatewayFundError, setGatewayFundError] = useState('');
   const [gatewayFundResult, setGatewayFundResult] = useState(null);
+  const [gatewayFundDeferred, setGatewayFundDeferred] = useState(null);
+  const [gatewayFundRetryClockMs, setGatewayFundRetryClockMs] = useState(() => Date.now());
   const gatewayAutoTopupEnabled = agent?.settings?.gatewayAutoTopupEnabled !== false;
   const gatewayAutoTopupMinUsdc = Math.max(Number(agent?.settings?.gatewayAutoTopupMinUsdc || 1), 1);
   const gatewayAutoTopupTargetUsdc = Math.max(Number(agent?.settings?.gatewayAutoTopupTargetUsdc || 3), gatewayAutoTopupMinUsdc);
@@ -385,6 +393,7 @@ export default function OracleTab() {
       setGatewayBalanceError('');
       setGatewayFundError('');
       setGatewayFundResult(null);
+      setGatewayFundDeferred(null);
       return;
     }
 
@@ -408,16 +417,33 @@ export default function OracleTab() {
     setGatewayFundLoading(true);
     setGatewayFundError('');
     setGatewayFundResult(null);
+    setGatewayFundDeferred(null);
 
     try {
       const data = await oracleApi.fundGateway(agent.id, { amountUsdc: MANUAL_GATEWAY_FUND_USDC });
-      setGatewayBalance(data);
-      setGatewayFundResult({
-        amountUsdc: data.amountUsdc,
-        approvalTxHash: data.deposit?.approvalTxHash || null,
-        depositTxHash: data.deposit?.depositTxHash || null,
-      });
+      const approvalTxHash = data.deposit?.approvalTxHash || null;
+      const depositTxHash = data.deposit?.depositTxHash || null;
+      const fundingSubmitted = shouldRecordManualGatewayFundSuccess(data);
+
+      if (fundingSubmitted) {
+        setGatewayBalance(data);
+        setGatewayFundResult({
+          amountUsdc: data.amountUsdc,
+          approvalTxHash,
+          depositTxHash,
+        });
+      } else {
+        setGatewayFundError('Gateway funding was not confirmed. No deposit transaction was submitted.');
+      }
     } catch (error) {
+      const deferredState = parseDeferredManualGatewayFundError(error);
+
+      if (deferredState?.status === 'deferred') {
+        setGatewayFundDeferred(deferredState);
+        setGatewayFundError('');
+        return;
+      }
+
       setGatewayFundError(error.message || 'Failed to fund Gateway balance');
     } finally {
       setGatewayFundLoading(false);
@@ -436,6 +462,16 @@ export default function OracleTab() {
   useEffect(() => {
     void loadGatewayBalance();
   }, [loadGatewayBalance]);
+
+  useEffect(() => {
+    if (!gatewayFundDeferred?.retryAt) return undefined;
+
+    const intervalId = setInterval(() => {
+      setGatewayFundRetryClockMs(Date.now());
+    }, 1000);
+
+    return () => clearInterval(intervalId);
+  }, [gatewayFundDeferred?.retryAt]);
 
   const warnings = useMemo(() => getOracleWarnings(oracleOverview), [oracleOverview]);
   const hasWarnings = warnings.length > 0;
@@ -464,6 +500,9 @@ export default function OracleTab() {
   const canManualFundGateway = walletAvailableForManualFund != null
     && walletAvailableForManualFund >= Number(MANUAL_GATEWAY_FUND_USDC)
     && !gatewayBalanceTemporarilyUnavailable;
+  const manualFundRetryCooldownActive = isRetryCooldownActive(gatewayFundDeferred?.retryAt, gatewayFundRetryClockMs);
+  const manualFundButtonDisabled = !canManualFundGateway || gatewayFundLoading || manualFundRetryCooldownActive;
+  const showGatewayFundDeferredMessage = isArcRpcDeferredManualFund(gatewayFundDeferred);
   const statusLabel = oracleError ? 'Needs attention' : hasWarnings ? 'Warnings' : 'Live';
   const statusClasses = oracleError
     ? 'border-red-200 bg-red-50 text-red-700'
@@ -1056,13 +1095,18 @@ export default function OracleTab() {
                         variant="outline"
                         onClick={handleManualGatewayFund}
                         loading={gatewayFundLoading}
-                        disabled={!canManualFundGateway}
+                        disabled={manualFundButtonDisabled}
                         className="px-4 py-2"
                       >
                         Fund Gateway +{MANUAL_GATEWAY_FUND_USDC} USDC
                       </Button>
                     </div>
-                    {!canManualFundGateway && (
+                    {manualFundRetryCooldownActive && gatewayFundDeferred?.retryAt && (
+                      <p className="mt-2 text-xs text-amber-700">
+                        Manual Gateway funding is temporarily paused until {formatTimestamp(gatewayFundDeferred.retryAt)}.
+                      </p>
+                    )}
+                    {!manualFundRetryCooldownActive && !canManualFundGateway && (
                       <p className="mt-2 text-xs text-amber-700">
                         {gatewayBalanceTemporarilyUnavailable
                           ? 'Gateway balances are temporarily unavailable while Arc RPC cools down. Manual pre-fund is disabled until balance reads recover.'
@@ -1070,6 +1114,18 @@ export default function OracleTab() {
                       </p>
                     )}
                   </div>
+
+                  {showGatewayFundDeferredMessage && (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+                      <p className="text-sm font-semibold">Gateway funding temporarily unavailable</p>
+                      <p className="mt-1 leading-5">
+                        The {MANUAL_GATEWAY_FUND_USDC} USDC deposit was not submitted because the configured Gateway transaction endpoints are currently rate limited. Existing balances are unchanged. Automatic top-up and payment settlement will retry through their normal schedules.
+                      </p>
+                      {gatewayFundDeferred?.retryAt && (
+                        <p className="mt-2 text-[11px] text-amber-700">Retry at: {formatTimestamp(gatewayFundDeferred.retryAt)}</p>
+                      )}
+                    </div>
+                  )}
 
                   <div className="grid gap-2 sm:grid-cols-2">
                     <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500 space-y-1.5">
