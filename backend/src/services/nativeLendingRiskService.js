@@ -1067,13 +1067,14 @@ function evaluateLiquidationOpportunity({ liquidatorSurface, borrowerSurface, de
   };
 }
 
-async function buildLendingSurfaceForWallet(walletAddress) {
+async function buildLendingSurfaceForWallet(walletAddress, options = {}) {
+  const trafficClass = String(options?.trafficClass || 'user_read').trim() || 'user_read';
   const supportedAssets = _getSupportedAssets();
   const provider = new ethers.JsonRpcProvider(_getArcRpcUrl());
 
   const [overview, accountOverview, priceSnapshot, walletBalances] = await Promise.all([
-    nativeLending.getNativeLendingOverview(),
-    nativeLending.getNativeLendingAccountOverview(walletAddress),
+    nativeLending.getNativeLendingOverview({ trafficClass }),
+    nativeLending.getNativeLendingAccountOverview(walletAddress, { trafficClass }),
     getLendingPriceSnapshot(supportedAssets.map((asset) => asset.symbol)),
     Promise.all(supportedAssets.map((asset) => _readWalletBalance(provider, walletAddress, asset))),
   ]);
@@ -1547,7 +1548,8 @@ async function guardAgentLiquidationAction({ agent, borrower, debtAsset, collate
   };
 }
 
-async function _buildCarrySnapshotForAgent(agent, surface) {
+async function _buildCarrySnapshotForAgent(agent, surface, options = {}) {
+  const trafficClass = String(options?.trafficClass || 'user_read').trim() || 'user_read';
   try {
     const stablePool = oracle.resolveCurvePool('USDC-EURC');
     const stablePricingPool = oracle.resolveCurvePool('EURC-USDC');
@@ -1555,6 +1557,7 @@ async function _buildCarrySnapshotForAgent(agent, surface) {
       oracle.getForexRate('EURC', 'USDC'),
       positionsService.getWalletPositions(agent.walletAddress, {
         poolKeys: [stablePool?.key].filter(Boolean),
+        trafficClass,
       }),
     ]);
     const stablePosition = Array.isArray(positionSnapshot?.positions)
@@ -1589,9 +1592,10 @@ async function _buildCarrySnapshotForAgent(agent, surface) {
   }
 }
 
-async function _buildAgentLendingSurfacePayload(agent) {
-  const surface = await buildLendingSurfaceForWallet(agent.walletAddress);
-  const carry = await _buildCarrySnapshotForAgent(agent, surface);
+async function _buildAgentLendingSurfacePayload(agent, options = {}) {
+  const trafficClass = String(options?.trafficClass || 'user_read').trim() || 'user_read';
+  const surface = await buildLendingSurfaceForWallet(agent.walletAddress, { trafficClass });
+  const carry = await _buildCarrySnapshotForAgent(agent, surface, { trafficClass });
 
   return {
     ...surface,
@@ -1609,7 +1613,7 @@ function _scheduleLendingSurfaceRefresh(agent) {
 
   const refreshPromise = (async () => {
     const payload = await withTimeout(
-      _buildAgentLendingSurfacePayload(agent),
+      _buildAgentLendingSurfacePayload(agent, { trafficClass: 'background_read' }),
       getBackgroundRefreshTimeoutMs(),
       'lending surface refresh timed out',
     );

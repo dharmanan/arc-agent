@@ -695,6 +695,7 @@ async function executeCurveLiquidityRemoveTask({ agent, params = {}, dryRun = fa
   const liveBalanceRead = await positionsService.readCurveLiveLpBalance(agent?.wallet_address, curvePool.address, {
     decimals: CURVE_LP_DECIMALS,
     label: 'curve_remove_live_lp_balance',
+    trafficClass: 'transaction',
   });
   if (!liveBalanceRead?.ok) {
     return {
@@ -864,6 +865,7 @@ async function executeCurveLiquidityRemoveBalancedTask({ agent, params = {}, dry
   const liveBalanceRead = await positionsService.readCurveLiveLpBalance(agent?.wallet_address, curvePool.address, {
     decimals: CURVE_LP_DECIMALS,
     label: 'curve_remove_balanced_live_lp_balance',
+    trafficClass: 'transaction',
   });
   if (!liveBalanceRead?.ok) {
     return {

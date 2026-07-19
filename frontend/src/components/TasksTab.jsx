@@ -12,6 +12,10 @@ import {
 } from 'lucide-react';
 import { CHAINS } from '../lib/chains.js';
 import ReputationProofModal from './ReputationProofModal.jsx';
+import {
+  getOnchainReputationLabelValue,
+  getOnchainReputationMessageValue,
+} from './reputationViewModel.js';
 
 const AUTOMATION_SNAPSHOT_TOLERANCE_MS = 60 * 1000;
 const CARRY_STALE_STATUSES = new Set(['fetch_error', 'decision_error']);
@@ -2871,33 +2875,11 @@ function formatReputationEventType(eventType) {
 }
 
 function getOnchainReputationLabel(onchain) {
-  switch (onchain?.status) {
-    case 'live':
-      return 'On-chain live';
-    case 'identity_required':
-      return 'Identity required';
-    case 'token_missing':
-      return 'Token missing';
-    case 'read_error':
-      return 'Read error';
-    default:
-      return 'Local only';
-  }
+  return getOnchainReputationLabelValue(onchain);
 }
 
 function getOnchainReputationMessage(onchain) {
-  switch (onchain?.status) {
-    case 'live':
-      return 'Reputation writes are mirrored on-chain and can be read back from the registry.';
-    case 'identity_required':
-      return 'Register the agent identity first so reputation can be attached to an ERC-8004 token.';
-    case 'token_missing':
-      return 'Identity is marked registered, but no ERC-8004 token id was found on the agent record.';
-    case 'read_error':
-      return 'The registry address is configured, but the current on-chain score could not be read.';
-    default:
-      return 'Events are still counted locally even while the registry is not configured.';
-  }
+  return getOnchainReputationMessageValue(onchain, formatTimestamp);
 }
 
 function getCurveStableTokenLabel(index) {
@@ -3850,12 +3832,26 @@ function getReputationSetupItems(reputationOverview) {
     {
       key: 'registry',
       title: 'Registry relay',
-      status: !onchain.configured ? 'Local only' : onchain.status === 'read_error' ? 'Needs attention' : 'Connected',
-      tone: !onchain.configured ? 'amber' : onchain.status === 'read_error' ? 'red' : 'green',
+      status: !onchain.configured
+        ? 'Local only'
+        : onchain.status === 'read_error'
+          ? 'Needs attention'
+          : onchain.status === 'cached'
+            ? 'Cached'
+            : 'Connected',
+      tone: !onchain.configured
+        ? 'amber'
+        : onchain.status === 'read_error'
+          ? 'red'
+          : onchain.status === 'cached'
+            ? 'amber'
+            : 'green',
       detail: !onchain.configured
         ? 'Reputation still works locally, but score is not mirrored on-chain yet.'
         : onchain.status === 'read_error'
           ? 'Registry is configured, but the current on-chain score could not be read.'
+          : onchain.status === 'cached'
+            ? 'Showing the last confirmed on-chain score while live registry reads recover.'
           : 'Arc reputation registry is configured for score reads and writes.',
     },
   ];
@@ -3867,7 +3863,11 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
   const onchain = reputationOverview?.onchain || {};
   const hasOverview = hasReputationOverviewPayload(reputationOverview);
   const modeLabel = hasOverview
-    ? (reputationOverview?.mode === 'hybrid' ? 'Local + On-Chain' : 'Local Only')
+    ? (reputationOverview?.mode === 'hybrid'
+      ? 'Local + On-Chain'
+      : reputationOverview?.mode === 'hybrid_cached'
+        ? 'Local + On-Chain (Cached)'
+        : 'Local Only')
     : 'Loading';
   const trackingEnabled = hasOverview ? Boolean(reputationOverview?.reputationEnabled) : null;
   const registryExplorerUrl = onchain.contractAddress
@@ -3942,10 +3942,15 @@ function ReputationHeroCard({ reputationOverview, trackingBusy, onToggleTracking
         <div className="rounded-xl border border-slate-200 bg-white/80 px-4 py-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">On-Chain Score</p>
           <p className="mt-1 text-2xl font-semibold text-slate-900">
-            {hasOverview && onchain.status === 'live' ? Number(onchain.score || 0) : '—'}
+            {hasOverview && (onchain.status === 'live' || onchain.status === 'cached') ? Number(onchain.score || 0) : '—'}
           </p>
+          {hasOverview && onchain.status === 'cached' && (
+            <span className="mt-1 inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+              Cached{onchain.cachedAt ? ` · Last confirmed ${formatTimestamp(onchain.cachedAt)}` : ''}
+            </span>
+          )}
           <p className="text-xs text-slate-500">{hasOverview ? getOnchainReputationMessage(onchain) : (fetchError || (isLoading ? 'Reputation snapshot is loading.' : 'Reputation snapshot is unavailable right now.'))}</p>
-          {hasOverview && onchain.status === 'live' && agentId && (
+          {hasOverview && (onchain.status === 'live' || onchain.status === 'cached') && agentId && (
             <button
               type="button"
               onClick={() => setProofOpen(true)}

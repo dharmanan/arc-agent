@@ -101,8 +101,8 @@ function buildExecutionReadState({
   };
 }
 
-function getProvider() {
-  return getHealthyArcRpcProvider('positions_provider');
+function getProvider(trafficClass = 'user_read') {
+  return getHealthyArcRpcProvider('positions_provider', { trafficClass });
 }
 
 function formatUnits(value, decimals) {
@@ -291,6 +291,7 @@ function invalidateWalletPositionCache(walletAddress, {
 async function readCurveLiveLpBalance(walletAddress, poolAddress, {
   decimals = 18,
   label = 'positions_curve_live_lp',
+  trafficClass = 'user_read',
 } = {}) {
   const checkedAt = new Date().toISOString();
   const baseExecutionRead = buildExecutionReadState({
@@ -310,7 +311,7 @@ async function readCurveLiveLpBalance(walletAddress, poolAddress, {
     };
   }
 
-  const provider = getHealthyArcRpcProvider(label);
+  const provider = getHealthyArcRpcProvider(label, { trafficClass });
   if (!provider) {
     return {
       ok: false,
@@ -337,7 +338,7 @@ async function readCurveLiveLpBalance(walletAddress, poolAddress, {
     };
   } catch (error) {
     if (isArcRpcRateLimitError(error)) {
-      markArcRpcEndpointUnhealthy(null, error, label);
+      markArcRpcEndpointUnhealthy(null, error, label, { trafficClass });
       return {
         ok: false,
         reason: 'live_lp_balance_unavailable',
@@ -383,7 +384,7 @@ function scheduleAgentPositionRefresh(agent) {
 
   const refreshPromise = (async () => {
     const refreshedSnapshot = await withTimeout(
-      getWalletPositions(agent.wallet_address),
+      getWalletPositions(agent.wallet_address, { trafficClass: 'background_read' }),
       getBackgroundRefreshTimeoutMs(),
       'positions refresh timed out',
     );
@@ -402,18 +403,18 @@ function scheduleAgentPositionRefresh(agent) {
   return true;
 }
 
-async function runWalletPositionsRead(walletAddress, { poolKeys } = {}) {
+async function runWalletPositionsRead(walletAddress, { poolKeys, trafficClass = 'user_read' } = {}) {
   const snapshotCacheKey = buildPositionSnapshotCacheKey(walletAddress, poolKeys);
-  const provider = getProvider();
+  const provider = getProvider(trafficClass);
   const trackedPools = dedupeTrackedCurvePools(poolKeys);
   const trackedDirectPairs = filterTrackedDirectPairPools(poolKeys);
 
   const settled = await Promise.allSettled(
-    trackedPools.map(pool => readCurvePosition(provider, walletAddress, pool)),
+    trackedPools.map(pool => readCurvePosition(provider, walletAddress, pool, { trafficClass })),
   );
 
   const directSettled = await Promise.allSettled(
-    trackedDirectPairs.map(pool => readDirectPairPosition(provider, walletAddress, pool)),
+    trackedDirectPairs.map(pool => readDirectPairPosition(provider, walletAddress, pool, { trafficClass })),
   );
 
   const rawPositions = settled
@@ -663,7 +664,7 @@ function filterTrackedDirectPairPools(poolKeys = []) {
   return getTrackedDirectPairPools().filter(pool => normalizedKeys.includes(String(pool.key || '').toUpperCase()));
 }
 
-async function getWalletPositions(walletAddress, { poolKeys } = {}) {
+async function getWalletPositions(walletAddress, { poolKeys, trafficClass = 'user_read' } = {}) {
   if (!walletAddress) {
     return {
       walletAddress: null,
@@ -692,7 +693,7 @@ async function getWalletPositions(walletAddress, { poolKeys } = {}) {
     return inflight;
   }
 
-  const readPromise = runWalletPositionsRead(walletAddress, { poolKeys })
+  const readPromise = runWalletPositionsRead(walletAddress, { poolKeys, trafficClass })
     .catch((error) => {
       const staleCache = readCachedPositionSnapshot(snapshotCacheKey);
       if (staleCache) {
@@ -728,7 +729,7 @@ function getTokenMetaForAddress(pool, address) {
   return null;
 }
 
-async function readDirectPairPosition(provider, walletAddress, pool) {
+async function readDirectPairPosition(provider, walletAddress, pool, { trafficClass = 'user_read' } = {}) {
   const readResult = await safeArcRpcCall('positions_direct_pair_read', async () => {
     const contract = new ethers.Contract(pool.address, V2_PAIR_POSITION_ABI, provider);
     const [lpBalanceRaw, totalSupplyRaw, token0, token1, reserves] = await Promise.all([
@@ -740,7 +741,7 @@ async function readDirectPairPosition(provider, walletAddress, pool) {
     ]);
 
     return { lpBalanceRaw, totalSupplyRaw, token0, token1, reserves };
-  }, null);
+  }, null, { trafficClass });
 
   if (!readResult) {
     return null;
@@ -796,7 +797,7 @@ async function readDirectPairPosition(provider, walletAddress, pool) {
   };
 }
 
-async function readCurvePosition(provider, walletAddress, pool) {
+async function readCurvePosition(provider, walletAddress, pool, { trafficClass = 'user_read' } = {}) {
   const readResult = await safeArcRpcCall('positions_curve_read', async () => {
     const contract = new ethers.Contract(pool.address, CURVE_POSITION_ABI, provider);
     const [lpBalanceRaw, totalSupplyRaw, reserve0Raw, reserve1Raw, virtualPriceRaw] = await Promise.all([
@@ -808,7 +809,7 @@ async function readCurvePosition(provider, walletAddress, pool) {
     ]);
 
     return { lpBalanceRaw, totalSupplyRaw, reserve0Raw, reserve1Raw, virtualPriceRaw };
-  }, null);
+  }, null, { trafficClass });
 
   if (!readResult) {
     return null;

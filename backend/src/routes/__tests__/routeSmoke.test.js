@@ -291,10 +291,9 @@ function loadOracleHarness() {
     getGatewayFacilitatorSummary: jest.fn(() => ({ configured: true })),
   }));
   jest.doMock('../../services/agenticEconomy/gatewayBuyer', () => ({
-    depositGatewayBalance: jest.fn(),
+    depositGatewayBalanceForAgent: jest.fn(),
     getAgentGatewayBalances: jest.fn(),
     getGatewayBuyerSummary: jest.fn(() => ({ configured: true })),
-    createGatewayClientForAgent: jest.fn(),
   }));
   jest.doMock('../../services/agenticEconomy/taskEconomyService', () => ({
     getTaskEconomyConfigSummary: jest.fn(() => ({ mode: 'task_fee' })),

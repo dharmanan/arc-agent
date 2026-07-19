@@ -149,6 +149,23 @@ CREATE TABLE IF NOT EXISTS agent_read_snapshots (
 CREATE INDEX IF NOT EXISTS idx_agent_read_snapshots_agent_kind_updated
   ON agent_read_snapshots(agent_id, kind, updated_at DESC);
 
+-- allow reputation snapshot payloads for display-only on-chain score fallback
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'agent_read_snapshots_kind_check'
+      AND conrelid = 'agent_read_snapshots'::regclass
+  ) THEN
+    ALTER TABLE agent_read_snapshots DROP CONSTRAINT agent_read_snapshots_kind_check;
+  END IF;
+END $$;
+
+ALTER TABLE agent_read_snapshots
+  ADD CONSTRAINT agent_read_snapshots_kind_check
+  CHECK (kind IN ('positions', 'lending', 'status', 'reputation'));
+
 -- ── Migrations (idempotent) ───────────────────────────────────────────────────
 -- Add private_key_encrypted if the column was missing from an earlier schema
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_key_encrypted TEXT;

@@ -1192,7 +1192,9 @@ async function processRetryIntent(options = {}) {
     return { ok: true, reconciled: true, status: 'confirmed' };
   }
 
-  const healthyArcRpcUrl = getHealthyArcRpcUrl('payment_retry_preflight');
+  const healthyArcRpcUrl = getHealthyArcRpcUrl('payment_retry_preflight', {
+    trafficClass: 'transaction',
+  });
   if (!healthyArcRpcUrl) {
     const nextAttemptAt = computeNextAttemptAt(intent.attempt_count, {
       jitterFn,

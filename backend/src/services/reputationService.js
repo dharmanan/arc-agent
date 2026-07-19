@@ -10,11 +10,13 @@
 const { ethers } = require('ethers');
 const {
   safeArcRpcCall,
-  getArcRpcUrl,
-  createArcRpcProvider,
   isArcRpcRateLimitError,
 } = require('./arcProvider');
-const { getUserReadTimeoutMs } = require('./agentReadSnapshotService');
+const {
+  SNAPSHOT_KINDS,
+  saveAgentReadSnapshot,
+  loadAgentReadSnapshot,
+} = require('./agentReadSnapshotService');
 const db          = require('../db');
 const { sendProtectedContractTx } = require('./txSecurityService');
 
@@ -67,16 +69,14 @@ const REPUTATION_CHAIN_REPLAY_EVENTS = new Set([
   EVENT_TYPES.DEFI_LOOP,
   EVENT_TYPES.DAILY_TASK,
 ]);
-const REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS = readPositiveIntegerEnv(
-  'REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS',
-  getUserReadTimeoutMs(),
-);
-const ARC_TESTNET_NETWORK = { chainId: 5042002, name: 'Arc Testnet' };
+const REPUTATION_OVERVIEW_ONCHAIN_READ_DEFAULT_TIMEOUT_MS = 3000;
+const REPUTATION_OVERVIEW_ONCHAIN_READ_MIN_TIMEOUT_MS = 2000;
 const REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS = (() => {
   const parsed = Number.parseInt(process.env.REPUTATION_ONCHAIN_WRITE_MIN_INTERVAL_MS || '', 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
 })();
 let reputationOnchainDispatchTail = Promise.resolve();
+let loggedReputationOverviewTimeout = false;
 
 function readPositiveIntegerEnv(name, fallback) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
@@ -97,7 +97,9 @@ function delay(ms) {
 }
 
 async function withSoftTimeout(promise, timeoutMs, fallbackValue = null) {
-  const durationMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : getUserReadTimeoutMs();
+  const durationMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : getReputationOverviewReadTimeoutMs();
 
   return new Promise((resolve) => {
     let settled = false;
@@ -221,12 +223,77 @@ function isRetryableRpcProviderError(error) {
   return /timeout|temporarily unavailable|socket hang up|connection reset|service unavailable|bad gateway|gateway timeout|503|504/i.test(message);
 }
 
-async function withArcRpcFailover(operationLabel, execute, fallbackValue) {
-  const fallbackProvided = arguments.length >= 3;
+async function withArcRpcFailover(operationLabel, execute, options = {}) {
+  const trafficClass = String(options?.trafficClass || 'reputation_read').trim() || 'reputation_read';
+  const fallbackProvided = options?.fallbackProvided === true;
+  const fallbackValue = options?.fallbackValue;
+  const arcOptions = { trafficClass };
 
-  return safeArcRpcCall(`reputation_${operationLabel}`, async (provider, rpcUrl) => (
-    execute({ provider, rpcUrl, index: 0, total: 1 })
-  ), fallbackProvided ? fallbackValue : undefined);
+  if (fallbackProvided) {
+    return safeArcRpcCall(
+      `reputation_${operationLabel}`,
+      async (provider, rpcUrl) => execute({ provider, rpcUrl, index: 0, total: 1 }),
+      fallbackValue,
+      arcOptions,
+    );
+  }
+
+  return safeArcRpcCall(
+    `reputation_${operationLabel}`,
+    async (provider, rpcUrl) => execute({ provider, rpcUrl, index: 0, total: 1 }),
+    arcOptions,
+  );
+}
+
+function getReputationOverviewReadTimeoutMs() {
+  const configured = readPositiveIntegerEnv(
+    'REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS',
+    REPUTATION_OVERVIEW_ONCHAIN_READ_DEFAULT_TIMEOUT_MS,
+  );
+  const effective = Math.max(configured, REPUTATION_OVERVIEW_ONCHAIN_READ_MIN_TIMEOUT_MS);
+
+  if (!loggedReputationOverviewTimeout) {
+    loggedReputationOverviewTimeout = true;
+    if (effective !== configured) {
+      console.warn(
+        `[REPUTATION] REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS=${configured} is below the safe minimum. Using ${effective}ms.`,
+      );
+    } else {
+      console.info(`[REPUTATION] overview on-chain read timeout set to ${effective}ms.`);
+    }
+  }
+
+  return effective;
+}
+
+function buildReputationSnapshotPayload({ score, tokenId, contractAddress }) {
+  return {
+    score: Number(score),
+    tokenId: tokenId == null ? null : String(tokenId),
+    contractAddress: contractAddress || null,
+    checkedAt: new Date().toISOString(),
+    source: 'live_rpc',
+  };
+}
+
+async function persistReputationSnapshot(agentId, payload) {
+  if (!agentId || !payload) return;
+
+  const persisted = await saveAgentReadSnapshot(agentId, SNAPSHOT_KINDS.REPUTATION, payload);
+  if (!persisted) {
+    console.warn(`[REPUTATION] failed to persist reputation snapshot agent=${agentId}`);
+  }
+}
+
+async function loadReputationSnapshot(agentId) {
+  if (!agentId) return null;
+
+  const snapshot = await loadAgentReadSnapshot(agentId, SNAPSHOT_KINDS.REPUTATION, {
+    freshTtlMs: Number.MAX_SAFE_INTEGER,
+    staleTtlMs: Number.MAX_SAFE_INTEGER,
+  });
+
+  return snapshot?.payload || null;
 }
 
 function isProtectedTxThrottleError(error) {
@@ -440,6 +507,9 @@ async function recordReputationEvent(agentId, eventType) {
           rpcUrl: selectedRpcUrl,
         };
       },
+      {
+        trafficClass: 'reputation_write',
+      },
     );
     console.log(
       `[REPUTATION] Recorded on-chain agent=${agentId} event=${eventType} delta=+${scoreDelta} tx=${txHash || 'unknown'} rpc=${describeRpcUrl(rpcUrl)}`,
@@ -509,7 +579,11 @@ async function getReputationOverview(agentId, userId, limit = 10) {
     identityRegistered: agent.erc8004_status === 'registered',
     score: null,
     status: 'not_configured',
+    cachedAt: null,
+    stale: false,
   };
+
+  const cachedSnapshot = await loadReputationSnapshot(agentId);
 
   if (onchain.configured && onchain.identityRegistered && onchain.tokenId) {
     try {
@@ -520,20 +594,47 @@ async function getReputationOverview(agentId, userId, limit = 10) {
             const registry = new ethers.Contract(REPUTATION_REGISTRY_ADDRESS, REPUTATION_REGISTRY_ABI, provider);
             return registry.getScore(BigInt(onchain.tokenId));
           },
+          {
+            trafficClass: 'reputation_read',
+          },
         ),
-        REPUTATION_OVERVIEW_ONCHAIN_READ_TIMEOUT_MS,
+        getReputationOverviewReadTimeoutMs(),
         null,
       );
 
       if (score == null) {
-        onchain.status = 'read_error';
+        if (cachedSnapshot && Number.isFinite(Number(cachedSnapshot.score))) {
+          onchain.status = 'cached';
+          onchain.score = Number(cachedSnapshot.score);
+          onchain.cachedAt = cachedSnapshot.checkedAt || null;
+          onchain.stale = true;
+        } else {
+          onchain.status = 'read_error';
+        }
       } else {
         onchain.score = Number(score);
         onchain.status = 'live';
+        onchain.cachedAt = null;
+        onchain.stale = false;
+        await persistReputationSnapshot(
+          agentId,
+          buildReputationSnapshotPayload({
+            score: onchain.score,
+            tokenId: onchain.tokenId,
+            contractAddress: onchain.contractAddress,
+          }),
+        );
       }
     } catch (err) {
       console.error(`[REPUTATION] On-chain read error agent=${agentId}:`, err.message);
-      onchain.status = 'read_error';
+      if (cachedSnapshot && Number.isFinite(Number(cachedSnapshot.score))) {
+        onchain.status = 'cached';
+        onchain.score = Number(cachedSnapshot.score);
+        onchain.cachedAt = cachedSnapshot.checkedAt || null;
+        onchain.stale = true;
+      } else {
+        onchain.status = 'read_error';
+      }
     }
   } else if (onchain.configured && !onchain.identityRegistered) {
     onchain.status = 'identity_required';
@@ -547,7 +648,11 @@ async function getReputationOverview(agentId, userId, limit = 10) {
     reputationEnabled: Boolean(agent.reputation_enabled),
     localScore: Number(summaryRow.local_score || 0),
     totalEvents: Number(summaryRow.total_events || 0),
-    mode: onchain.status === 'live' ? 'hybrid' : 'local_only',
+    mode: onchain.status === 'live'
+      ? 'hybrid'
+      : onchain.status === 'cached'
+        ? 'hybrid_cached'
+        : 'local_only',
     onchain,
     breakdown: breakdownResult.rows.map(row => ({
       eventType: row.event_type,
@@ -629,7 +734,11 @@ async function getReputationProof(agentId, userId) {
           registry: selectedRegistry,
         };
       },
-      null,
+      {
+        fallbackProvided: true,
+        fallbackValue: null,
+        trafficClass: 'reputation_read',
+      },
     );
 
     if (!liveRead) {

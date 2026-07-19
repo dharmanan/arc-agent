@@ -6,7 +6,11 @@ const SNAPSHOT_KINDS = Object.freeze({
   POSITIONS: 'positions',
   LENDING: 'lending',
   STATUS: 'status',
+  REPUTATION: 'reputation',
 });
+
+const BACKGROUND_REFRESH_TIMEOUT_MIN_MS = 10000;
+let loggedBackgroundRefreshTimeout = false;
 
 function readPositiveIntegerEnv(name, fallback) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
@@ -26,7 +30,21 @@ function getUserReadTimeoutMs() {
 }
 
 function getBackgroundRefreshTimeoutMs() {
-  return readPositiveIntegerEnv('ARC_RPC_BACKGROUND_REFRESH_TIMEOUT_MS', 10000);
+  const configured = readPositiveIntegerEnv('ARC_RPC_BACKGROUND_REFRESH_TIMEOUT_MS', BACKGROUND_REFRESH_TIMEOUT_MIN_MS);
+  const effective = Math.max(configured, BACKGROUND_REFRESH_TIMEOUT_MIN_MS);
+
+  if (!loggedBackgroundRefreshTimeout) {
+    loggedBackgroundRefreshTimeout = true;
+    if (effective !== configured) {
+      console.warn(
+        `[ARC_RPC] ARC_RPC_BACKGROUND_REFRESH_TIMEOUT_MS=${configured} is below the safe minimum. Using ${effective}ms.`,
+      );
+    } else {
+      console.info(`[ARC_RPC] background refresh timeout set to ${effective}ms.`);
+    }
+  }
+
+  return effective;
 }
 
 function normalizeSnapshotKind(kind) {

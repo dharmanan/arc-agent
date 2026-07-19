@@ -165,7 +165,8 @@ async function approveIfNeeded(tokenAddress, signer, spender, amountRaw, txSecur
   }
 }
 
-async function readConfiguredReserveSnapshots(contract, requestState = makeRequestCycleState()) {
+async function readConfiguredReserveSnapshots(contract, requestState = makeRequestCycleState(), options = {}) {
+  const trafficClass = String(options?.trafficClass || 'user_read').trim() || 'user_read';
   const contractAddress = getArcLendingPoolAddress();
   const now = Date.now();
 
@@ -188,7 +189,7 @@ async function readConfiguredReserveSnapshots(contract, requestState = makeReque
   const count = await memoizedRead(requestState, 'native_lending_supported_asset_count', () => (
     safeArcRpcCall('native_lending_supported_asset_count', async () => (
       contract.supportedAssetCount()
-    ), null)
+    ), null, { trafficClass })
   ));
   if (count == null) {
     throw new Error('Arc RPC unavailable for supportedAssetCount');
@@ -200,7 +201,7 @@ async function readConfiguredReserveSnapshots(contract, requestState = makeReque
     const assetAddress = await memoizedRead(requestState, `native_lending_supported_asset_at:${index}`, () => (
       safeArcRpcCall('native_lending_supported_asset_at', async () => (
         contract.supportedAssetAt(index)
-      ), null)
+      ), null, { trafficClass })
     ));
     if (!assetAddress) {
       throw new Error('Arc RPC unavailable for supportedAssetAt');
@@ -209,12 +210,12 @@ async function readConfiguredReserveSnapshots(contract, requestState = makeReque
     const config = await memoizedRead(requestState, `native_lending_reserve_config:${assetAddress.toLowerCase()}`, () => (
       safeArcRpcCall('native_lending_reserve_config', async () => (
         contract.getReserveConfig(assetAddress)
-      ), null)
+      ), null, { trafficClass })
     ));
     const state = await memoizedRead(requestState, `native_lending_reserve_state:${assetAddress.toLowerCase()}`, () => (
       safeArcRpcCall('native_lending_reserve_state', async () => (
         contract.getReserveState(assetAddress)
-      ), null)
+      ), null, { trafficClass })
     ));
     if (!config || !state) {
       throw new Error('Arc RPC unavailable for reserve snapshot');
@@ -272,7 +273,8 @@ async function readConfiguredReserveSnapshots(contract, requestState = makeReque
   }
 }
 
-async function getNativeLendingOverview() {
+async function getNativeLendingOverview(options = {}) {
+  const trafficClass = String(options?.trafficClass || 'user_read').trim() || 'user_read';
   const contractAddress = getArcLendingPoolAddress();
   const cacheKey = `overview:${contractAddress || 'none'}`;
 
@@ -318,10 +320,10 @@ async function getNativeLendingOverview() {
     const provider = getReadProvider();
     const contract = getNativeLendingContract(provider);
     const [treasury, globalPaused, buildState, reserves] = await Promise.all([
-      memoizedRead(requestState, 'native_lending_treasury', () => safeArcRpcCall('native_lending_treasury', async () => contract.treasury(), null)),
-      memoizedRead(requestState, 'native_lending_global_paused', () => safeArcRpcCall('native_lending_global_paused', async () => contract.globalPaused(), null)),
-      memoizedRead(requestState, 'native_lending_status', () => safeArcRpcCall('native_lending_status', async () => contract.implementationStatus(), null)),
-      readConfiguredReserveSnapshots(contract, requestState),
+      memoizedRead(requestState, 'native_lending_treasury', () => safeArcRpcCall('native_lending_treasury', async () => contract.treasury(), null, { trafficClass })),
+      memoizedRead(requestState, 'native_lending_global_paused', () => safeArcRpcCall('native_lending_global_paused', async () => contract.globalPaused(), null, { trafficClass })),
+      memoizedRead(requestState, 'native_lending_status', () => safeArcRpcCall('native_lending_status', async () => contract.implementationStatus(), null, { trafficClass })),
+      readConfiguredReserveSnapshots(contract, requestState, { trafficClass }),
     ]);
 
     if (treasury == null || globalPaused == null || buildState == null) {
@@ -373,7 +375,8 @@ async function getNativeLendingOverview() {
   }
 }
 
-async function getNativeLendingAccountOverview(account) {
+async function getNativeLendingAccountOverview(account, options = {}) {
+  const trafficClass = String(options?.trafficClass || 'user_read').trim() || 'user_read';
   const contractAddress = getArcLendingPoolAddress();
   const normalizedAccount = String(account || '').toLowerCase();
   const cacheKey = `account:${contractAddress || 'none'}:${normalizedAccount}`;
@@ -415,11 +418,11 @@ async function getNativeLendingAccountOverview(account) {
     const requestState = makeRequestCycleState();
     const provider = getReadProvider();
     const contract = getNativeLendingContract(provider);
-    const reserves = await readConfiguredReserveSnapshots(contract, requestState);
+    const reserves = await readConfiguredReserveSnapshots(contract, requestState, { trafficClass });
     const liquidity = await memoizedRead(requestState, `native_lending_account_liquidity:${normalizedAccount}`, () => (
       safeArcRpcCall('native_lending_account_liquidity', async () => (
         contract.previewAccountLiquidity(account)
-      ), null)
+      ), null, { trafficClass })
     ));
     if (!liquidity) {
       return {
@@ -435,7 +438,7 @@ async function getNativeLendingAccountOverview(account) {
       const position = await memoizedRead(requestState, `native_lending_user_position:${normalizedAccount}:${String(reserve.assetAddress || '').toLowerCase()}`, () => (
         safeArcRpcCall('native_lending_user_position', async () => (
           contract.getUserPosition(account, reserve.assetAddress)
-        ), null)
+        ), null, { trafficClass })
       ));
       if (!position) {
         return {

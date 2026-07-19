@@ -15,11 +15,20 @@ const ARC_TESTNET_NETWORK = Object.freeze({
 });
 const ARC_TESTNET_STATIC_NETWORK = ethers.Network.from(ARC_TESTNET_NETWORK);
 
+const SUPPORTED_TRAFFIC_CLASSES = new Set([
+  'user_read',
+  'background_read',
+  'reputation_read',
+  'reputation_write',
+  'gateway',
+  'transaction',
+]);
+const DEFAULT_TRAFFIC_CLASS = 'user_read';
+
 const providerCache = new Map();
 const endpointHealthState = new Map();
 const throttledLogState = new Map();
-
-let endpointCursor = 0;
+const endpointCursorByTrafficClass = new Map();
 
 function readPositiveIntegerEnv(name, fallback) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
@@ -76,6 +85,33 @@ function getArcRpcUrl() {
 
 function normalizeRpcUrl(rpcUrl = getArcRpcUrl()) {
   return String(rpcUrl || '').trim() || getArcRpcUrl();
+}
+
+function normalizeTrafficClass(trafficClass) {
+  const normalized = String(trafficClass || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_');
+
+  if (!normalized) {
+    return DEFAULT_TRAFFIC_CLASS;
+  }
+
+  if (SUPPORTED_TRAFFIC_CLASSES.has(normalized)) {
+    return normalized;
+  }
+
+  return DEFAULT_TRAFFIC_CLASS;
+}
+
+function getEndpointHealthKey(rpcUrl, trafficClass = DEFAULT_TRAFFIC_CLASS) {
+  return `${normalizeTrafficClass(trafficClass)}|${normalizeRpcUrl(rpcUrl)}`;
+}
+
+function getArcRpcOptions(options = {}) {
+  return {
+    trafficClass: normalizeTrafficClass(options?.trafficClass),
+  };
 }
 
 function getProviderOptions() {
@@ -191,39 +227,44 @@ function isArcRpcTransientError(error) {
     || text.includes('500 internal server error');
 }
 
-function getEndpointState(rpcUrl) {
-  const normalized = normalizeRpcUrl(rpcUrl);
-  const existing = endpointHealthState.get(normalized);
+function getEndpointState(rpcUrl, trafficClass = DEFAULT_TRAFFIC_CLASS) {
+  const normalizedRpcUrl = normalizeRpcUrl(rpcUrl);
+  const normalizedTrafficClass = normalizeTrafficClass(trafficClass);
+  const key = getEndpointHealthKey(normalizedRpcUrl, normalizedTrafficClass);
+  const existing = endpointHealthState.get(key);
   if (existing) return existing;
 
   const initial = {
+    trafficClass: normalizedTrafficClass,
+    rpcUrl: normalizedRpcUrl,
     cooldownUntil: 0,
     lastErrorCode: null,
     lastErrorReason: null,
     lastErrorAt: null,
   };
-  endpointHealthState.set(normalized, initial);
+  endpointHealthState.set(key, initial);
   return initial;
 }
 
-function getCooldownRemainingMs(rpcUrl, now = Date.now()) {
-  const until = Number(getEndpointState(rpcUrl).cooldownUntil || 0);
+function getCooldownRemainingMs(rpcUrl, now = Date.now(), trafficClass = DEFAULT_TRAFFIC_CLASS) {
+  const until = Number(getEndpointState(rpcUrl, trafficClass).cooldownUntil || 0);
   return Math.max(until - now, 0);
 }
 
-function getSuppressionKey({ level, kind, label, endpoint, errorCode }) {
+function getSuppressionKey({ level, kind, label, trafficClass, endpoint, errorCode }) {
   return [
     level || 'info',
     kind || 'generic',
     label || 'unknown',
+    normalizeTrafficClass(trafficClass),
     endpoint || 'unknown',
     errorCode || 'none',
   ].join('|');
 }
 
-function logWithThrottle({ level = 'info', kind = 'generic', label = 'unknown', endpoint = null, errorCode = null, message }) {
+function logWithThrottle({ level = 'info', kind = 'generic', label = 'unknown', trafficClass = DEFAULT_TRAFFIC_CLASS, endpoint = null, errorCode = null, message }) {
   const windowMs = getLogThrottleMs();
-  const key = getSuppressionKey({ level, kind, label, endpoint, errorCode });
+  const key = getSuppressionKey({ level, kind, label, trafficClass, endpoint, errorCode });
   const now = Date.now();
   const state = throttledLogState.get(key) || {
     windowStart: now,
@@ -260,12 +301,15 @@ function logWithThrottle({ level = 'info', kind = 'generic', label = 'unknown', 
   throttledLogState.set(key, state);
 }
 
-function markArcRpcEndpointUnhealthy(rpcUrl, error, label = 'unknown') {
-  if (!isArcRpcRateLimitError(error) && !isArcRpcBatchLimitError(error)) {
+function markArcRpcEndpointUnhealthy(rpcUrl, error, label = 'unknown', options = {}) {
+  const forceMark = options?.force === true;
+  if (!forceMark && !isArcRpcRateLimitError(error) && !isArcRpcBatchLimitError(error)) {
     return false;
   }
 
-  const isBatchLimit = isArcRpcBatchLimitError(error);
+  const { trafficClass } = getArcRpcOptions(options);
+  const forcedReason = String(options?.reason || '').trim().toLowerCase();
+  const isBatchLimit = !forceMark && isArcRpcBatchLimitError(error);
   const cooldownMs = isBatchLimit
     ? getBatchLimitCooldownMs()
     : getEndpointErrorCooldownMs();
@@ -275,39 +319,51 @@ function markArcRpcEndpointUnhealthy(rpcUrl, error, label = 'unknown') {
     : getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
 
   for (const endpoint of [...new Set(targets)]) {
-    const state = getEndpointState(endpoint);
+    const state = getEndpointState(endpoint, trafficClass);
     state.cooldownUntil = now + cooldownMs;
     state.lastErrorCode = String(error?.code || error?.info?.responseStatus || 'unknown');
-    state.lastErrorReason = isBatchLimit ? 'batch_limit' : 'rate_limit';
+    state.lastErrorReason = isBatchLimit
+      ? 'batch_limit'
+      : (forcedReason || 'rate_limit');
     state.lastErrorAt = new Date(now).toISOString();
 
-    const kind = isBatchLimit ? 'batch_limit' : 'rate_limit';
+    const kind = isBatchLimit ? 'batch_limit' : (forcedReason || 'rate_limit');
     logWithThrottle({
       level: 'warn',
       kind,
       label,
+      trafficClass,
       endpoint: getEndpointLabel(endpoint),
       errorCode: state.lastErrorCode,
-      message: `[ARC_RPC] ${isBatchLimit ? 'batch limited' : 'rate limited'} endpoint=${getEndpointLabel(endpoint)} label=${label} cooldown=${Math.round(cooldownMs / 1000)}s`,
+      message: `[ARC_RPC] ${isBatchLimit ? 'batch limited' : 'endpoint marked unhealthy'} class=${trafficClass} endpoint=${getEndpointLabel(endpoint)} label=${label} cooldown=${Math.round(cooldownMs / 1000)}s reason=${state.lastErrorReason}`,
     });
   }
 
   return true;
 }
 
-function pickHealthyEndpoint(pool, excluded = new Set()) {
+function markArcRpcEndpointHealthy(rpcUrl, trafficClass = DEFAULT_TRAFFIC_CLASS) {
+  const state = getEndpointState(rpcUrl, trafficClass);
+  state.cooldownUntil = 0;
+  state.lastErrorCode = null;
+  state.lastErrorReason = null;
+  state.lastErrorAt = null;
+}
+
+function pickHealthyEndpoint(pool, excluded = new Set(), trafficClass = DEFAULT_TRAFFIC_CLASS) {
   if (!pool.length) return null;
 
   const now = Date.now();
-  const startIndex = endpointCursor % pool.length;
+  const cursor = Number(endpointCursorByTrafficClass.get(trafficClass) || 0);
+  const startIndex = cursor % pool.length;
 
   for (let offset = 0; offset < pool.length; offset += 1) {
     const index = (startIndex + offset) % pool.length;
     const candidate = pool[index];
     if (excluded.has(candidate)) continue;
-    if (getCooldownRemainingMs(candidate, now) > 0) continue;
+    if (getCooldownRemainingMs(candidate, now, trafficClass) > 0) continue;
 
-    endpointCursor = (index + 1) % pool.length;
+    endpointCursorByTrafficClass.set(trafficClass, (index + 1) % pool.length);
     return {
       rpcUrl: candidate,
       usedFallbackEndpoint: index !== startIndex,
@@ -317,31 +373,35 @@ function pickHealthyEndpoint(pool, excluded = new Set()) {
   return null;
 }
 
-function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
+function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set(), options = {}) {
+  const { trafficClass } = getArcRpcOptions(options);
   const pool = getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
   if (pool.length === 0) {
     return {
       rpcUrl: normalizeRpcUrl(DEFAULT_ARC_RPC_URL),
       usedFallbackEndpoint: false,
       unavailable: false,
+      trafficClass,
     };
   }
 
-  const selected = pickHealthyEndpoint(pool, excluded);
+  const selected = pickHealthyEndpoint(pool, excluded, trafficClass);
   if (!selected) {
     logWithThrottle({
       level: 'warn',
       kind: 'all_cooling',
       label,
+      trafficClass,
       endpoint: 'pool',
       errorCode: 'cooldown',
-      message: `[ARC_RPC] all endpoints cooling down label=${label} fallback=true`,
+      message: `[ARC_RPC] all endpoints cooling down class=${trafficClass} label=${label} fallback=true`,
     });
 
     return {
       rpcUrl: null,
       usedFallbackEndpoint: false,
       unavailable: true,
+      trafficClass,
     };
   }
 
@@ -350,9 +410,10 @@ function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
       level: 'info',
       kind: 'using_fallback',
       label,
+      trafficClass,
       endpoint: getEndpointLabel(selected.rpcUrl),
       errorCode: 'fallback',
-      message: `[ARC_RPC] using fallback endpoint label=${label}`,
+      message: `[ARC_RPC] using fallback endpoint class=${trafficClass} label=${label}`,
     });
   }
 
@@ -360,26 +421,58 @@ function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set()) {
     rpcUrl: selected.rpcUrl,
     usedFallbackEndpoint: selected.usedFallbackEndpoint,
     unavailable: false,
+    trafficClass,
   };
 }
 
-function getHealthyArcRpcUrl(label = 'arc_rpc') {
-  const selected = selectArcRpcUrl(label);
+function getHealthyArcRpcUrl(label = 'arc_rpc', options = {}) {
+  const selected = selectArcRpcUrl(label, new Set(), options);
   return selected.rpcUrl || null;
 }
 
-function getHealthyArcRpcProvider(label = 'arc_rpc') {
-  const rpcUrl = getHealthyArcRpcUrl(label);
+function getHealthyArcRpcProvider(label = 'arc_rpc', options = {}) {
+  const rpcUrl = getHealthyArcRpcUrl(label, options);
   if (!rpcUrl) {
     return null;
   }
   return createArcRpcProvider(rpcUrl);
 }
 
-async function safeArcRpcCall(label, fn, fallbackValue) {
+async function safeArcRpcCall(label, fn, fallbackValueOrOptions, maybeOptions) {
   if (typeof fn !== 'function') {
     throw new TypeError('safeArcRpcCall requires a callback function');
   }
+
+  let fallbackProvided = false;
+  let fallbackValue;
+  let options = getArcRpcOptions();
+
+  if (arguments.length >= 3) {
+    const thirdIsOptions = (
+      fallbackValueOrOptions
+      && typeof fallbackValueOrOptions === 'object'
+      && !Array.isArray(fallbackValueOrOptions)
+      && Object.prototype.hasOwnProperty.call(fallbackValueOrOptions, 'trafficClass')
+      && arguments.length === 3
+    );
+
+    if (thirdIsOptions) {
+      options = getArcRpcOptions(fallbackValueOrOptions);
+    } else {
+      const explicitFallbackProvided = arguments.length >= 4
+        || fallbackValueOrOptions !== undefined;
+
+      if (explicitFallbackProvided) {
+        fallbackProvided = true;
+        fallbackValue = fallbackValueOrOptions;
+        if (arguments.length >= 4) {
+          options = getArcRpcOptions(maybeOptions || {});
+        }
+      }
+    }
+  }
+
+  const { trafficClass } = options;
 
   const pool = getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
   const attempts = Math.max(pool.length, 1);
@@ -387,7 +480,7 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
   let lastError = null;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const selected = selectArcRpcUrl(label, excluded);
+    const selected = selectArcRpcUrl(label, excluded, options);
     if (!selected.rpcUrl) {
       break;
     }
@@ -397,23 +490,31 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
     const provider = createArcRpcProvider(rpcUrl);
 
     try {
-      return await fn(provider, rpcUrl);
+      const result = await fn(provider, rpcUrl);
+      markArcRpcEndpointHealthy(rpcUrl, trafficClass);
+      return result;
     } catch (error) {
       lastError = error;
 
       if (isArcRpcBatchLimitError(error) || isArcRpcRateLimitError(error)) {
-        markArcRpcEndpointUnhealthy(rpcUrl, error, label);
+        markArcRpcEndpointUnhealthy(rpcUrl, error, label, options);
         continue;
       }
 
       if (isArcRpcTransientError(error) && excluded.size < pool.length) {
+        markArcRpcEndpointUnhealthy(rpcUrl, error, label, {
+          ...options,
+          force: true,
+          reason: 'transient',
+        });
         logWithThrottle({
           level: 'warn',
           kind: 'transient',
           label,
+          trafficClass,
           endpoint: getEndpointLabel(rpcUrl),
           errorCode: String(error?.code || 'transient'),
-          message: `[ARC_RPC] rpc transient error label=${label} endpoint=${getEndpointLabel(rpcUrl)} retrying_next=true`,
+          message: `[ARC_RPC] rpc transient error class=${trafficClass} label=${label} endpoint=${getEndpointLabel(rpcUrl)} retrying_next=true`,
         });
         continue;
       }
@@ -422,25 +523,27 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
     }
   }
 
-  if (arguments.length >= 3) {
+  if (fallbackProvided) {
     if (lastError) {
       if (isArcRpcRateLimitError(lastError) || isArcRpcBatchLimitError(lastError)) {
         logWithThrottle({
           level: 'warn',
           kind: 'no_healthy',
           label,
+          trafficClass,
           endpoint: 'pool',
           errorCode: String(lastError?.code || lastError?.info?.responseStatus || 'rate_limit'),
-          message: `[ARC_RPC] no healthy endpoint available label=${label} fallback=true`,
+          message: `[ARC_RPC] no healthy endpoint available class=${trafficClass} label=${label} fallback=true`,
         });
       } else {
         logWithThrottle({
           level: 'error',
           kind: 'rpc_failed',
           label,
+          trafficClass,
           endpoint: 'pool',
           errorCode: String(lastError?.code || 'unknown'),
-          message: `[ARC_RPC] rpc call failed label=${label} fallback=true error=${lastError?.message || lastError}`,
+          message: `[ARC_RPC] rpc call failed class=${trafficClass} label=${label} fallback=true error=${lastError?.message || lastError}`,
         });
       }
     }
@@ -453,21 +556,40 @@ async function safeArcRpcCall(label, fn, fallbackValue) {
 
 function getArcRpcHealthSnapshot() {
   const now = Date.now();
-  const endpoints = getArcRpcUrlPool().map((rpcUrl) => {
-    const normalized = normalizeRpcUrl(rpcUrl);
-    const state = getEndpointState(normalized);
-    const cooldownRemainingMs = getCooldownRemainingMs(normalized, now);
+  const knownTrafficClasses = new Set([...SUPPORTED_TRAFFIC_CLASSES]);
+  for (const state of endpointHealthState.values()) {
+    if (state?.trafficClass) {
+      knownTrafficClasses.add(state.trafficClass);
+    }
+  }
 
-    return {
-      endpoint: getEndpointLabel(normalized),
-      maskedUrl: maskRpcUrl(normalized),
-      healthy: cooldownRemainingMs <= 0,
-      cooldownRemainingMs,
-      lastErrorCode: state.lastErrorCode,
-      lastErrorReason: state.lastErrorReason,
-      lastErrorAt: state.lastErrorAt,
-    };
-  });
+  const rpcUrlSet = new Set(
+    getArcRpcUrlPool().map((rpcUrl) => normalizeRpcUrl(rpcUrl)),
+  );
+  for (const state of endpointHealthState.values()) {
+    if (state?.rpcUrl) {
+      rpcUrlSet.add(normalizeRpcUrl(state.rpcUrl));
+    }
+  }
+
+  const endpoints = [];
+  for (const trafficClass of knownTrafficClasses) {
+    for (const rpcUrl of rpcUrlSet) {
+      const state = getEndpointState(rpcUrl, trafficClass);
+      const cooldownRemainingMs = getCooldownRemainingMs(rpcUrl, now, trafficClass);
+
+      endpoints.push({
+        trafficClass,
+        endpoint: getEndpointLabel(rpcUrl),
+        maskedUrl: maskRpcUrl(rpcUrl),
+        healthy: cooldownRemainingMs <= 0,
+        cooldownRemainingMs,
+        lastErrorCode: state.lastErrorCode,
+        lastErrorReason: state.lastErrorReason,
+        lastErrorAt: state.lastErrorAt,
+      });
+    }
+  }
 
   const suppressedLogCounts = {};
   for (const [key, state] of throttledLogState.entries()) {
@@ -489,7 +611,7 @@ function clearArcRpcProviderCache() {
   providerCache.clear();
   endpointHealthState.clear();
   throttledLogState.clear();
-  endpointCursor = 0;
+  endpointCursorByTrafficClass.clear();
 }
 
 module.exports = {

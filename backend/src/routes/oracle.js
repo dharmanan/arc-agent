@@ -28,10 +28,9 @@ const {
 } = require('../services/agenticEconomy/gatewaySeller');
 const { getGatewayFacilitatorSummary } = require('../services/agenticEconomy/gatewayFacilitator');
 const {
-  depositGatewayBalance,
+  depositGatewayBalanceForAgent,
   getAgentGatewayBalances,
   getGatewayBuyerSummary,
-  createGatewayClientForAgent,
 } = require('../services/agenticEconomy/gatewayBuyer');
 const { getTaskEconomyConfigSummary } = require('../services/agenticEconomy/taskEconomyService');
 const { getJobEconomyConfigSummary } = require('../services/agenticEconomy/jobEconomyService');
@@ -1692,8 +1691,7 @@ router.post('/gateway/fund', requireAuth, async (req, res, next) => {
     }
 
     const walletAddress = String(agent.walletAddress || rawAgent.wallet_address || '').toLowerCase();
-    const client = createGatewayClientForAgent(rawAgent, { chainName });
-    const funding = await depositGatewayBalance(client, amountUsdc, {
+    const funding = await depositGatewayBalanceForAgent(rawAgent, amountUsdc, {
       chainName,
       walletAddress,
       operation: 'manual_gateway_fund',
