@@ -68,7 +68,11 @@ function parseArcRpcUrlList(value) {
     .filter(Boolean);
 }
 
-function getArcRpcUrlPool() {
+function isGatewayTrafficClass(trafficClass) {
+  return String(trafficClass || '').trim().toLowerCase().startsWith('gateway');
+}
+
+function getDefaultArcRpcUrlPool() {
   const pooledUrls = parseArcRpcUrlList(process.env.ARC_RPC_URLS);
   if (pooledUrls.length > 0) {
     return pooledUrls;
@@ -83,8 +87,34 @@ function getArcRpcUrlPool() {
     .filter(Boolean);
 }
 
+function getArcRpcUrlPool(options = {}) {
+  const trafficClass = String(options?.trafficClass || '').trim().toLowerCase();
+
+  if (isGatewayTrafficClass(trafficClass)) {
+    const gatewayUrls = parseArcRpcUrlList(process.env.ARC_GATEWAY_RPC_URLS);
+    if (gatewayUrls.length > 0) {
+      return gatewayUrls;
+    }
+  }
+
+  return getDefaultArcRpcUrlPool();
+}
+
 function getArcRpcUrl() {
   return getArcRpcUrlPool()[0] || DEFAULT_ARC_RPC_URL;
+}
+
+function getArcRpcPoolConfiguration(options = {}) {
+  const trafficClass = String(options?.trafficClass || '').trim().toLowerCase();
+  const gatewayConfigured = parseArcRpcUrlList(process.env.ARC_GATEWAY_RPC_URLS).length > 0;
+  const selectedPool = getArcRpcUrlPool(options);
+
+  return {
+    trafficClass: trafficClass || DEFAULT_TRAFFIC_CLASS,
+    poolKind: isGatewayTrafficClass(trafficClass) && gatewayConfigured ? 'gateway_dedicated' : 'default',
+    endpointCount: selectedPool.length,
+    gatewayDedicatedConfigured: gatewayConfigured,
+  };
 }
 
 function normalizeRpcUrl(rpcUrl = getArcRpcUrl()) {
@@ -396,7 +426,7 @@ function pickHealthyEndpoint(pool, excluded = new Set(), trafficClass = DEFAULT_
 
 function selectArcRpcUrl(label = 'arc_rpc', excluded = new Set(), options = {}) {
   const { trafficClass } = getArcRpcOptions(options);
-  const pool = getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
+  const pool = getArcRpcUrlPool(options).map((entry) => normalizeRpcUrl(entry));
   if (pool.length === 0) {
     return {
       rpcUrl: normalizeRpcUrl(DEFAULT_ARC_RPC_URL),
@@ -498,7 +528,7 @@ async function safeArcRpcCall(label, fn, fallbackValueOrOptions, maybeOptions) {
 
   const { trafficClass, strictRpcProvenance } = options;
 
-  const pool = getArcRpcUrlPool().map((entry) => normalizeRpcUrl(entry));
+  const pool = getArcRpcUrlPool(options).map((entry) => normalizeRpcUrl(entry));
   const attempts = Math.max(pool.length, 1);
   const excluded = new Set();
   let lastError = null;
@@ -699,6 +729,8 @@ function clearArcRpcProviderCache() {
 }
 
 module.exports = {
+  getArcRpcUrlPool,
+  getArcRpcPoolConfiguration,
   ARC_TESTNET_NETWORK,
   createArcRpcProvider,
   getArcRpcUrl,
