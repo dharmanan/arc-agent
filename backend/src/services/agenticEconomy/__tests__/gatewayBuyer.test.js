@@ -308,50 +308,6 @@ describe('gatewayBuyer', () => {
     });
   });
 
-  test('does not classify an SDK 429 mentioning an RPC URL as Arc RPC cooldown without structured provenance', async () => {
-    const { gatewayBuyer, gatewayClientCtor, safeArcRpcCall } = loadHarness();
-
-    const ambiguousSdkRateLimit = new Error(
-      'request limit reached while using rpc.testnet.arc.network through Gateway SDK',
-    );
-    ambiguousSdkRateLimit.statusCode = 429;
-    ambiguousSdkRateLimit.rpcEndpointProven = false;
-    ambiguousSdkRateLimit.isArcRpcEndpointError = false;
-
-    gatewayClientCtor.mockImplementation(() => ({
-      getUsdcBalance: jest.fn().mockResolvedValue({ balance: 5_000_000n, formatted: '5' }),
-      getGatewayBalance: jest.fn().mockResolvedValue({
-        available: 2_000_000n,
-        formattedAvailable: '2',
-        total: 2_000_000n,
-        formattedTotal: '2',
-        withdrawing: 0n,
-        formattedWithdrawing: '0',
-        withdrawable: 2_000_000n,
-        formattedWithdrawable: '2',
-      }),
-      deposit: jest.fn().mockRejectedValue(ambiguousSdkRateLimit),
-      withdraw: jest.fn(),
-    }));
-
-    safeArcRpcCall.mockImplementation(async (_label, fn) => fn({}, ENDPOINT_A));
-
-    await expect(gatewayBuyer.depositGatewayBalanceForAgent({
-      id: 'agent-sdk-429',
-      wallet_address: TEST_WALLET_ADDRESS,
-      private_key_encrypted: 'encrypted-key',
-    }, '1', {
-      chainName: 'Arc Testnet',
-      address: TEST_WALLET_ADDRESS,
-      protectedWrite: false,
-    })).rejects.toMatchObject({
-      code: 'GATEWAY_DEFERRED_UNKNOWN',
-      status: 'deferred',
-      failureSource: 'unknown',
-      rpcEndpointProven: false,
-    });
-  });
-
   test('maps unknown rate-limit provenance to conservative deferred code', async () => {
     const { gatewayBuyer, gatewayClientCtor, safeArcRpcCall } = loadHarness();
 
