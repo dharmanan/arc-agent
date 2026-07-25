@@ -173,6 +173,60 @@ function getGatewayOperationLabel(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_') || 'gateway_operation';
 }
 
+function sanitizeGatewayTelemetryValue(value, maxLength = 800) {
+  if (value == null) return null;
+
+  let text;
+  if (typeof value === 'string') {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+
+  return String(text)
+    .replace(/https?:\/\/[^/\s:@]+:[^@\s/]+@/gi, 'https://[redacted]@')
+    .replace(/([?&](?:key|api_key|apikey|token|secret|authorization)=)[^&\s]+/gi, '$1[redacted]')
+    .replace(/\b0x[a-fA-F0-9]{64}\b/g, '[redacted-hex-32]')
+    .replace(/\b(sk|pk)_[A-Za-z0-9_-]{12,}\b/g, '[redacted-key]')
+    .slice(0, maxLength);
+}
+
+function buildGatewayFailureTelemetry(error, context = {}) {
+  return {
+    operation: getGatewayOperationLabel(context.operation || error?.operation),
+    failureStage: context.failureStage || error?.failureStage || null,
+    trafficClass: normalizeGatewayTrafficClass(
+      context.trafficClass || error?.trafficClass || GATEWAY_TRAFFIC_CLASS_DEFAULT,
+    ),
+    rpcEndpointLabel: context.rpcUrl ? getRpcEndpointLabel(context.rpcUrl) : (error?.rpcEndpointLabel || null),
+    name: sanitizeGatewayTelemetryValue(error?.name, 120),
+    message: sanitizeGatewayTelemetryValue(error?.message, 800),
+    shortMessage: sanitizeGatewayTelemetryValue(error?.shortMessage, 500),
+    code: sanitizeGatewayTelemetryValue(error?.code, 120),
+    status: sanitizeGatewayTelemetryValue(error?.status, 120),
+    statusCode: Number.isFinite(Number(error?.statusCode)) ? Number(error.statusCode) : null,
+    httpStatus: Number.isFinite(Number(error?.httpStatus)) ? Number(error.httpStatus) : null,
+    failureSource: sanitizeGatewayTelemetryValue(error?.failureSource, 120),
+    rpcEndpointProven: error?.rpcEndpointProven === true
+      ? true
+      : (error?.rpcEndpointProven === false ? false : null),
+    isArcRpcEndpointError: error?.isArcRpcEndpointError === true
+      ? true
+      : (error?.isArcRpcEndpointError === false ? false : null),
+    infoResponseStatus: sanitizeGatewayTelemetryValue(error?.info?.responseStatus, 250),
+    infoResponseBody: sanitizeGatewayTelemetryValue(error?.info?.responseBody, 800),
+    infoPayload: sanitizeGatewayTelemetryValue(error?.info?.payload, 800),
+    nestedErrorCode: sanitizeGatewayTelemetryValue(error?.error?.code, 120),
+    nestedErrorMessage: sanitizeGatewayTelemetryValue(error?.error?.message, 500),
+    causeCode: sanitizeGatewayTelemetryValue(error?.cause?.code, 120),
+    causeMessage: sanitizeGatewayTelemetryValue(error?.cause?.message, 500),
+  };
+}
+
 function getRpcEndpointLabel(rpcUrl) {
   try {
     const hostname = new URL(String(rpcUrl || '').trim()).hostname;
@@ -625,12 +679,20 @@ async function withGatewayClientFailover(agent, options = {}, execute) {
       try {
         return await execute(client, rpcUrl);
       } catch (error) {
-        const annotatedError = annotateGatewayFailure(error, {
+        const telemetryContext = {
           operation,
           failureStage: error?.failureStage || 'gateway_operation',
-          failureSource: error?.failureSource || 'unknown',
           trafficClass,
           rpcUrl,
+        };
+        logGateway('error', 'Gateway operation raw failure telemetry', buildGatewayFailureTelemetry(
+          error,
+          telemetryContext,
+        ));
+
+        const annotatedError = annotateGatewayFailure(error, {
+          ...telemetryContext,
+          failureSource: error?.failureSource || 'unknown',
         });
 
         if (isGatewayServiceRateLimitError(annotatedError)) {
