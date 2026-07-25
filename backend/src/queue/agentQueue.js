@@ -74,7 +74,7 @@ const CIRBTC_GLOBAL_GUARD_MIN_FAILURES = Math.max(
   1,
 );
 const CIRBTC_GLOBAL_GUARD_MIN_AGENTS = Math.max(
-  Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_MIN_AGENTS || '2', 10) || 2,
+  Number.parseInt(process.env.CIRBTC_GLOBAL_GUARD_MIN_AGENTS || '1', 10) || 1,
   1,
 );
 const CIRBTC_GLOBAL_GUARD_CACHE_MS = Math.max(
@@ -4311,16 +4311,6 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   if (!isDailyLimitBypassed(agent) && agent.daily_market_analysis_count >= DAILY_ORACLE_CAP) {
     console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} daily cap reached`);
     return finishOracle('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_market_analysis_count });
-  }
-
-  if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
-    console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} paused because this agent's daily DeFi cap is full`);
-    return finishOracle('cap_reached', {
-      ok: false,
-      reason: 'shared_defi_daily_cap_reached',
-      count: agent.daily_defi_loop_count,
-      summary: "Oracle snapshots are paused because this agent's daily DeFi automation cap is already full.",
-    });
   }
 
   await maybeWarmAgentGatewayBalance(agent, 'oracle_query');
