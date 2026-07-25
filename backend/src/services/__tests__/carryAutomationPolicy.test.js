@@ -132,6 +132,21 @@ describe('carryAutomationPolicy', () => {
     expect(policy.metrics.lpShortfallUsd).toBe(0);
   });
 
+  test('marks carry as active for exclusivity only when managed state is active-like', () => {
+    const activePolicy = evaluateCarryAutomationPolicy(buildCarryFixture({
+      eurcBorrowUsd: 40,
+      eurcBorrowAmount: 34.482759,
+    }));
+    expect(activePolicy.metrics.carryState).toBe('active');
+
+    const inactivePolicy = evaluateCarryAutomationPolicy(buildCarryFixture({
+      stableCurvePosition: null,
+      eurcBorrowUsd: 0,
+      eurcBorrowAmount: 0,
+    }));
+    expect(inactivePolicy.metrics.carryState).toBe('inactive');
+  });
+
   test('deploys wallet balance only when borrowed carry is sitting outside the LP', () => {
     const policy = evaluateCarryAutomationPolicy(buildCarryFixture({
       eurcBorrowUsd: 40,

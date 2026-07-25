@@ -727,19 +727,6 @@ async function createSwapFallbackConfirmationError({ fromToken, toToken, amountI
   return nextError;
 }
 
-function isPrimarySwapFallbackCandidate(error) {
-  if (!error) return false;
-
-  const message = String(error.userMessage || error.message || '').trim();
-  const txHash = error.txHash || error.hash || error.transactionHash || null;
-
-  if (txHash) {
-    return false;
-  }
-
-  return /simulation failed|insufficientamountout|0xe52970aa|stop limit|execution reverted|swap failed/i.test(message);
-}
-
 async function estimateArcSwap({ adapter, fromToken, toToken, amountIn, slippagePct }) {
   return SWAP_KIT.estimate({
     from: { adapter, chain: ARC_SWAP_CHAIN },

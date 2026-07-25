@@ -51,6 +51,14 @@ const {
   registerStableLpExitFailureCooldownHit,
   findActiveStableLpExitFailureCooldownForAgent,
 } = require('./stableLpExitFailureCooldown');
+const {
+  readDeterministicLaneFailureCooldownMs,
+  buildDeterministicLaneFailureScopeKey,
+  buildDeterministicLaneFailureFingerprint,
+  buildDeterministicLaneFailureMeta,
+  registerDeterministicLaneFailureCooldownHit,
+  findActiveDeterministicLaneFailureByScope,
+} = require('./deterministicLaneFailureCooldown');
 
 const ARC_USDC_ADDRESS = process.env.USDC_ADDRESS_ARC || process.env.USDC_ADDRESS || '0x3600000000000000000000000000000000000000';
 const ARC_EURC_ADDRESS = process.env.EURC_ADDRESS_ARC || process.env.EURC_ADDRESS || '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a';
@@ -140,7 +148,7 @@ async function readCirbtcGlobalFailureGuardState({ forceRefresh = false } = {}) 
          MAX(created_at) AS last_failure_at
        FROM transactions
        WHERE created_at >= NOW() - ($1 * INTERVAL '1 minute')
-         AND status = 'failed'
+         AND status IN ('failed', 'execution_blocked', 'skipped')
          AND type = 'direct_lp_add'
          AND COALESCE(meta->>'executionSource', '') = $2
          AND (
@@ -1563,6 +1571,7 @@ function getErrorText(value) {
 }
 
 const STABLE_LP_EXIT_FAILURE_COOLDOWN_MS = readStableLpExitFailureCooldownMs();
+const DETERMINISTIC_LANE_FAILURE_COOLDOWN_MS = readDeterministicLaneFailureCooldownMs();
 
 function isStableLpExitExecution({ automationType, operationType, transactionType }) {
   return String(automationType || '').toLowerCase() === 'stable'
@@ -1736,6 +1745,227 @@ function buildExecutionErrorDetails(err) {
     executionRead: simulationContext?.executionRead || null,
     snapshotExecutionRead: simulationContext?.snapshotExecutionRead || null,
   };
+}
+
+function buildExecutionRecommendationFingerprint({
+  automationType,
+  operationType,
+  policyId,
+  actionParams,
+  signal,
+}) {
+  const payload = {
+    automationType: String(automationType || '').toLowerCase(),
+    operationType: String(operationType || '').toLowerCase(),
+    policyId: String(policyId || '').trim(),
+    actionParams: actionParams && typeof actionParams === 'object' ? actionParams : null,
+    signalLane: signal?.lane || signal?.strategy || null,
+  };
+
+  return ethers.id(JSON.stringify(payload));
+}
+
+function resolveLanePairOrPool({
+  actionParams,
+  automationPolicy,
+  executionPayload,
+}) {
+  return String(
+    actionParams?.poolKey
+    || actionParams?.pairKey
+    || automationPolicy?.metrics?.selectedPoolKey
+    || executionPayload?.poolKey
+    || executionPayload?.poolAddress
+    || executionPayload?.routeAddress
+    || 'unknown_pool',
+  ).trim().toUpperCase();
+}
+
+function resolveDeterministicFailureCode({ reason, error, errorCode }) {
+  const normalizedErrorCode = String(errorCode || '').trim().toUpperCase();
+  if (normalizedErrorCode) return normalizedErrorCode;
+
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  if (normalizedReason === 'swap_error') {
+    const msg = String(error || '').toLowerCase();
+    if (msg.includes('circle route is currently unavailable')) return 'CIRBTC_ROUTE_UNAVAILABLE';
+    if (msg.includes('direct arc fallback is disabled')) return 'CIRBTC_FALLBACK_DISABLED';
+    return 'SWAP_ERROR_PRE_BROADCAST';
+  }
+
+  if (normalizedReason === 'direct_pair_seed_required') return 'DIRECT_PAIR_SEED_REQUIRED';
+  if (normalizedReason === 'no_live_lp_position') return 'NO_LIVE_LP_POSITION';
+  if (normalizedReason === 'live_lp_balance_unavailable') return 'LIVE_LP_BALANCE_UNAVAILABLE';
+  if (normalizedReason === 'insufficient_balance') return 'INSUFFICIENT_BALANCE';
+  if (normalizedReason === 'wallet_balance_unavailable') return 'WALLET_BALANCE_UNAVAILABLE';
+  if (normalizedReason === 'stable_lp_exit_failure_cooldown') return 'STABLE_LP_EXIT_FAILURE_COOLDOWN';
+
+  return 'DETERMINISTIC_PRE_BROADCAST';
+}
+
+function shouldTreatExecutionResultAsDeterministicPreBroadcastFailure(executionResult = {}) {
+  if (!executionResult || executionResult.ok !== false) return false;
+
+  if (String(executionResult?.errorCode || '').trim().toUpperCase() === 'TX_SIMULATION_FAILED') {
+    return true;
+  }
+
+  const reason = String(executionResult.reason || '').trim().toLowerCase();
+  const deterministicReasons = new Set([
+    'swap_error',
+    'direct_pair_seed_required',
+    'no_live_lp_position',
+    'live_lp_balance_unavailable',
+    'insufficient_balance',
+    'wallet_balance_unavailable',
+    'stable_lp_exit_failure_cooldown',
+  ]);
+
+  return deterministicReasons.has(reason);
+}
+
+function shouldCountAsMeaningfulExecutionAttempt({ txResult, executionResult, errorDetails }) {
+  const txHash = String(
+    txResult?.txHash
+    || executionResult?.payload?.txHash
+    || executionResult?.payload?.mintTxHash
+    || executionResult?.payload?.burnTxHash
+    || executionResult?.payload?.swapTxHash
+    || errorDetails?.errorTxHash
+    || '',
+  ).trim();
+
+  if (txHash) return true;
+
+  if (executionResult?.ok === false) {
+    if (shouldTreatExecutionResultAsDeterministicPreBroadcastFailure(executionResult)) {
+      return false;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+async function incrementDailyDefiLoopCount(agentId) {
+  if (!agentId) return;
+  await db.query(
+    'UPDATE agents SET daily_defi_loop_count = daily_defi_loop_count + 1 WHERE id = $1',
+    [agentId],
+  );
+}
+
+async function maybeIncrementDailyDefiLoopCount({
+  agentId,
+  didCountRef,
+  txResult,
+  executionResult,
+  errorDetails,
+}) {
+  if (!agentId || didCountRef?.value === true) return false;
+
+  const shouldCount = shouldCountAsMeaningfulExecutionAttempt({
+    txResult,
+    executionResult,
+    errorDetails,
+  });
+  if (!shouldCount) return false;
+
+  await incrementDailyDefiLoopCount(agentId);
+  if (didCountRef) didCountRef.value = true;
+  return true;
+}
+
+function buildDeterministicLaneFailureContext({
+  agentId,
+  transactionType,
+  executionSource,
+  policyLane,
+  operationType,
+  actionParams,
+  automationPolicy,
+  executionPayload,
+  defaultFromToken,
+  defaultToToken,
+  requestedExecutionAmount,
+  reason,
+  error,
+  errorCode,
+  routeMode = 'auto',
+  recommendationFingerprint,
+} = {}) {
+  const normalizedErrorCode = resolveDeterministicFailureCode({ reason, error, errorCode });
+  const pairOrPool = resolveLanePairOrPool({
+    actionParams,
+    automationPolicy,
+    executionPayload,
+  });
+
+  const scopeKey = buildDeterministicLaneFailureScopeKey({
+    policyLane,
+    executionSource,
+    pairOrPool,
+    tokenIn: defaultFromToken,
+    tokenOut: defaultToToken,
+    requestedAmount: requestedExecutionAmount,
+    routeMode,
+    recommendationFingerprint,
+  });
+  const fingerprint = buildDeterministicLaneFailureFingerprint({
+    agentId,
+    scopeKey,
+    errorCode: normalizedErrorCode,
+  });
+
+  return {
+    transactionType,
+    policyLane,
+    executionSource,
+    operationType,
+    pairOrPool,
+    tokenIn: String(defaultFromToken || '').toUpperCase() || null,
+    tokenOut: String(defaultToToken || '').toUpperCase() || null,
+    requestedAmountIn: normalizeUsdcAmount(requestedExecutionAmount),
+    routeMode,
+    recommendationFingerprint,
+    errorCode: normalizedErrorCode,
+    fingerprint,
+    scopeKey,
+  };
+}
+
+async function registerDeterministicLaneFailureCooldown({
+  agentId,
+  context,
+}) {
+  if (!context?.fingerprint || !context?.transactionType) {
+    return { active: false, retryAfterMs: 0, rowId: null, repeatCount: 0 };
+  }
+
+  return registerDeterministicLaneFailureCooldownHit(db, {
+    agentId,
+    transactionType: context.transactionType,
+    fingerprint: context.fingerprint,
+    scopeKey: context.scopeKey,
+    errorCode: context.errorCode,
+    cooldownMs: DETERMINISTIC_LANE_FAILURE_COOLDOWN_MS,
+  });
+}
+
+async function findActiveDeterministicLaneCooldownForContext({
+  agentId,
+  context,
+}) {
+  if (!context?.scopeKey || !context?.transactionType) {
+    return { active: false, retryAfterMs: 0, rowId: null, fingerprint: null };
+  }
+
+  return findActiveDeterministicLaneFailureByScope(db, {
+    agentId,
+    transactionType: context.transactionType,
+    scopeKey: context.scopeKey,
+    cooldownMs: DETERMINISTIC_LANE_FAILURE_COOLDOWN_MS,
+  });
 }
 
 // Upstash Redis: connect via URL (rediss://...)
@@ -2867,7 +3097,7 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
     };
   }
 
-  if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
+  if (shouldSuspendMarketAndOracleDiscoveryWhenDefiCapReached(agent)) {
     const decisionSnapshot = {
       recordedAt: new Date().toISOString(),
       status: 'cap_reached',
@@ -2888,6 +3118,7 @@ queue.process('MARKET_ANALYSIS', 2, async (job) => {
       queuedDefiReview: false,
       rawDecision: null,
       pausedBy: 'shared_defi_daily_cap',
+        discoveryAllowedWhenExecutionCapReached: !DISCOVERY_REQUIRES_EXECUTION_CAP_HEADROOM,
     };
 
     await _setAutomationState(agentId, 'marketAnalysis', 'cap_reached');
@@ -3015,6 +3246,9 @@ const DEFI_LOOP_ORPHAN_RECOVERY_MAX_REQUEUES = Math.max(
 const DAILY_DEFI_LOOP_CAP     = Math.max(parseInt(process.env.DAILY_DEFI_LOOP_CAP || '24', 10) || 24, 1);
 const DAILY_ORACLE_CAP        = Math.max(parseInt(process.env.DAILY_ORACLE_CAP || '48', 10) || 48, 1);
 const SUSPEND_CAP_REACHED_SCAN_JOBS = String(process.env.SUSPEND_CAP_REACHED_SCAN_JOBS || '').trim().toLowerCase() === 'true';
+const DISCOVERY_REQUIRES_EXECUTION_CAP_HEADROOM = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.DISCOVERY_REQUIRES_EXECUTION_CAP_HEADROOM || 'false').trim().toLowerCase(),
+);
 const GLOBAL_DRY_RUN          = process.env.DRY_RUN === 'true';
 const PAYMENT_RETRY_ENABLED = isEnvEnabled('PAYMENT_RETRY_ENABLED', true);
 const PAYMENT_RETRY_INTERVAL_MS = Math.max(
@@ -3718,6 +3952,12 @@ function hasReachedSharedDefiDailyCap(agent, nowMs = Date.now()) {
 function shouldSuspendScanJobsWhenDefiCapReached(agent, nowMs = Date.now()) {
   return SUSPEND_CAP_REACHED_SCAN_JOBS && hasReachedSharedDefiDailyCap(agent, nowMs);
 }
+
+function shouldSuspendMarketAndOracleDiscoveryWhenDefiCapReached(agent, nowMs = Date.now()) {
+  if (!SUSPEND_CAP_REACHED_SCAN_JOBS) return false;
+  if (!DISCOVERY_REQUIRES_EXECUTION_CAP_HEADROOM) return false;
+  return hasReachedSharedDefiDailyCap(agent, nowMs);
+}
 const DEFAULT_ORACLE_POST_EXIT_REENTRY_COOLDOWN_MINUTES = 60;
 
 function readPositiveNumberEnv(name, fallback) {
@@ -4313,6 +4553,16 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
     return finishOracle('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_market_analysis_count });
   }
 
+  if (shouldSuspendMarketAndOracleDiscoveryWhenDefiCapReached(agent)) {
+    console.log(`[QUEUE] ORACLE_QUERY agent=${agentId} paused because this agent's daily DeFi cap is full`);
+    return finishOracle('cap_reached', {
+      ok: false,
+      reason: 'shared_defi_daily_cap_reached',
+      count: agent.daily_defi_loop_count,
+      summary: "Oracle snapshots are paused because this agent's daily DeFi automation cap is already full.",
+    });
+  }
+
   await maybeWarmAgentGatewayBalance(agent, 'oracle_query');
 
   // ── Fetch oracle data ──────────────────────────────────────────────────────
@@ -4358,12 +4608,12 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
   // Log the signal + decision to transactions table as an 'oracle_signal' record
   if (signal.opportunity.found) {
     const dailyLimitBypass = getDailyLimitBypass(agent);
-    const defiLoopCapReached = !dailyLimitBypass.enabled
+    const executionCapReached = !dailyLimitBypass.enabled
       && Number(agent.daily_defi_loop_count || 0) >= DAILY_DEFI_LOOP_CAP;
     const executionPermissionGranted = Boolean(agent.defi_loop_enabled && arbitragePermissionGranted);
     const gateAllowsExecution = executionPermissionGranted
       && executionGate?.verdict?.execute === true
-      && !defiLoopCapReached;
+      && !executionCapReached;
     const signalMeta = {
       signal,
       decision: executionGate?.decision || null,
@@ -4374,10 +4624,11 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
       dailyLimitBypass,
       dailyCap: DAILY_DEFI_LOOP_CAP,
       dailyCapCount: agent.daily_defi_loop_count ?? 0,
+      discoveryAllowedWhenExecutionCapReached: !DISCOVERY_REQUIRES_EXECUTION_CAP_HEADROOM,
       executionPermissionGranted,
       executionState: !executionPermissionGranted
         ? 'signal_only'
-        : defiLoopCapReached
+        : executionCapReached
           ? 'daily_cap_reached'
         : gateAllowsExecution
           ? 'eligible_for_defi_loop'
@@ -4386,7 +4637,7 @@ queue.process('ORACLE_QUERY', 2, async (job) => {
         ? 'Signal only — the Arbitrage strategy preference is disabled for this agent, so autonomous oracle strategy execution is blocked.'
         : !agent.defi_loop_enabled
         ? 'Signal only — autonomous DeFi execution is disabled for this agent, so no on-chain trade was submitted.'
-        : defiLoopCapReached
+        : executionCapReached
         ? `Autonomous DeFi execution is enabled, but no on-chain trade was submitted because this agent already used ${agent.daily_defi_loop_count || 0}/${DAILY_DEFI_LOOP_CAP} daily DeFi loop runs.`
         : executionPermissionGranted
         ? (gateAllowsExecution
@@ -4434,7 +4685,7 @@ async function scheduleOracleLoop() {
       let suspendedCount = 0;
       let runningSkipCount = 0;
       for (const agent of rows) {
-        if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
+        if (shouldSuspendMarketAndOracleDiscoveryWhenDefiCapReached(agent)) {
           suspendedCount += 1;
           continue;
         }
@@ -4485,7 +4736,7 @@ async function scheduleMarketAnalysisLoop() {
       let suspendedCount = 0;
       let runningSkipCount = 0;
       for (const agent of rows) {
-        if (shouldSuspendScanJobsWhenDefiCapReached(agent)) {
+        if (shouldSuspendMarketAndOracleDiscoveryWhenDefiCapReached(agent)) {
           suspendedCount += 1;
           continue;
         }
@@ -4556,6 +4807,7 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
   let activeAutomationKey = 'defiLoop';
   let stableStatePersisted = false;
   let allowCirbtcReviewDespiteStablePriority = false;
+  const countedMeaningfulExecutionRef = { value: false };
 
   const persistAutomationSnapshot = async (automationKey, status, payload) => {
     await _setAutomationState(agentId, automationKey, status);
@@ -4814,12 +5066,6 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
     );
     return finishDefi('cap_reached', { ok: false, reason: 'daily_cap_reached', count: agent.daily_defi_loop_count });
   }
-
-  // Count each started cycle once the shared daily cap gate is cleared.
-  await db.query(
-    'UPDATE agents SET daily_defi_loop_count = daily_defi_loop_count + 1 WHERE id = $1',
-    [agentId],
-  );
 
   if (shouldSkipDefiCycle) {
     if (!arbitragePermissionGranted && (stableLoopConfigured || cirbtcLpConfigured)) {
@@ -5094,7 +5340,13 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
             ok: true,
             action: 'hold',
             reason: 'carry_mode_exclusive',
-            summary: 'Stable DeFi Loop is paused because Auto Carry owns the stable LP lane while it is enabled.',
+            summary: 'Stable DeFi Loop is paused because Auto Carry currently has an active managed carry state.',
+            carryExclusivity: {
+              active: true,
+              carryState: 'active',
+              carryExecute: true,
+              reason: 'managed_carry_state_active',
+            },
             stablePolicy,
             executionGate,
           });
@@ -5184,7 +5436,12 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
   }
 
   if (carryAutomationEnabled && latestCarryPolicy && automationType !== 'lending') {
-    if (stableLoopEnabled && !stableStatePersisted) {
+      const carryExclusivityRequired = Boolean(
+        latestCarryPolicy?.verdict?.execute === true
+        || ['active', 'debt_idle', 'unwind'].includes(String(latestCarryPolicy?.metrics?.carryState || '').toLowerCase()),
+      );
+
+      if (stableLoopEnabled && !stableStatePersisted && carryExclusivityRequired) {
       latestStablePolicy = stablePolicy;
       latestExecutionSource = getStableAutomationExecutionSource();
       latestPositionSummary = positionSummary;
@@ -5192,7 +5449,13 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
         ok: true,
         action: 'hold',
         reason: 'carry_mode_exclusive',
-        summary: 'Stable DeFi Loop is paused because Auto Carry owns the stable LP lane while it is enabled.',
+          summary: 'Stable DeFi Loop is paused because Auto Carry currently has an active managed carry state.',
+          carryExclusivity: {
+            active: true,
+            carryState: latestCarryPolicy?.metrics?.carryState || null,
+            carryExecute: latestCarryPolicy?.verdict?.execute === true,
+            reason: 'managed_carry_state_active',
+          },
         stablePolicy,
         executionGate,
       });
@@ -5222,7 +5485,15 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
       }
 
       allowCirbtcReviewDespiteStablePriority = true;
-      await persistAutomationSnapshot('carryAutomation', 'policy_hold', carryHoldPayload);
+      await persistAutomationSnapshot('carryAutomation', 'policy_hold', {
+        ...carryHoldPayload,
+        carryExclusivity: {
+          active: false,
+          carryState: latestCarryPolicy?.metrics?.carryState || null,
+          carryExecute: false,
+          reason: 'carry_enabled_but_not_exclusive',
+        },
+      });
     }
   }
 
@@ -5343,6 +5614,71 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
           },
         };
       }
+
+      const cirbtcActionParams = cirbtcPolicy?.verdict?.actionParams || {};
+      const cirbtcRequestedAmount = normalizeUsdcAmount(cirbtcActionParams.amountIn || cirbtcPolicy?.verdict?.suggestedAmountUsdc || 0);
+      const cirbtcRecommendationFingerprint = buildExecutionRecommendationFingerprint({
+        automationType: 'cirbtc',
+        operationType: cirbtcPolicy?.verdict?.operationType,
+        policyId: cirbtcPolicy?.policyId,
+        actionParams: cirbtcActionParams,
+        signal,
+      });
+      const cirbtcPreflightFailureScope = buildDeterministicLaneFailureContext({
+        agentId,
+        transactionType: getCirbtcAutomationTransactionType(cirbtcPolicy?.verdict?.operationType),
+        executionSource: getCirbtcAutomationExecutionSource(),
+        policyLane: cirbtcPolicy?.verdict?.lane || null,
+        operationType: cirbtcPolicy?.verdict?.operationType,
+        actionParams: cirbtcActionParams,
+        automationPolicy: cirbtcPolicy,
+        executionPayload: {
+          poolKey: cirbtcPolicy?.metrics?.selectedPoolKey || null,
+          poolAddress: cirbtcPolicy?.metrics?.selectedPoolAddress || null,
+        },
+        defaultFromToken: String(cirbtcActionParams?.stableToken || 'USDC').toUpperCase(),
+        defaultToToken: 'cirBTC',
+        requestedExecutionAmount: cirbtcRequestedAmount,
+        reason: 'swap_error',
+        error: null,
+        errorCode: 'CIRBTC_ROUTE_UNAVAILABLE',
+        routeMode: 'primary_only',
+        recommendationFingerprint: cirbtcRecommendationFingerprint,
+      });
+      const cirbtcPreflightCooldown = await findActiveDeterministicLaneCooldownForContext({
+        agentId,
+        context: cirbtcPreflightFailureScope,
+      });
+
+      if (cirbtcPreflightCooldown.active) {
+        cirbtcPolicy = {
+          ...cirbtcPolicy,
+          verdict: {
+            ...(cirbtcPolicy.verdict || {}),
+            execute: false,
+            blockedBy: 'lane_failure_cooldown',
+            reason: `cirBTC LP automation is temporarily paused for this lane because the same deterministic pre-broadcast failure repeated recently. Retry in about ${Math.max(Math.ceil(Number(cirbtcPreflightCooldown.retryAfterMs || 0) / 60000), 1)} minute(s).`,
+            actionParams: null,
+            suggestedAmountUsdc: 0,
+          },
+          metrics: {
+            ...(cirbtcPolicy.metrics || {}),
+            laneFailureCooldown: {
+              active: true,
+              retryAfterMs: cirbtcPreflightCooldown.retryAfterMs,
+              rowId: cirbtcPreflightCooldown.rowId,
+              fingerprint: cirbtcPreflightCooldown.fingerprint,
+            },
+          },
+          checks: {
+            ...(cirbtcPolicy.checks || {}),
+            laneFailureCooldown: {
+              passed: false,
+              detail: 'This exact cirBTC lane failure is under cooldown and is excluded from the current planning cycle.',
+            },
+          },
+        };
+      }
     }
 
     const cirbtcPositionSummary = summarizePosition(
@@ -5448,6 +5784,12 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
     }
 
     if (automationType === 'stable' && cirbtcHoldPayload && (!stableLoopEnabled || stablePolicy.metrics?.positionPresent !== true)) {
+      cirbtcHoldPayload = {
+        ...cirbtcHoldPayload,
+        laneCandidateExcluded: true,
+        alternativeLaneSelected: false,
+        noSafeAlternative: true,
+      };
       return cirbtcHoldPayload;
     }
   }
@@ -5540,6 +5882,13 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
 
   let requestedExecutionAmount = normalizeUsdcAmount(actionParams.amountIn);
   let executionAmount = requestedExecutionAmount;
+  const recommendationFingerprint = buildExecutionRecommendationFingerprint({
+    automationType,
+    operationType,
+    policyId: automationPolicy?.policyId,
+    actionParams,
+    signal,
+  });
   const automationLabel = automationType === 'cirbtc'
     ? 'cirBTC LP automation'
     : automationType === 'oracle'
@@ -5555,6 +5904,10 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
       return finishDefi('balance_check_failed', {
         ok: false,
         reason: 'wallet_balance_unavailable',
+        executionState: 'execution_blocked',
+        laneCandidateExcluded: true,
+        noSafeAlternative: true,
+        recommendationFingerprint,
         stablePolicy: automationPolicy,
       });
     }
@@ -5573,6 +5926,10 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
       return finishDefi('balance_check_failed', {
         ok: false,
         reason: 'wallet_balance_unavailable',
+        executionState: 'execution_blocked',
+        laneCandidateExcluded: true,
+        noSafeAlternative: true,
+        recommendationFingerprint,
         stablePolicy: automationPolicy,
       });
     }
@@ -5594,6 +5951,10 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
       return finishDefi('balance_check_failed', {
         ok: false,
         reason: 'wallet_balance_unavailable',
+        executionState: 'execution_blocked',
+        laneCandidateExcluded: true,
+        noSafeAlternative: true,
+        recommendationFingerprint,
         stablePolicy: automationPolicy,
       });
     }
@@ -5604,6 +5965,10 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
       return finishDefi('balance_check_failed', {
         ok: false,
         reason: 'wallet_balance_unavailable',
+        executionState: 'execution_blocked',
+        laneCandidateExcluded: true,
+        noSafeAlternative: true,
+        recommendationFingerprint,
         stablePolicy: automationPolicy,
       });
     }
@@ -5648,6 +6013,10 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
       ok: true,
       action: 'hold',
       reason: 'insufficient_balance',
+      executionState: 'skipped',
+      laneCandidateExcluded: true,
+      noSafeAlternative: true,
+      recommendationFingerprint,
       operationType,
       requestedAmountUsdc: requestedExecutionAmount,
       availableBalanceUsdc: availableUsdcBalance,
@@ -5886,41 +6255,21 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
         dryRunEnabled: false,
       });
       if (!executionResult.ok) {
-        await db.query(
-          `INSERT INTO transactions
-             (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
-           VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, 'failed', $5::jsonb)`,
-          [agentId, transactionType, transactionToken, nominalActionAmountUsdc || executionAmount, JSON.stringify({
-            signal,
-            executionGate,
-            automationPolicy,
-            stablePolicy: automationType === 'stable' ? automationPolicy : undefined,
-            policyId: automationPolicy?.policyId || null,
-            policyLane: automationPolicy?.verdict?.lane || null,
-            executionState: 'failed',
-            executionSource,
-            operationType,
-            fromToken: defaultFromToken,
-            toToken: defaultToToken,
-            amountIn: actionParams.amountIn || executionAmount,
-            requestedAmountIn: requestedExecutionAmount,
-            withdrawPct: actionParams.withdrawPct || null,
-            availableBalanceUsdc: availableUsdcBalance,
-            availableBalanceEurc: availableEurcBalance,
-            walletReserveUsdc,
-            availableToTradeUsdc,
-            positionBefore: positionSummary,
-            summary: `Lending automation could not execute ${operationType.replace(/_/g, ' ')}: ${executionResult.error || executionResult.reason}`,
-            reason: executionResult.reason,
-            error: executionResult.error || null,
-          })],
-        );
+        await maybeIncrementDailyDefiLoopCount({
+          agentId,
+          didCountRef: countedMeaningfulExecutionRef,
+          executionResult,
+        });
 
         return finishDefi('execution_blocked', {
           ok: false,
           reason: executionResult.reason,
           error: executionResult.error,
           operationType,
+          executionState,
+          laneCandidateExcluded: true,
+          noSafeAlternative: true,
+          recommendationFingerprint,
         });
       }
 
@@ -5938,33 +6287,11 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
         sourceTaskId: shouldTrackAutoCarryTaskRun ? carrySourceTaskId : null,
       });
       if (!executionResult.ok) {
-        await db.query(
-          `INSERT INTO transactions
-             (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
-           VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, 'failed', $5::jsonb)`,
-          [agentId, transactionType, transactionToken, nominalActionAmountUsdc || executionAmount, JSON.stringify({
-            signal,
-            executionGate,
-            automationPolicy,
-            policyId: automationPolicy?.policyId || null,
-            policyLane: automationPolicy?.verdict?.lane || null,
-            executionState: 'failed',
-            executionSource,
-            operationType,
-            fromToken: defaultFromToken,
-            toToken: defaultToToken,
-            amountIn: actionParams.amountIn || executionAmount,
-            requestedAmountIn: requestedExecutionAmount,
-            availableBalanceUsdc: availableUsdcBalance,
-            availableBalanceEurc: availableEurcBalance,
-            walletReserveUsdc,
-            availableToTradeUsdc,
-            positionBefore: positionSummary,
-            summary: `Auto Carry could not execute ${operationType.replace(/_/g, ' ')}: ${executionResult.error || executionResult.reason}`,
-            reason: executionResult.reason,
-            error: executionResult.error || null,
-          })],
-        );
+        await maybeIncrementDailyDefiLoopCount({
+          agentId,
+          didCountRef: countedMeaningfulExecutionRef,
+          executionResult,
+        });
 
         return finishDefi('execution_blocked', {
           ok: false,
@@ -6030,18 +6357,75 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
         dryRunEnabled: false,
       });
       if (!executionResult.ok) {
-        await db.query(
+        const failureContext = buildDeterministicLaneFailureContext({
+          agentId,
+          transactionType,
+          executionSource,
+          policyLane: automationPolicy?.verdict?.lane || null,
+          operationType,
+          actionParams,
+          automationPolicy,
+          executionPayload: executionResult.payload || {},
+          defaultFromToken,
+          defaultToToken,
+          requestedExecutionAmount,
+          reason: executionResult.reason,
+          error: executionResult.error,
+          errorCode: executionResult.errorCode,
+          routeMode: 'primary_only',
+          recommendationFingerprint,
+        });
+
+        const existingCooldown = await findActiveDeterministicLaneCooldownForContext({
+          agentId,
+          context: failureContext,
+        });
+
+        if (existingCooldown.active) {
+          return finishDefi('policy_hold', {
+            ok: true,
+            action: 'hold',
+            reason: 'lane_failure_cooldown',
+            operationType,
+            laneCandidateExcluded: true,
+            noSafeAlternative: true,
+            recommendationFingerprint,
+            retryAfterMs: existingCooldown.retryAfterMs,
+            summary: 'Skipped repeating an identical deterministic cirBTC lane failure while cooldown is active.',
+            cooldown: {
+              type: 'deterministic_lane_failure',
+              retryAfterMs: existingCooldown.retryAfterMs,
+              rowId: existingCooldown.rowId,
+              fingerprint: existingCooldown.fingerprint,
+            },
+          });
+        }
+
+        const status = shouldTreatExecutionResultAsDeterministicPreBroadcastFailure(executionResult)
+          ? 'execution_blocked'
+          : 'failed';
+        const executionState = shouldTreatExecutionResultAsDeterministicPreBroadcastFailure(executionResult)
+          ? 'execution_blocked'
+          : 'failed';
+        const reasonCode = resolveDeterministicFailureCode({
+          reason: executionResult.reason,
+          error: executionResult.error,
+          errorCode: executionResult.errorCode,
+        });
+
+        const inserted = await db.query(
           `INSERT INTO transactions
-             (agent_id, type, from_chain, to_chain, token, amount_usdc, status, meta)
-           VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, 'failed', $5::jsonb)`,
-          [agentId, transactionType, transactionToken, nominalActionAmountUsdc || executionAmount, JSON.stringify({
+             (agent_id, type, from_chain, to_chain, token, amount_usdc, status, tx_hash, meta)
+           VALUES ($1, $2, 'arc-testnet', 'arc-testnet', $3, $4, $5, NULL, $6::jsonb)
+           RETURNING id::text AS id`,
+          [agentId, transactionType, transactionToken, nominalActionAmountUsdc || executionAmount, status, JSON.stringify({
             signal,
             executionGate,
             automationPolicy,
             stablePolicy: automationType === 'stable' ? automationPolicy : undefined,
             policyId: automationPolicy?.policyId || null,
             policyLane: automationPolicy?.verdict?.lane || null,
-            executionState: 'failed',
+            executionState,
             executionSource,
             operationType,
             fromToken: defaultFromToken,
@@ -6057,8 +6441,56 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
             summary: `cirBTC LP automation could not execute ${operationType.replace(/_/g, ' ')}: ${executionResult.error || executionResult.reason}`,
             reason: executionResult.reason,
             error: executionResult.error || null,
+            errorCode: reasonCode,
+            deterministicPreBroadcastFailure: shouldTreatExecutionResultAsDeterministicPreBroadcastFailure(executionResult),
+            routeMode: 'primary_only',
+            routeUnavailable: reasonCode === 'CIRBTC_ROUTE_UNAVAILABLE',
+            fallbackDisabled: reasonCode === 'CIRBTC_FALLBACK_DISABLED',
+            laneFailureCooldownApplied: false,
+            laneFailureDeduped: false,
+            laneCandidateExcluded: true,
+            noSafeAlternative: true,
+            recommendationFingerprint,
+            laneFailureScope: failureContext,
           })],
         );
+
+        if (shouldTreatExecutionResultAsDeterministicPreBroadcastFailure(executionResult)) {
+          const cooldown = await registerDeterministicLaneFailureCooldown({
+            agentId,
+            context: failureContext,
+          });
+
+          await db.query(
+            `UPDATE transactions
+                SET meta = COALESCE(meta, '{}'::jsonb)
+                      || jsonb_build_object(
+                        'laneFailureCooldownApplied', true,
+                        'laneFailureDeduped', false,
+                        'laneFailureRetryAfterMs', $2::int,
+                        'laneFailureRepeatCount', $3::int,
+                        'laneFailureFingerprint', $4::text,
+                        'laneFailureScopeKey', $5::text,
+                        'firstSeenAt', COALESCE(meta->>'firstSeenAt', NOW()::text),
+                        'lastSeenAt', NOW()::text,
+                        'repeatCount', GREATEST(COALESCE((meta->>'repeatCount')::int, 1), 1)
+                      )
+              WHERE id = $1::uuid`,
+            [
+              inserted.rows?.[0]?.id || null,
+              Number(cooldown.retryAfterMs || 0),
+              Number(cooldown.repeatCount || 1),
+              failureContext.fingerprint,
+              failureContext.scopeKey,
+            ],
+          ).catch(() => {});
+        } else {
+          await maybeIncrementDailyDefiLoopCount({
+            agentId,
+            didCountRef: countedMeaningfulExecutionRef,
+            executionResult,
+          });
+        }
 
         return finishDefi('execution_blocked', {
           ok: false,
@@ -6172,6 +6604,13 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
       };
     }
 
+    await maybeIncrementDailyDefiLoopCount({
+      agentId,
+      didCountRef: countedMeaningfulExecutionRef,
+      txResult,
+      executionResult: { ok: true, payload: executionPayload },
+    });
+
     let economy = null;
     try {
       economy = await taskEconomyService.settleExecutionFee({
@@ -6273,6 +6712,12 @@ queue.process('DEFI_LOOP', DEFI_LOOP_WORKER_CONCURRENCY, async (job) => {
   } catch (err) {
     const errorDetails = buildExecutionErrorDetails(err);
     console.error(`[QUEUE] DEFI_LOOP ${operationType} error agent=${agentId}:`, errorDetails.error);
+
+    await maybeIncrementDailyDefiLoopCount({
+      agentId,
+      didCountRef: countedMeaningfulExecutionRef,
+      errorDetails,
+    });
 
     const stableLpExitFailureContext = isStableLpExit
       ? buildStableLpExitFailureContext({
@@ -8780,3 +9225,10 @@ module.exports.cleanupMalformedActiveDefiLoopJobs = cleanupMalformedActiveDefiLo
 module.exports.recoverMissingAutoCarryHandoffRuns = recoverMissingAutoCarryHandoffRuns;
 module.exports.queueDefiLoopForAgent = queueDefiLoopForAgent;
 module.exports.__buildFeeSettlementRetryJobId = buildFeeSettlementRetryJobId;
+module.exports.__testOnly = {
+  shouldCountAsMeaningfulExecutionAttempt,
+  resolveDeterministicFailureCode,
+  buildExecutionRecommendationFingerprint,
+  buildDeterministicLaneFailureContext,
+  shouldSuspendMarketAndOracleDiscoveryWhenDefiCapReached,
+};
