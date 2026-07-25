@@ -221,6 +221,13 @@ function parseErrorRpcCode(error) {
 function inferGatewayFailureSource(error, fallback = 'unknown') {
   const text = extractGatewayErrorText(error);
 
+  // An explicit negative provenance marker must win. Gateway SDK/service errors
+  // often include an RPC URL or the word "rpc" even when the failure came from
+  // Circle/facilitator HTTP. Those errors must never poison Arc endpoint health.
+  if (error?.rpcEndpointProven === false || error?.isArcRpcEndpointError === false) {
+    return fallback;
+  }
+
   if (
     text.includes('gateway api balance fetch failed')
     || text.includes('gateway api error')
@@ -237,10 +244,17 @@ function inferGatewayFailureSource(error, fallback = 'unknown') {
     return 'facilitator_http';
   }
 
+  const hasStructuredRpcEvidence = Boolean(
+    error?.info?.responseStatus
+    || error?.info?.responseBody
+    || error?.info?.payload
+    || error?.payload?.jsonrpc
+    || error?.error?.code != null
+  );
+
   if (
-    text.includes('json-rpc')
-    || text.includes('rpc')
-    || text.includes('request limit reached')
+    hasStructuredRpcEvidence
+    || text.includes('json-rpc')
     || text.includes('could not coalesce')
     || text.includes('batch of more than')
     || text.includes('-32603')
@@ -696,7 +710,7 @@ async function readGatewayBalances(client, address, options = {}) {
     wallet = await runGatewayStage({
       operation,
       failureStage: 'wallet_balance_read',
-      failureSource: 'json_rpc',
+      failureSource: 'unknown',
       trafficClass,
       rpcUrl: options.rpcUrl,
     }, () => client.getUsdcBalance(address));
@@ -1077,7 +1091,7 @@ async function ensureGatewayAvailableBalanceUnlocked(client, amountUsdc, options
   const depositResult = await runGatewayStage({
     operation,
     failureStage: 'gateway_available_balance_deposit',
-    failureSource: 'json_rpc',
+    failureSource: 'unknown',
     trafficClass,
     rpcUrl: options.rpcUrl,
   }, () => client.deposit(shortfall));
@@ -1152,7 +1166,7 @@ async function ensureGatewayPaymentBalanceUnlocked(client, amountUsdc, options =
   const depositResult = await runGatewayStage({
     operation,
     failureStage: 'gateway_payment_balance_deposit',
-    failureSource: 'json_rpc',
+    failureSource: 'unknown',
     trafficClass,
     rpcUrl: options.rpcUrl,
   }, () => client.deposit(shortfall));
@@ -1225,7 +1239,7 @@ async function depositGatewayBalanceUnlocked(client, amountUsdc, options = {}) {
   const depositResult = await runGatewayStage({
     operation,
     failureStage: 'gateway_manual_deposit_submission',
-    failureSource: 'json_rpc',
+    failureSource: 'unknown',
     trafficClass,
     rpcUrl: options.rpcUrl,
   }, () => client.deposit(amount));
