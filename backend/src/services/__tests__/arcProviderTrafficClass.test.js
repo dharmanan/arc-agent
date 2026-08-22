@@ -207,6 +207,27 @@ describe('arcProvider safeArcRpcCall fallback semantics', () => {
     )).rejects.toThrow('hard failure');
   });
 
+  test('deduplicates repeated endpoints before retrying', async () => {
+    jest.resetModules();
+    process.env.ARC_RPC_URLS = [ENDPOINT_A, ENDPOINT_A, ENDPOINT_B].join(',');
+
+    let arcProvider;
+    jest.isolateModules(() => {
+      arcProvider = require('../arcProvider');
+    });
+
+    const attempted = [];
+    await expect(arcProvider.safeArcRpcCall(
+      'duplicate_endpoint_probe',
+      async (_provider, rpcUrl) => {
+        attempted.push(rpcUrl);
+        throw createRateLimitError();
+      },
+    )).rejects.toThrow('request limit reached');
+
+    expect(attempted).toEqual([ENDPOINT_A, ENDPOINT_B]);
+  });
+
   test('strict provenance mode does not mark endpoint unhealthy for gateway service 429', async () => {
     const arcProvider = loadProvider();
 

@@ -62,10 +62,10 @@ function getBatchLimitCooldownMs() {
 function parseArcRpcUrlList(value) {
   if (!value) return [];
 
-  return String(value)
+  return [...new Set(String(value)
     .split(/[\n,;\s]+/)
     .map((entry) => entry.trim())
-    .filter(Boolean);
+    .filter(Boolean))];
 }
 
 function isGatewayTrafficClass(trafficClass) {
@@ -78,13 +78,13 @@ function getDefaultArcRpcUrlPool() {
     return pooledUrls;
   }
 
-  return [
+  return [...new Set([
     process.env.ARC_RPC_URL,
     process.env.ARC_TESTNET_RPC,
     DEFAULT_ARC_RPC_URL,
   ]
     .map((entry) => String(entry || '').trim())
-    .filter(Boolean);
+    .filter(Boolean))];
 }
 
 function getArcRpcUrlPool(options = {}) {

@@ -10,13 +10,23 @@ import {
 } from './ui/index.jsx';
 import { Bot, Plus, Trash2, Key, AlertTriangle, LogOut, Brain, Shield, Zap, CheckCircle, XCircle, RefreshCw, FlaskConical } from 'lucide-react';
 
+const DEFAULT_GROQ_MODEL = 'openai/gpt-oss-20b';
+const RETIRED_GROQ_MODELS = new Set([
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+]);
+
 function getProviderLabel(model) {
   if (!model) return 'Unknown';
   if (model.startsWith('claude')) return 'Anthropic';
   if (model.startsWith('gemini')) return 'Google';
+  if (model === DEFAULT_GROQ_MODEL || model.startsWith('groq/')) return 'Groq';
   if (model.startsWith('gpt-')) return 'OpenAI';
-  if (model.startsWith('llama-')) return 'Groq';
   return 'Unknown';
+}
+
+function normalizeLlmModel(model) {
+  return RETIRED_GROQ_MODELS.has(model) ? DEFAULT_GROQ_MODEL : model;
 }
 
 function parseNonNegativeUsdc(value) {
@@ -62,7 +72,7 @@ export default function AgentTab() {
   // Settings state
   const [settings, setSettings]   = useState({});
   const [llmApiKey, setLlmApiKey] = useState('');
-  const [llmModel, setLlmModel]   = useState('llama-3.3-70b-versatile');
+  const [llmModel, setLlmModel]   = useState(DEFAULT_GROQ_MODEL);
   const [smartMode, setSmartMode] = useState(false);
   const [testingLlm, setTestingLlm] = useState(false);
   const [llmTestMsg, setLlmTestMsg] = useState('');
@@ -89,7 +99,7 @@ export default function AgentTab() {
       setSettings(agent.settings);
     }
     if (agent?.isSmartMode !== undefined) setSmartMode(agent.isSmartMode);
-    if (agent?.llmModel) setLlmModel(agent.llmModel);
+    if (agent?.llmModel) setLlmModel(normalizeLlmModel(agent.llmModel));
     if (agent?.features) setFeatures(f => ({ ...f, ...agent.features }));
   }, [agent]);
 
@@ -646,14 +656,17 @@ export default function AgentTab() {
             <div className="rounded-xl border border-arc-green/20 bg-arc-greenBg p-3 text-xs text-slate-600">
               Smart Mode can use an LLM to scan for opportunities and act within your limits.
             </div>
+            <Alert type="warning">
+              Groq no longer provides Llama 3.3 70B and Llama 3.1 8B for this account. Existing Groq configurations now use GPT-OSS 20B. Choose a model below and save to change it.
+            </Alert>
             <Select
               label="LLM Model"
               value={llmModel}
               onChange={e => setLlmModel(e.target.value)}
             >
               <optgroup label="Free Tier (No cost)">
-                <option value="llama-3.3-70b-versatile">Llama 3.3 70B — Groq FREE ⭐ Recommended</option>
-                <option value="llama-3.1-8b-instant">Llama 3.1 8B Instant — Groq FREE (fastest)</option>
+                <option value="openai/gpt-oss-20b">GPT-OSS 20B — Groq FREE ⭐ Recommended</option>
+                <option value="groq/compound-mini">Compound Mini — Groq FREE (fast)</option>
               </optgroup>
               <optgroup label="Paid Tier">
                 <option value="claude-haiku-3-5-20241022">Claude Haiku 3.5 — Anthropic</option>
@@ -686,21 +699,21 @@ export default function AgentTab() {
               <p className="text-xs text-arc-green">API key is stored securely.</p>
             )}
             {/* Groq onboarding card */}
-            {(llmModel === 'llama-3.3-70b-versatile' || llmModel === 'llama-3.1-8b-instant') && (
+            {(llmModel === 'openai/gpt-oss-20b' || llmModel === 'groq/compound-mini') && (
               <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-xs text-blue-900 space-y-3">
                 {/* Capability answer */}
                 <div>
                   <p className="font-bold text-sm text-blue-800 mb-1">Is Groq's free tier capable enough?</p>
                   <p>
                     <span className="font-semibold text-arc-green">Yes.</span>{' '}
-                    Llama 3.3 70B is a large, capable model — it can analyze market signals, evaluate trade conditions, and make decisions within your agent's limits.
+                    GPT-OSS 20B is a capable general-purpose model — it can analyze market signals, evaluate trade conditions, and make decisions within your agent's limits.
                     This is a <span className="font-semibold">testnet environment</span>, so the free tier is more than sufficient to get started.
                   </p>
                 </div>
                 {/* Tier comparison */}
                 <div className="rounded-lg border border-blue-200 bg-white/60 p-2 space-y-1">
                   <p className="font-semibold text-blue-700">Free vs Paid models:</p>
-                  <p>• <span className="font-medium">Groq free (Llama 3.3 70B)</span> — handles testnet tasks well, no cost, great for getting started</p>
+                  <p>• <span className="font-medium">Groq free (GPT-OSS 20B)</span> — handles testnet tasks well, no cost, great for getting started</p>
                   <p>• <span className="font-medium">Paid models</span> (Claude, GPT-4o, Gemini) — higher reasoning quality, better for complex strategies or mainnet</p>
                   <p className="text-blue-600 italic">You can always switch to a paid model later as your strategy gets more sophisticated.</p>
                 </div>

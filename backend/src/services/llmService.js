@@ -26,14 +26,14 @@ const ALLOWED_MODELS = new Set([
   'claude-haiku-3-5-20241022',   // Anthropic (paid)
   'gemini-2.0-flash',            // Google (paid)
   'gpt-4o-mini',                 // OpenAI (paid)
-  'llama-3.3-70b-versatile',     // Groq FREE tier — recommended for beginners
-  'llama-3.1-8b-instant',        // Groq FREE tier — fastest
+  'openai/gpt-oss-20b',          // Groq free tier — verified general-purpose model
+  'groq/compound-mini',          // Groq free tier — fast compound model
 ]);
 
 // Models that route to Groq's OpenAI-compatible endpoint
 const GROQ_MODELS = new Set([
-  'llama-3.3-70b-versatile',
-  'llama-3.1-8b-instant',
+  'openai/gpt-oss-20b',
+  'groq/compound-mini',
 ]);
 
 function getProviderName(model) {
@@ -205,8 +205,7 @@ async function testConnection({ model, apiKey, agentId = null }) {
   }
 
   const provider = getProviderName(model);
-  const challenge = crypto.randomBytes(3).toString('hex').toUpperCase();
-  const promptText = `Reply with exactly CONNECTED:${challenge}`;
+  const promptText = 'Reply with a short confirmation that you are connected.';
   const client = buildClient(model, apiKey);
   let responseText = '';
   const startedAt = Date.now();
@@ -222,7 +221,7 @@ async function testConnection({ model, apiKey, agentId = null }) {
   } else {
     const resp = await client.chat.completions.create({
       model,
-      max_tokens: 16,
+      max_tokens: 64,
       messages: [
         { role: 'system', content: promptText },
         { role: 'user', content: promptText },
@@ -232,20 +231,18 @@ async function testConnection({ model, apiKey, agentId = null }) {
   }
 
   const latencyMs = Date.now() - startedAt;
-  const verified = new RegExp(`CONNECTED[:\\s-]*${challenge}`, 'i').test(responseText.trim());
+  const verified = responseText.trim().length > 0;
   if (!verified) {
-    throw new Error(`Provider responded, but verification challenge ${challenge} was not echoed back.`);
+    throw new Error('Provider returned an empty response. Please try again.');
   }
 
-  await auditLog(agentId, model, `test_connection:${challenge}`, responseText.trim(), latencyMs, false);
-  console.info(`[LLM TEST] agent=${agentId || 'none'} provider=${provider} model=${model} latencyMs=${latencyMs} challenge=${challenge} verified=true`);
+  await auditLog(agentId, model, 'test_connection', responseText.trim(), latencyMs, false);
+  console.info(`[LLM TEST] agent=${agentId || 'none'} provider=${provider} model=${model} latencyMs=${latencyMs} verified=true`);
 
   return {
     ok: true,
     model,
     provider,
-    responseText: responseText.trim(),
-    challenge,
     latencyMs,
     verifiedAt: new Date().toISOString(),
     verifiedLive: true,

@@ -105,7 +105,8 @@ function withTimeout(promise, ms) {
 
 function isArchiveAccessError(error) {
   const message = String(error?.message || error?.error?.message || '').toLowerCase();
-  return message.includes('archive requests require');
+  return message.includes('archive requests require')
+    || message.includes('pruned history unavailable');
 }
 
 function getChainEnvPrefix(chain) {

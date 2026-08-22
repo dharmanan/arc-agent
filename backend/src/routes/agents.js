@@ -24,8 +24,8 @@ const LLM_MODEL_OPTIONS = [
   'claude-haiku-3-5-20241022',
   'gemini-2.0-flash',
   'gpt-4o-mini',
-  'llama-3.3-70b-versatile',
-  'llama-3.1-8b-instant',
+  'openai/gpt-oss-20b',
+  'groq/compound-mini',
 ];
 
 router.use(requireAuth);
@@ -157,7 +157,7 @@ router.post('/:id/test-llm', async (req, res, next) => {
     const agent = await agentService.getAgentWithKey(req.params.id, req.user.userId);
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
 
-    const model = data.llmModel || agent.llm_model || 'llama-3.3-70b-versatile';
+    const model = data.llmModel || agent.llm_model || 'openai/gpt-oss-20b';
     const typedKey = String(data.llmApiKey || '').trim();
     const usingStoredKey = typedKey.length === 0;
 
