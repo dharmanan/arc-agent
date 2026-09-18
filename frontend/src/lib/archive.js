@@ -1,10 +1,20 @@
 /**
- * Production archive mode for the retired Arc Testnet deployment.
+ * Archive mode for the retired Arc Testnet deployment.
  *
- * Vercel enables this with VITE_ARCHIVE_MODE=true. Local development stays
- * unchanged unless the same environment variable is explicitly set.
+ * The public production domain is always read-only. The VITE_ARCHIVE_MODE
+ * environment variable remains as an explicit opt-in for preview/static builds.
  */
+const hostname =
+  typeof window !== 'undefined'
+    ? String(window.location.hostname || '').toLowerCase()
+    : '';
+
+const archiveHost =
+  hostname === 'arcmachina.xyz' ||
+  hostname === 'www.arcmachina.xyz';
+
 export const ARCHIVE_MODE =
+  archiveHost ||
   String(import.meta.env.VITE_ARCHIVE_MODE || '').toLowerCase() === 'true';
 
 export const ARCHIVE_TITLE = 'Arc Testnet archived';
