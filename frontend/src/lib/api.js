@@ -2,6 +2,8 @@
  * Arc Machina — Frontend API Client
  */
 
+import { ARCHIVE_MODE, createArchiveError } from './archive.js';
+
 const BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
 function readStoredToken() {
@@ -32,6 +34,8 @@ export function getToken()  { return _token; }
 export function isLoggedIn() { return !!_token; }
 
 async function request(method, path, body) {
+  if (ARCHIVE_MODE) throw createArchiveError();
+
   const headers = { 'Content-Type': 'application/json' };
   if (_token) headers['Authorization'] = `Bearer ${_token}`;
 

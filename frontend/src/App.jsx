@@ -14,6 +14,7 @@ import OracleTab from './components/OracleTab.jsx';
 import TradeTab from './components/TradeTab.jsx';
 import LandingPage from './components/LandingPage.jsx';
 import { ChevronDown } from 'lucide-react';
+import { ARCHIVE_MODE, ARCHIVE_MESSAGE } from './lib/archive.js';
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', compactLabel: 'Dash' },
@@ -120,12 +121,20 @@ function Header({ activeTab, setTab, onOpenLanding }) {
 
         {/* Right: network switcher + connect */}
         <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1.5 sm:gap-2">
-          {isConnected && <NetworkSwitcher />}
-          <ConnectButton
-            accountStatus="avatar"
-            chainStatus="none"
-            showBalance={false}
-          />
+          {ARCHIVE_MODE ? (
+            <span className="rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-amber-800">
+              Archived demo
+            </span>
+          ) : (
+            <>
+              {isConnected && <NetworkSwitcher />}
+              <ConnectButton
+                accountStatus="avatar"
+                chainStatus="none"
+                showBalance={false}
+              />
+            </>
+          )}
         </div>
       </div>
 
@@ -171,6 +180,11 @@ function AppContent() {
     <div className="min-h-screen overflow-x-hidden">
       <Header activeTab={tab} setTab={setTab} onOpenLanding={() => setShowLanding(true)} />
       <main className="mx-auto max-w-6xl overflow-x-hidden px-3 py-6 sm:px-6 sm:py-8 lg:px-8">
+        {ARCHIVE_MODE && (
+          <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 shadow-sm">
+            <strong>Arc Testnet archived.</strong> {ARCHIVE_MESSAGE}
+          </div>
+        )}
         {tab === 'dashboard' && <DashboardTab onNavigate={navigate} />}
         {tab === 'bridge' && <BridgeTab onBack={back} />}
         {tab === 'swap' && <SwapTab onBack={back} />}

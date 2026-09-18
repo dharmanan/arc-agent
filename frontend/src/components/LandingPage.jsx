@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import Spline from '@splinetool/react-spline';
 import { LiquidButton } from './ui/liquid-glass-button';
 import { DemoModal } from './DemoModal';
+import { ARCHIVE_MODE } from '../lib/archive.js';
 
 const MatrixRain = () => {
   const canvasRef = useRef(null);
@@ -99,12 +100,21 @@ const MatrixReveal = ({ text, delay = 0, speed = 40, className = "" }) => {
   return <span className={className}>{displayText || text.replace(/./g, "\u00A0")}</span>;
 };
 
-const benefitList = [
+const liveBenefitList = [
   "No coding knowledge required.",
   "Deploy agents that execute and trade for you.",
   "Agents collaborate to find the best market strategies.",
   "Your digital workforce never sleeps."
 ];
+
+const archiveBenefitList = [
+  "Original no-code agent workflow preserved.",
+  "Wallet, automation, trading, jobs, Oracle, and DeFi surfaces remain explorable.",
+  "Live execution is disabled after the Arc Testnet deployment.",
+  "The product remains online as a read-only project archive."
+];
+
+const benefitList = ARCHIVE_MODE ? archiveBenefitList : liveBenefitList;
 
 export default function LandingPage({ onEnterApp }) {
   const [status, setStatus] = useState('idle');
@@ -159,8 +169,10 @@ export default function LandingPage({ onEnterApp }) {
             transition={{ duration: 0.8, delay: 0.5 }}
             className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-[#347A3D]/30 bg-[#347A3D]/10 mb-6"
           >
-            <span className="w-2.5 h-2.5 rounded-full bg-[#347A3D] animate-pulse"></span>
-            <span className="text-xs font-bold text-[#347A3D] tracking-widest uppercase mt-0.5">TESTNET LIVE</span>
+            <span className={`w-2.5 h-2.5 rounded-full ${ARCHIVE_MODE ? 'bg-amber-500' : 'bg-[#347A3D] animate-pulse'}`}></span>
+            <span className={`text-xs font-bold tracking-widest uppercase mt-0.5 ${ARCHIVE_MODE ? 'text-amber-700' : 'text-[#347A3D]'}`}>
+              {ARCHIVE_MODE ? 'ARC TESTNET · ARCHIVED DEMO' : 'TESTNET LIVE'}
+            </span>
           </motion.div>
 
           <motion.div 
@@ -179,7 +191,9 @@ export default function LandingPage({ onEnterApp }) {
 
           <div className="text-lg text-[#5A6E60] mb-8 max-w-lg leading-relaxed font-semibold min-h-[90px]">
             <MatrixReveal 
-              text="Arc Machina lets anyone join the agent economy. Simply build your team, and your autonomous workforce will collaborate and execute trades for you day and night." 
+              text={ARCHIVE_MODE
+                ? "Arc Machina is preserved as an archived Arc Testnet demo, showing the original agent wallet, automation, trading, jobs, Oracle, and DeFi product experience."
+                : "Arc Machina lets anyone join the agent economy. Simply build your team, and your autonomous workforce will collaborate and execute trades for you day and night."} 
               delay={1200} 
               speed={20}
             />
@@ -209,7 +223,9 @@ export default function LandingPage({ onEnterApp }) {
             className="flex flex-col sm:flex-row justify-center md:justify-start md:ml-20 w-full relative z-30"
           >
             <LiquidButton onClick={handleEnter} className="w-full sm:w-auto h-14 px-10 text-lg group">
-              <span className="relative z-10 transition-colors uppercase leading-none">ENTER THE FUTURE</span>
+              <span className="relative z-10 transition-colors uppercase leading-none">
+                {ARCHIVE_MODE ? 'EXPLORE THE ARCHIVE' : 'ENTER THE FUTURE'}
+              </span>
             </LiquidButton>
           </motion.div>
 
@@ -241,7 +257,7 @@ export default function LandingPage({ onEnterApp }) {
           className="absolute top-[48%] lg:top-[48%] z-30 pointer-events-auto"
         >
           <LiquidButton onClick={() => setIsDemoOpen(true)} size="lg" className="px-8 py-3 font-bold tracking-widest shadow-xl text-[#347A3D]">
-            <span className="relative z-10">TRY ME</span>
+            <span className="relative z-10">{ARCHIVE_MODE ? 'VIEW DEMO' : 'TRY ME'}</span>
           </LiquidButton>
         </motion.div>
       </motion.div>
