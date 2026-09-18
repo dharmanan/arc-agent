@@ -159,8 +159,8 @@ export default function LandingPage({ onEnterApp }) {
             transition={{ duration: 0.8, delay: 0.5 }}
             className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-[#347A3D]/30 bg-[#347A3D]/10 mb-6"
           >
-            <span className="w-2.5 h-2.5 rounded-full bg-[#347A3D] animate-pulse"></span>
-            <span className="text-xs font-bold text-[#347A3D] tracking-widest uppercase mt-0.5">TESTNET LIVE</span>
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+            <span className="text-xs font-bold text-amber-700 tracking-widest uppercase mt-0.5">ARC TESTNET · ARCHIVED DEMO</span>
           </motion.div>
 
           <motion.div 
@@ -179,7 +179,7 @@ export default function LandingPage({ onEnterApp }) {
 
           <div className="text-lg text-[#5A6E60] mb-8 max-w-lg leading-relaxed font-semibold min-h-[90px]">
             <MatrixReveal 
-              text="Arc Machina lets anyone join the agent economy. Simply build your team, and your autonomous workforce will collaborate and execute trades for you day and night." 
+              text="Arc Machina is preserved as an archived Arc Testnet demo, showing the original agent wallet, automation, trading, jobs, Oracle, and DeFi product experience." 
               delay={1200} 
               speed={20}
             />
@@ -209,7 +209,7 @@ export default function LandingPage({ onEnterApp }) {
             className="flex flex-col sm:flex-row justify-center md:justify-start md:ml-20 w-full relative z-30"
           >
             <LiquidButton onClick={handleEnter} className="w-full sm:w-auto h-14 px-10 text-lg group">
-              <span className="relative z-10 transition-colors uppercase leading-none">ENTER THE FUTURE</span>
+              <span className="relative z-10 transition-colors uppercase leading-none">EXPLORE THE ARCHIVE</span>
             </LiquidButton>
           </motion.div>
 
@@ -241,7 +241,7 @@ export default function LandingPage({ onEnterApp }) {
           className="absolute top-[48%] lg:top-[48%] z-30 pointer-events-auto"
         >
           <LiquidButton onClick={() => setIsDemoOpen(true)} size="lg" className="px-8 py-3 font-bold tracking-widest shadow-xl text-[#347A3D]">
-            <span className="relative z-10">TRY ME</span>
+            <span className="relative z-10">VIEW DEMO</span>
           </LiquidButton>
         </motion.div>
       </motion.div>
