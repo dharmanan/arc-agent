@@ -18,6 +18,10 @@
   ],
   "rewrites": [
     {
+      "source": "/api/(.*)",
+      "destination": "/archive-api.json"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
