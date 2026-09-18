@@ -3,6 +3,7 @@
  * Fetches native (ETH/ARC) and USDC ERC-20 balances for an agent wallet.
  */
 import { CHAINS } from './chains.js';
+import { ARCHIVE_MODE } from './archive.js';
 
 // ERC-20 balanceOf(address) selector = 0x70a08231
 function balanceOfCalldata(address) {
@@ -16,6 +17,8 @@ function formatUnits(rawValue, decimals, fractionDigits) {
 
 /** Native ETH/ARC balance — returns string with 4 decimals */
 export async function fetchAgentBalance(agentAddress, chainId) {
+  if (ARCHIVE_MODE) return null;
+
   const chainConfig = Object.values(CHAINS).find(c => c.chainId === chainId);
   if (!chainConfig || !agentAddress) return null;
 
@@ -40,6 +43,8 @@ export async function fetchAgentBalance(agentAddress, chainId) {
 }
 
 export async function fetchTokenBalance(agentAddress, chainId, tokenAddress, decimals = 6, fractionDigits = 2) {
+  if (ARCHIVE_MODE) return null;
+
   const chainConfig = Object.values(CHAINS).find(c => c.chainId === chainId);
   if (!chainConfig || !tokenAddress || !agentAddress) return null;
 
