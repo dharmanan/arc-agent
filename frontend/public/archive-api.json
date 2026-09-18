@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "status": "archived",
+  "code": "ARC_TESTNET_ARCHIVED",
+  "message": "Arc Machina is preserved as a read-only Arc Testnet demo. Live backend and execution APIs are no longer available."
+}
