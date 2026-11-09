@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useAccount, useSignMessage } from 'wagmi';
 import { useAgent } from '../providers/AgentProvider.jsx';
 import { agents as agentApi } from '../lib/api.js';
+import { agentForClientState } from '../lib/agentState.js';
 import { AGENT_PERMISSIONS } from '../lib/chains.js';
 import { fetchUsdcBalance } from '../lib/agentBalances.js';
 import { registerPasskey, authenticatePasskey, isPasskeySupported } from '../lib/passkey.js';
@@ -160,7 +161,7 @@ export default function AgentTab() {
       }
       setJwt(authResult.token);
       const created = await agentApi.create({ name: name.trim() });
-      pendingAgent.current = created.agent || created;
+      pendingAgent.current = agentForClientState(created);
       setNewKey(created.privateKey || '');
       setStep('confirm');
     } catch (e) {
